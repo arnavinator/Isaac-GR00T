@@ -83,6 +83,7 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+        self.verbose = False
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -353,8 +354,25 @@ class Gr00tN1d6ActionHead(nn.Module):
 
             pred_velocity = pred[:, -self.action_horizon :]
 
+            if self.verbose:
+                action_norm = actions.float().norm().item()
+                velocity_norm = pred_velocity.float().norm().item()
+                print(
+                    f"[Denoising] Step {t}/{self.num_inference_timesteps} | "
+                    f"t_cont={t_cont:.3f} | t_disc={t_discretized} | "
+                    f"action_norm={action_norm:.4f} | velocity_norm={velocity_norm:.4f}"
+                )
+
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
+
+        if self.verbose:
+            a = actions.float()
+            print(
+                f"[Denoising] Final action shape: {tuple(actions.shape)} | "
+                f"mean={a.mean().item():.4f} | std={a.std().item():.4f}"
+            )
+
         return BatchFeature(
             data={
                 "action_pred": actions,

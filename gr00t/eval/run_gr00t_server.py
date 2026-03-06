@@ -49,6 +49,9 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    verbose: bool = False
+    """Enable verbose denoising step logging in the action head"""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T inference server...")
@@ -92,6 +95,12 @@ def main(config: ServerConfig):
         from gr00t.policy.gr00t_policy import Gr00tSimPolicyWrapper
 
         policy = Gr00tSimPolicyWrapper(policy)
+
+    # Enable verbose denoising logging if requested
+    if config.verbose and config.model_path is not None:
+        inner_policy = policy.policy if config.use_sim_policy_wrapper else policy
+        inner_policy.model.action_head.verbose = True
+        print("Verbose denoising logging enabled")
 
     server = PolicyServer(
         policy=policy,

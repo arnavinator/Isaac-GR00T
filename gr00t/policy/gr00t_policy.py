@@ -76,7 +76,7 @@ class Gr00tPolicy(BasePolicy):
         import gr00t.model  # noqa: F401
 
         super().__init__(strict=strict)
-        model_dir = Path(model_path)
+        model_dir = Path(model_path)        # comes from run_gr00t_server.py
 
         # Load the pretrained model and move to target device with bfloat16 precision
         model = AutoModel.from_pretrained(model_dir)
@@ -89,16 +89,16 @@ class Gr00tPolicy(BasePolicy):
         self.processor.eval()
 
         # Store embodiment-specific configurations
-        self.embodiment_tag = embodiment_tag
-        self.modality_configs = self.processor.get_modality_configs()[self.embodiment_tag.value]
+        self.embodiment_tag = embodiment_tag            # comes from run_gr00t_server.py
+        self.modality_configs = self.processor.get_modality_configs()[self.embodiment_tag.value]        # this contains every supported embodiment, pick the embodiment_tag's configs (such as action chunk timestep window, name of joints, etc.)
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration
         # Currently only supports single language input per timestep
         language_keys = self.modality_configs["language"].modality_keys
-        language_delta_indices = self.modality_configs["language"].delta_indices
-        assert len(language_keys) == 1, "Only one language key is supported"
-        assert len(language_delta_indices) == 1, "Only one language delta index is supported"
+        language_delta_indices = self.modality_configs["language"].delta_indices        
+        assert len(language_keys) == 1, "Only one language key is supported"                    # ex. ["annotation.human.action.task_description"] ... key tells language instruction for task  
+        assert len(language_delta_indices) == 1, "Only one language delta index is supported"   # model receives one language string at the current timestep (no history of past instructions)
         self.language_key = language_keys[0]
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
@@ -211,7 +211,7 @@ class Gr00tPolicy(BasePolicy):
             )
 
             # Verify temporal dimension matches the expected horizon from config
-            assert batched_video.shape[1] == len(self.modality_configs["video"].delta_indices), (
+            assert batched_video.shape[1] == len(self.modality_configs["video"].delta_indices), (   
                 f"Video key '{video_key}'s horizon must be {len(self.modality_configs['video'].delta_indices)}. Got {batched_video.shape[1]}"
             )
 
@@ -303,6 +303,7 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
+    # called by rollout policy
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -397,7 +398,7 @@ class Gr00tPolicy(BasePolicy):
                 f"Action key '{action_key}' must be a numpy array of shape (B, T, D), got {action_arr.shape}"
             )
 
-            # Verify action horizon matches the expected temporal dimension from config
+            # Verify action horizon matches the expected temporal dimension from config ... returned data will correspond to the original data at a sampled base index + delta indices (ie how many timesteps in each action chunk)
             assert action_arr.shape[1] == len(self.modality_configs["action"].delta_indices), (
                 f"Action key '{action_key}'s horizon must be {len(self.modality_configs['action'].delta_indices)}. Got {action_arr.shape[1]}"
             )

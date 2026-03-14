@@ -40,8 +40,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 **config.diffusion_model_cfg, cross_attention_dim=config.backbone_embedding_dim
             )
             print("Using DiT for diffusion model")
-        self.action_dim = config.max_action_dim
-        self.action_horizon = config.action_horizon
+        self.action_dim = config.max_action_dim             # 128 is the max for any embodiment, only relevant dims are sliced  
+        self.action_horizon = config.action_horizon         # 50 is the max across all embodiment, only relevant time sliced off 
         self.num_inference_timesteps = config.num_inference_timesteps
 
         self.state_encoder = CategorySpecificMLP(

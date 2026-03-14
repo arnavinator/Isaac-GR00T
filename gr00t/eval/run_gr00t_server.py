@@ -17,10 +17,10 @@ class ServerConfig:
     """Configuration for running the Groot N1.5 inference server."""
 
     # Gr00t policy configs
-    model_path: str | None = None
+    model_path: str | None = None       # ex. nvidia/GR00T-N1.6-3B
     """Path to the model checkpoint directory"""
 
-    embodiment_tag: EmbodimentTag = EmbodimentTag.NEW_EMBODIMENT
+    embodiment_tag: EmbodimentTag = EmbodimentTag.NEW_EMBODIMENT        # ex. ROBOCASA_PANDA_OMRON
     """Embodiment tag"""
 
     device: str = "cuda"

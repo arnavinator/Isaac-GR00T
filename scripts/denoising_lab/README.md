@@ -83,8 +83,9 @@ Observation saved to: /tmp/saved_observations/ep000_step000.npz
 **Step 3 — Open the PandaOmron notebook** (main `.venv`, GPU):
 
 ```bash
-uv run jupyter lab scripts/denoising_lab/interactive_denoising_panda.ipynb
+code scripts/denoising_lab/interactive_denoising_panda.ipynb
 ```
+Set the python kernel to be .venv/bin/python
 
 Set `OBS_PATH` in cell 1 to point to your saved `.npz` file, then run all cells. The 3D plots show true EEF (end-effector) Cartesian trajectories.
 

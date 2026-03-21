@@ -87,7 +87,43 @@ code scripts/denoising_lab/interactive_denoising_panda.ipynb
 ```
 Set the python kernel to be .venv/bin/python
 
-Set `OBS_PATH` in cell 1 to point to your saved `.npz` file, then run all cells. The 3D plots show true EEF (end-effector) Cartesian trajectories.
+Set `OBS_PATH` in cell 1 to point to your saved `.npz` file, then run all cells. The 3D plots show true EEF (end-effector) Cartesian trajectories. Cell 3b shows the camera views so you can see the scene.
+
+### Replay — visualize action chunks in the simulator
+
+After experimenting with denoising in the notebook, you can replay action chunks in the actual simulator to see the robot move:
+
+**Step 1** — In the PandaOmron notebook, run cell 14 to export an action chunk:
+```python
+DenoisingLab.save_action_chunk(decoded, "/tmp/action_chunks/my_strategy.npz")
+```
+
+**Step 2** — Run the replay in the sim venv:
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/interactive_rollout.py \
+  --replay \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --obs-path /tmp/saved_observations/ep000_step001.npz \
+  --action-path /tmp/action_chunks/my_strategy.npz \
+  --video-out /tmp/replay.mp4
+```
+
+The replay restores the sim to the exact state when the observation was captured, applies the action chunk, and saves a video of the result. You can compare different denoising strategies by replaying each and examining the videos.
+
+### Video recording during rollouts
+
+Add `--video-dir` to record full episode videos during interactive rollouts:
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/interactive_rollout.py \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --host 127.0.0.1 --port 5555 \
+  --n-action-steps 8 --max-episode-steps 720 \
+  --save-dir /tmp/saved_observations \
+  --video-dir /tmp/rollout_videos
+```
 
 ## API reference
 
@@ -136,6 +172,14 @@ Returns a human-readable string showing all action dimensions for one sub-step.
 
 Save/load observation dicts as compressed `.npz` files. The bridge between the sim venv and model venv.
 
+**`save_action_chunk(decoded_actions, path)`** / **`load_action_chunk(path)`** (static methods)
+
+Save/load decoded action chunks for replay in the simulator.
+
+**`plot_camera_views(observation, figsize=None) -> Figure`** (static method)
+
+Display all camera images from an observation side-by-side. Works with both flat (sim) and nested observation formats. The PandaOmron notebook uses this to show what the robot sees at the saved observation, making it easier to identify interesting states to experiment with.
+
 ### `TrajectoryVisualizer`
 
 Accumulates EEF trajectories from different denoising runs for comparison plotting.
@@ -146,9 +190,16 @@ viz.add_trajectory(decoded_actions, "label", eef_key="end_effector_position")
 viz.add_from_denoise_result(result, lab, "label")
 
 viz.plot_eef_3d()                               # 3D trajectory plot
+viz.plot_eef_3d(show_orientation=True)          # + mini RGB coordinate frames (R=X, G=Y, B=Z)
+viz.plot_eef_3d(show_gripper=True)              # + green→red markers for gripper state
+viz.plot_eef_3d(show_orientation=True,          # both at once
+                show_gripper=True,
+                frame_stride=2)                 # orientation frames every 2nd timestep
 viz.plot_eef_components()                       # X/Y/Z over timesteps
 viz.plot_denoising_progression(result, lab)      # trajectory at each denoising step
 ```
+
+`add_trajectory()` automatically stores rotation deltas and gripper values from the decoded actions dict (when present) for use by the orientation/gripper visualization. The defaults (`rotation_key="end_effector_rotation"`, `gripper_key="gripper_close"`) match PandaOmron. For embodiments without these keys (e.g. GR1 joint-angle actions), the data is simply `None` and the orientation/gripper toggles are silently ignored.
 
 ### `compare_strategies()`
 
@@ -174,6 +225,7 @@ runner = InteractiveRollout(
     host="127.0.0.1", port=5555,
     n_action_steps=8, max_episode_steps=720,
     save_dir="/tmp/saved_observations",
+    video_dir="/tmp/rollout_videos",  # optional — records episode video
 )
 runner.run_episode()
 ```
@@ -184,29 +236,58 @@ The interactive menu at each step:
 |-----|--------|
 | `s` | Execute the action chunk in the environment |
 | `d` | Print per-sub-step action dimensions and values |
-| `o` | Save current observation to `.npz` in `save_dir` |
+| `o` | Save current observation + sim state to `.npz`, plus a camera snapshot `.png` |
 | `r` | Discard action, re-query the server for a new one |
 | `q` | End the episode |
 
+When saving (`[o]`), two files are written:
+- `ep000_step003.npz` — full observation with state, camera images, language, and MuJoCo sim state
+- `ep000_step003.png` — camera montage image for quick visual reference
+
+The MuJoCo sim state embedded in the `.npz` enables **replay** of action chunks from the notebook.
+
+### `ReplayRollout`
+
+Replays an action chunk exported from the notebook in the simulator, recording a video. This lets you try different denoising strategies in the notebook and see their effect in the actual environment.
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/interactive_rollout.py \
+  --replay \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --obs-path /tmp/saved_observations/ep000_step001.npz \
+  --action-path /tmp/action_chunks/default_seed42.npz \
+  --video-out /tmp/replay_default.mp4
+```
+
+The replay:
+1. Creates the environment and resets it
+2. Restores the MuJoCo sim state from the saved observation `.npz`
+3. Steps through each sub-step of the action chunk
+4. Records all camera frames and saves an `.mp4` video
+
 ## Notebook cells
 
-Both notebooks share the same cell structure (14 cells, numbered 1–13 with cell 0 as a markdown header):
+Both notebooks share the same cell structure. The PandaOmron notebook has two extra cells (3b and 14):
 
 | Cell | Purpose |
 |------|---------|
 | 1 | Imports + configuration (model path, embodiment tag, device) |
 | 2 | Load model into `DenoisingLab` |
 | 3 | Load observation (GR1: from demo dataset; Panda: from `.npz` file) |
+| 3b | *(Panda only)* Visualize camera views from the saved observation |
 | 4 | Encode backbone features (expensive — run once) |
 | 5 | Default 4-step denoising with step-by-step metrics |
 | 6 | Decode to physical units + human-readable inspection |
 | 7 | 3D trajectory plot (GR1: joint-angle proxy; Panda: true EEF Cartesian) |
+| 7b | *(Panda only)* 3D trajectory with orientation frames (RGB=XYZ) and gripper state |
 | 8 | Compare 5 random seeds on the same observation |
 | 9 | Compare 2/4/8/16 denoising steps |
 | 10 | Manual step-by-step denoising via `denoise_single_step()` |
 | 11 | Guided denoising (velocity scaling example) |
 | 12 | Raw denoising loop — fully editable playground mode |
 | 13 | Denoising progression visualization (noise → final trajectory) |
+| 14 | *(Panda only)* Export action chunk for replay in the simulator |
 
 ## How the denoising loop works
 

@@ -430,7 +430,7 @@ class DenoisingLab:
 
         pred = self.action_head.action_decoder(model_output, embodiment_id)
         velocity = pred[:, -self.action_horizon :]
-        updated_actions = actions + dt * velocity
+        updated_actions = actions + dt * velocity           # SINGLE STEP DENOISING HERE
         return velocity, updated_actions
 
     # ------------------------------------------------------------------
@@ -472,6 +472,88 @@ class DenoisingLab:
     # ------------------------------------------------------------------
     # Observation I/O
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def save_action_chunk(
+        decoded_actions: dict[str, np.ndarray], path: str | Path
+    ) -> None:
+        """Save a decoded action chunk to ``.npz`` for replay in the simulator.
+
+        Args:
+            decoded_actions: Output of ``decode_raw_actions()``, e.g.
+                ``{"end_effector_position": (B, 16, 3), ...}``.
+            path: Destination ``.npz`` file.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(str(path), **decoded_actions)
+
+    @staticmethod
+    def load_action_chunk(path: str | Path) -> dict[str, np.ndarray]:
+        """Load a decoded action chunk saved by ``save_action_chunk()``."""
+        data = dict(np.load(str(path), allow_pickle=True))
+        return data
+
+    @staticmethod
+    def plot_camera_views(
+        observation: dict[str, Any],
+        figsize: tuple[int, int] | None = None,
+    ) -> plt.Figure:
+        """Display camera images from an observation dict.
+
+        Works with both flat sim observations (``video.cam_name``) and
+        nested observations (``observation["video"]["cam_name"]``).
+
+        Args:
+            observation: Observation dict (flat or nested).
+            figsize: Optional figure size.
+
+        Returns:
+            The matplotlib Figure.
+        """
+        images: list[tuple[str, np.ndarray]] = []
+
+        # Collect images — handle both flat and nested formats
+        for key, val in observation.items():
+            if key.startswith("video.") and isinstance(val, np.ndarray):
+                # Flat format: video.res256_image_side_0 -> (1, 1, H, W, 3)
+                # Prefer 256 resolution for display; skip 512 duplicates
+                if "res512" in key:
+                    continue
+                img = val
+                while img.ndim > 3:
+                    img = img[0]
+                name = key.replace("video.", "")
+                images.append((name, img))
+            elif key == "video" and isinstance(val, dict):
+                # Nested format: observation["video"]["cam_name"] -> (1, H, W, 3)
+                for cam_name, cam_val in val.items():
+                    if "res512" in cam_name:
+                        continue
+                    if isinstance(cam_val, np.ndarray):
+                        img = cam_val
+                        while img.ndim > 3:
+                            img = img[0]
+                        images.append((cam_name, img))
+
+        if not images:
+            raise ValueError("No camera images found in observation")
+
+        n = len(images)
+        if figsize is None:
+            figsize = (4 * n, 4)
+
+        fig, axes = plt.subplots(1, n, figsize=figsize)
+        if n == 1:
+            axes = [axes]
+
+        for ax, (name, img) in zip(axes, images):
+            ax.imshow(img)
+            ax.set_title(name, fontsize=10)
+            ax.axis("off")
+
+        plt.tight_layout()
+        return fig
 
     @staticmethod
     def save_observation(observation: dict[str, Any], path: str | Path) -> None:
@@ -520,6 +602,7 @@ class DenoisingLab:
         """Load an observation dict from a ``.npz`` file saved by ``save_observation``.
 
         Returns a flat dict with keys like ``video.cam``, ``state.joints``, etc.
+        Internal keys (``__metadata__``, ``__sim_state__``) are excluded.
         """
         import json
 
@@ -528,6 +611,9 @@ class DenoisingLab:
 
         if "__metadata__" in data:
             metadata = json.loads(str(data.pop("__metadata__")))
+
+        # Remove internal keys
+        data.pop("__sim_state__", None)
 
         result: dict[str, Any] = {}
         for key, arr in data.items():
@@ -548,6 +634,39 @@ class DenoisingLab:
 # ---------------------------------------------------------------------------
 
 
+def _accumulate_orientations(rot_deltas: np.ndarray) -> list[np.ndarray]:
+    """Accumulate rotation matrices from axis-angle deltas (Rodrigues).
+
+    Args:
+        rot_deltas: ``(T, 3)`` axis-angle rotation deltas.
+
+    Returns:
+        List of ``T+1`` rotation matrices ``(3, 3)``, starting from identity.
+    """
+
+    def _rotvec_to_matrix(rv: np.ndarray) -> np.ndarray:
+        angle = float(np.linalg.norm(rv))
+        if angle < 1e-10:
+            return np.eye(3)
+        axis = rv / angle
+        K = np.array(
+            [
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0],
+            ]
+        )
+        return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+    current = np.eye(3)
+    orientations = [current.copy()]
+    for t in range(len(rot_deltas)):
+        delta_mat = _rotvec_to_matrix(rot_deltas[t])
+        current = current @ delta_mat
+        orientations.append(current.copy())
+    return orientations
+
+
 class TrajectoryVisualizer:
     """Accumulate and compare EEF trajectories from different denoising strategies."""
 
@@ -561,6 +680,8 @@ class TrajectoryVisualizer:
         color: str | None = None,
         start_pos: np.ndarray | None = None,
         eef_key: str = "end_effector_position",
+        rotation_key: str = "end_effector_rotation",
+        gripper_key: str = "gripper_close",
     ) -> None:
         """Add a trajectory from decoded actions.
 
@@ -570,6 +691,10 @@ class TrajectoryVisualizer:
             color: Optional matplotlib color.
             start_pos: Starting EEF position ``(3,)``. Defaults to origin.
             eef_key: Key for EEF position in decoded_actions.
+            rotation_key: Key for EEF rotation deltas (axis-angle).
+                Stored for optional orientation visualization in ``plot_eef_3d``.
+            gripper_key: Key for gripper state.
+                Stored for optional gripper visualization in ``plot_eef_3d``.
         """
         if eef_key not in decoded_actions:
             available = list(decoded_actions.keys())
@@ -577,7 +702,9 @@ class TrajectoryVisualizer:
                 f"Key '{eef_key}' not in decoded_actions. Available: {available}"
             )
 
-        deltas = decoded_actions[eef_key][0]  # (T, 3) — batch 0
+        deltas = decoded_actions[eef_key][0]  # (T, D) — batch 0
+        # Use only first 3 dims for 3D plotting (e.g. GR1 joint keys have D>3)
+        deltas = deltas[:, :3]
         if start_pos is None:
             start_pos = np.zeros(3)
 
@@ -586,12 +713,24 @@ class TrajectoryVisualizer:
         for t in range(deltas.shape[0]):
             positions[t + 1] = positions[t] + deltas[t]
 
+        # Store rotation deltas if available
+        rotations = None
+        if rotation_key in decoded_actions:
+            rotations = decoded_actions[rotation_key][0]  # (T, 3) axis-angle deltas
+
+        # Store gripper values if available
+        gripper = None
+        if gripper_key in decoded_actions:
+            gripper = decoded_actions[gripper_key][0]  # (T, 1)
+
         self.trajectories.append(
             {
                 "positions": positions,
                 "label": label,
                 "color": color,
                 "deltas": deltas,
+                "rotations": rotations,
+                "gripper": gripper,
             }
         )
 
@@ -604,29 +743,112 @@ class TrajectoryVisualizer:
         start_pos: np.ndarray | None = None,
         states: dict[str, np.ndarray] | None = None,
         eef_key: str = "end_effector_position",
+        rotation_key: str = "end_effector_rotation",
+        gripper_key: str = "gripper_close",
     ) -> dict[str, np.ndarray]:
         """Decode a DenoiseResult and add the trajectory. Returns decoded actions."""
         decoded = lab.decode_raw_actions(result.action_pred, states)
-        self.add_trajectory(decoded, label, color, start_pos, eef_key)
+        self.add_trajectory(
+            decoded, label, color, start_pos, eef_key, rotation_key, gripper_key,
+        )
         return decoded
 
     def plot_eef_3d(
         self,
         title: str | None = None,
         figsize: tuple[int, int] = (10, 8),
+        show_orientation: bool = False,
+        show_gripper: bool = False,
+        frame_scale: float | None = None,
+        frame_stride: int = 1,
     ) -> plt.Figure:
-        """3D plot of all accumulated EEF trajectories."""
+        """3D plot of all accumulated EEF trajectories.
+
+        Args:
+            title: Plot title.
+            figsize: Figure size.
+            show_orientation: Draw mini RGB coordinate frames at each
+                timestep showing EEF orientation (red=X, green=Y, blue=Z).
+            show_gripper: Color trajectory markers by gripper state
+                (green=open, red=closed). Adds a colorbar.
+            frame_scale: Length of orientation frame arrows. Auto-scaled
+                from trajectory extent if *None*.
+            frame_stride: Draw orientation frames every *N* timesteps
+                (default 1 = every timestep).
+        """
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection="3d")
+
+        has_gripper_data = False
 
         for traj in self.trajectories:
             pos = traj["positions"]
             kwargs: dict[str, Any] = {"label": traj["label"]}
             if traj["color"]:
                 kwargs["color"] = traj["color"]
-            ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "-o", markersize=3, **kwargs)
+
+            if show_gripper and traj.get("gripper") is not None:
+                # Line only — coloured markers drawn separately below
+                ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], "-", **kwargs)
+            else:
+                ax.plot(
+                    pos[:, 0], pos[:, 1], pos[:, 2],
+                    "-o", markersize=3, **kwargs,
+                )
+
             ax.scatter(*pos[0], marker="^", s=60, zorder=5)
             ax.scatter(*pos[-1], marker="s", s=60, zorder=5)
+
+            # Gripper-coloured markers
+            if show_gripper and traj.get("gripper") is not None:
+                gripper_vals = traj["gripper"][:, 0]  # (T,)
+                has_gripper_data = True
+                cmap = plt.cm.RdYlGn_r
+                for t in range(len(gripper_vals)):
+                    val = float(np.clip(gripper_vals[t], 0, 1))
+                    ax.scatter(
+                        pos[t + 1, 0], pos[t + 1, 1], pos[t + 1, 2],
+                        color=cmap(val), s=50, edgecolors="k",
+                        linewidths=0.5, zorder=6,
+                    )
+
+        # Equal axis scaling — use bounding-box center (not mean)
+        all_pos = np.concatenate([t["positions"] for t in self.trajectories])
+        bbox_min = all_pos.min(axis=0)
+        bbox_max = all_pos.max(axis=0)
+        mid = (bbox_min + bbox_max) / 2
+        max_range = (bbox_max - bbox_min).max() / 2
+        if max_range < 1e-8:
+            max_range = 0.01
+
+        # Orientation frames (drawn after limits are known for auto-scaling)
+        if show_orientation:
+            arrow_len = (
+                frame_scale if frame_scale is not None else max_range * 0.10
+            )
+            axis_colors = ["red", "green", "blue"]
+            for traj in self.trajectories:
+                if traj.get("rotations") is None:
+                    continue
+                pos = traj["positions"]
+                orientations = _accumulate_orientations(traj["rotations"])
+                for i in range(0, len(pos), frame_stride):
+                    if i >= len(orientations):
+                        break
+                    pt = pos[i]
+                    rot_mat = orientations[i]
+                    for axis_idx in range(3):
+                        d = rot_mat[:, axis_idx]
+                        ax.quiver(
+                            pt[0], pt[1], pt[2], d[0], d[1], d[2],
+                            length=arrow_len, normalize=True,
+                            color=axis_colors[axis_idx], alpha=0.5,
+                            arrow_length_ratio=0.2, linewidth=1.0,
+                        )
+
+        ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
+        ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
+        ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
@@ -635,15 +857,16 @@ class TrajectoryVisualizer:
         if title:
             ax.set_title(title)
 
-        # Equal axis scaling
-        all_pos = np.concatenate([t["positions"] for t in self.trajectories])
-        mid = all_pos.mean(axis=0)
-        max_range = (all_pos.max(axis=0) - all_pos.min(axis=0)).max() / 2
-        if max_range < 1e-8:
-            max_range = 0.01
-        ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
-        ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
-        ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
+        # Gripper colorbar
+        if show_gripper and has_gripper_data:
+            import matplotlib.colors as mcolors
+            sm = plt.cm.ScalarMappable(
+                cmap=plt.cm.RdYlGn_r,
+                norm=mcolors.Normalize(vmin=0, vmax=1),
+            )
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.1)
+            cbar.set_label("Gripper (0=open, 1=closed)")
 
         plt.tight_layout()
         return fig
@@ -697,6 +920,7 @@ class TrajectoryVisualizer:
             decoded = lab.decode_raw_actions(tensor)
             if eef_key in decoded:
                 deltas = decoded[eef_key][0]
+                deltas = deltas[:, :3]  # first 3 dims for 3D plotting
                 pos = np.zeros((deltas.shape[0] + 1, 3))
                 for t in range(deltas.shape[0]):
                     pos[t + 1] = pos[t] + deltas[t]
@@ -708,8 +932,10 @@ class TrajectoryVisualizer:
         # Uniform axis limits
         if all_positions:
             all_pos = np.concatenate(all_positions)
-            mid = all_pos.mean(axis=0)
-            max_range = (all_pos.max(axis=0) - all_pos.min(axis=0)).max() / 2
+            bbox_min = all_pos.min(axis=0)
+            bbox_max = all_pos.max(axis=0)
+            mid = (bbox_min + bbox_max) / 2
+            max_range = (bbox_max - bbox_min).max() / 2
             if max_range < 1e-8:
                 max_range = 0.01
             for ax in axes:

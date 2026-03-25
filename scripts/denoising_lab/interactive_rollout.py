@@ -50,6 +50,21 @@ from gr00t.eval.rollout_policy import (
 from gr00t.policy.server_client import PolicyClient
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types in ep_meta dicts."""
+
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+
 class InteractiveRollout:
     """Interactive step-by-step rollout with observation capture."""
 
@@ -108,6 +123,21 @@ class InteractiveRollout:
             base_env = self.env.unwrapped  # gymnasium base
             robosuite_env = base_env.env    # robosuite env stored in RoboCasaEnv.env
             return np.array(robosuite_env.sim.get_state().flatten())
+        except (AttributeError, TypeError):
+            return None
+
+    def _get_ep_meta(self) -> dict | None:
+        """Get robosuite episode metadata (layout_id, style_id, etc.) for replay.
+
+        The ep_meta dict captures all the random choices made during
+        ``_load_model()`` — kitchen layout, style, object assets, camera poses —
+        so that ``set_ep_meta()`` + ``reset()`` can reproduce the exact same
+        scene geometry.
+        """
+        try:
+            base_env = self.env.unwrapped
+            robosuite_env = base_env.env
+            return robosuite_env.get_ep_meta()
         except (AttributeError, TypeError):
             return None
 
@@ -180,6 +210,14 @@ class InteractiveRollout:
 
         if metadata:
             save_dict["__metadata__"] = np.array(json.dumps(metadata), dtype=object)
+
+        # Save episode metadata (layout_id, style_id, object configs, etc.)
+        # as a separate JSON blob so replay can restore the exact kitchen layout.
+        ep_meta = self._get_ep_meta()
+        if ep_meta is not None:
+            save_dict["__ep_meta__"] = np.array(
+                json.dumps(ep_meta, cls=_NumpyEncoder), dtype=object
+            )
 
         np.savez_compressed(str(path), **save_dict)
 
@@ -298,6 +336,10 @@ class InteractiveRollout:
                     sim_state = self._get_sim_state()
                     if sim_state is not None:
                         print(f"Sim state saved ({sim_state.shape[0]} floats) — replay-ready")
+                    ep_meta = self._get_ep_meta()
+                    if ep_meta is not None:
+                        print(f"Layout saved: layout_id={ep_meta.get('layout_id')}, "
+                              f"style_id={ep_meta.get('style_id')}")
 
                 elif choice in ("r", "re-query", "requery"):
                     action, _ = self.client.get_action(batched_obs)
@@ -403,7 +445,7 @@ class ReplayRollout:
         """
         import av
 
-        # Load observation .npz (contains sim state)
+        # Load observation .npz (contains sim state + ep_meta for layout replay)
         data = dict(np.load(str(self.obs_path), allow_pickle=True))
         if "__sim_state__" not in data:
             raise ValueError(
@@ -412,13 +454,30 @@ class ReplayRollout:
             )
         sim_state = data["__sim_state__"]
 
+        # Load episode metadata (layout_id, style_id, object configs, etc.)
+        # so the reset rebuilds the exact same kitchen instead of randomizing.
+        ep_meta = None
+        if "__ep_meta__" in data:
+            ep_meta = json.loads(str(data["__ep_meta__"]))
+
         # Load action chunk
         action_data = dict(np.load(str(self.action_path), allow_pickle=True))
         print(f"Action chunk keys: {list(action_data.keys())}")
         for k, v in action_data.items():
             print(f"  {k}: shape={v.shape}")
 
-        # Reset env first (needed to initialize sim), then restore state
+        # Inject ep_meta BEFORE reset so _load_model() builds the same kitchen
+        robosuite_env = self._get_robosuite_env()
+        if ep_meta is not None:
+            robosuite_env.set_ep_meta(ep_meta)
+            print(f"Restored ep_meta: layout_id={ep_meta.get('layout_id')}, "
+                  f"style_id={ep_meta.get('style_id')}")
+        else:
+            print("WARNING: No ep_meta in saved observation — kitchen layout "
+                  "will be randomized. Re-save with the updated interactive_rollout.py "
+                  "for deterministic replay.")
+
+        # Reset env (uses saved layout via ep_meta), then restore exact state
         print("Resetting environment...")
         obs, info = self.env.reset()
         print("Restoring sim state...")

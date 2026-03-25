@@ -240,11 +240,11 @@ The interactive menu at each step:
 | `r` | Discard action, re-query the server for a new one |
 | `q` | End the episode |
 
-When saving (`[o]`), two files are written:
-- `ep000_step003.npz` — full observation with state, camera images, language, and MuJoCo sim state
+When saving (`[o]`), three items are written:
+- `ep000_step003.npz` — full observation with state, camera images, language, MuJoCo sim state, and ep_meta (kitchen layout/style configuration for deterministic replay)
 - `ep000_step003.png` — camera montage image for quick visual reference
 
-The MuJoCo sim state embedded in the `.npz` enables **replay** of action chunks from the notebook.
+The ep_meta and MuJoCo sim state embedded in the `.npz` enable **replay** of action chunks from the notebook — the kitchen layout, drawer positions, and robot pose are all restored exactly as they were when the observation was captured.
 
 ### `ReplayRollout`
 
@@ -261,10 +261,12 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 ```
 
 The replay:
-1. Creates the environment and resets it
-2. Restores the MuJoCo sim state from the saved observation `.npz`
-3. Steps through each sub-step of the action chunk
-4. Records all camera frames and saves an `.mp4` video
+1. Creates the environment
+2. Restores the kitchen layout from saved ``ep_meta`` (layout_id, style_id, object configs, etc.)
+3. Resets the environment with the correct layout
+4. Restores the MuJoCo sim state (qpos/qvel) for exact joint/object positions
+5. Steps through each sub-step of the action chunk
+6. Records all camera frames and saves an ``.mp4`` video
 
 ## Notebook cells
 

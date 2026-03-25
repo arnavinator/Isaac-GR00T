@@ -273,6 +273,18 @@ class InteractiveRollout:
         print(f"Episode {self.episode_count} started. Env: {self.env_name}")
         print(f"{'='*60}")
 
+        # Detect language key and initialize prompt tracking
+        language_key = None
+        for key, val in obs.items():
+            if isinstance(val, str):
+                language_key = key
+                break
+        original_prompt = obs.get(language_key, "") if language_key else ""
+        prompt_override = None  # None = use env default
+        prompt_history: list[tuple[int, str]] = [(0, original_prompt)]
+        if language_key:
+            print(f"Text prompt: '{original_prompt}'")
+
         done = False
         total_reward = 0.0
         success = False
@@ -282,12 +294,27 @@ class InteractiveRollout:
             action, _ = self.client.get_action(batched_obs)
 
             print(f"\nStep {self.step_count} | Reward so far: {total_reward:.2f}")
-            print("Menu: [s]tep  [d]etails  [o]save-obs  [r]e-query  [q]uit")
+            if prompt_override is not None:
+                print(f"  Prompt (modified): '{prompt_override}'")
+            print("Menu: [s]tep  [so]save+step  [d]etails  [o]save-obs  [m]odify-text  [r]e-query  [q]uit")
 
             while True:
                 choice = input("> ").strip().lower()
 
-                if choice in ("s", "step", ""):
+                if choice in ("s", "step", "", "so", "save-step"):
+                    # Save observation first if requested
+                    if choice in ("so", "save-step"):
+                        path = self._save_observation(batched_obs)
+                        print(f"Observation saved to: {path}")
+                        print(f"Camera snapshot: {path.with_suffix('.png')}")
+                        sim_state = self._get_sim_state()
+                        if sim_state is not None:
+                            print(f"Sim state saved ({sim_state.shape[0]} floats) — replay-ready")
+                        ep_meta = self._get_ep_meta()
+                        if ep_meta is not None:
+                            print(f"Layout saved: layout_id={ep_meta.get('layout_id')}, "
+                                  f"style_id={ep_meta.get('style_id')}")
+
                     # Execute action
                     # Remove batch dimension for single env
                     unbatched_action = {}
@@ -324,6 +351,9 @@ class InteractiveRollout:
                                 batched_obs[key] = val
                             else:
                                 batched_obs[key] = val
+                        # Apply persistent prompt override
+                        if prompt_override is not None and language_key is not None:
+                            batched_obs[language_key] = (prompt_override,)
                     break
 
                 elif choice in ("d", "details"):
@@ -345,13 +375,38 @@ class InteractiveRollout:
                     action, _ = self.client.get_action(batched_obs)
                     print("Re-queried server for new action.")
 
+                elif choice in ("m", "modify-text", "modify"):
+                    if language_key is None:
+                        print("No language key found in observation.")
+                    else:
+                        print("\n--- Text Prompt History ---")
+                        for i, (step, prompt) in enumerate(prompt_history):
+                            if i == 0:
+                                label = f"step {step} (original)"
+                            else:
+                                label = f"step {step}"
+                            print(f"  [{label}]: '{prompt}'")
+                        current = prompt_override if prompt_override is not None else original_prompt
+                        print(f"\n  Current prompt: '{current}'")
+                        print("---")
+                        new_prompt = input("Enter new prompt (or press Enter to keep): ").strip()
+                        if new_prompt:
+                            prompt_override = new_prompt
+                            prompt_history.append((self.step_count, new_prompt))
+                            batched_obs[language_key] = (new_prompt,)
+                            # Re-query so the next [s]tep uses the new prompt
+                            action, _ = self.client.get_action(batched_obs)
+                            print(f"Prompt changed to: '{new_prompt}' — action re-queried.")
+                        else:
+                            print("Prompt unchanged.")
+
                 elif choice in ("q", "quit"):
                     print("Quitting episode.")
                     done = True
                     break
 
                 else:
-                    print("Unknown command. Use [s]tep [d]etails [o]save [r]e-query [q]uit")
+                    print("Unknown command. Use [s]tep [so]save+step [d]etails [o]save [m]odify-text [r]e-query [q]uit")
 
         self.episode_count += 1
         return {

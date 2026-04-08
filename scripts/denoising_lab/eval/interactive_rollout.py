@@ -14,7 +14,7 @@ Usage::
 
     # Terminal 2 (sim venv) — run interactive rollout
     gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \\
-        scripts/denoising_lab/interactive_rollout.py \\
+        scripts/denoising_lab/eval/interactive_rollout.py \\
         --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \\
         --host 127.0.0.1 --port 5555 \\
         --n-action-steps 8 --max-episode-steps 720 \\
@@ -22,7 +22,7 @@ Usage::
 
     # Replay an action chunk (after exporting from the notebook)
     gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \\
-        scripts/denoising_lab/interactive_rollout.py \\
+        scripts/denoising_lab/eval/interactive_rollout.py \\
         --replay \\
         --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \\
         --obs-path /tmp/saved_observations/ep000_step001.npz \\

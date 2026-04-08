@@ -17,17 +17,23 @@ The Denoising Lab splits these two stages apart so you can run the backbone **on
 scripts/denoising_lab/
   __init__.py
   denoising_lab.py                       # Core library (model loading, open denoising loop, decoding, visualization)
-  interactive_denoising_gr1.ipynb        # GR1 notebook — uses bundled demo dataset, no simulator needed
-  interactive_denoising_panda.ipynb      # PandaOmron notebook — uses .npz observations from simulator
-  interactive_rollout.py                 # Sim-side script (robocasa venv, CPU)
+  notebooks/
+    interactive_denoising_gr1.ipynb      # GR1 notebook — uses bundled demo dataset, no simulator needed
+    interactive_denoising_panda.ipynb    # PandaOmron notebook — uses .npz observations from simulator
+  eval/
+    interactive_rollout.py               # Sim-side script (robocasa venv, CPU)
+    robocasa_eval_benchmark.py           # Reproducible benchmark runner (robocasa venv, CPU)
+    strategies/                          # Denoising strategy implementations
+      baseline_euler/                    # Control group — stock 4-step Euler
 ```
 
 The toolkit enforces a strict two-venv separation, matching the existing server/client architecture:
 
 | Component | Venv | GPU | What it does |
 |-----------|------|-----|-------------|
-| `denoising_lab.py` + notebooks | Main `.venv` | Yes | Model loading, backbone encoding, denoising experiments, visualization |
-| `interactive_rollout.py` | Sim venv (`robocasa_uv/.venv`) | No | Runs the simulator, captures observations, executes actions |
+| `denoising_lab.py` + `notebooks/` | Main `.venv` | Yes | Model loading, backbone encoding, denoising experiments, visualization |
+| `eval/interactive_rollout.py` | Sim venv (`robocasa_uv/.venv`) | No | Runs the simulator, captures observations, executes actions |
+| `eval/robocasa_eval_benchmark.py` | Sim venv (`robocasa_uv/.venv`) | No | Reproducible seeded evaluation across envs |
 
 The bridge between them is `.npz` files on disk — the rollout script saves observations, and the PandaOmron notebook loads them.
 
@@ -39,7 +45,7 @@ The repo ships `demo_data/gr1.PickNPlace`, a small LeRobot-format dataset of GR1
 
 ```bash
 # From repo root
-uv run jupyter lab scripts/denoising_lab/interactive_denoising_gr1.ipynb
+uv run jupyter lab scripts/denoising_lab/notebooks/interactive_denoising_gr1.ipynb
 ```
 
 Run cells 1–13 in order. Cell 3 loads a single observation from the demo dataset using the same `LeRobotEpisodeLoader` / `extract_step_data` pattern as `getting_started/GR00T_inference.ipynb`.
@@ -63,7 +69,7 @@ uv run python gr00t/eval/run_gr00t_server.py \
 
 ```bash
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-  scripts/denoising_lab/interactive_rollout.py \
+  scripts/denoising_lab/eval/interactive_rollout.py \
   --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
   --host 127.0.0.1 --port 5555 \
   --n-action-steps 8 --max-episode-steps 720 \
@@ -83,7 +89,7 @@ Observation saved to: /tmp/saved_observations/ep000_step000.npz
 **Step 3 — Open the PandaOmron notebook** (main `.venv`, GPU):
 
 ```bash
-code scripts/denoising_lab/interactive_denoising_panda.ipynb
+code scripts/denoising_lab/notebooks/interactive_denoising_panda.ipynb
 ```
 Set the python kernel to be .venv/bin/python
 
@@ -101,7 +107,7 @@ DenoisingLab.save_action_chunk(decoded, "/tmp/action_chunks/my_strategy.npz")
 **Step 2** — Run the replay in the sim venv:
 ```bash
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-  scripts/denoising_lab/interactive_rollout.py \
+  scripts/denoising_lab/eval/interactive_rollout.py \
   --replay \
   --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
   --obs-path /tmp/saved_observations/ep000_step001.npz \
@@ -117,13 +123,36 @@ Add `--video-dir` to record full episode videos during interactive rollouts:
 
 ```bash
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-  scripts/denoising_lab/interactive_rollout.py \
+  scripts/denoising_lab/eval/interactive_rollout.py \
   --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
   --host 127.0.0.1 --port 5555 \
   --n-action-steps 8 --max-episode-steps 720 \
   --save-dir /tmp/saved_observations \
   --video-dir /tmp/rollout_videos
 ```
+
+### Reproducible benchmarking
+
+`eval/robocasa_eval_benchmark.py` runs seeded episodes against a running server, producing JSONL per-episode logs and a `summary.json` with aggregate stats. It is strategy-agnostic — it connects to whatever server is running.
+
+```bash
+# Terminal 1 (model venv) — start server (e.g. baseline)
+bash scripts/denoising_lab/eval/strategies/baseline_euler/run_server.sh
+
+# Terminal 2 (sim venv) — run benchmark
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+  --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --n-episodes 10 --seed 42 \
+  --output-dir /tmp/benchmark_results/baseline_euler \
+  --strategy-name baseline_euler
+```
+
+Key features:
+- **Reproducible**: uses a single env with explicit `env.reset(seed=N)` (not AsyncVectorEnv) so identical seeds produce identical episodes
+- **Crash-recoverable**: each episode result is appended to `episodes.jsonl` immediately
+- **Multi-env**: pass multiple `--env-names` to benchmark across tasks in one run
+- **Video**: add `--video` to record episode videos
 
 ## API reference
 
@@ -139,7 +168,7 @@ Runs the Eagle VLM backbone + state encoder. Takes a nested observation dict (sa
 
 **`encode_features_from_sim_obs(sim_obs) -> BackboneFeatures`**
 
-Same as above, but takes the flat sim observation format (keys like `video.cam`, `state.joints`) that `interactive_rollout.py` saves. Handles the flat-to-nested conversion internally.
+Same as above, but takes the flat sim observation format (keys like `video.cam`, `state.joints`) that `eval/interactive_rollout.py` saves. Handles the flat-to-nested conversion internally.
 
 **`denoise(features, *, num_steps=4, dt=None, seed=None, initial_noise=None, guided_fn=None, step_callback=None) -> DenoiseResult`**
 
@@ -252,7 +281,7 @@ Replays an action chunk exported from the notebook in the simulator, recording a
 
 ```bash
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-  scripts/denoising_lab/interactive_rollout.py \
+  scripts/denoising_lab/eval/interactive_rollout.py \
   --replay \
   --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
   --obs-path /tmp/saved_observations/ep000_step001.npz \
@@ -320,9 +349,9 @@ The repo bundles two demo datasets in `demo_data/`:
 | `gr1.PickNPlace` | GR1 humanoid | 5 | ~2k | Joint angles (relative) |
 | `cube_to_bowl_5` | so101 follower | 5 | ~4k | Joint positions |
 
-The GR1 notebook (`interactive_denoising_gr1.ipynb`) defaults to `gr1.PickNPlace` because GR1 is a pretrained embodiment (id=20) with normalization statistics in the checkpoint. The `cube_to_bowl_5` dataset uses an `so101_follower` robot which is not a pretrained embodiment.
+The GR1 notebook (`notebooks/interactive_denoising_gr1.ipynb`) defaults to `gr1.PickNPlace` because GR1 is a pretrained embodiment (id=20) with normalization statistics in the checkpoint. The `cube_to_bowl_5` dataset uses an `so101_follower` robot which is not a pretrained embodiment.
 
-There is no bundled `ROBOCASA_PANDA_OMRON` demo dataset. The PandaOmron notebook (`interactive_denoising_panda.ipynb`) requires `.npz` observations captured from the simulator via `interactive_rollout.py`.
+There is no bundled `ROBOCASA_PANDA_OMRON` demo dataset. The PandaOmron notebook (`notebooks/interactive_denoising_panda.ipynb`) requires `.npz` observations captured from the simulator via `eval/interactive_rollout.py`.
 
 ## Supported embodiments
 

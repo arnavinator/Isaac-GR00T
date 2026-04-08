@@ -56,4 +56,27 @@ Unchanged. RK4 produces the same-shaped output $(B, 50, 128)$ which is decoded t
 - **Karras et al., "Elucidating the Design Space of Diffusion-Based Generative Models" (EDM)** — arXiv:2206.00364. Systematically compared ODE solvers (Euler, Heun, RK4) for diffusion model sampling. Found Heun's method (2nd-order) to be the best cost-accuracy tradeoff.
 - **torchdiffeq** — Standard neural ODE library provides `odeint(method='rk4')` as a drop-in solver.
 
+### How to run
+
+From the **repo root**:
+
+```bash
+# Terminal 1 (model venv) — start the RK4 server
+bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_server.sh
+
+# Terminal 2 (sim venv) — run the reproducible benchmark
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --n-episodes 10 --seed 42 \
+    --output-dir /tmp/benchmark_results/single_step_rk4 \
+    --strategy-name single_step_rk4
+```
+
+To override server options (e.g., port):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_server.sh --port 5556
+```
+
 ---

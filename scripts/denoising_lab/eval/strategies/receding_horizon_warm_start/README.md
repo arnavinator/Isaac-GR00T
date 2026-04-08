@@ -113,4 +113,28 @@ This strategy *modifies the initialization* of each chunk rather than the integr
 
 **Enhancement:** Adopt STEP's spatiotemporal consistency predictor for higher-quality warm initialization if retraining budget is available. For a zero-training approach, GPC's formulation matches ours and validates the core mechanism.
 
+### How to run
+
+From the **repo root**:
+
+```bash
+# Terminal 1 (model venv) — start the warm-start server
+bash scripts/denoising_lab/eval/strategies/receding_horizon_warm_start/run_server.sh
+
+# Terminal 2 (sim venv) — run the reproducible benchmark
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --n-episodes 10 --seed 42 \
+    --output-dir /tmp/benchmark_results/receding_horizon_warm_start \
+    --strategy-name receding_horizon_warm_start
+```
+
+To tune warm-start parameters:
+
+```bash
+bash scripts/denoising_lab/eval/strategies/receding_horizon_warm_start/run_server.sh \
+    --tau-start 0.5 --n-executed 4
+```
+
 ---

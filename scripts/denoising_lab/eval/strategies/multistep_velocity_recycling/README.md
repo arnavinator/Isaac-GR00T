@@ -71,4 +71,27 @@ Completely transparent. Output shape, normalization, decoding, and chunk executi
 - **Lu et al., "DPM-Solver++: Fast Solver for Guided Diffusion Sampling"** — arXiv:2211.01095. The multistep variant achieves 2nd-order accuracy with 1 NFE per step. Original DPM-Solver (arXiv:2206.00927) introduced the exponential integrator approach.
 - **Adams-Bashforth methods** — classical numerical analysis. AB2 is the simplest linear multistep method. See Hairer, Norsett, Wanner, "Solving Ordinary Differential Equations I" (1993).
 
+### How to run
+
+From the **repo root**:
+
+```bash
+# Terminal 1 (model venv) — start the AB2 server
+bash scripts/denoising_lab/eval/strategies/multistep_velocity_recycling/run_server.sh
+
+# Terminal 2 (sim venv) — run the reproducible benchmark
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --n-episodes 10 --seed 42 \
+    --output-dir /tmp/benchmark_results/multistep_velocity_recycling \
+    --strategy-name multistep_velocity_recycling
+```
+
+To override server options (e.g., port):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/multistep_velocity_recycling/run_server.sh --port 5556
+```
+
 ---

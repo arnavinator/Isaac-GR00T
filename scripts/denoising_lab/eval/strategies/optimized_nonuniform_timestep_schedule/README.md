@@ -105,4 +105,190 @@ Fully transparent. Same 4 Euler steps, same output format, same `MultiStepWrappe
 - **Sabour et al., "Align Your Steps: Optimizing Sampling Schedules in Diffusion Models"** — arXiv:2404.14507. Uses stochastic calculus to derive optimal noise-level schedules for a given solver and model. Particularly effective in the few-step regime.
 - **Esser et al., "Scaling Rectified Flow Transformers for High-Resolution Image Synthesis" (SD3)** — arXiv:2403.03206. Introduced logit-normal timestep sampling during training, which implicitly creates a non-uniform distribution over $\tau$ values. GR00T's $\text{Beta}(1.5, 1.0)$ training distribution serves a similar purpose.
 
+### How to run (inference)
+
+From the **repo root**:
+
+```bash
+# Terminal 1 (model venv) — start the non-uniform schedule server
+bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/run_server.sh
+
+# Terminal 2 (sim venv) — run the reproducible benchmark
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --n-episodes 10 --seed 42 \
+    --output-dir /tmp/benchmark_results/optimized_nonuniform_timestep_schedule \
+    --strategy-name optimized_nonuniform_timestep_schedule
+```
+
+To use a custom schedule (e.g., found via calibration below):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/run_server.sh \
+    --schedule 0.0 0.1 0.4 0.85
+```
+
+### How to run (schedule calibration)
+
+The default schedule `[0.0, 0.08, 0.35, 0.82]` is a starting hypothesis.
+`calibrate_schedule.py` finds the best schedule for your embodiment and task
+distribution in a single command.  It is a **one-time offline GPU job** — run
+it once, get a schedule, hard-code it for all future inference.
+
+#### Quick start
+
+```bash
+# One command — collects observations from sim rollouts, then grid-searches.
+# Runs in the model venv.  The sim venv is invoked automatically as a subprocess.
+bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/calibrate_schedule.sh
+```
+
+Or with custom arguments:
+
+```bash
+uv run python scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/calibrate_schedule.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CloseDrawer_PandaOmron_Env \
+    --n-episodes 5 --seed 42 \
+    --n-candidates 2000 \
+    --output-dir /tmp/schedule_calibration
+```
+
+If you already have saved observations (e.g., from `interactive_rollout.py`),
+skip collection entirely:
+
+```bash
+uv run python .../calibrate_schedule.py \
+    --obs-dir /tmp/my_saved_obs \
+    --output-dir /tmp/schedule_calibration
+```
+
+#### What the flags mean
+
+The script has **two phases**, and the flags control different phases:
+
+**Phase 1 flags** control observation collection (sim rollouts):
+
+| Flag | Default | What it controls |
+|------|---------|------------------|
+| `--env-names` | *(required)* | Which sim environments to collect observations from |
+| `--n-episodes` | 5 | How many rollout episodes to run **per env** |
+| `--obs-per-episode` | 4 | Observations saved per episode (evenly spaced through the episode) |
+| `--obs-dir` | *(none)* | If set, **skips Phase 1 entirely** — uses pre-collected `.npz` files |
+
+With 2 envs × 5 episodes × 4 obs/episode you get **40 observations**.
+These are camera images + proprioceptive state snapshots from the sim, saved
+as `.npz` files.  The quality of the *actions* during collection does not
+matter — the observations are only used as conditioning inputs for the grid
+search.
+
+**Phase 2 flags** control the schedule search:
+
+| Flag | Default | What it controls |
+|------|---------|------------------|
+| `--n-candidates` | 1000 | How many random 4-step schedules to try |
+| `--reference-steps` | 64 | Euler steps for the "ground truth" reference |
+
+Every candidate schedule still uses exactly **4 denoising steps** (same as
+baseline Euler).  `--n-candidates` controls how many *different placements*
+of those 4 steps are tried — e.g., `[0.0, 0.12, 0.41, 0.87]` vs
+`[0.0, 0.05, 0.33, 0.79]` vs 998 others.  The step size (`dt`) for each
+step varies per candidate (it equals the gap to the next τ value), but every
+candidate integrates the full interval from τ=0 to τ=1.
+
+#### How it works
+
+**Phase 1 — Collect observations.**  Starts a temporary baseline GR00T server
+in a background thread, then spawns `_collect_observations.py` as a subprocess
+in the sim venv (robocasa).  The subprocess runs rollouts, saving
+evenly-spaced observations as `.npz` files.  Skipped when `--obs-dir` is
+provided.
+
+**Phase 2 — Grid search.**  Loads the model into `DenoisingLab`, encodes each
+saved observation through the Eagle VLM backbone, then:
+
+1. **Compute references** — For each observation, run `--reference-steps`-step
+   Euler to get the "ground truth" action chunk.
+2. **For each of `--n-candidates` random schedules** — Run 4-step non-uniform
+   Euler on every observation (from the *same* initial noise as the reference)
+   and compute the mean L2 distance to the reference.
+3. **Pick the winner** — The schedule with the lowest mean error is returned,
+   alongside the uniform baseline's error for comparison.
+
+Because the reference and each candidate start from identical noise (same
+`seed`), the error isolates the discretization gap — no stochastic variance.
+
+#### Concrete example
+
+```
+calibrate_schedule.py \
+    --env-names .../OpenDrawer .../CloseDrawer \
+    --n-episodes 5 --obs-per-episode 4 \
+    --n-candidates 2000
+
+Phase 1: Collect observations
+├── Start temporary baseline server (standard 4-step Euler)
+├── Run 5 episodes of OpenDrawer → save 20 .npz snapshots
+├── Run 5 episodes of CloseDrawer → save 20 .npz snapshots
+└── 40 observations total
+
+Phase 2: Grid search (all on GPU, no sim needed)
+├── Encode 40 observations through Eagle backbone
+├── Compute 64-step Euler reference for each (40 × 64 = 2,560 NFEs)
+├── Try 2000 random 4-step schedules:
+│   └── Each: run 4-step Euler on all 40 obs (2000 × 40 × 4 = 320,000 NFEs)
+├── Also evaluate uniform baseline [0.0, 0.25, 0.5, 0.75]
+└── Output: best schedule + improvement % over uniform
+```
+
+#### Output
+
+The script writes `calibration_result.json` to `--output-dir`:
+
+```json
+{
+  "best_schedule": [0.0, 0.06, 0.37, 0.83],
+  "best_error": 1.234567,
+  "uniform_schedule": [0.0, 0.25, 0.5, 0.75],
+  "uniform_error": 1.456789,
+  "improvement_pct": 15.24,
+  ...
+}
+```
+
+It also prints a ready-to-use `--schedule` flag for `run_server.sh`.
+
+#### Using the result
+
+```bash
+# Plug the calibrated schedule into the server
+bash .../run_server.sh --schedule 0.0 0.06 0.37 0.83
+```
+
+Or hard-code it as the new default in `strategy.py`:
+
+```python
+DEFAULT_SCHEDULE: list[float] = [0.0, 0.06, 0.37, 0.83]
+```
+
+#### Resource estimates
+
+| n_candidates | n_observations | NFEs (approx) | Time (L40) |
+|:------------:|:--------------:|:-------------:|:----------:|
+| 500          | 10             | ~21k          | ~5 min     |
+| 1000         | 20             | ~81k          | ~20 min    |
+| 2000         | 20             | ~161k         | ~40 min    |
+
+Phase 1 (observation collection) adds ~1 minute per episode on top.
+
+#### Tips
+
+- **More observations help more than more candidates.**  20 obs × 1000
+  candidates beats 5 obs × 4000 candidates.
+- **Task diversity matters.**  Include observations from different episodes,
+  different timesteps, and (if applicable) different task descriptions.
+- **Sanity check the improvement.**  If `improvement_pct` is < 5 %, the
+  velocity field is roughly uniform and this strategy has minimal impact.
+
 ---

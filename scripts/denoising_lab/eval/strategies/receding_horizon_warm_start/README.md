@@ -122,12 +122,14 @@ From the **repo root**:
 bash scripts/denoising_lab/eval/strategies/receding_horizon_warm_start/run_server.sh
 
 # Terminal 2 (sim venv) — run the reproducible benchmark
-gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --n-episodes 10 --seed 42 \
-    --output-dir /tmp/benchmark_results/receding_horizon_warm_start \
-    --strategy-name receding_horizon_warm_start
+bash scripts/denoising_lab/eval/strategies/receding_horizon_warm_start/run_eval.sh
+```
+
+To override defaults (e.g., more episodes):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/receding_horizon_warm_start/run_eval.sh \
+    --n-episodes 50
 ```
 
 To tune warm-start parameters:

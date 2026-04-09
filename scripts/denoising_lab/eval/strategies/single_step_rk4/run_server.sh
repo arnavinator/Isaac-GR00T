@@ -11,5 +11,5 @@ uv run python scripts/denoising_lab/eval/strategies/single_step_rk4/run_server.p
     --model-path nvidia/GR00T-N1.6-3B \
     --embodiment-tag ROBOCASA_PANDA_OMRON \
     --use-sim-policy-wrapper \
-    --verbose \
+    --port 5555 \
     "$@"

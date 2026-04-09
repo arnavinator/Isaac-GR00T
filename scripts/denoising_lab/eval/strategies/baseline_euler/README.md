@@ -20,12 +20,14 @@ From the **repo root**:
 bash scripts/denoising_lab/eval/strategies/baseline_euler/run_server.sh
 
 # Terminal 2 (sim venv) -- run the reproducible benchmark
-gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --n-episodes 10 --seed 42 \
-    --output-dir /tmp/benchmark_results/baseline_euler \
-    --strategy-name baseline_euler
+bash scripts/denoising_lab/eval/strategies/baseline_euler/run_eval.sh
+```
+
+To override defaults (e.g., more episodes, different env):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/baseline_euler/run_eval.sh \
+    --n-episodes 50 --env-names robocasa_panda_omron/CloseDrawer_PandaOmron_Env
 ```
 
 ## Expected characteristics
@@ -42,5 +44,3 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 - This is the reference point. When evaluating a new strategy, run both
   `baseline_euler` and the new strategy with the same `--seed` and compare
   `summary.json` outputs.
-- The server uses `--verbose` to log denoising steps. Remove the flag for
-  slightly lower latency in production runs.

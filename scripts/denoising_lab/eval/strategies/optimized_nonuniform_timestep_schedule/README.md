@@ -114,12 +114,14 @@ From the **repo root**:
 bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/run_server.sh
 
 # Terminal 2 (sim venv) — run the reproducible benchmark
-gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --n-episodes 10 --seed 42 \
-    --output-dir /tmp/benchmark_results/optimized_nonuniform_timestep_schedule \
-    --strategy-name optimized_nonuniform_timestep_schedule
+bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/run_eval.sh
+```
+
+To override defaults (e.g., more episodes):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/run_eval.sh \
+    --n-episodes 50
 ```
 
 To use a custom schedule (e.g., found via calibration below):

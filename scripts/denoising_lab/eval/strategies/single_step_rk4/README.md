@@ -65,17 +65,14 @@ From the **repo root**:
 bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_server.sh
 
 # Terminal 2 (sim venv) — run the reproducible benchmark
-gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --n-episodes 10 --seed 42 \
-    --output-dir /tmp/benchmark_results/single_step_rk4 \
-    --strategy-name single_step_rk4
+bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_eval.sh
 ```
 
-To override server options (e.g., port):
+To override defaults (e.g., more episodes, different port):
 
 ```bash
+bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_eval.sh \
+    --n-episodes 50
 bash scripts/denoising_lab/eval/strategies/single_step_rk4/run_server.sh --port 5556
 ```
 

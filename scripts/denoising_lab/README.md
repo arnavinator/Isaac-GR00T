@@ -139,20 +139,31 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 # Terminal 1 (model venv) — start server (e.g. baseline)
 bash scripts/denoising_lab/eval/strategies/baseline_euler/run_server.sh
 
-# Terminal 2 (sim venv) — run benchmark
+# Terminal 2 (sim venv) — run benchmark (single env, fully reproducible)
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
   scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
   --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-  --n-episodes 10 --seed 42 \
+  --n-episodes 10 --seed 42 --max-episode-steps 720 \
+  --output-dir /tmp/benchmark_results/baseline_euler \
+  --strategy-name baseline_euler
+
+# Terminal 2 (sim venv) — run with parallel envs for batched GPU inference
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+  --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --n-episodes 10 --n-envs 5 --seed 42 --max-episode-steps 720 \
   --output-dir /tmp/benchmark_results/baseline_euler \
   --strategy-name baseline_euler
 ```
 
 Key features:
-- **Reproducible**: uses a single env with explicit `env.reset(seed=N)` (not AsyncVectorEnv) so identical seeds produce identical episodes
+- **Reproducible**: every episode gets an explicit seed (`--seed 42` → seeds 42, 43, 44, …) regardless of `--n-envs`
+- **Batched inference**: `--n-envs N` (N > 1) processes episodes in batches of N using `AsyncVectorEnv`, sending N observations to the server in each `get_action` call for better GPU utilisation. Each batch resets all envs with explicit seeds, steps until every env in the batch finishes, then moves to the next batch
 - **Crash-recoverable**: each episode result is appended to `episodes.jsonl` immediately
 - **Multi-env**: pass multiple `--env-names` to benchmark across tasks in one run
 - **Video**: add `--video` to record episode videos
+
+`--max-episode-steps 720` (default) sets the truncation limit in **inner MuJoCo steps**. `MultiStepWrapper` executes `--n-action-steps` (default 8) inner steps per outer step, so the benchmark's episode length is measured in outer steps (action chunks): 720 inner steps / 8 inner steps per chunk = **90 action chunks** before truncation. An episode that doesn't succeed will report `length: 90` in the results.
 
 ## API reference
 

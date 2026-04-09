@@ -2,8 +2,10 @@
 
 Runs in the **sim venv** (robocasa). Strategy-agnostic -- connects to whatever
 GR00T server is already running over ZMQ.  Guarantees identical episodes given
-the same seed by using a single env with explicit ``env.reset(seed=...)``
-instead of AsyncVectorEnv (which auto-resets with random seeds).
+the same seed regardless of ``--n-envs``.  With ``--n-envs 1`` (default) a
+single env is stepped sequentially.  With ``--n-envs N`` (N > 1) episodes are
+processed in batches of N using a vectorized env, sending N observations to
+the server in each ``get_action`` call for better GPU utilisation.
 
 Usage::
 
@@ -13,11 +15,19 @@ Usage::
         --embodiment-tag ROBOCASA_PANDA_OMRON \
         --use-sim-policy-wrapper --verbose
 
-    # Terminal 2 (sim venv) -- run reproducible benchmark
+    # Terminal 2 (sim venv) -- run reproducible benchmark (single env, seeded)
     gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
         scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
         --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
         --n-episodes 10 --seed 42 \
+        --output-dir /tmp/benchmark_results \
+        --strategy-name baseline_euler
+
+    # Terminal 2 (sim venv) -- run with parallel envs (batched inference)
+    gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+        scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+        --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+        --n-episodes 10 --n-envs 5 --seed 42 \
         --output-dir /tmp/benchmark_results \
         --strategy-name baseline_euler
 """
@@ -28,9 +38,11 @@ import argparse
 import json
 import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 
 from gr00t.eval.rollout_policy import (
@@ -260,6 +272,185 @@ def run_benchmark_for_env(
 
 
 # ---------------------------------------------------------------------------
+# Per-env benchmark loop (vectorized / parallel)
+# ---------------------------------------------------------------------------
+
+
+def run_benchmark_for_env_parallel(
+    env_name: str,
+    seeds: list[int],
+    client: PolicyClient,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Run seeded episodes in batches of ``n_envs`` for batched GPU inference.
+
+    Episodes are processed in batches: each batch resets all envs with explicit
+    seeds, steps until every env in the batch finishes, then moves to the next
+    batch.  This preserves per-episode seed reproducibility while sending
+    ``n_envs`` observations to the server in a single ``get_action`` call.
+    """
+    env_dir = args.output_dir / _sanitize_env_dir(env_name)
+    env_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = env_dir / "episodes.jsonl"
+    video_dir = str(env_dir / "videos") if args.video else None
+
+    n_envs = args.n_envs
+    n_episodes = len(seeds)
+
+    wrapper_configs = WrapperConfigs(
+        video=VideoConfig(
+            video_dir=video_dir,
+            max_episode_steps=args.max_episode_steps,
+        ),
+        multistep=MultiStepConfig(
+            n_action_steps=args.n_action_steps,
+            max_episode_steps=args.max_episode_steps,
+            terminate_on_success=True,
+        ),
+    )
+
+    env_fns = [
+        partial(
+            create_eval_env,
+            env_idx=idx,
+            env_name=env_name,
+            total_n_envs=n_envs,
+            wrapper_configs=wrapper_configs,
+        )
+        for idx in range(n_envs)
+    ]
+
+    print(f"Creating {n_envs} vectorized envs for {env_name}...")
+    if n_envs == 1:
+        env = gym.vector.SyncVectorEnv(env_fns)
+    else:
+        env = gym.vector.AsyncVectorEnv(
+            env_fns,
+            shared_memory=False,
+            context="spawn",
+        )
+
+    records: list[dict[str, Any]] = []
+    successes = 0
+    short_name = env_name.split("/")[-1] if "/" in env_name else env_name
+
+    pbar = None
+    if tqdm is not None:
+        pbar = tqdm(
+            total=n_episodes,
+            desc=f"{short_name} [0/{n_episodes}]",
+            leave=True,
+        )
+
+    # Process episodes in batches of n_envs
+    for batch_start in range(0, n_episodes, n_envs):
+        batch_seeds = seeds[batch_start:batch_start + n_envs]
+        batch_size = len(batch_seeds)
+
+        # Pad seeds if last batch is smaller than n_envs
+        reset_seeds = list(batch_seeds) + [batch_seeds[0]] * (n_envs - batch_size)
+
+        observations, _ = env.reset(seed=reset_seeds)
+        client.reset()
+
+        # Per-env tracking for this batch
+        env_done = [False] * n_envs
+        env_successes = [False] * n_envs
+        env_rewards = [0.0] * n_envs
+        env_lengths = [0] * n_envs
+        ep_start_times = [time.monotonic()] * n_envs
+
+        while not all(env_done[:batch_size]):
+            actions, _ = client.get_action(observations)
+            next_obs, rewards, terminations, truncations, env_infos = env.step(actions)
+
+            for i in range(batch_size):
+                if env_done[i]:
+                    continue
+
+                # Track success from step info
+                if "success" in env_infos:
+                    s = env_infos["success"][i]
+                    if isinstance(s, (list, np.ndarray)):
+                        s = bool(np.any(s))
+                    else:
+                        s = bool(s)
+                    env_successes[i] |= s
+
+                # Track success from final_info (set on auto-reset)
+                if (
+                    "final_info" in env_infos
+                    and env_infos["final_info"][i] is not None
+                ):
+                    fi_s = env_infos["final_info"][i]["success"]
+                    if isinstance(fi_s, (list, np.ndarray)):
+                        fi_s = bool(np.any(fi_s))
+                    else:
+                        fi_s = bool(fi_s)
+                    env_successes[i] |= fi_s
+
+                env_rewards[i] += float(rewards[i])
+                env_lengths[i] += 1
+
+                if terminations[i] or truncations[i]:
+                    env_done[i] = True
+
+                    ep_idx = batch_start + i
+                    duration = time.monotonic() - ep_start_times[i]
+                    record = {
+                        "episode_idx": ep_idx,
+                        "seed": batch_seeds[i],
+                        "env_name": env_name,
+                        "success": env_successes[i],
+                        "reward": round(env_rewards[i], 4),
+                        "length": env_lengths[i],
+                        "n_action_chunks": env_lengths[i],
+                        "duration_s": round(duration, 2),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    records.append(record)
+
+                    # Append immediately (crash-recoverable)
+                    with open(jsonl_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                    if record["success"]:
+                        successes += 1
+
+                    status = "SUCCESS" if record["success"] else "FAIL"
+                    print(
+                        f"  ep {ep_idx} (seed={batch_seeds[i]}): {status} in "
+                        f"{record['length']} steps ({record['duration_s']}s)"
+                    )
+
+                    if pbar:
+                        completed = len(records)
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{short_name} [{completed}/{n_episodes}] | "
+                            f"success={successes}/{completed} "
+                            f"({100*successes/completed:.0f}%)"
+                        )
+
+            observations = next_obs
+
+    if pbar:
+        pbar.close()
+
+    rate = 100 * successes / n_episodes if n_episodes else 0
+    mean_len = np.mean([r["length"] for r in records]) if records else 0
+    total_time = sum(r["duration_s"] for r in records)
+    print(
+        f"{short_name}: {successes}/{n_episodes} ({rate:.1f}%) | "
+        f"mean_len={mean_len:.1f} | {total_time:.1f}s total"
+    )
+
+    env.reset()
+    env.close()
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -301,6 +492,7 @@ def write_summary(
             "seed": args.seed,
             "max_episode_steps": args.max_episode_steps,
             "n_action_steps": args.n_action_steps,
+            "n_envs": args.n_envs,
             "host": args.host,
             "port": args.port,
         },
@@ -357,6 +549,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=720,
         help="Truncation limit (outer steps)",
+    )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="Number of parallel envs for batched inference (1 = seeded single-env mode)",
     )
     parser.add_argument(
         "--host",
@@ -416,7 +614,10 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"Env: {env_name}")
         print(f"{'='*60}")
-        records = run_benchmark_for_env(env_name, seeds, client, args)
+        if args.n_envs > 1:
+            records = run_benchmark_for_env_parallel(env_name, seeds, client, args)
+        else:
+            records = run_benchmark_for_env(env_name, seeds, client, args)
         all_records[env_name] = records
 
     wall_time = time.monotonic() - wall_start

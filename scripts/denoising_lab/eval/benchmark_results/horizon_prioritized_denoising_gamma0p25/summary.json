@@ -1,0 +1,66 @@
+{
+  "strategy_name": "horizon_prioritized_denoising",
+  "timestamp": "2026-04-10T22:21:17.081354+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
+    ],
+    "n_episodes": 15,
+    "seed": 42,
+    "max_episode_steps": 400,
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/OpenDrawer_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.8,
+      "mean_reward": 0.8,
+      "mean_length": 33.8,
+      "std_length": 9.6,
+      "mean_duration_s": 38.93,
+      "successes": [
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        true
+      ],
+      "seeds": [
+        42,
+        43,
+        44,
+        45,
+        47,
+        46,
+        49,
+        48,
+        50,
+        51,
+        53,
+        52,
+        54,
+        55,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 15,
+    "total_envs": 1,
+    "overall_success_rate": 0.8,
+    "total_wall_time_s": 488.13
+  }
+}

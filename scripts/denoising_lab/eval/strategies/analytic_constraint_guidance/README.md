@@ -34,19 +34,44 @@ The guidance strength is **annealed** with denoising progress:
 
 $$\eta_i = \eta \cdot \tau_i$$
 
-At $\tau = 0$ (pure noise), $\eta_0 = 0$ — no guidance, because constraints are meaningless on noise. At $\tau = 0.75$ (last step), $\eta_3 = 0.75\eta$ — strong guidance, because the action has taken shape and constraints are meaningful.
+The annealing schedule is linear in $\tau$ and serves a critical purpose: **constraint guidance is only meaningful when the action has structure.** At the start of denoising ($\tau = 0$), the action tensor is pure Gaussian noise — every position is random, so "smoothness" or "gripper decisiveness" have no physical meaning. Applying constraint gradients to noise would inject arbitrary bias that fights the DiT's initial structure-forming velocity. As denoising progresses and the action takes shape, the constraints become increasingly relevant:
+
+| Step $i$ | $\tau_i$ | $\eta_i$ (with $\eta = 0.1$) | Interpretation |
+|-----------|----------|-------------------------------|----------------|
+| 0 | 0.00 | **0.000** (off) | Pure noise. DiT establishes gross trajectory structure. No guidance — let the model work. |
+| 1 | 0.25 | 0.025 (gentle) | Trajectory shape is emerging. Light smoothing nudges away from jittery modes. |
+| 2 | 0.50 | 0.050 (moderate) | Trajectory is recognisable. Discrete dims start being pushed toward {0, 1}. |
+| 3 | 0.75 | **0.075** (strongest) | Near-final refinement. Strong smoothing and decisive gripper/mode signals. |
+
+This "off → gentle → strong" ramp means the DiT controls the overall trajectory plan in early steps (where it is most capable) and the constraint gradients polish physical validity in late steps (where the actions are concrete enough for constraints to be meaningful). The approach avoids the failure mode of constant-strength guidance, which can warp the trajectory structure before it has formed.
 
 **Constraint functions for PandaOmron:**
 
 **1. Temporal smoothness** (minimize jerk across the action horizon):
 
-$$C_{\text{smooth}}(a) = \sum_{j=0}^{H-3} \left\| a[j{+}2] - 2\,a[j{+}1] + a[j] \right\|^2$$
+$$C_{\text{smooth}}(a) = \sum_{j=0}^{H-3} \left\| L[j] \right\|^2 \quad \text{where } L[j] = a[j{+}1] - 2\,a[j] + a[j{-}1]$$
 
-This penalizes the second-order finite difference (discrete acceleration change). The gradient is a simple tridiagonal Laplacian — no neural network, no backpropagation:
+$L[j]$ is the **discrete Laplacian** — the second-order finite difference at position $j$. It measures how much $a[j]$ deviates from being a linear interpolation of its neighbors. Equivalently, it is the discrete acceleration (the difference of consecutive velocities):
 
-$$\frac{\partial C_{\text{smooth}}}{\partial a[j]} = 2 \left( a[j{+}2] - 2a[j{+}1] + a[j] \right) - 4 \left( a[j{+}1] - 2a[j] + a[j{-}1] \right) + 2 \left( a[j] - 2a[j{-}1] + a[j{-}2] \right)$$
+$$L[j] = \underbrace{(a[j{+}1] - a[j])}_{\text{velocity}[j]} - \underbrace{(a[j] - a[j{-}1])}_{\text{velocity}[j{-}1]}$$
 
-(boundary terms handled by clamping indices). Applied only to continuous EEF position/rotation dimensions.
+When the trajectory is locally linear (constant velocity), $L[j] = 0$. Large values indicate abrupt direction changes — kinks or jitter.
+
+**Exact gradient vs. implementation approximation:**
+
+The exact gradient of $C_{\text{smooth}} = \sum_j \|L[j]\|^2$ requires the chain rule. Since each $L[j]$ depends on three positions ($a[j{-}1], a[j], a[j{+}1]$), and each position $a[k]$ participates in three Laplacian terms ($L[k{-}1], L[k], L[k{+}1]$):
+
+$$\frac{\partial C_{\text{smooth}}}{\partial a[k]} = \sum_j 2\,L[j] \cdot \frac{\partial L[j]}{\partial a[k]} = 2\bigl(L[k{+}1] - 2\,L[k] + L[k{-}1]\bigr)$$
+
+This is the **Laplacian of the Laplacian** (bi-Laplacian) — applying the $[1, -2, 1]$ stencil twice, which yields the 4th-order stencil $[1, -4, 6, -4, 1]$ convolved with $a$.
+
+Our implementation uses an **approximation** that drops the second application of the stencil:
+
+$$\nabla_a C_{\text{smooth}} \approx 2\,L[k] \quad \text{(used in code)} \qquad \text{vs.} \qquad 2\bigl(L[k{+}1] - 2\,L[k] + L[k{-}1]\bigr) \quad \text{(exact)}$$
+
+This is valid because $L[k]$ and the exact gradient are both large where the trajectory is jerky and zero where it is smooth — they point in the same direction. The approximation is equivalent to **Laplacian smoothing** (a single step of heat diffusion), which nudges each point toward the average of its neighbors. The exact bi-Laplacian would be a more aggressive 4th-order smoothing operator. For gentle guidance within a denoising loop, the 1st-order version is preferable: less risk of overshooting, and the iterative application across 3 guided steps (steps 1–3) provides cumulative smoothing.
+
+Applied only to continuous EEF position/rotation dimensions (not discrete gripper/mode dims).
 
 **2. Discrete action decisiveness** (push gripper and control_mode toward binary values):
 
@@ -183,6 +208,43 @@ The key interaction with action chunking: the temporal smoothness constraint ope
 
 **Related VLA work (similar but not identical):** SafeDiffuser (arXiv:2306.00148) embeds CBF constraints during diffusion planning; SafeFlow (arXiv:2504.08661) extends this to flow matching for robot manipulation; KCGG (arXiv:2409.15528) uses FK-based gradients during diffusion sampling. All use different constraint types and/or model architectures. **Enhancement:** Adopt SafeFlow's barrier functions for hard safety constraints alongside our smoothness/workspace gradients. Use KCGG's FK-based gradients for joint-space validity.
 
----
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main venv):
+```bash
+# Default parameters (eta=0.1, lambda_smooth=0.005, lambda_discrete=0.01, lambda_mode=0.003)
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/run_server.sh
+
+# Custom guidance strength
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/run_server.sh --eta 0.2
+
+# Custom port
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/run_server.sh --port 5556
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+# Default: 10 episodes, seed 42, OpenDrawer
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/run_eval.sh
+
+# More episodes
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from strategy import make_constraint_guided_fn, denoise_with_lab, ConstraintConfig
+
+# Default config
+actions = denoise_with_lab(lab, features, seed=42)
+
+# Custom config
+cfg = ConstraintConfig(eta=0.2, lambda_smooth=0.01)
+actions = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+
+# Or use the guided_fn interface directly
+guided_fn = make_constraint_guided_fn(cfg)
+result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
+```
 
 ---

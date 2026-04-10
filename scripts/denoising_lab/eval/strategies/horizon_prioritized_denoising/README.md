@@ -101,7 +101,7 @@ The `MultiStepWrapper` is unmodified. The output shape and decode pipeline are i
 | Aspect | Assessment |
 |--------|------------|
 | **Expected quality** | Potentially high. Near-horizon actions (which are executed) receive ~15% more velocity integration than far-horizon actions (which are discarded). This preferential denoising directly improves the actions that matter. Furthermore, the DiT's self-attention creates an information flow from the early-converging near-horizon tokens to the still-noisy far-horizon tokens — a form of *self-guided denoising* that emerges naturally from the architecture. |
-| **Risk** | (1) **Timestep distribution mismatch**: After step 0, near-horizon positions are more denoised than the global $\tau$ would suggest, while far-horizon positions are less denoised. The DiT's AdaLayerNorm conditions on a single global $\tau$ — it cannot distinguish per-position noise levels. If the model is sensitive to this mismatch, quality could degrade. However, the mismatch is small ($\pm$15% of baseline velocity) and the model processes partially-noised inputs at every step, so some robustness is expected. (2) The $\gamma$ parameter requires tuning. Too large: excessive mismatch and potential instability. Too small: no effect. |
+| **Risk** | (1) **Timestep distribution mismatch**: After step 0, near-horizon positions are more denoised than the global $\tau$ would suggest, while far-horizon positions are less denoised. The DiT's AdaLayerNorm conditions on a single global $\tau$ — it cannot distinguish per-position noise levels. If the model is sensitive to this mismatch, quality could degrade. However, the mismatch is small ($\pm$15% of baseline velocity) and the model processes partially-noised inputs at every step, so some robustness is expected. (2) The $\gamma$ parameter requires tuning — use the `find_optimal_gamma` calibration utility (see below) to find the best value for a given embodiment and checkpoint. Too large: excessive mismatch and potential instability. Too small: no effect. |
 | **Latency** | Identical — same 4 NFEs, same ~64ms. The Gaussian weight computation is precomputed; the per-step gating is a single element-wise multiply. |
 | **Implementation** | Trivial — implemented entirely in the `guided_fn` callback via element-wise velocity scaling. One precomputed weight matrix. |
 
@@ -112,5 +112,65 @@ The `MultiStepWrapper` is unmodified. The output shape and decode pipeline are i
 - **Receding-horizon MPC with variable precision**: In classical MPC, it is standard practice to use finer discretization for near-horizon states and coarser discretization for far-horizon states. Our velocity gating is the flow-matching analog of this principle — "spend more denoising effort on the immediate future."
 
 **What makes this novel:** To our knowledge, no prior work applies position-dependent velocity scaling during flow matching or diffusion sampling. The key insight — that sequential predictions have non-uniform temporal importance and that this can be exploited via the learned model's self-attention — is specific to VLA action generation and has no analog in image/video generation. This strategy transforms the ODE solver from a position-agnostic integrator into a position-aware one that respects the causal structure of robot control.
+
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main venv):
+```bash
+# Default parameters (gamma=0.5, sigma_w=3.0, effective_horizon=16)
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_server.sh
+
+# Custom boost amplitude
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_server.sh --gamma 0.7
+
+# Custom port
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_server.sh --port 5556
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+# Default: 10 episodes, seed 42, OpenDrawer
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_eval.sh
+
+# More episodes
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from strategy import make_horizon_prioritized_fn, denoise_with_lab
+
+# Default parameters
+actions = denoise_with_lab(lab, features, seed=42)
+
+# Custom parameters
+actions = denoise_with_lab(lab, features, seed=42, gamma=0.7, sigma_w=4.0)
+
+# Or use the guided_fn interface directly
+guided_fn = make_horizon_prioritized_fn(gamma=0.5, sigma_w=3.0)
+result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
+```
+
+**Calibrating gamma with `find_optimal_gamma`:**
+
+The optimal `gamma` depends on how tolerant the trained DiT is to per-position noise level mismatch — the weights make near-horizon positions more denoised than the global $\tau$ suggests, but the DiT conditions on a single global $\tau$. This tolerance is an empirical property of the checkpoint that can't be determined analytically.
+
+`find_optimal_gamma` automates the search. It generates a high-fidelity reference (64-step uniform Euler, which closely approximates the true ODE solution), then sweeps gamma values and picks the one whose 4-step output is closest to the reference by L2 distance. Run it once on a few validation observations (one-time cost, ~1 GPU-minute per observation):
+
+```python
+from strategy import find_optimal_gamma
+
+# features_list: 3-5 BackboneFeatures from representative observations
+best_gamma, results = find_optimal_gamma(lab, features_list)
+
+# results is sorted by error: [(best_gamma, error), (next_best, error), ...]
+for gamma, err in results:
+    print(f"  gamma={gamma:.1f}  error={err:.3f}")
+
+# Use the winner
+actions = denoise_with_lab(lab, features, seed=42, gamma=best_gamma)
+```
+
+Then hard-code the winning gamma into `run_server.sh` (via `--gamma`) or pass it to `patch_action_head()` for evaluation.
 
 ---

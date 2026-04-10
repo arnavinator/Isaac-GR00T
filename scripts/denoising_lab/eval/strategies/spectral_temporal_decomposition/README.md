@@ -270,4 +270,45 @@ By amplifying each step's natural frequency contribution, we help the denoiser r
 
 **What makes this novel for VLAs:** No prior work applies spectral (DCT) analysis to the velocity field of a flow matching action denoiser. The connection between denoising step index and temporal frequency band has been established in the image/video domain but never exploited for *action trajectories*, where the frequency decomposition has direct physical meaning (gross motion vs. fine manipulation). The zero-cost nature (same NFEs, negligible DCT overhead) makes this the cheapest possible improvement strategy — if it works, it's pure profit.
 
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main venv):
+```bash
+# Default parameters (gamma=0.3, energy_preserve=True)
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_server.sh
+
+# Stronger frequency guidance
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_server.sh --gamma 0.5
+
+# Disable energy preservation (allow net amplification)
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_server.sh --no-energy-preserve
+
+# Custom port
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_server.sh --port 5556
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+# Default: 10 episodes, seed 42, OpenDrawer
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_eval.sh
+
+# More episodes
+bash scripts/denoising_lab/eval/strategies/spectral_temporal_decomposition/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from strategy import make_spectral_fn, denoise_with_lab
+
+# Default parameters
+actions = denoise_with_lab(lab, features, seed=42)
+
+# Custom parameters
+actions = denoise_with_lab(lab, features, seed=42, gamma=0.5, energy_preserve=False)
+
+# Or use the guided_fn interface directly
+guided_fn = make_spectral_fn(gamma=0.3, energy_preserve=True)
+result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
+```
+
 ---

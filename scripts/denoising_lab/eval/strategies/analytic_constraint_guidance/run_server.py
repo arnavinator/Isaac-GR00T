@@ -43,7 +43,7 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = True
     """Whether to use the sim policy wrapper."""
 
-    verbose: bool = True
+    verbose: bool = False
     """Enable verbose denoising step logging."""
 
     # --- Constraint guidance parameters ---

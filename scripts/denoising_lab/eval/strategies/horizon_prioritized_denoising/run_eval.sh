@@ -13,6 +13,6 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
     --n-episodes 6 --seed 42 \
     --n-envs 2 --port 5555 \
     --max-episode-steps 480 \
-    --output-dir /tmp/benchmark_results/horizon_prioritized_denoising_gamma_0p25 \
+    --output-dir /tmp/benchmark_results/horizon_prioritized_denoising_gamma_0p75 \
     --strategy-name horizon_prioritized_denoising \
     "$@"

@@ -1,0 +1,66 @@
+{
+  "strategy_name": "receding_horizon_warm_start",
+  "timestamp": "2026-04-10T18:20:33.321198+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 15,
+    "seed": 42,
+    "max_episode_steps": 480,
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.5333,
+      "mean_reward": 0.5333,
+      "mean_length": 50.0,
+      "std_length": 14.8,
+      "mean_duration_s": 57.89,
+      "successes": [
+        true,
+        false,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "seeds": [
+        43,
+        42,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 15,
+    "total_envs": 1,
+    "overall_success_rate": 0.5333,
+    "total_wall_time_s": 688.01
+  }
+}

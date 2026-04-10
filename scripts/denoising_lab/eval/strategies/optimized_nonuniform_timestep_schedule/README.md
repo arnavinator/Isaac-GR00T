@@ -141,7 +141,7 @@ it once, get a schedule, hard-code it for all future inference.
 #### Quick start
 
 ```bash
-# One command — collects observations from sim rollouts, then grid-searches.
+# One command — collects observations from sim rollouts (it launches the gr00t server as well), then grid-searches.
 # Runs in the model venv.  The sim venv is invoked automatically as a subprocess.
 bash scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/calibrate_schedule.sh
 ```
@@ -150,8 +150,8 @@ Or with custom arguments:
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/optimized_nonuniform_timestep_schedule/calibrate_schedule.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-                robocasa_panda_omron/CloseDrawer_PandaOmron_Env \
+    --env-names robocasa_panda_omron/OpenSingleDoor_PandaOmron_Env \
+                robocasa_panda_omron/PnPCounterToStove_PandaOmron_Env \
     --n-episodes 5 --seed 42 \
     --n-candidates 2000 \
     --output-dir /tmp/schedule_calibration

@@ -1,0 +1,66 @@
+{
+  "strategy_name": "single_step_rk4",
+  "timestamp": "2026-04-10T01:55:03.089910+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 15,
+    "seed": 42,
+    "max_episode_steps": 480,
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5556
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.3333,
+      "mean_reward": 0.3333,
+      "mean_length": 51.3,
+      "std_length": 16.2,
+      "mean_duration_s": 74.57,
+      "successes": [
+        false,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      "seeds": [
+        42,
+        43,
+        44,
+        45,
+        47,
+        46,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        55,
+        54,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 15,
+    "total_envs": 1,
+    "overall_success_rate": 0.3333,
+    "total_wall_time_s": 846.85
+  }
+}

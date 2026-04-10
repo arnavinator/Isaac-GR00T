@@ -1,0 +1,66 @@
+{
+  "strategy_name": "multistep_velocity_recycling",
+  "timestamp": "2026-04-10T02:14:18.295315+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 15,
+    "seed": 42,
+    "max_episode_steps": 480,
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.6667,
+      "mean_reward": 0.6667,
+      "mean_length": 49.7,
+      "std_length": 14.6,
+      "mean_duration_s": 62.38,
+      "successes": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      "seeds": [
+        43,
+        42,
+        45,
+        44,
+        46,
+        47,
+        48,
+        49,
+        51,
+        50,
+        53,
+        52,
+        55,
+        54,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 15,
+    "total_envs": 1,
+    "overall_success_rate": 0.6667,
+    "total_wall_time_s": 703.71
+  }
+}

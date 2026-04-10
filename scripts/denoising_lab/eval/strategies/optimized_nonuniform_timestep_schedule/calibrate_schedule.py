@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
     g = p.add_argument_group("model")
     g.add_argument("--model-path", default="nvidia/GR00T-N1.6-3B")
-    g.add_argument("--embodiment-tag", default="ROBOCASA_PANDA_OMRON")
+    g.add_argument("--embodiment-tag", default="robocasa_panda_omron")
     g.add_argument("--device", default="cuda")
 
     g = p.add_argument_group("grid search")
@@ -155,6 +155,7 @@ def _run_grid_search(args: argparse.Namespace, obs_dir: Path) -> None:
 
     # Strategy imports (local — avoids polluting sys.path at module level)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
     from strategy import DEFAULT_SCHEDULE, denoise_with_lab  # noqa: E402
 
     # Late import so Phase 1 can release GPU first

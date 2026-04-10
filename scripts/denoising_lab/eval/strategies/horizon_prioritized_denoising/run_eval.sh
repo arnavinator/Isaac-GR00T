@@ -9,10 +9,10 @@ set -euo pipefail
 
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
     scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --n-episodes 10 --seed 42 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --n-episodes 6 --seed 42 \
     --n-envs 2 --port 5555 \
     --max-episode-steps 480 \
-    --output-dir /tmp/benchmark_results/horizon_prioritized_denoising \
+    --output-dir /tmp/benchmark_results/horizon_prioritized_denoising_gamma_0p25 \
     --strategy-name horizon_prioritized_denoising \
     "$@"

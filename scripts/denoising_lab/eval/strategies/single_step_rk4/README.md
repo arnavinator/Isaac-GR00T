@@ -1,5 +1,21 @@
 ## Strategy 1: Single-Step RK4
 
+> **DEPRECATED** — This strategy is **discarded** after benchmark evaluation.
+> It scored 3/15 on OpenDrawer (vs 13/15 baseline) and 5/15 on CoffeeServeMug
+> (vs 8/15 baseline), for a combined 8/30 (26.7%) vs baseline's 21/30 (70.0%).
+> The degradation is statistically significant (McNemar's p ~ 0.002).
+>
+> **Root cause:** RK4's intermediate evaluations feed the DiT action states that
+> are *extrapolations of learned velocity* — not states the model was trained to
+> denoise from. Specifically, `k2` and `k3` evaluate at `tau_bucket=500` with
+> action inputs (`a + 0.5*k1`, `a + 0.5*k2`) that don't lie on the rectified-flow
+> interpolation path `(1-tau)*noise + tau*data`. Even worse, `k4` evaluates at
+> `tau_bucket=999`, a region where the training distribution (Beta(1.5, 1.0)) provides
+> almost no coverage. The resulting velocity predictions are unreliable, and the
+> weighted RK4 combination amplifies these errors rather than cancelling them.
+> This is unsalvageable without retraining the model to expect non-standard noise
+> levels at intermediate ODE solver states.
+
 **Category:** Drop-in replacement | **NFEs:** 4 (same as baseline) | **Retraining:** None
 
 ### Overview

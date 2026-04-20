@@ -1,76 +1,77 @@
-"""Horizon-Prioritized Denoising for GR00T N1.6.
+"""Mean-Residual Velocity Decomposition.
 
-Applies position-dependent velocity scaling that creates a "denoising wave"
-sweeping from near-horizon to far-horizon across the 4 denoising steps.
+Decomposes the velocity field at each denoising step into its horizon
+mean (uniform correction) and residual (structured, position-dependent
+correction), then scales the residual to counteract the empirically
+observed DC dominance at later steps.
 
-Near-horizon positions (executed next) receive larger velocity updates in early
-steps, while far-horizon positions (discarded at re-query) receive larger
-updates in later steps.  The total velocity integrated per position is
-approximately preserved.
+Spectral analysis of GR00T's velocity field shows:
+  - DC (mean) energy grows 59% from step 0 to step 3
+  - Residual (structured) energy stays approximately constant
+  - Later steps predominantly "translate" the trajectory uniformly
 
-The gating function is a Gaussian attention window centered at c_i that sweeps
-across the horizon:
+By scaling the residual component (rho > 1.0), we boost trajectory
+structure that the model's growing DC dominance may under-resolve.
 
-    w_j^{(i)} = 1 + gamma * exp(-(j - c_i)^2 / (2 * sigma_w^2))
-
-Same 4 NFEs, identical latency to baseline.
+Same 4 NFEs, <0.01 ms overhead per step (one mean + one multiply).
 
 Usage (server):
     from strategy import patch_action_head
-    patch_action_head(policy.model.action_head)
+    patch_action_head(policy.model.action_head, rho=1.15)
 
 Usage (notebook with DenoisingLab):
-    from strategy import make_horizon_prioritized_fn, denoise_with_lab
+    from strategy import make_mean_residual_fn, denoise_with_lab
     actions = denoise_with_lab(lab, features, seed=42)
     decoded = lab.decode_raw_actions(actions)
 """
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
 
 # ---------------------------------------------------------------------------
-# Weight construction
+# Core: mean-residual velocity modification
 # ---------------------------------------------------------------------------
 
 
-def build_horizon_weights(
-    num_steps: int = 4,
-    action_horizon: int = 50,
-    effective_horizon: int = 16,
-    gamma: float = 0.5,
-    sigma_w: float = 3.0,
+def _modify_velocity(
+    velocity: torch.Tensor,
+    rho: float,
+    energy_preserve: bool = True,
 ) -> torch.Tensor:
-    """Build per-step position-dependent gating weights.
+    """Decompose velocity into mean + residual and scale residual by rho.
 
     Args:
-        num_steps: Number of denoising steps.
-        action_horizon: Padded horizon length (50 for GR00T).
-        effective_horizon: Actual action steps for the embodiment (16 for PandaOmron).
-        gamma: Boost amplitude.  ``gamma=0`` recovers standard Euler.
-        sigma_w: Width of the Gaussian attention window.
+        velocity: ``(B, H, D)`` velocity from the DiT.
+        rho: Residual scaling factor.  ``1.0`` = identity (baseline).
+        energy_preserve: Normalise to preserve total velocity magnitude.
 
     Returns:
-        ``(num_steps, action_horizon)`` tensor of gating weights.
+        Modified velocity, same shape and dtype as input.
     """
-    # Sweep centers evenly across the effective horizon
-    centers = [i * (effective_horizon - 1) / (num_steps - 1) for i in range(num_steps)]
-    j = np.arange(action_horizon)
+    orig_dtype = velocity.dtype
+    v = velocity.float()
 
-    weights = np.ones((num_steps, action_horizon), dtype=np.float32)
-    for i in range(num_steps):
-        gaussian = np.exp(-0.5 * ((j[:effective_horizon] - centers[i]) / sigma_w) ** 2)
-        weights[i, :effective_horizon] = 1.0 + gamma * gaussian
-        # Padded positions (effective_horizon..action_horizon-1) keep weight 1.0
+    # Decompose
+    v_mean = v.mean(dim=1, keepdim=True)  # (B, 1, D)
+    v_res = v - v_mean                     # (B, H, D)
 
-    return torch.from_numpy(weights)
+    # Scale residual
+    v_mod = v_mean + rho * v_res
+
+    if energy_preserve:
+        v_norm = v.norm()
+        vm_norm = v_mod.norm()
+        if vm_norm > 1e-8:
+            v_mod = v_mod * (v_norm / vm_norm)
+
+    return v_mod.to(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
-# Shared helper: evaluate the DiT velocity field
+# DiT velocity evaluation (shared helper)
 # ---------------------------------------------------------------------------
 
 
@@ -114,18 +115,18 @@ def _evaluate_velocity(action_head, actions, t_bucket, vl_embeds, state_features
 # ---------------------------------------------------------------------------
 
 
-def denoise_horizon_prioritized(
+def denoise_mean_residual(
     action_head, vl_embeds, state_features, embodiment_id, backbone_output,
     *,
-    weights: torch.Tensor,
-    num_steps: int = 4,
-    effective_horizon: int = 16,
+    rho: float = 1.15,
+    onset: int = 2,
+    energy_preserve: bool = True,
     initial_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """4-step Euler with horizon-prioritized velocity gating.
+    """4-step Euler with mean-residual velocity decomposition.
 
-    At each step, velocity is element-wise multiplied by position-dependent
-    weights before the Euler update.
+    At steps >= onset: velocity -> decompose -> scale residual -> Euler update.
+    Zero extra NFEs.  Same cost as baseline.
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` instance.
@@ -133,26 +134,27 @@ def denoise_horizon_prioritized(
         state_features: Encoded state ``(B, state_horizon, hidden_dim)``.
         embodiment_id: Embodiment IDs ``(B,)``.
         backbone_output: Full backbone output.
-        weights: Precomputed ``(num_steps, action_horizon)`` gating weights
-            from ``build_horizon_weights``.
-        num_steps: Number of denoising steps.
-        effective_horizon: Actual action steps (for verbose logging only).
+        rho: Residual scaling factor.  ``1.0`` recovers baseline Euler.
+        onset: First denoising step to apply the decomposition (0-3).
+        energy_preserve: Normalise modified velocity to preserve magnitude.
         initial_noise: Optional starting noise ``(B, action_horizon, action_dim)``.
 
     Returns:
         Denoised actions ``(B, action_horizon, action_dim)``.
     """
+    num_steps = 4
     batch_size = vl_embeds.shape[0]
     device = vl_embeds.device
     dtype = vl_embeds.dtype
     num_buckets = action_head.num_timestep_buckets
     dt = 1.0 / num_steps
+    H = action_head.action_horizon
 
     if initial_noise is not None:
         actions = initial_noise.to(device=device, dtype=dtype)
     else:
         actions = torch.randn(
-            batch_size, action_head.action_horizon, action_head.action_dim,
+            batch_size, H, action_head.action_dim,
             dtype=dtype, device=device,
         )
 
@@ -165,24 +167,24 @@ def denoise_horizon_prioritized(
             vl_embeds, state_features, embodiment_id, backbone_output,
         )
 
-        # Position-dependent velocity gating: (B, H, D) * (1, H, 1)
-        w = weights[step]  # (action_horizon,)
-        actions = actions + dt * velocity * w[None, :, None]
+        if step >= onset:
+            velocity = _modify_velocity(velocity, rho, energy_preserve)
+
+        actions = actions + dt * velocity
 
         if action_head.verbose:
-            w_eff = w[:effective_horizon]
+            vf = velocity.float()
             print(
-                f"[HorizonPrioritized] Step {step}/{num_steps}  "
+                f"[MeanRes] Step {step}/{num_steps}  "
                 f"tau={tau:.3f}  bucket={t_bucket}  "
-                f"w_min={w_eff.min():.3f}  w_max={w_eff.max():.3f}  "
-                f"a_norm={actions.float().norm():.4f}  "
-                f"v_norm={velocity.float().norm():.4f}"
+                f"rho={'%.2f' % rho if step >= onset else 'n/a'}  "
+                f"v_norm={vf.norm():.4f}  a_norm={actions.float().norm():.4f}"
             )
 
     if action_head.verbose:
         af = actions.float()
         print(
-            f"[HorizonPrioritized] Final  shape={tuple(actions.shape)}  "
+            f"[MeanRes] Final  shape={tuple(actions.shape)}  "
             f"mean={af.mean():.4f}  std={af.std():.4f}"
         )
 
@@ -194,26 +196,30 @@ def denoise_horizon_prioritized(
 # ---------------------------------------------------------------------------
 
 
-def make_horizon_prioritized_fn(
-    action_horizon: int = 50,
-    effective_horizon: int = 16,
-    gamma: float = 0.5,
-    sigma_w: float = 3.0,
-    num_steps: int = 4,
+def make_mean_residual_fn(
+    rho: float = 1.15,
+    onset: int = 2,
+    energy_preserve: bool = True,
 ):
-    """Factory for horizon-prioritized velocity gating.
+    """Factory for mean-residual velocity modifier.
 
     Returns a function compatible with ``DenoisingLab.denoise(guided_fn=...)``.
+
+    Args:
+        rho: Residual scaling factor.  ``1.0`` recovers baseline.
+        onset: First step to apply decomposition (0-3).
+        energy_preserve: Normalise to preserve velocity magnitude.
+
+    Returns:
+        A ``guided_fn(actions_before, step_idx, velocity) -> velocity``.
     """
-    weights = build_horizon_weights(
-        num_steps, action_horizon, effective_horizon, gamma, sigma_w,
-    )
 
     def guided_fn(
         actions_before: torch.Tensor, step_idx: int, velocity: torch.Tensor,
     ) -> torch.Tensor:
-        w = weights[step_idx].to(device=velocity.device, dtype=velocity.dtype)
-        return velocity * w[None, :, None]
+        if step_idx < onset:
+            return velocity
+        return _modify_velocity(velocity, rho, energy_preserve)
 
     return guided_fn
 
@@ -225,29 +231,29 @@ def make_horizon_prioritized_fn(
 
 def patch_action_head(
     action_head,
-    gamma: float = 0.5,
-    sigma_w: float = 3.0,
-    effective_horizon: int = 16,
+    rho: float = 1.15,
+    onset: int = 2,
+    energy_preserve: bool = True,
 ):
-    """Monkey-patch the action head to use horizon-prioritized denoising.
+    """Monkey-patch the action head to use mean-residual denoising.
 
-    Replaces ``get_action_with_features()`` in-place.  Weights are built once
-    here and reused for every subsequent inference call.
+    Replaces ``get_action_with_features()`` in-place.
+
+    Args:
+        action_head: ``Gr00tN1d6ActionHead`` to patch.
+        rho: Residual scaling factor.
+        onset: First denoising step to apply decomposition.
+        energy_preserve: Normalise to preserve velocity magnitude.
     """
-    num_steps = action_head.num_inference_timesteps
-    weights = build_horizon_weights(
-        num_steps, action_head.action_horizon, effective_horizon, gamma, sigma_w,
-    ).to(device=action_head.device, dtype=action_head.dtype)
 
     @torch.no_grad()
-    def hp_get_action_with_features(
+    def mean_residual_get_action_with_features(
         backbone_features, state_features, embodiment_id, backbone_output,
     ):
-        actions = denoise_horizon_prioritized(
+        actions = denoise_mean_residual(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output,
-            weights=weights, num_steps=num_steps,
-            effective_horizon=effective_horizon,
+            rho=rho, onset=onset, energy_preserve=energy_preserve,
         )
         return BatchFeature(data={
             "action_pred": actions,
@@ -255,7 +261,7 @@ def patch_action_head(
             "state_features": state_features,
         })
 
-    action_head.get_action_with_features = hp_get_action_with_features
+    action_head.get_action_with_features = mean_residual_get_action_with_features
 
 
 # ---------------------------------------------------------------------------
@@ -265,24 +271,26 @@ def patch_action_head(
 
 def denoise_with_lab(
     lab, features, *, seed=None,
-    gamma: float = 0.5, sigma_w: float = 3.0, effective_horizon: int = 16,
+    rho: float = 1.15, onset: int = 2, energy_preserve: bool = True,
 ):
-    """Run horizon-prioritized denoising via DenoisingLab.
+    """Run mean-residual denoising via DenoisingLab.
 
     Uses the ``guided_fn`` interface so all intermediates are recorded.
+
+    Args:
+        lab: ``DenoisingLab`` instance (model loaded).
+        features: Encoded features from ``lab.encode_features_from_sim_obs()``.
+        seed: Random seed for reproducibility.
+        rho: Residual scaling factor.  ``1.0`` = baseline.
+        onset: First step to apply decomposition.
+        energy_preserve: Normalise to preserve velocity magnitude.
 
     Returns:
         ``torch.Tensor`` -- raw actions ``(B, action_horizon, action_dim)``.
         Decode with ``lab.decode_raw_actions(actions)``.
     """
-    guided_fn = make_horizon_prioritized_fn(
-        action_horizon=lab.action_horizon,
-        effective_horizon=effective_horizon,
-        gamma=gamma, sigma_w=sigma_w,
-        num_steps=lab.num_inference_timesteps,
-    )
+    guided_fn = make_mean_residual_fn(rho=rho, onset=onset, energy_preserve=energy_preserve)
     result = lab.denoise(
-        features, num_steps=lab.num_inference_timesteps,
-        guided_fn=guided_fn, seed=seed,
+        features, num_steps=4, guided_fn=guided_fn, seed=seed,
     )
     return result.action_pred

@@ -1,8 +1,22 @@
 ## Strategy 15: Spectral Temporal Decomposition with Frequency-Band Velocity Scaling
 
+> **STATUS: DEPRECATED — hypothesis invalidated by empirical analysis.**
+>
+> The core premise — that GR00T's denoising steps exhibit a low-frequency-to-high-frequency spectral progression analogous to image diffusion — is **empirically false**. Spectral analysis of the velocity field across 160 denoising runs (`analyze_spectral_structure.py`, 32 observations x 5 seeds) shows that:
+>
+> 1. **All four steps peak at k=0 (DC).** No step concentrates energy at high frequencies.
+> 2. **Spectral centroids decrease across steps** (19.0 → 18.3 → 17.1 → 15.7), the exact opposite of the assumed low-pass → high-pass progression.
+> 3. **All steps have nearly identical spectral shapes** — a DC spike followed by a flat tail. There is no meaningful spectral separation between steps to exploit.
+>
+> The inverted weighting (boost high frequencies early) is also unviable: at step 0 the model conditions on pure noise, so its high-frequency velocity components are unreliable guesses, not underweighted signal. Amplifying them (while energy preservation suppresses the reliable low-frequency components) injects noise into step 0's output, pushing subsequent steps off-distribution and compounding errors through the ODE.
+>
+> **Root cause:** The coarse-to-fine spectral progression in image/video diffusion relies on many steps (50-1000), nonlinear noise schedules, and high-dimensional spatial structure. GR00T's 4-step linear flow matching on low-dimensional, inherently smooth action trajectories does not produce spectral separation between steps. The analogy from Hoogeboom et al. (2023) and Yang et al. (2024) does not transfer to this setting.
+>
+> Results are in `freq_analysis_on_fixed_data/analysis/`. The analysis code (`analyze_spectral_structure.py`) and strategy implementation are preserved for reference.
+
 **Category:** Novel, drop-in | **NFEs:** 4 (same as baseline) | **Retraining:** None
 
-### Overview
+### Overview (Original Hypothesis)
 
 Every denoising step modifies the action chunk uniformly across its 16-timestep horizon. But not all temporal frequencies are created equal, and not all denoising steps contribute equally to each frequency. Early denoising steps (near $\tau = 0$) collapse noise into gross trajectory structure — the low-frequency "shape" of the action chunk (approach direction, overall motion trend). Late denoising steps (near $\tau = 1$) refine high-frequency detail — precise timing of transitions, gripper open/close moments, contact dynamics.
 

@@ -1,5 +1,25 @@
 ## Strategy 9: Horizon-Prioritized Denoising
 
+> **DEPRECATED** — This strategy is **discarded** after benchmark evaluation.
+> With the best gamma (0.25, found by manual sweep on OpenSingleDoor and
+> PnPCounterToStove), it scored 12/15 on OpenDrawer (vs 13/15 baseline) and
+> 8/15 on CoffeeServeMug (matching baseline), for a combined 20/30 (66.7%)
+> vs baseline's 21/30 (70.0%). It regressed on seed 55 (OpenDrawer) which
+> baseline and 4 other strategies handle easily.
+>
+> **Root cause:** The DiT uses a single global timestep `tau` for AdaLayerNorm
+> conditioning across all action positions. When horizon-prioritized gating
+> advances near-horizon positions faster than far-horizon ones, the per-position
+> effective noise level diverges from what `tau` tells the model to expect. The
+> DiT cannot distinguish per-position noise levels, so it applies the wrong
+> normalization statistics. At gamma=0.25 the mismatch (~15% velocity boost) is
+> small enough to avoid catastrophic failure, but also too small to provide any
+> measurable benefit. Higher gamma values (tested during calibration) worsen the
+> mismatch without improving success rate. The hypothesis that self-attention
+> would propagate information from "more denoised" near-horizon tokens to "less
+> denoised" far-horizon tokens does not appear to outweigh the distribution
+> mismatch cost in practice.
+
 **Category:** Novel, drop-in | **NFEs:** 4 (same as baseline) | **Retraining:** None
 
 ### Overview
@@ -101,7 +121,7 @@ The `MultiStepWrapper` is unmodified. The output shape and decode pipeline are i
 | Aspect | Assessment |
 |--------|------------|
 | **Expected quality** | Potentially high. Near-horizon actions (which are executed) receive ~15% more velocity integration than far-horizon actions (which are discarded). This preferential denoising directly improves the actions that matter. Furthermore, the DiT's self-attention creates an information flow from the early-converging near-horizon tokens to the still-noisy far-horizon tokens — a form of *self-guided denoising* that emerges naturally from the architecture. |
-| **Risk** | (1) **Timestep distribution mismatch**: After step 0, near-horizon positions are more denoised than the global $\tau$ would suggest, while far-horizon positions are less denoised. The DiT's AdaLayerNorm conditions on a single global $\tau$ — it cannot distinguish per-position noise levels. If the model is sensitive to this mismatch, quality could degrade. However, the mismatch is small ($\pm$15% of baseline velocity) and the model processes partially-noised inputs at every step, so some robustness is expected. (2) The $\gamma$ parameter requires tuning — use the `find_optimal_gamma` calibration utility (see below) to find the best value for a given embodiment and checkpoint. Too large: excessive mismatch and potential instability. Too small: no effect. |
+| **Risk** | (1) **Timestep distribution mismatch**: After step 0, near-horizon positions are more denoised than the global $\tau$ would suggest, while far-horizon positions are less denoised. The DiT's AdaLayerNorm conditions on a single global $\tau$ — it cannot distinguish per-position noise levels. If the model is sensitive to this mismatch, quality could degrade. However, the mismatch is small ($\pm$15% of baseline velocity) and the model processes partially-noised inputs at every step, so some robustness is expected. (2) The $\gamma$ parameter requires tuning via benchmark success rate (not L2 calibration — see "Tuning gamma" below). Too large: excessive mismatch and potential instability. Too small: no effect. |
 | **Latency** | Identical — same 4 NFEs, same ~64ms. The Gaussian weight computation is precomputed; the per-step gating is a single element-wise multiply. |
 | **Implementation** | Trivial — implemented entirely in the `guided_fn` callback via element-wise velocity scaling. One precomputed weight matrix. |
 
@@ -151,26 +171,21 @@ guided_fn = make_horizon_prioritized_fn(gamma=0.5, sigma_w=3.0)
 result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
 ```
 
-**Calibrating gamma with `find_optimal_gamma`:**
+**Tuning gamma:**
 
-The optimal `gamma` depends on how tolerant the trained DiT is to per-position noise level mismatch — the weights make near-horizon positions more denoised than the global $\tau$ suggests, but the DiT conditions on a single global $\tau$. This tolerance is an empirical property of the checkpoint that can't be determined analytically.
+L2 distance to a high-fidelity Euler reference is **not** a useful metric for this strategy. The whole point of horizon prioritization is to reshape the velocity integration — the output is *supposed* to diverge from what unmodified Euler produces. L2 calibration will always prefer gamma=0 (baseline).
 
-`find_optimal_gamma` automates the search. It generates a high-fidelity reference (64-step uniform Euler, which closely approximates the true ODE solution), then sweeps gamma values and picks the one whose 4-step output is closest to the reference by L2 distance. Run it once on a few validation observations (one-time cost, ~1 GPU-minute per observation):
+Instead, tune gamma by running the benchmark with different values and comparing **task success rate** directly:
 
-```python
-from strategy import find_optimal_gamma
+```bash
+# Run server with gamma=0.3
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_server.sh --gamma 0.3
+# In another terminal, run benchmark
+bash scripts/denoising_lab/eval/strategies/horizon_prioritized_denoising/run_eval.sh --n-episodes 50
 
-# features_list: 3-5 BackboneFeatures from representative observations
-best_gamma, results = find_optimal_gamma(lab, features_list)
-
-# results is sorted by error: [(best_gamma, error), (next_best, error), ...]
-for gamma, err in results:
-    print(f"  gamma={gamma:.1f}  error={err:.3f}")
-
-# Use the winner
-actions = denoise_with_lab(lab, features, seed=42, gamma=best_gamma)
+# Repeat with gamma=0.5, 0.7, etc. and compare success rates
 ```
 
-Then hard-code the winning gamma into `run_server.sh` (via `--gamma`) or pass it to `patch_action_head()` for evaluation.
+Start with values in the range `[0.3, 0.7]`. Lower gamma is safer (closer to baseline); higher gamma gives more prioritization but risks degradation from per-position noise level mismatch.
 
 ---

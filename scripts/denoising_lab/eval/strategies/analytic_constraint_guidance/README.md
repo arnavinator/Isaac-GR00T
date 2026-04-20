@@ -247,4 +247,47 @@ guided_fn = make_constraint_guided_fn(cfg)
 result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
 ```
 
+### Hyperparameter Calibration
+
+The default constraint weights (`lambda_smooth=0.005`, `lambda_discrete=0.01`,
+`lambda_mode=0.003`, `eta=0.1`) were hand-chosen and produce +6.7% over baseline
+on the 15-episode benchmark. To explore whether tuning can flip additional hard
+seeds (those that fail for *all* strategies), use the grid search script:
+
+```bash
+# Quick screening: test only universally-hard seeds (5 seeds x 27 configs)
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibrate_lambdas.sh
+
+# Full evaluation: all 15 seeds x 27 configs (for complete comparison)
+bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibrate_lambdas.sh \
+    --seeds-only  # pass empty to disable seed filtering
+
+# Custom grid: sweep eta as well (3x3x3x3 = 81 configs)
+uv run python scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibrate_lambdas.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 400 480 \
+    --n-episodes 15 --seed 42 \
+    --seeds-only 45 52 54 55 56 \
+    --lambda-smooth 0.002 0.005 0.01 \
+    --lambda-discrete 0.005 0.01 0.02 \
+    --lambda-mode 0.001 0.003 0.01 \
+    --eta 0.05 0.1 0.2 \
+    --output-dir ./my_calibration_results
+```
+
+**Architecture:** The model loads ONCE, runs as a ZMQ server in a daemon thread,
+and the action head is re-patched between configs. The eval client (robocasa venv)
+is launched as a subprocess for each config. Total runtime for 27 configs on 5
+hard seeds is approximately 30 minutes (dominated by simulation, not model loading).
+
+**Output:** `results.json` in the output directory with all configs ranked by
+combined success rate, plus per-config `episodes.jsonl` for detailed inspection.
+
+**Recommended workflow:**
+1. Run `calibrate_lambdas.sh` (hard-seeds-only screening) to identify promising configs
+2. Re-run the best 3-5 configs with `--seeds-only` removed (full 15-seed evaluation)
+3. Pick the config with highest combined success rate that doesn't regress vs baseline
+   on the "swing" seeds (42, 46, 47, 49 on CoffeeServeMug)
+
 ---

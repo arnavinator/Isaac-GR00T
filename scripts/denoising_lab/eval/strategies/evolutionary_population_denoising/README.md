@@ -268,3 +268,35 @@ Action chunking is unchanged. The evolutionary search produces a single $(B, 50,
 **What makes this novel for VLAs:** GDP (Clemente et al., arXiv:2510.21991, NeurIPS 2025) directly implements population-based denoising with per-step fitness selection for robot DDPM policies — making the *core mechanism* (population + per-step selection) not novel. Our contribution adapts this to **flow matching VLAs** with three specific innovations beyond GDP: (1) The **consensus fitness term** — inter-particle velocity agreement as a self-consistency proxy — is new and specific to the population setting. (2) **Annealed mutation** that respects denoising progress (GDP uses selection only, no crossover or mutation). (3) **Crossover in partially-denoised action space** — blending structured actions after 1+ denoising steps. **Enhancement:** Adopt GDP's Stein-based fitness (distributional anomaly) as an additional scoring term alongside our smoothness/consensus. Compare selection-only (GDP-style) vs. full evolutionary operators to determine the marginal value of crossover/mutation.
 
 ---
+
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main model venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/evolutionary_population_denoising/run_server.sh
+# Or with custom population size:
+bash scripts/denoising_lab/eval/strategies/evolutionary_population_denoising/run_server.sh --K 16
+# With verbose fitness logging:
+bash scripts/denoising_lab/eval/strategies/evolutionary_population_denoising/run_server.sh --verbose
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/evolutionary_population_denoising/run_eval.sh
+# Or with more episodes:
+bash scripts/denoising_lab/eval/strategies/evolutionary_population_denoising/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from scripts.denoising_lab.eval.strategies.evolutionary_population_denoising.strategy import (
+    denoise_with_lab, EvolutionaryConfig,
+)
+cfg = EvolutionaryConfig(K=8, lambda_smooth=1.0, lambda_consensus=0.3)
+actions = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+```
+
+---
+
+---

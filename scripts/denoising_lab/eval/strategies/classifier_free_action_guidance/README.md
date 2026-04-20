@@ -204,3 +204,35 @@ The task-phase scheduling interacts with chunking at the *episode* level: as the
 **What makes this novel for VLA flow matching:** CFG-DP was demonstrated on DDPM-style diffusion policies (noise/score prediction). Our formulation adapts CFG to **flow matching velocity prediction**, which is mathematically distinct — the guidance operates on the velocity field $v$ rather than the score function $\nabla_x \log p$. Concretely, the flow matching guidance $v_{\text{uncond}} + w(v_{\text{cond}} - v_{\text{uncond}})$ amplifies the velocity *direction* that the observation contributes, while DDPM guidance amplifies the score *magnitude*. These are different geometric operations on different vector fields. Additionally, our task-phase scheduling uses episode progress as the scheduling signal (available at inference without any additional model), rather than CFG-DP's task completion probability (which requires a learned estimator). The synthesis of flow matching + CFG + VLA + task-phase scheduling is, to our knowledge, unpublished.
 
 ---
+
+### How to Run
+
+**Note:** Full CFG quality requires the model to be fine-tuned with observation dropout (p=0.1). Without that training, the null-embedding velocity is not well-calibrated. Moderate guidance weights (w <= 2.0) are recommended for the standard pretrained model.
+
+**Terminal 1 — Server** (from repo root, main model venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/classifier_free_action_guidance/run_server.sh
+# Or with custom guidance weight:
+bash scripts/denoising_lab/eval/strategies/classifier_free_action_guidance/run_server.sh --guidance-weight 2.0
+# With a fine-tuned null embedding:
+bash scripts/denoising_lab/eval/strategies/classifier_free_action_guidance/run_server.sh --null-embed-path /path/to/null_embed.pt
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/classifier_free_action_guidance/run_eval.sh
+# Or with more episodes:
+bash scripts/denoising_lab/eval/strategies/classifier_free_action_guidance/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab** (with sigmoid schedule):
+```python
+from scripts.denoising_lab.eval.strategies.classifier_free_action_guidance.strategy import (
+    denoise_with_lab, CFGConfig,
+)
+cfg = CFGConfig(w_min=1.0, w_max=4.0, use_sigmoid_schedule=True)
+actions = denoise_with_lab(lab, features, seed=42, episode_step=200, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+```
+
+---

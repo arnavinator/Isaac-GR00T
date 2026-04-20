@@ -237,3 +237,38 @@ Action chunking is unchanged. The adaptive solver produces the same $(B, 50, 128
 **What makes this novel:** To our knowledge, embedded Runge-Kutta error estimation has never been applied to flow matching or diffusion model denoising. Classical adaptive ODE solvers have been used for neural ODE *training* (Chen et al., 2018) but not for generative model *sampling*. The sampling context is distinct because: (a) the velocity field was trained for a specific interpolation path, and adaptive stepping may visit off-path states; (b) the computational budget is extremely tight (6-8 NFEs, not 50+); (c) the error tolerance must be calibrated for *action quality* (success rate), not mathematical precision. The connection between "velocity field curvature at a given observation" and "that observation's denoising difficulty" is a novel interpretive framework that could inform future work on adaptive denoising beyond the specific Euler-Heun pair.
 
 ---
+
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main model venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_server.sh
+# Or with custom tolerance:
+bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_server.sh --atol 0.03
+# With verbose step logging (shows accept/reject decisions):
+bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_server.sh --verbose
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_eval.sh
+# Or with more episodes:
+bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from scripts.denoising_lab.eval.strategies.curvature_adaptive_step_size.strategy import (
+    denoise_with_lab, AdaptiveConfig,
+)
+cfg = AdaptiveConfig(atol=0.05, max_nfe=8)
+actions, step_log = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+# Inspect adaptive behaviour:
+for entry in step_log:
+    print(f"  {entry.outcome}  tau={entry.tau:.3f}  dt={entry.dt:.4f}  error={entry.error}")
+```
+
+---
+
+---

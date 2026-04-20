@@ -172,3 +172,31 @@ Action chunking is unchanged. The noise selection happens entirely before the ma
 **What makes this novel:** The combination of (1) online, per-observation noise selection (2) using a 1-step velocity preview as a lightweight quality proxy (3) applied to flow-matching VLA models is, to our knowledge, unpublished. The closest work (Golden Ticket) requires offline optimization with full rollouts; our 1-step proxy eliminates this requirement entirely. The insight that mode selection happens in the first denoising step — and that this can be exploited for cheap quality improvement — is specific to the flow-matching paradigm where early steps establish gross structure.
 
 ---
+
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main model venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh
+# Or with custom parameters:
+bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh --K 8 --lambda-smooth 2.0
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_eval.sh
+# Or with more episodes:
+bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from scripts.denoising_lab.eval.strategies.noise_space_mode_selection.strategy import (
+    denoise_with_lab, NoiseSelectionConfig,
+)
+cfg = NoiseSelectionConfig(K=4, lambda_smooth=1.0, lambda_mag=0.1)
+actions = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+```
+
+---

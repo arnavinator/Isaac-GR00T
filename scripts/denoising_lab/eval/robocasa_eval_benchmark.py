@@ -30,6 +30,16 @@ Usage::
         --n-episodes 10 --n-envs 5 --seed 42 \
         --output-dir /tmp/benchmark_results \
         --strategy-name baseline_euler
+
+    # Terminal 2 -- per-env max episode steps
+    gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+        scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+        --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                    robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+        --max-episode-steps 400 480 \
+        --n-episodes 15 --seed 42 \
+        --output-dir /tmp/benchmark_results \
+        --strategy-name my_strategy
 """
 
 from __future__ import annotations
@@ -218,7 +228,7 @@ def run_benchmark_for_env(
     env = create_single_env(
         env_name=env_name,
         n_action_steps=args.n_action_steps,
-        max_episode_steps=args.max_episode_steps,
+        max_episode_steps=args._current_max_episode_steps,
         video_dir=video_dir,
     )
 
@@ -300,11 +310,11 @@ def run_benchmark_for_env_parallel(
     wrapper_configs = WrapperConfigs(
         video=VideoConfig(
             video_dir=video_dir,
-            max_episode_steps=args.max_episode_steps,
+            max_episode_steps=args._current_max_episode_steps,
         ),
         multistep=MultiStepConfig(
             n_action_steps=args.n_action_steps,
-            max_episode_steps=args.max_episode_steps,
+            max_episode_steps=args._current_max_episode_steps,
             terminate_on_success=True,
         ),
     )
@@ -547,8 +557,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=720,
-        help="Truncation limit (outer steps)",
+        nargs="+",
+        default=[720],
+        help="Truncation limit (outer steps). One value applies to all envs; "
+        "multiple values are matched 1:1 with --env-names.",
     )
     parser.add_argument(
         "--n-envs",
@@ -587,6 +599,17 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.output_dir = Path(args.output_dir)
+
+    n_envs_named = len(args.env_names)
+    n_steps = len(args.max_episode_steps)
+    if n_steps == 1:
+        args.max_episode_steps = args.max_episode_steps * n_envs_named
+    elif n_steps != n_envs_named:
+        parser.error(
+            f"--max-episode-steps got {n_steps} values but "
+            f"--env-names got {n_envs_named}; provide 1 or {n_envs_named}"
+        )
+
     return args
 
 
@@ -610,9 +633,10 @@ def main() -> None:
     all_records: dict[str, list[dict[str, Any]]] = {}
     wall_start = time.monotonic()
 
-    for env_name in args.env_names:
+    for env_idx, env_name in enumerate(args.env_names):
+        args._current_max_episode_steps = args.max_episode_steps[env_idx]
         print(f"\n{'='*60}")
-        print(f"Env: {env_name}")
+        print(f"Env: {env_name} (max_episode_steps={args._current_max_episode_steps})")
         print(f"{'='*60}")
         if args.n_envs > 1:
             records = run_benchmark_for_env_parallel(env_name, seeds, client, args)

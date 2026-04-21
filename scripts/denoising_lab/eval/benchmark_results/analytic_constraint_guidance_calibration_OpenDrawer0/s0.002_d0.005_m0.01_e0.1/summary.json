@@ -1,0 +1,40 @@
+{
+  "strategy_name": "constraint_guidance_s0.002_d0.005_m0.01_e0.1",
+  "timestamp": "2026-04-21T02:43:51.526907+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
+    ],
+    "n_episodes": 2,
+    "seed": 44,
+    "max_episode_steps": 400,
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/OpenDrawer_PandaOmron_Env": {
+      "n_episodes": 2,
+      "success_rate": 0.5,
+      "mean_reward": 0.5,
+      "mean_length": 39.5,
+      "std_length": 10.5,
+      "mean_duration_s": 59.19,
+      "successes": [
+        true,
+        false
+      ],
+      "seeds": [
+        44,
+        45
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 2,
+    "total_envs": 1,
+    "overall_success_rate": 0.5,
+    "total_wall_time_s": 126.2
+  }
+}

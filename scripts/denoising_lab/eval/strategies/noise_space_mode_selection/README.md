@@ -1,6 +1,6 @@
 ## Strategy 10: Noise-Space Mode Selection via Velocity Preview
 
-**Category:** Novel, drop-in | **NFEs:** K + 3 (~7 for K=4) | **Retraining:** None
+**Category:** Novel, drop-in | **NFEs:** K + 3 (~8 for K=5) | **Retraining:** None
 
 ### Overview
 
@@ -8,9 +8,11 @@ This is a **novel strategy** inspired by a striking finding: **the initial noise
 
 **Golden Ticket's limitation:** The original approach finds optimal noise vectors through offline Monte Carlo search — rolling out the full policy with hundreds of noise candidates and keeping the best. This requires a simulator, is computationally expensive, and produces a *fixed* noise vector that doesn't adapt to the specific observation.
 
-**Our innovation:** Replace the offline search with an **online, per-observation 1-step velocity preview**. Sample $K$ noise candidates, run a single batched Euler step on all $K$ simultaneously, score the partially-denoised results using a lightweight quality proxy, select the best noise, and complete the remaining 3 denoising steps only for the winner.
+**Our innovation:** Replace the offline search with an **online, per-observation 1-step velocity preview**. Sample $K$ noise candidates, run a single batched Euler step on all $K$ simultaneously, score the **fully-extrapolated action proxy** $a_{1.0}^* = \epsilon + v(\epsilon, 0)$ using a lightweight quality proxy, select the best noise, and complete the remaining 3 denoising steps only for the winner.
 
-**Why 1 step is sufficient for mode selection:** In flow matching, the first Euler step ($\tau = 0 \to 0.25$) does the most dramatic transformation — it collapses the isotropic Gaussian noise into a rough action structure. After just 1 step, the gross trajectory shape is established: which direction the arm reaches, whether the gripper opens or closes, which control mode is active. The remaining 3 steps refine this structure but rarely change the mode. This is visible in the denoising_lab notebook's progression plots (cell 13): the step-0 → step-1 transition dominates.
+**Why the fully-extrapolated proxy works:** In rectified flow, $v(\epsilon, 0) \approx \text{data} - \epsilon$, so $\epsilon + v(\epsilon, 0) \approx \text{data}_{\text{predicted}}$. This single-step extrapolation is dominated by signal (not noise), giving the scoring heuristics meaningful action-quality information at zero extra NFEs. An earlier version scored the 25%-denoised $a_{0.25} = \epsilon + 0.25v$ instead, but that proxy was 75% noise and scoring it was essentially measuring noise structure — which caused the strategy to underperform baseline. The fully-extrapolated proxy resolves this.
+
+**Why 1 step is sufficient for mode selection:** In flow matching, the first Euler step ($\tau = 0 \to 0.25$) does the most dramatic transformation — it collapses the isotropic Gaussian noise into a rough action structure. The velocity at $\tau = 0$ already encodes the full trajectory intent, so the extrapolated proxy $a_{1.0}^*$ reveals which direction the arm reaches, whether the gripper opens or closes, and which control mode is active. The remaining 3 steps refine this structure but rarely change the mode.
 
 **Why this is novel:**
 - **Golden Ticket** (Patil et al., 2026): Offline, fixed noise, requires rollout evaluation. Ours: online, per-observation, 1-step proxy evaluation.
@@ -25,23 +27,27 @@ Sample $K$ noise candidates and batch-evaluate 1 Euler step:
 
 $$\epsilon^{(k)} \sim \mathcal{N}(0, I), \quad k = 1, \ldots, K$$
 
-$$a^{(k),\, 0.25} = \epsilon^{(k)} + \Delta\tau \cdot v(\epsilon^{(k)},\; 0,\; o_t,\; l_t), \quad k = 1, \ldots, K$$
+$$v^{(k)} = v(\epsilon^{(k)},\; 0,\; o_t,\; l_t), \quad k = 1, \ldots, K$$
+
+$$a^{(k),\, 0.25} = \epsilon^{(k)} + \Delta\tau \cdot v^{(k)} \quad \text{(for denoising continuation)}$$
+
+$$a^{(k),\, 1.0*} = \epsilon^{(k)} + v^{(k)} \quad \text{(fully-extrapolated proxy for scoring)}$$
 
 This is a single forward pass with batch size $K \cdot B$ (all candidates concatenated).
 
 **Step 2 — Score:**
 
-Evaluate each candidate's partially-denoised action using a quality proxy $S$:
+Evaluate each candidate's fully-extrapolated action proxy using a quality score $S$:
 
-$$k^* = \arg\max_k \; S\!\left(a^{(k),\, 0.25},\; v^{(k)}\right)$$
+$$k^* = \arg\max_k \; S\!\left(a^{(k),\, 1.0*},\; v^{(k)}\right)$$
 
-The quality proxy $S$ can combine multiple signals (all computable from the 1-step output):
+The quality proxy $S$ combines multiple signals (all computable from the 1-step output):
 
-$$S(a, v) = \underbrace{-\lambda_{\text{smooth}} \sum_{j} \| a[j{+}1] - a[j] \|^2}_{\text{temporal smoothness}} + \underbrace{-\lambda_{\text{mag}} \| v \|^2}_{\text{velocity magnitude}} + \underbrace{\lambda_{\text{anchor}} \cos(v[\text{overlap}],\; V_{\text{prev}}[\text{overlap}])}_{\text{consistency with previous chunk}}$$
+$$S(a^*, v) = \underbrace{-\lambda_{\text{smooth}} \sum_{j} \| a^*[j{+}1] - a^*[j] \|^2}_{\text{temporal smoothness}} + \underbrace{-\lambda_{\text{mag}} \| v \|^2}_{\text{velocity magnitude}} + \underbrace{\lambda_{\text{anchor}} \cos(v[\text{overlap}],\; V_{\text{prev}}[\text{overlap}])}_{\text{consistency with previous chunk}}$$
 
-- **Smoothness**: Rough actions after 1 step indicate a noisy mode — penalize.
+- **Smoothness**: Rough predicted actions indicate a noisy or unstable mode — penalize.
 - **Velocity magnitude**: Lower velocity suggests the noise was already closer to the action manifold — reward.
-- **Anchor consistency** (if previous chunk available): Velocity in the overlap region should align with the previous chunk's predictions — reward. This can integrate with RTC-style temporal coherence (Black et al., 2025).
+- **Anchor consistency** (enabled in server mode): Velocity in the overlap region should align with the previous chunk's final velocity — reward. This ensures temporal coherence between consecutive action chunks. The server patch automatically caches and threads `prev_velocity` across calls.
 
 **Step 3 — Commit and complete:**
 
@@ -53,7 +59,7 @@ $$a_t^{0.75} = a_t^{0.50} + \Delta\tau \cdot v(a_t^{0.50},\; 0.50,\; o_t,\; l_t)
 
 $$a_t^{1.0} = a_t^{0.75} + \Delta\tau \cdot v(a_t^{0.75},\; 0.75,\; o_t,\; l_t)$$
 
-Total: $K + 3$ NFEs. For $K = 4$: 7 NFEs. The step-0 evaluation is batched ($K \cdot B$ samples in one forward pass), so wall-clock latency is approximately 4 sequential DiT forward passes — **same as baseline** if the GPU has spare batch capacity.
+Total: $K + 3$ NFEs. For $K = 5$: 8 NFEs. The step-0 evaluation is batched ($K \cdot B$ samples in one forward pass), so wall-clock latency is approximately 4 sequential DiT forward passes — **same as baseline** if the GPU has spare batch capacity.
 
 ### Pseudocode
 
@@ -61,11 +67,11 @@ Total: $K + 3$ NFEs. For $K = 4$: 7 NFEs. The step-0 evaluation is batched ($K \
 def denoise_with_noise_selection(
     lab,                    # DenoisingLab instance
     features,               # BackboneFeatures
-    K=4,                     # number of noise candidates
+    K=5,                     # number of noise candidates
     lambda_smooth=1.0,
     lambda_mag=0.1,
     lambda_anchor=0.5,
-    prev_velocity=None,      # cached velocity from RTC-style anchoring, or None
+    prev_velocity=None,      # cached velocity from previous chunk (auto-managed in server)
     seed=None,
 ):
     """Noise-space mode selection with 1-step velocity preview."""
@@ -95,21 +101,20 @@ def denoise_with_noise_selection(
     flat_emb_id = embodiment_id.repeat(K)
     # (repeat backbone_output fields similarly)
 
-    velocity_0, actions_025 = lab._denoise_step_inner(
-        flat_vl, flat_state, flat_emb_id, backbone_output,  # broadcast
-        flat_noise, t_discretized=0, dt=0.25,
-        batch_size=K * B, device=device,
-    )
+    velocity_0 = lab._evaluate_velocity(flat_noise, t_bucket=0, ...)
+    actions_025 = flat_noise + 0.25 * velocity_0     # for denoising continuation
+    actions_1_star = flat_noise + 1.0 * velocity_0   # fully-extrapolated proxy
 
     # Reshape back: (K, B, 50, 128)
     velocity_0 = velocity_0.reshape(K, B, lab.action_horizon, lab.action_dim)
     actions_025 = actions_025.reshape(K, B, lab.action_horizon, lab.action_dim)
+    actions_1_star = actions_1_star.reshape(K, B, lab.action_horizon, lab.action_dim)
 
-    # --- Step 3: Score each candidate ---
+    # --- Step 3: Score each candidate using fully-extrapolated proxy ---
     scores = torch.zeros(K, B, device=device)
     for k in range(K):
-        a = actions_025[k]  # (B, 50, 128)
-        v = velocity_0[k]   # (B, 50, 128)
+        a = actions_1_star[k]  # (B, 50, 128) — signal-dominated proxy
+        v = velocity_0[k]      # (B, 50, 128)
 
         # Temporal smoothness (lower = smoother)
         diffs = a[:, 1:, :] - a[:, :-1, :]  # (B, 49, 128)
@@ -139,12 +144,10 @@ def denoise_with_noise_selection(
     actions = best_actions
     for step in range(1, 4):
         tau_bucket = int(step / 4.0 * 1000)
-        velocity, actions = lab._denoise_step_inner(
-            vl_embeds, state_features, embodiment_id, backbone_output,
-            actions, tau_bucket, dt=0.25, batch_size=B, device=device,
-        )
+        velocity = lab._evaluate_velocity(actions, tau_bucket, ...)
+        actions = actions + 0.25 * velocity
 
-    return actions, best_noise  # return noise for potential caching
+    return actions, best_noise, velocity  # velocity = last step's velocity for caching
 ```
 
 ### How It Replaces Action Chunking
@@ -157,9 +160,9 @@ Action chunking is unchanged. The noise selection happens entirely before the ma
 
 | Aspect | Assessment |
 |--------|------------|
-| **Expected quality** | Potentially very high. Golden Ticket (Patil et al., 2026) reports up to 58% relative improvement from noise optimization alone. Our 1-step proxy is weaker than full-rollout evaluation but captures the mode-level structure that matters most. For $K = 4$, we're selecting the best of 4 modes — in multi-modal action distributions (e.g., approach object from different directions), this can avoid catastrophically bad modes. |
-| **Risk** | (1) The 1-step proxy may not correlate well with final action quality. After only 25% denoising, the action is still 75% noise — the quality signal is noisy itself. The smoothness and velocity-magnitude scores are heuristics. (2) The scoring function weights ($\lambda$) require tuning. (3) For observations with unimodal action distributions, all $K$ candidates produce similar results — the selection provides no benefit. The overhead is wasted. |
-| **Latency** | $K + 3$ NFEs. For $K = 4$: the step-0 batch uses $4B$ samples in a single forward pass. On GPUs with spare batch capacity (typical for $B = 1$ inference), this costs the same wall-clock time as 1 sequential NFE. Total wall-clock: ~4 sequential forward passes = **~64ms, same as baseline**. For larger $B$ or $K$, latency grows. |
+| **Expected quality** | Potentially very high. Golden Ticket (Patil et al., 2026) reports up to 58% relative improvement from noise optimization alone. The fully-extrapolated proxy $a_{1.0}^*$ gives a signal-dominated estimate of the clean action, enabling meaningful quality scoring. For $K = 5$, we're selecting the best of 5 modes — in multi-modal action distributions (e.g., approach object from different directions), this can avoid catastrophically bad modes. The server patch caches `prev_velocity` across calls for anchor consistency, improving temporal coherence between chunks. |
+| **Risk** | (1) The single-step proxy $a_{1.0}^*$ is a first-order extrapolation — it matches the true denoised action well for near-linear velocity fields but may diverge for highly curved fields. However, this only affects scoring accuracy, not the denoised output. (2) The scoring function weights ($\lambda$) require tuning. (3) For observations with unimodal action distributions, all $K$ candidates produce similar results — the selection provides no benefit. |
+| **Latency** | $K + 3$ NFEs. For $K = 5$: the step-0 batch uses $5B$ samples in a single forward pass. On GPUs with spare batch capacity (typical for $B = 1$ inference), this costs the same wall-clock time as 1 sequential NFE. Total wall-clock: ~4 sequential forward passes = **~64ms, same as baseline**. For larger $B$ or $K$, latency grows. |
 | **Implementation** | Moderate — requires batched forward pass with duplicated VLM features, scoring function, per-batch-element selection. The `_denoise_step_inner` interface supports arbitrary batch sizes, so the main challenge is replicating the backbone features $K$ times. |
 
 ### Prior Work and What Makes This Novel
@@ -194,8 +197,8 @@ bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_eval.s
 from scripts.denoising_lab.eval.strategies.noise_space_mode_selection.strategy import (
     denoise_with_lab, NoiseSelectionConfig,
 )
-cfg = NoiseSelectionConfig(K=4, lambda_smooth=1.0, lambda_mag=0.1)
-actions = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+cfg = NoiseSelectionConfig(K=5, lambda_smooth=1.0, lambda_mag=0.1)
+actions, best_noise, last_velocity = denoise_with_lab(lab, features, seed=42, cfg=cfg)
 decoded = lab.decode_raw_actions(actions)
 ```
 

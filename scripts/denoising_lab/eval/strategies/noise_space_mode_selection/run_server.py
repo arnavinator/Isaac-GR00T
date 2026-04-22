@@ -48,7 +48,7 @@ class ServerConfig:
 
     # --- Noise selection parameters ---
 
-    K: int = 4
+    K: int = 5
     """Number of noise candidates to evaluate."""
 
     lambda_smooth: float = 1.0

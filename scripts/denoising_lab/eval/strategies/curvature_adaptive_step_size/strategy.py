@@ -5,12 +5,14 @@ that automatically adjusts step sizes based on the velocity field's local
 curvature.  The embedded Euler-Heun error estimate is free (no extra NFEs
 beyond standard Heun).
 
-When the velocity field is nearly linear (easy observations), steps grow and
-the solver finishes in 3 Heun steps (6 NFEs).  When the field is highly
-nonlinear (hard observations), steps stay small (4 Heun steps, 8 NFEs).
+With dt_grow_max=1.0 (default), step sizes never increase — the solver takes
+4 Heun steps at dt=0.25, matching baseline's tau schedule while achieving
+2nd-order accuracy.  Steps can still shrink when error is high, using
+additional NFEs from the budget to refine difficult regions.
+
 All accepted steps use 2nd-order Heun accuracy.
 
-NFEs: 6-8 (adaptive).  Max latency bounded by max_nfe parameter.
+NFEs: 8-10 (adaptive).  Max latency bounded by max_nfe parameter.
 
 Usage (server):
     from strategy import patch_action_head, AdaptiveConfig
@@ -42,7 +44,7 @@ class AdaptiveConfig:
     atol: float = 0.05
     """Absolute error tolerance (in normalized action space)."""
 
-    max_nfe: int = 8
+    max_nfe: int = 10
     """Hard NFE budget.  Guarantees bounded worst-case latency."""
 
     dt_init: float = 0.25
@@ -54,8 +56,10 @@ class AdaptiveConfig:
     safety_factor: float = 0.9
     """Safety factor for step-size adaptation (Hairer-Wanner)."""
 
-    dt_grow_max: float = 2.0
-    """Maximum step-size growth factor per accepted step."""
+    dt_grow_max: float = 1.0
+    """Maximum step-size growth factor per accepted step.  Capped at 1.0 to
+    prevent the solver from skipping tau regions (e.g., tau=0.5) that baseline
+    Euler always evaluates.  Set >1.0 to re-enable adaptive growth."""
 
     dt_shrink_min: float = 0.5
     """Minimum step-size shrink factor per rejected step."""

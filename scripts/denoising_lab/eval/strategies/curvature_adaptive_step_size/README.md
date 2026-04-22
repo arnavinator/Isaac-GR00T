@@ -1,6 +1,6 @@
 ## Strategy 12: Curvature-Adaptive Step-Size Control via Embedded Error Estimation
 
-**Category:** Novel, drop-in | **NFEs:** 6–8 (adaptive, per-observation) | **Retraining:** None
+**Category:** Novel, drop-in | **NFEs:** 8–10 (adaptive, per-observation) | **Retraining:** None
 
 ### Overview
 
@@ -8,7 +8,9 @@ Every strategy in this document — and every published VLA denoiser — uses a 
 
 **D3P** (Dynamic Denoising Diffusion Policy, Dockhorn et al., Aug 2025) demonstrated that adaptive step allocation improves efficiency — using fewer steps on easy observations and more on hard ones. But D3P achieves this by training a separate RL-based adaptor network — adding training complexity, task-specific tuning, and a separate model artifact.
 
-**Our approach:** Use a classical numerical analysis technique — **embedded Runge-Kutta error estimation** — to automatically detect when the ODE solver is struggling and needs smaller steps, *without any training*. This is the same principle behind MATLAB's `ode45` solver (Dormand-Prince method) and `scipy.integrate.solve_ivp`, applied for the first time to generative model denoising. The trade-off is latency: this strategy uses 6–8 NFEs (vs baseline's 4), spending a larger total compute budget but allocating it adaptively — and upgrading every step to 2nd-order Heun accuracy.
+**Our approach:** Use a classical numerical analysis technique — **embedded Runge-Kutta error estimation** — to automatically detect when the ODE solver is struggling and needs smaller steps, *without any training*. This is the same principle behind MATLAB's `ode45` solver (Dormand-Prince method) and `scipy.integrate.solve_ivp`, applied for the first time to generative model denoising. The trade-off is latency: this strategy uses 8–10 NFEs (vs baseline's 4), spending a larger total compute budget but allocating it adaptively — and upgrading every step to 2nd-order Heun accuracy.
+
+**Step growth is disabled by default** (`dt_grow_max=1.0`): An earlier version allowed the step size to grow up to 2× after low-error steps. Benchmarking revealed this caused the solver to skip tau regions (e.g., jumping from tau=0.25 to tau=0.75, missing tau=0.5) that baseline Euler always evaluates. With growth disabled, the solver takes 4 Heun steps at dt=0.25 by default — matching baseline's tau schedule — and only uses smaller steps when error is high, drawing from the enlarged NFE budget (max_nfe=10) to refine difficult regions.
 
 **The mechanism:** At each tentative step, compute both a 1st-order Euler estimate and a 2nd-order Heun estimate using the same velocity evaluations. The difference between these two estimates is a *free* local truncation error estimate:
 
@@ -16,7 +18,7 @@ $$e = \|\hat{a}_{\text{Euler}} - \hat{a}_{\text{Heun}}\| = \frac{\Delta\tau}{2}\
 
 If $e$ is below a tolerance → accept the step (using the Heun estimate for 2nd-order accuracy as a bonus). If $e$ exceeds the tolerance → reject the step, halve $\Delta\tau$, retry.
 
-**Key insight — the error estimate is free:** The Heun corrector already requires 2 NFEs per step — one for the Euler predictor ($v_1$), one for the corrector ($v_2$). The error estimate $e = \frac{\Delta\tau}{2}\|v_1 - v_2\|$ is a free byproduct of these two evaluations — no additional NFEs beyond standard Heun integration. When all steps are accepted on the first try, the solver uses exactly the same NFEs as pure Heun. The cost of adaptivity only materializes when steps are *rejected* — and even then, the rejected step's $v_1$ is cached and reused on the retry (same starting state, same $\tau$), so a rejection wastes only 1 NFE (the corrector evaluation at the wrong step size). The solver starts conservatively at $\Delta\tau = 0.25$ (matching baseline Euler's step size) and lets the adaptive mechanism *grow* the step size in later stages where the velocity field is more linear — the typical easy-observation path is 3 Heun steps (6 NFEs) with the middle step growing to $\Delta\tau \approx 0.5$.
+**Key insight — the error estimate is free:** The Heun corrector already requires 2 NFEs per step — one for the Euler predictor ($v_1$), one for the corrector ($v_2$). The error estimate $e = \frac{\Delta\tau}{2}\|v_1 - v_2\|$ is a free byproduct of these two evaluations — no additional NFEs beyond standard Heun integration. When all steps are accepted on the first try, the solver uses exactly the same NFEs as pure Heun. The cost of adaptivity only materializes when steps are *rejected* — and even then, the rejected step's $v_1$ is cached and reused on the retry (same starting state, same $\tau$), so a rejection wastes only 1 NFE (the corrector evaluation at the wrong step size). The solver starts conservatively at $\Delta\tau = 0.25$ (matching baseline Euler's step size). With `dt_grow_max=1.0`, steps never grow — the typical path is 4 Heun steps (8 NFEs) at the same tau schedule as baseline, but with 2nd-order accuracy. When error is high, steps shrink and additional NFEs from the budget (up to 10) are used to refine difficult regions.
 
 **Why this is novel:**
 1. **D3P** uses a learned RL adaptor → ours uses the mathematical error bound from the embedded pair, zero training.
@@ -55,11 +57,11 @@ $$\text{If } e \geq \text{atol}: \quad \text{Reject step, set } \Delta\tau \left
 
 After an accepted step, adapt the next step size:
 
-$$\Delta\tau_{\text{next}} = \Delta\tau \cdot \min\!\left(2.0,\; \max\!\left(0.5,\; 0.9 \cdot \left(\frac{\text{atol}}{e}\right)^{1/2}\right)\right)$$
+$$\Delta\tau_{\text{next}} = \Delta\tau \cdot \min\!\left(1.0,\; \max\!\left(0.5,\; 0.9 \cdot \left(\frac{\text{atol}}{e}\right)^{1/2}\right)\right)$$
 
-The 0.9 safety factor and [0.5, 2.0] clamp prevent oscillatory step-size behavior.
+The 0.9 safety factor and [0.5, 1.0] clamp prevent oscillatory step-size behavior. The growth cap of 1.0 (instead of the classical 2.0) prevents the solver from skipping tau regions that baseline Euler evaluates — this was found to be critical for maintaining action quality with this model.
 
-**NFE budget:** To guarantee bounded latency, impose $N_{\max} = 8$ NFEs. If the budget is exhausted, accept the current Euler estimate regardless of error. This guarantees worst-case latency of $8 \times 16\text{ms} = 128\text{ms}$.
+**NFE budget:** To guarantee bounded latency, impose $N_{\max} = 10$ NFEs. If the budget is exhausted, accept the current Euler estimate regardless of error. This guarantees worst-case latency of $10 \times 16\text{ms} = 160\text{ms}$.
 
 **Why start at $\Delta\tau = 0.25$, not $0.5$:** The velocity field near $\tau = 0$ is highly nonlinear — it must collapse Gaussian noise into structured action trajectories. Starting with $\Delta\tau = 0.5$ would almost always trigger a step rejection on the very first step, burning 2 NFEs for nothing. Starting at $0.25$ (matching baseline Euler's step size) avoids this waste, and the adaptive mechanism grows the step size in later stages where the flow straightens out.
 
@@ -67,12 +69,12 @@ The 0.9 safety factor and [0.5, 2.0] clamp prevent oscillatory step-size behavio
 
 | Observation type | Velocity curvature | Steps taken | NFEs | Latency |
 |-----------------|-------------------|-------------|------|---------|
-| Free-space transit | Low (nearly linear) | 3 Heun steps (dt grows to ~0.5 mid-trajectory) | 6 | ~96ms |
-| Approach + position | Moderate | 3 Heun steps (adaptive dt, stays ~0.25–0.35) | 6 | ~96ms |
-| Precision grasp / narrow clearance | High (nonlinear) | 4 Heun steps (small dt throughout) | 8 | ~128ms |
-| Average across episodes | Mixed | ~3.5 steps | ~7 | ~112ms |
+| Routine (low curvature) | Low (nearly linear) | 4 Heun steps at dt=0.25 (no growth) | 8 | ~128ms |
+| Moderate difficulty | Moderate | 4 Heun steps, all accepted | 8 | ~128ms |
+| Precision grasp / narrow clearance | High (nonlinear) | 4+ Heun steps (some rejections, smaller dt) | 8–10 | ~128–160ms |
+| Average across episodes | Mixed | ~4 steps | ~8 | ~128ms |
 
-The solver allocates its 6–8 NFE budget adaptively: easy observations get 3 large Heun steps (growing dt mid-trajectory), hard observations get 4 smaller Heun steps concentrated where the velocity field is most nonlinear. Unlike D3P, this requires zero training — the error estimate drives allocation automatically.
+The solver allocates its 8–10 NFE budget adaptively: routine observations get 4 Heun steps at the standard dt=0.25 schedule (matching baseline Euler's tau points but with 2nd-order accuracy), while hard observations get additional refined steps where the velocity field is most nonlinear. Unlike D3P, this requires zero training — the error estimate drives allocation automatically.
 
 ### Pseudocode
 
@@ -81,7 +83,7 @@ def denoise_adaptive(
     a_noise, vl_embeds, state_embeds, embodiment_id, backbone_output,
     lab,                        # DenoisingLab for DiT access
     atol=0.05,                  # absolute error tolerance (normalized action space)
-    max_nfe=8,                  # hard NFE budget
+    max_nfe=10,                 # hard NFE budget
     dt_init=0.25,               # initial step size (conservative: match baseline, let solver grow)
     dt_min=0.125,               # minimum step size (8 substeps resolution)
 ):
@@ -145,12 +147,12 @@ def denoise_adaptive(
             })
             tau += dt
 
-            # Adapt step size for next step
+            # Adapt step size for next step (no growth: dt_grow_max=1.0)
             if error > 1e-10:
                 scale = 0.9 * (atol / error) ** 0.5
-                dt = dt * min(2.0, max(0.5, scale))
+                dt = dt * min(1.0, max(0.5, scale))
             else:
-                dt = min(dt * 2.0, 1.0 - tau)  # double if error negligible
+                dt = min(dt, 1.0 - tau)  # keep dt if error negligible
         else:
             # Reject step — halve step size, retry
             step_log.append({
@@ -214,7 +216,7 @@ def analyze_adaptive_behavior(lab, features_list, seeds):
 
 Action chunking is unchanged. The adaptive solver produces the same $(B, 50, 128)$ output as baseline Euler, decoded identically. The only difference is the internal integration path — some chunks are produced in 3 steps with growing step sizes, others require 4 smaller steps, depending on the velocity field's local curvature for that particular observation.
 
-**Interaction with action chunking timing:** Since the solver uses a variable number of NFEs, the latency per chunk varies. For real-time control at 10Hz, the worst case (8 NFEs, $128\text{ms}$) exceeds the $100\text{ms}$ budget — but this only occurs on high-curvature observations (precision grasps, tight clearances) where the extra denoising quality is most critical. The typical case (~7 NFEs, ~$112\text{ms}$) is moderately above baseline, trading latency for 2nd-order accuracy and adaptive step placement.
+**Interaction with action chunking timing:** Since the solver uses a variable number of NFEs, the latency per chunk varies. The typical case (8 NFEs, ~$128\text{ms}$) exceeds the $100\text{ms}$ budget for 10Hz control, trading latency for 2nd-order accuracy and adaptive step placement on difficult observations. The worst case (10 NFEs, $160\text{ms}$) occurs only when step rejections require extra refinement.
 
 **Diagnostic value:** The `step_log` provides a rich signal for understanding the velocity field. Observations that consistently trigger step rejections or small step sizes are "hard" for the model — these are candidates for additional training data, curriculum emphasis, or task decomposition. This makes the adaptive solver a *profiling tool* for the model's competence, not just a quality improvement.
 
@@ -222,9 +224,9 @@ Action chunking is unchanged. The adaptive solver produces the same $(B, 50, 128
 
 | Aspect | Assessment |
 |--------|------------|
-| **Expected quality** | High. The Heun estimate (used for all accepted steps) is 2nd-order accurate — a free upgrade from baseline Euler's 1st-order. The adaptive step sizing concentrates compute where the velocity field is most nonlinear, which is exactly where discretization error matters most. On "easy" observations, the solver finishes in 6 NFEs (3 Heun steps with the middle step growing to $\Delta\tau \approx 0.5$) — 50% more than baseline but with 2nd-order accuracy. On "hard" observations, it uses up to 8 NFEs — more than baseline but exactly where the extra compute is needed. |
-| **Risk** | (1) **Adaptivity may collapse to fixed-step Heun.** The error estimate measures velocity field curvature. If the curvature at $\tau \in [0, 0.25]$ is uniformly high for *all* observations (not just hard ones) — which is plausible since this region always collapses noise to structure — then the first step's error will prevent dt growth regardless of observation difficulty. Every observation would take 4 Heun steps = 8 NFEs = 128ms, with no adaptivity. Starting at $\Delta\tau = 0.25$ avoids *rejected* first steps, but doesn't guarantee the error will be low enough to trigger *growth*. **Mitigation:** A per-$\tau$ tolerance schedule (`atol_i = atol_base / (1 - tau_i)` or similar) that is deliberately loose near $\tau = 0$ and tight near $\tau = 1$ would allow growth after the structurally-nonlinear early phase. This is likely necessary for adaptivity to manifest in practice and should be the first thing to calibrate empirically. (2) The tolerance `atol` requires calibration — too tight and every step stays at dt_min (8 NFEs always); too loose and errors pass undetected (no better than fixed Heun). Calibration on a validation set is recommended. (3) Variable latency complicates real-time control budgeting — the system must be designed for worst-case (128ms), not average-case (112ms). The 128ms worst case exceeds the 100ms budget for 10Hz control but only occurs on high-curvature observations. |
-| **Latency** | Variable: 6–8 NFEs × ~16ms = ~96–128ms. Average: ~7 NFEs = ~112ms (estimated based on D3P's finding that ~55% of actions are "routine" and ~45% are "crucial"). |
+| **Expected quality** | High. The Heun estimate (used for all accepted steps) is 2nd-order accurate — a free upgrade from baseline Euler's 1st-order. With `dt_grow_max=1.0`, the solver follows baseline's tau schedule (0, 0.25, 0.5, 0.75) by default, never skipping tau regions. Only when error is high do steps shrink, using additional NFEs from the budget to refine difficult regions. This ensures the strategy never has *fewer* effective tau evaluations than baseline. |
+| **Risk** | (1) **Fixed 2× latency overhead on easy observations.** With growth disabled, routine observations always take 8 NFEs (4 Heun steps at dt=0.25) — 2× baseline's 4 NFEs. The quality gain from Heun's 2nd-order accuracy must justify this cost. (2) The tolerance `atol` requires calibration — too tight and every step triggers subdivision (10 NFEs always); too loose and errors pass undetected (no better than fixed Heun). (3) Variable latency on hard observations (up to 10 NFEs / 160ms) complicates real-time control budgeting. |
+| **Latency** | Typical: 8 NFEs × ~16ms = ~128ms (4 Heun steps, no rejections). Worst case: 10 NFEs × ~16ms = ~160ms (with step rejections). |
 | **Implementation** | Moderate — replaces the fixed denoising loop with an adaptive while-loop (~40 lines of core logic). Requires bypassing DenoisingLab's standard `denoise()` method to directly control the step-by-step integration. No changes to the DiT model, encode/decode pipeline, or inference server. |
 
 ### Prior Work
@@ -234,7 +236,7 @@ Action chunking is unchanged. The adaptive solver produces the same $(B, 50, 128
 - **Dockhorn et al., "D3P: Dynamic Denoising Diffusion Policy"** — arXiv:2508.06804. Learns an RL-based adaptor for dynamic step allocation in diffusion policies. Achieves 2.2× speedup on simulation, 1.9× on real Franka robot, with <0.1% success rate drop. **Key differences:** (1) D3P targets *speedup* (fewer steps on easy observations); our approach targets *quality* (2nd-order accuracy + more steps on hard observations), trading ~50–100% more latency for better action quality. (2) D3P requires training the adaptor via PPO; ours uses the mathematical error bound from the embedded Euler-Heun pair — zero training, zero additional parameters.
 - **ProbeFlow** (Fang et al., 2026). Uses velocity cosine similarity between consecutive steps to decide whether to skip a step. **Key difference:** Velocity cosine similarity is a heuristic (high similarity → skip); our embedded error estimate is a principled truncation error bound from numerical analysis (error < tolerance → accept). The error estimate directly measures solution quality; cosine similarity measures velocity field stationarity, which is a proxy.
 
-**What makes this novel:** To our knowledge, embedded Runge-Kutta error estimation has never been applied to flow matching or diffusion model denoising. Classical adaptive ODE solvers have been used for neural ODE *training* (Chen et al., 2018) but not for generative model *sampling*. The sampling context is distinct because: (a) the velocity field was trained for a specific interpolation path, and adaptive stepping may visit off-path states; (b) the computational budget is extremely tight (6-8 NFEs, not 50+); (c) the error tolerance must be calibrated for *action quality* (success rate), not mathematical precision. The connection between "velocity field curvature at a given observation" and "that observation's denoising difficulty" is a novel interpretive framework that could inform future work on adaptive denoising beyond the specific Euler-Heun pair.
+**What makes this novel:** To our knowledge, embedded Runge-Kutta error estimation has never been applied to flow matching or diffusion model denoising. Classical adaptive ODE solvers have been used for neural ODE *training* (Chen et al., 2018) but not for generative model *sampling*. The sampling context is distinct because: (a) the velocity field was trained for a specific interpolation path, and adaptive stepping may visit off-path states; (b) the computational budget is extremely tight (8-10 NFEs, not 50+); (c) the error tolerance must be calibrated for *action quality* (success rate), not mathematical precision. The connection between "velocity field curvature at a given observation" and "that observation's denoising difficulty" is a novel interpretive framework that could inform future work on adaptive denoising beyond the specific Euler-Heun pair.
 
 ---
 
@@ -261,7 +263,7 @@ bash scripts/denoising_lab/eval/strategies/curvature_adaptive_step_size/run_eval
 from scripts.denoising_lab.eval.strategies.curvature_adaptive_step_size.strategy import (
     denoise_with_lab, AdaptiveConfig,
 )
-cfg = AdaptiveConfig(atol=0.05, max_nfe=8)
+cfg = AdaptiveConfig(atol=0.05, max_nfe=10)
 actions, step_log = denoise_with_lab(lab, features, seed=42, cfg=cfg)
 decoded = lab.decode_raw_actions(actions)
 # Inspect adaptive behaviour:

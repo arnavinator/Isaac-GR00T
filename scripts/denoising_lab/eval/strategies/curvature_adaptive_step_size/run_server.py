@@ -52,7 +52,7 @@ class ServerConfig:
     atol: float = 0.05
     """Absolute error tolerance (normalised action space)."""
 
-    max_nfe: int = 8
+    max_nfe: int = 10
     """Hard NFE budget for bounded worst-case latency."""
 
     dt_init: float = 0.25
@@ -89,7 +89,7 @@ def main(config: ServerConfig):
         dt_min=config.dt_min,
     )
     patch_action_head(policy.model.action_head, cfg=cfg)
-    print(f"  Strategy:   curvature_adaptive_step_size (6-{config.max_nfe} NFEs adaptive)")
+    print(f"  Strategy:   curvature_adaptive_step_size (8-{config.max_nfe} NFEs adaptive)")
 
     # Wrap for sim if needed
     if config.use_sim_policy_wrapper:

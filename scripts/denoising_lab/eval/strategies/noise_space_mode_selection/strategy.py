@@ -1,9 +1,10 @@
 """Noise-Space Mode Selection via Velocity Preview for GR00T N1.6.
 
 Samples K noise candidates, evaluates 1 Euler step on all K simultaneously
-(single batched forward pass), scores partially-denoised actions with
-lightweight quality proxies, selects the best noise, then completes the
-remaining 3 denoising steps for the winner.
+(single batched forward pass), scores the single-step fully-extrapolated
+action proxy a_1.0* = noise + velocity with lightweight quality proxies,
+selects the best noise, then completes the remaining 3 denoising steps for
+the winner.
 
 Total NFEs: K + 3 (K batched in 1 pass + 3 sequential).
 
@@ -13,8 +14,8 @@ Usage (server):
 
 Usage (notebook with DenoisingLab):
     from strategy import denoise_with_lab, NoiseSelectionConfig
-    cfg = NoiseSelectionConfig(K=4)
-    actions, best_noise = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+    cfg = NoiseSelectionConfig(K=5)
+    actions, best_noise, last_velocity = denoise_with_lab(lab, features, seed=42, cfg=cfg)
     decoded = lab.decode_raw_actions(actions)
 """
 
@@ -36,7 +37,7 @@ from transformers.feature_extraction_utils import BatchFeature
 class NoiseSelectionConfig:
     """Tunable parameters for noise-space mode selection."""
 
-    K: int = 4
+    K: int = 5
     """Number of noise candidates to evaluate."""
 
     lambda_smooth: float = 1.0
@@ -111,11 +112,14 @@ def _repeat_backbone_output(backbone_output, K):
 # ---------------------------------------------------------------------------
 
 
-def _score_candidates(actions_025, velocities, K, B, cfg, prev_velocity=None):
-    """Score K noise candidates after 1 Euler step.
+def _score_candidates(action_proxy, velocities, K, B, cfg, prev_velocity=None):
+    """Score K noise candidates using single-step fully-extrapolated proxy.
 
     Args:
-        actions_025: (K, B, H, D) partially-denoised actions.
+        action_proxy: (K, B, H, D) fully-extrapolated action estimates
+            a_1.0* = noise + velocity(noise, tau=0).  This is the model's
+            single-step prediction of the clean action, providing a much
+            stronger quality signal than the 25%-denoised a_0.25.
         velocities: (K, B, H, D) velocity predictions.
         K: Number of candidates.
         B: Batch size.
@@ -125,14 +129,14 @@ def _score_candidates(actions_025, velocities, K, B, cfg, prev_velocity=None):
     Returns:
         scores: (K, B) quality scores (higher = better).
     """
-    device = actions_025.device
+    device = action_proxy.device
     scores = torch.zeros(K, B, device=device, dtype=torch.float32)
 
     for k in range(K):
-        a = actions_025[k].float()  # (B, H, D)
-        v = velocities[k].float()   # (B, H, D)
+        a = action_proxy[k].float()  # (B, H, D)
+        v = velocities[k].float()    # (B, H, D)
 
-        # Temporal smoothness: penalise jerky partially-denoised actions
+        # Temporal smoothness: penalise jerky predicted actions
         diffs = a[:, 1:, :] - a[:, :-1, :]  # (B, H-1, D)
         smoothness = -(diffs ** 2).sum(dim=(1, 2))  # (B,)
         scores[k] += cfg.lambda_smooth * smoothness
@@ -171,16 +175,18 @@ def denoise_with_noise_selection(
         state_features: Encoded state (B, state_horizon, hidden_dim).
         embodiment_id: Embodiment IDs (B,).
         backbone_output: Full backbone output (BatchFeature).
-        cfg: NoiseSelectionConfig. Defaults to K=4.
+        cfg: NoiseSelectionConfig. Defaults to K=5.
         seed: Random seed for noise generation.
         prev_velocity: Optional (B, H, D) velocity from previous chunk for
             anchor consistency scoring.
 
     Returns:
-        (actions, best_noise) tuple:
+        (actions, best_noise, last_velocity) tuple:
             actions: Denoised actions (B, action_horizon, action_dim).
             best_noise: Selected noise vectors (B, action_horizon, action_dim),
                 useful for caching / warm-starting future chunks.
+            last_velocity: Velocity from the final denoising step (B, H, D),
+                used for prev_velocity caching in the server patch.
     """
     if cfg is None:
         cfg = NoiseSelectionConfig()
@@ -215,12 +221,19 @@ def denoise_with_noise_selection(
     )
     actions_flat = flat_noise + dt * velocity_flat
 
+    # Single-step fully-extrapolated proxy for scoring: a_1.0* = noise + v
+    # In rectified flow, v(noise, 0) ≈ data - noise, so noise + v ≈ data.
+    # This proxy is dominated by signal (not noise), giving the scoring
+    # heuristics meaningful action-quality information at zero extra NFEs.
+    actions_1_star_flat = flat_noise + 1.0 * velocity_flat
+
     # Reshape back: (K, B, H, D)
     velocities = velocity_flat.reshape(K, B, H, D)
     actions_025 = actions_flat.reshape(K, B, H, D)
+    actions_1_star = actions_1_star_flat.reshape(K, B, H, D)
 
-    # --- Step 3: Score each candidate ---
-    scores = _score_candidates(actions_025, velocities, K, B, cfg, prev_velocity)
+    # --- Step 3: Score each candidate using the fully-extrapolated proxy ---
+    scores = _score_candidates(actions_1_star, velocities, K, B, cfg, prev_velocity)
 
     # --- Step 4: Select best noise per batch element ---
     best_k = scores.argmax(dim=0)  # (B,)
@@ -234,6 +247,7 @@ def denoise_with_noise_selection(
               f"Score range: [{scores.min():.2f}, {scores.max():.2f}]")
 
     # --- Step 5: Complete denoising with remaining 3 steps ---
+    last_velocity = None
     for step in range(1, cfg.num_steps):
         tau = step / float(cfg.num_steps)
         t_bucket = int(tau * num_buckets)
@@ -243,6 +257,7 @@ def denoise_with_noise_selection(
             vl_embeds, state_features, embodiment_id, backbone_output,
         )
         actions = actions + dt * velocity
+        last_velocity = velocity
 
         if action_head.verbose:
             print(f"[NoiseSelection] Step {step}/{cfg.num_steps}  "
@@ -255,7 +270,7 @@ def denoise_with_noise_selection(
         print(f"[NoiseSelection] Final  shape={tuple(actions.shape)}  "
               f"mean={af.mean():.4f}  std={af.std():.4f}")
 
-    return actions, best_noise
+    return actions, best_noise, last_velocity
 
 
 # ---------------------------------------------------------------------------
@@ -266,19 +281,25 @@ def denoise_with_noise_selection(
 def patch_action_head(action_head, cfg=None):
     """Monkey-patch the action head to use noise-space mode selection.
 
-    Replaces ``get_action_with_features()`` in-place.
+    Replaces ``get_action_with_features()`` in-place.  Caches the final
+    denoising velocity across calls to enable anchor consistency scoring
+    via ``prev_velocity``.
     """
     if cfg is None:
         cfg = NoiseSelectionConfig()
+
+    _prev_velocity = [None]  # mutable closure state for cross-chunk caching
 
     @torch.no_grad()
     def patched_get_action_with_features(
         backbone_features, state_features, embodiment_id, backbone_output,
     ):
-        actions, _best_noise = denoise_with_noise_selection(
+        actions, _best_noise, last_velocity = denoise_with_noise_selection(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output, cfg=cfg,
+            prev_velocity=_prev_velocity[0],
         )
+        _prev_velocity[0] = last_velocity.detach()
         return BatchFeature(data={
             "action_pred": actions,
             "backbone_features": backbone_features,
@@ -304,9 +325,10 @@ def denoise_with_lab(lab, features, *, seed=None, cfg=None, prev_velocity=None):
         prev_velocity: Optional (B, H, D) velocity from previous chunk.
 
     Returns:
-        (actions, best_noise) tuple:
+        (actions, best_noise, last_velocity) tuple:
             actions: torch.Tensor -- raw actions (B, action_horizon, action_dim).
             best_noise: torch.Tensor -- selected noise (B, action_horizon, action_dim).
+            last_velocity: torch.Tensor -- velocity from final denoising step (B, H, D).
         Decode actions with lab.decode_raw_actions(actions).
     """
     if cfg is None:

@@ -6,11 +6,16 @@ action proxy a_1.0* = noise + velocity with lightweight quality proxies,
 selects the best noise, then completes the remaining 3 denoising steps for
 the winner.
 
+Anchor consistency uses distance-weighted L2 in action space: the candidate's
+extrapolated proxy (steps 0..n-1) is compared to the previous chunk's
+predicted-but-unexecuted tail (steps n_exec..end).  Comparison weights decay
+geometrically so nearer predictions dominate.
+
 Total NFEs: K + 3 (K batched in 1 pass + 3 sequential).
 
 Usage (server):
     from strategy import patch_action_head
-    patch_action_head(policy.model.action_head)
+    reset_fn = patch_action_head(policy.model.action_head)
 
 Usage (notebook with DenoisingLab):
     from strategy import denoise_with_lab, NoiseSelectionConfig
@@ -24,7 +29,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -48,6 +52,11 @@ class NoiseSelectionConfig:
 
     lambda_anchor: float = 0.5
     """Weight for anchor consistency with previous chunk."""
+
+    anchor_decay: float = 0.5
+    """Per-step decay for distance-weighted anchor scoring.  Step 0 of the
+    overlap gets weight 1.0, step j gets weight ``anchor_decay ** j``.
+    Nearer predictions are more reliable so they dominate the score."""
 
     num_steps: int = 4
     """Number of denoising steps (remaining steps after selection)."""
@@ -112,7 +121,7 @@ def _repeat_backbone_output(backbone_output, K):
 # ---------------------------------------------------------------------------
 
 
-def _score_candidates(action_proxy, velocities, K, B, cfg, prev_velocity=None):
+def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
     """Score K noise candidates using single-step fully-extrapolated proxy.
 
     Args:
@@ -124,7 +133,8 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_velocity=None):
         K: Number of candidates.
         B: Batch size.
         cfg: NoiseSelectionConfig.
-        prev_velocity: Optional (B, H, D) cached velocity from previous chunk.
+        prev_actions: Optional (B, H, D) cached denoised actions from
+            previous chunk.  Used for action-space anchor consistency.
 
     Returns:
         scores: (K, B) quality scores (higher = better).
@@ -145,15 +155,31 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_velocity=None):
         mag = -(v ** 2).sum(dim=(1, 2))  # (B,)
         scores[k] += cfg.lambda_mag * mag
 
-        # Anchor consistency with previous chunk (if available)
-        if prev_velocity is not None:
-            n = min(cfg.n_exec_steps, v.shape[1], prev_velocity.shape[1])
-            cos_sim = F.cosine_similarity(
-                v[:, :n, :].reshape(B, -1),
-                prev_velocity[:, :n, :].float().reshape(B, -1),
-                dim=1,
-            )  # (B,)
-            scores[k] += cfg.lambda_anchor * cos_sim
+        # Anchor consistency: distance-weighted L2 in action space.
+        # Compare candidate's predicted near-future (steps 0..n-1) to the
+        # previous chunk's predicted-but-unexecuted tail (steps n_exec..n_exec+n-1).
+        # Both tensors are action estimates in the same normalised space.
+        if prev_actions is not None:
+            n = cfg.n_exec_steps
+            H_total = a.shape[1]
+            n_prev_tail = H_total - n
+            n_overlap = min(n, n_prev_tail)
+
+            if n_overlap > 0:
+                candidate_near = a[:, :n_overlap, :]           # (B, n_overlap, D)
+                prev_tail = prev_actions[:, n:n + n_overlap, :].float()  # (B, n_overlap, D)
+
+                # Distance-weighted: step j gets weight decay^j
+                weights = torch.tensor(
+                    [cfg.anchor_decay ** j for j in range(n_overlap)],
+                    device=device, dtype=torch.float32,
+                )  # (n_overlap,)
+                weights = weights / weights.sum()
+
+                sq_dist = (candidate_near - prev_tail) ** 2  # (B, n_overlap, D)
+                sq_dist_per_step = sq_dist.sum(dim=2)        # (B, n_overlap)
+                weighted_dist = (sq_dist_per_step * weights.unsqueeze(0)).sum(dim=1)  # (B,)
+                scores[k] -= cfg.lambda_anchor * weighted_dist
 
     return scores
 
@@ -165,7 +191,7 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_velocity=None):
 
 def denoise_with_noise_selection(
     action_head, vl_embeds, state_features, embodiment_id, backbone_output,
-    *, cfg=None, seed=None, prev_velocity=None,
+    *, cfg=None, seed=None, prev_actions=None,
 ):
     """Noise-space mode selection: sample K noises, preview, select, complete.
 
@@ -177,16 +203,15 @@ def denoise_with_noise_selection(
         backbone_output: Full backbone output (BatchFeature).
         cfg: NoiseSelectionConfig. Defaults to K=5.
         seed: Random seed for noise generation.
-        prev_velocity: Optional (B, H, D) velocity from previous chunk for
-            anchor consistency scoring.
+        prev_actions: Optional (B, H, D) denoised actions from previous chunk
+            for action-space anchor consistency scoring.
 
     Returns:
         (actions, best_noise, last_velocity) tuple:
             actions: Denoised actions (B, action_horizon, action_dim).
             best_noise: Selected noise vectors (B, action_horizon, action_dim),
                 useful for caching / warm-starting future chunks.
-            last_velocity: Velocity from the final denoising step (B, H, D),
-                used for prev_velocity caching in the server patch.
+            last_velocity: Velocity from the final denoising step (B, H, D).
     """
     if cfg is None:
         cfg = NoiseSelectionConfig()
@@ -233,7 +258,7 @@ def denoise_with_noise_selection(
     actions_1_star = actions_1_star_flat.reshape(K, B, H, D)
 
     # --- Step 3: Score each candidate using the fully-extrapolated proxy ---
-    scores = _score_candidates(actions_1_star, velocities, K, B, cfg, prev_velocity)
+    scores = _score_candidates(actions_1_star, velocities, K, B, cfg, prev_actions)
 
     # --- Step 4: Select best noise per batch element ---
     best_k = scores.argmax(dim=0)  # (B,)
@@ -281,14 +306,18 @@ def denoise_with_noise_selection(
 def patch_action_head(action_head, cfg=None):
     """Monkey-patch the action head to use noise-space mode selection.
 
-    Replaces ``get_action_with_features()`` in-place.  Caches the final
-    denoising velocity across calls to enable anchor consistency scoring
-    via ``prev_velocity``.
+    Replaces ``get_action_with_features()`` in-place.  Caches the denoised
+    actions across calls to enable action-space anchor consistency scoring.
+
+    Returns:
+        A ``reset()`` callable that clears the cached state.  **Must** be
+        hooked into the policy's ``reset()`` method so that stale actions
+        from a previous episode don't distort anchor scoring.
     """
     if cfg is None:
         cfg = NoiseSelectionConfig()
 
-    _prev_velocity = [None]  # mutable closure state for cross-chunk caching
+    _prev_actions = [None]  # mutable closure state for cross-chunk caching
 
     @torch.no_grad()
     def patched_get_action_with_features(
@@ -297,9 +326,9 @@ def patch_action_head(action_head, cfg=None):
         actions, _best_noise, last_velocity = denoise_with_noise_selection(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output, cfg=cfg,
-            prev_velocity=_prev_velocity[0],
+            prev_actions=_prev_actions[0],
         )
-        _prev_velocity[0] = last_velocity.detach()
+        _prev_actions[0] = actions.detach()
         return BatchFeature(data={
             "action_pred": actions,
             "backbone_features": backbone_features,
@@ -308,13 +337,19 @@ def patch_action_head(action_head, cfg=None):
 
     action_head.get_action_with_features = patched_get_action_with_features
 
+    def reset():
+        """Clear cached prev_actions (call on episode reset)."""
+        _prev_actions[0] = None
+
+    return reset
+
 
 # ---------------------------------------------------------------------------
 # Notebook convenience (DenoisingLab interface)
 # ---------------------------------------------------------------------------
 
 
-def denoise_with_lab(lab, features, *, seed=None, cfg=None, prev_velocity=None):
+def denoise_with_lab(lab, features, *, seed=None, cfg=None, prev_actions=None):
     """Run noise-space mode selection via DenoisingLab.
 
     Args:
@@ -322,7 +357,7 @@ def denoise_with_lab(lab, features, *, seed=None, cfg=None, prev_velocity=None):
         features: BackboneFeatures from lab.encode_features().
         seed: Random seed for reproducibility.
         cfg: NoiseSelectionConfig.
-        prev_velocity: Optional (B, H, D) velocity from previous chunk.
+        prev_actions: Optional (B, H, D) denoised actions from previous chunk.
 
     Returns:
         (actions, best_noise, last_velocity) tuple:
@@ -339,5 +374,5 @@ def denoise_with_lab(lab, features, *, seed=None, cfg=None, prev_velocity=None):
             lab.action_head,
             features.backbone_features, features.state_features,
             features.embodiment_id, features.backbone_output,
-            cfg=cfg, seed=seed, prev_velocity=prev_velocity,
+            cfg=cfg, seed=seed, prev_actions=prev_actions,
         )

@@ -60,6 +60,9 @@ class ServerConfig:
     lambda_anchor: float = 0.5
     """Weight for anchor consistency with previous chunk."""
 
+    anchor_decay: float = 0.5
+    """Per-step decay for distance-weighted anchor scoring."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T server with NOISE-SPACE MODE SELECTION")
@@ -86,9 +89,20 @@ def main(config: ServerConfig):
         lambda_smooth=config.lambda_smooth,
         lambda_mag=config.lambda_mag,
         lambda_anchor=config.lambda_anchor,
+        anchor_decay=config.anchor_decay,
     )
-    patch_action_head(policy.model.action_head, cfg=cfg)
+    reset_fn = patch_action_head(policy.model.action_head, cfg=cfg)
     print(f"  Strategy:   noise_space_mode_selection ({config.K}+3 NFEs)")
+
+    # Hook reset_fn into policy.reset() so cached prev_actions is cleared
+    # between episodes (prevents stale cross-episode anchor distortion)
+    _original_reset = policy.reset
+
+    def _patched_reset(options=None):
+        reset_fn()
+        return _original_reset(options)
+
+    policy.reset = _patched_reset
 
     # Wrap for sim if needed
     if config.use_sim_policy_wrapper:

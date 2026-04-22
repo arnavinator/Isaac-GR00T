@@ -1,37 +1,83 @@
 {
   "strategy_name": "curvature_adaptive_step_size",
-  "timestamp": "2026-04-21T04:20:07.476313+00:00",
+  "timestamp": "2026-04-22T03:11:11.271026+00:00",
   "args": {
     "env_names": [
+      "robocasa_panda_omron/OpenDrawer_PandaOmron_Env",
       "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
     ],
     "n_episodes": 15,
     "seed": 42,
-    "max_episode_steps": 480,
+    "max_episode_steps": [
+      400,
+      480
+    ],
     "n_action_steps": 8,
     "n_envs": 2,
     "host": "127.0.0.1",
-    "port": 5555
+    "port": 5556
   },
   "results": {
+    "robocasa_panda_omron/OpenDrawer_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.7333,
+      "mean_reward": 0.7333,
+      "mean_length": 32.9,
+      "std_length": 10.6,
+      "mean_duration_s": 61.01,
+      "successes": [
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false
+      ],
+      "seeds": [
+        42,
+        43,
+        44,
+        45,
+        47,
+        46,
+        49,
+        48,
+        51,
+        50,
+        53,
+        52,
+        54,
+        55,
+        56
+      ]
+    },
     "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
       "n_episodes": 15,
-      "success_rate": 0.4,
-      "mean_reward": 0.4,
-      "mean_length": 49.9,
-      "std_length": 15.9,
-      "mean_duration_s": 73.98,
+      "success_rate": 0.5333,
+      "mean_reward": 0.5333,
+      "mean_length": 49.6,
+      "std_length": 15.0,
+      "mean_duration_s": 77.19,
       "successes": [
-        false,
-        false,
-        true,
-        false,
         true,
         false,
         true,
         true,
         true,
         false,
+        true,
+        false,
+        true,
+        true,
         true,
         false,
         false,
@@ -39,10 +85,10 @@
         false
       ],
       "seeds": [
-        42,
         43,
-        45,
+        42,
         44,
+        45,
         46,
         47,
         48,
@@ -58,9 +104,9 @@
     }
   },
   "overall": {
-    "total_episodes": 15,
-    "total_envs": 1,
-    "overall_success_rate": 0.4,
-    "total_wall_time_s": 812.55
+    "total_episodes": 30,
+    "total_envs": 2,
+    "overall_success_rate": 0.6333,
+    "total_wall_time_s": 1623.82
   }
 }

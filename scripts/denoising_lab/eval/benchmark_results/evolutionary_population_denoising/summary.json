@@ -1,6 +1,6 @@
 {
-  "strategy_name": "noise_space_mode_selection",
-  "timestamp": "2026-04-22T02:59:35.041968+00:00",
+  "strategy_name": "evolutionary_population_denoising",
+  "timestamp": "2026-04-22T03:21:08.250510+00:00",
   "args": {
     "env_names": [
       "robocasa_panda_omron/OpenDrawer_PandaOmron_Env",
@@ -22,9 +22,9 @@
       "n_episodes": 15,
       "success_rate": 0.8,
       "mean_reward": 0.8,
-      "mean_length": 32.9,
-      "std_length": 9.4,
-      "mean_duration_s": 43.43,
+      "mean_length": 33.7,
+      "std_length": 9.7,
+      "mean_duration_s": 55.14,
       "successes": [
         true,
         false,
@@ -37,10 +37,10 @@
         true,
         true,
         true,
+        false,
         true,
         true,
-        true,
-        false
+        true
       ],
       "seeds": [
         43,
@@ -64,39 +64,39 @@
       "n_episodes": 15,
       "success_rate": 0.5333,
       "mean_reward": 0.5333,
-      "mean_length": 48.1,
-      "std_length": 16.1,
-      "mean_duration_s": 63.93,
+      "mean_length": 48.9,
+      "std_length": 15.5,
+      "mean_duration_s": 48.06,
       "successes": [
         true,
         false,
         true,
         false,
-        true,
-        true,
-        true,
-        true,
-        true,
+        false,
         false,
         true,
-        false,
+        true,
+        true,
+        true,
+        true,
+        true,
         false,
         false,
         false
       ],
       "seeds": [
-        43,
         42,
-        45,
+        43,
         44,
-        47,
+        45,
         46,
+        47,
         48,
         49,
         50,
         51,
-        52,
         53,
+        52,
         54,
         55,
         56
@@ -107,6 +107,6 @@
     "total_episodes": 30,
     "total_envs": 2,
     "overall_success_rate": 0.6667,
-    "total_wall_time_s": 1340.39
+    "total_wall_time_s": 1213.09
   }
 }

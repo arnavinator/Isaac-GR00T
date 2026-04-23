@@ -126,6 +126,17 @@ def _evaluate_velocity(action_head, actions, t_bucket, vl_embeds, state_features
     return pred[:, -action_head.action_horizon:]
 
 
+def _clone_backbone_output(backbone_output):
+    """Clone tensor fields in a BatchFeature to escape inference-mode."""
+    cloned = BatchFeature()
+    for key, val in backbone_output.items():
+        if isinstance(val, torch.Tensor):
+            cloned[key] = val.clone()
+        else:
+            cloned[key] = val
+    return cloned
+
+
 # ---------------------------------------------------------------------------
 # Core denoising function
 # ---------------------------------------------------------------------------
@@ -197,10 +208,20 @@ def denoise_ddto(
     # backward").
     with torch.inference_mode(False), torch.enable_grad():
         eps = epsilon.detach().clone().requires_grad_(True)
+
+        # All tensors from the backbone were created under inference_mode and
+        # are "inference tensors".  Clone them so autograd can save activations
+        # for the backward pass.  Only needed for the Phase-1 grad call — the
+        # no-grad Phase-3 Euler steps use the originals directly.
+        vl_grad = vl_embeds.clone()
+        sf_grad = state_features.clone()
+        eid_grad = embodiment_id.clone()
+        bo_grad = _clone_backbone_output(backbone_output)
+
         # Single DiT forward pass (1 NFE) — gradients tracked
         v0 = _evaluate_velocity(
             action_head, eps, 0,
-            vl_embeds, state_features, embodiment_id, backbone_output,
+            vl_grad, sf_grad, eid_grad, bo_grad,
         )
 
         # Fully-extrapolated proxy for quality scoring (signal-dominated).

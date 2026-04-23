@@ -127,7 +127,8 @@ def _repeat_backbone_output(backbone_output, K):
 # ---------------------------------------------------------------------------
 
 
-def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
+def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
+                      return_breakdown=False):
     """Score K noise candidates using single-step fully-extrapolated proxy.
 
     Args:
@@ -141,12 +142,22 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
         cfg: NoiseSelectionConfig.
         prev_actions: Optional (B, H, D) cached denoised actions from
             previous chunk.  Used for action-space anchor consistency.
+        return_breakdown: If True, return ``(scores, breakdown)`` where
+            breakdown is a dict of per-component weighted contributions.
 
     Returns:
         scores: (K, B) quality scores (higher = better).
+        breakdown (only when return_breakdown=True): dict with keys
+            ``scores_smooth``, ``scores_mag``, ``scores_anchor``,
+            ``scores_total`` — each (K, B).
     """
     device = action_proxy.device
     scores = torch.zeros(K, B, device=device, dtype=torch.float32)
+
+    if return_breakdown:
+        bd_smooth = torch.zeros(K, B, device=device, dtype=torch.float32)
+        bd_mag = torch.zeros(K, B, device=device, dtype=torch.float32)
+        bd_anchor = torch.zeros(K, B, device=device, dtype=torch.float32)
 
     for k in range(K):
         a = action_proxy[k].float()  # (B, H, D)
@@ -155,11 +166,17 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
         # Temporal smoothness: penalise jerky predicted actions
         diffs = a[:, 1:, :] - a[:, :-1, :]  # (B, H-1, D)
         smoothness = -(diffs ** 2).sum(dim=(1, 2))  # (B,)
-        scores[k] += cfg.lambda_smooth * smoothness
+        smooth_contrib = cfg.lambda_smooth * smoothness
+        scores[k] += smooth_contrib
+        if return_breakdown:
+            bd_smooth[k] = smooth_contrib
 
         # Velocity magnitude: lower magnitude = noise was closer to manifold
         mag = -(v ** 2).sum(dim=(1, 2))  # (B,)
-        scores[k] += cfg.lambda_mag * mag
+        mag_contrib = cfg.lambda_mag * mag
+        scores[k] += mag_contrib
+        if return_breakdown:
+            bd_mag[k] = mag_contrib
 
         # Anchor consistency: distance-weighted L2 in action space.
         # Compare candidate's predicted near-future (steps 0..n-1) to the
@@ -185,8 +202,19 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
                 sq_dist = (candidate_near - prev_tail) ** 2  # (B, n_overlap, D)
                 sq_dist_per_step = sq_dist.sum(dim=2)        # (B, n_overlap)
                 weighted_dist = (sq_dist_per_step * weights.unsqueeze(0)).sum(dim=1)  # (B,)
-                scores[k] -= cfg.lambda_anchor * weighted_dist
+                anchor_contrib = -cfg.lambda_anchor * weighted_dist
+                scores[k] += anchor_contrib
+                if return_breakdown:
+                    bd_anchor[k] = anchor_contrib
 
+    if return_breakdown:
+        breakdown = {
+            "scores_smooth": bd_smooth,
+            "scores_mag": bd_mag,
+            "scores_anchor": bd_anchor,
+            "scores_total": scores,
+        }
+        return scores, breakdown
     return scores
 
 
@@ -197,7 +225,7 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None):
 
 def denoise_with_noise_selection(
     action_head, vl_embeds, state_features, embodiment_id, backbone_output,
-    *, cfg=None, seed=None, prev_actions=None,
+    *, cfg=None, seed=None, prev_actions=None, diagnostics_log=None,
 ):
     """Noise-space mode selection: sample K noises, preview, select, complete.
 
@@ -211,6 +239,8 @@ def denoise_with_noise_selection(
         seed: Random seed for noise generation.
         prev_actions: Optional (B, H, D) denoised actions from previous chunk
             for action-space anchor consistency scoring.
+        diagnostics_log: Optional list to append per-chunk diagnostic dicts to.
+            When provided, captures full scoring internals and candidate tensors.
 
     Returns:
         (actions, best_noise, last_velocity) tuple:
@@ -272,7 +302,13 @@ def denoise_with_noise_selection(
     actions_1_star = actions_1_star_flat.reshape(K, B, H, D)
 
     # --- Step 3: Score each candidate using the fully-extrapolated proxy ---
-    scores = _score_candidates(actions_1_star, velocities, K, B, cfg, prev_actions)
+    if diagnostics_log is not None:
+        scores, breakdown = _score_candidates(
+            actions_1_star, velocities, K, B, cfg, prev_actions,
+            return_breakdown=True,
+        )
+    else:
+        scores = _score_candidates(actions_1_star, velocities, K, B, cfg, prev_actions)
 
     # --- Step 4: Select best noise per batch element ---
     best_k = scores.argmax(dim=0)  # (B,)
@@ -284,6 +320,31 @@ def denoise_with_noise_selection(
         print(f"[NoiseSelection] K={K} candidates scored. "
               f"Best indices: {best_k.tolist()}  "
               f"Score range: [{scores.min():.2f}, {scores.max():.2f}]")
+
+    # Capture diagnostics before denoising loop (scoring + candidate tensors)
+    if diagnostics_log is not None:
+        sorted_scores, _ = scores[:, 0].sort(descending=True)
+        score_gap = (sorted_scores[0] - sorted_scores[1]).item() if K > 1 else 0.0
+
+        diag = {
+            "scores_smooth":        breakdown["scores_smooth"][:, 0].cpu().clone(),
+            "scores_mag":           breakdown["scores_mag"][:, 0].cpu().clone(),
+            "scores_anchor":        breakdown["scores_anchor"][:, 0].cpu().clone(),
+            "scores_total":         breakdown["scores_total"][:, 0].cpu().clone(),
+            "best_k":               best_k[0].item(),
+            "score_gap":            score_gap,
+            "score_mean":           scores[:, 0].mean().item(),
+            "score_std":            scores[:, 0].std().item(),
+            "score_min":            scores[:, 0].min().item(),
+            "score_max":            scores[:, 0].max().item(),
+            "noise_candidates":     noise_candidates[:, 0].cpu().clone(),
+            "action_proxies_1star": actions_1_star[:, 0].cpu().clone(),
+            "velocities":           velocities[:, 0].cpu().clone(),
+            "prev_actions":         prev_actions[0].cpu().clone() if prev_actions is not None else None,
+            "has_prev_actions":     prev_actions is not None,
+            "denoising_actions":    [],
+            "denoising_velocities": [],
+        }
 
     # --- Step 5: Complete denoising with remaining 3 steps ---
     last_velocity = None
@@ -298,6 +359,10 @@ def denoise_with_noise_selection(
         actions = actions + dt * velocity
         last_velocity = velocity
 
+        if diagnostics_log is not None:
+            diag["denoising_actions"].append(actions[0].cpu().clone())
+            diag["denoising_velocities"].append(velocity[0].cpu().clone())
+
         if action_head.verbose:
             print(f"[NoiseSelection] Step {step}/{cfg.num_steps}  "
                   f"tau={tau:.3f}  bucket={t_bucket}  "
@@ -309,6 +374,10 @@ def denoise_with_noise_selection(
         print(f"[NoiseSelection] Final  shape={tuple(actions.shape)}  "
               f"mean={af.mean():.4f}  std={af.std():.4f}")
 
+    if diagnostics_log is not None:
+        diag["final_actions"] = actions[0].cpu().clone()
+        diagnostics_log.append(diag)
+
     return actions, best_noise, last_velocity
 
 
@@ -317,11 +386,16 @@ def denoise_with_noise_selection(
 # ---------------------------------------------------------------------------
 
 
-def patch_action_head(action_head, cfg=None):
+def patch_action_head(action_head, cfg=None, diagnostics_log=None):
     """Monkey-patch the action head to use noise-space mode selection.
 
     Replaces ``get_action_with_features()`` in-place.  Caches the denoised
     actions across calls to enable action-space anchor consistency scoring.
+
+    Args:
+        action_head: ``Gr00tN1d6ActionHead`` to patch in-place.
+        cfg: ``NoiseSelectionConfig``.
+        diagnostics_log: Optional list to collect per-chunk diagnostics into.
 
     Returns:
         A ``reset()`` callable that clears the cached state.  **Must** be
@@ -332,6 +406,7 @@ def patch_action_head(action_head, cfg=None):
         cfg = NoiseSelectionConfig()
 
     _prev_actions = [None]  # mutable closure state for cross-chunk caching
+    _chunk_idx = [0]
 
     @torch.no_grad()
     def patched_get_action_with_features(
@@ -341,8 +416,14 @@ def patch_action_head(action_head, cfg=None):
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output, cfg=cfg,
             prev_actions=_prev_actions[0],
+            diagnostics_log=diagnostics_log,
         )
         _prev_actions[0] = actions.detach()
+
+        if diagnostics_log is not None and len(diagnostics_log) > 0:
+            diagnostics_log[-1]["chunk_idx"] = _chunk_idx[0]
+        _chunk_idx[0] += 1
+
         return BatchFeature(data={
             "action_pred": actions,
             "backbone_features": backbone_features,
@@ -354,6 +435,7 @@ def patch_action_head(action_head, cfg=None):
     def reset():
         """Clear cached prev_actions (call on episode reset)."""
         _prev_actions[0] = None
+        _chunk_idx[0] = 0
 
     return reset
 

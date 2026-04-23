@@ -14,29 +14,35 @@ This means we can backpropagate through the DiT to compute the exact gradient of
 
 **The key design decision: 1-step backprop, not 4-step.** Backpropagating through all 4 DiT calls is expensive (~264ms, ~6GB activation memory). Instead, we backprop through **a single DiT call at step 0 only**. This is sufficient because step 0 is where mode selection happens — after 1 Euler step, the gross trajectory structure (approach direction, gripper intent, control mode) is established. The gradient $\partial L / \partial \epsilon$ through 1 DiT call tells us exactly how to change ε to improve the step-0 output. The cost is 1 forward+backward through 1 DiT call (~1.5GB activations, ~48ms) plus 4 standard Euler steps for the final denoising (~64ms). Total: ~112ms.
 
+**Why the fully-extrapolated proxy, not the 0.25-stepped state:** We compute the quality loss on $a_{1.0}^* = \epsilon + v_0$, the fully-extrapolated proxy, rather than the partially-denoised $a^{0.25} = \epsilon + 0.25 \cdot v_0$. In rectified flow, $v(\epsilon, 0) \approx \text{data} - \epsilon$, so $\epsilon + v(\epsilon, 0) \approx \text{data}_{\text{predicted}}$. This proxy is **signal-dominated** — gradients through it reflect actual action quality, not noise artifacts. The $a^{0.25}$ alternative is 75% noise and 25% signal; optimizing through it is essentially gradient descent on noise structure, which Strategy 10 discovered and corrected for its own scoring heuristics. Note: the proxy is for loss computation only — the actual Euler integration still advances from $a^{0.25}$ (the properly-stepped state at $\tau = 0.25$).
+
 ### Mathematical Formulation
 
 **1-step differentiable probe:**
 
 $$v_0 = v_\theta(\epsilon,\; 0,\; o_t,\; l_t)$$
 
-$$a^{0.25} = \epsilon + 0.25 \cdot v_0$$
+$$a^{1.0*} = \epsilon + v_0 \quad \text{(fully-extrapolated proxy for quality loss — signal-dominated)}$$
 
-**Quality objective** (deterministic, computed on the partially-denoised $a^{0.25}$):
+$$a^{0.25} = \epsilon + 0.25 \cdot v_0 \quad \text{(for Euler continuation after noise update)}$$
 
-$$\mathcal{L}(\epsilon) = \lambda_{\text{smooth}} \,\mathcal{L}_{\text{smooth}} + \lambda_{\text{temporal}} \,\mathcal{L}_{\text{temporal}}$$
+**Quality objective** (deterministic, computed on the fully-extrapolated proxy $a^{1.0*}$):
 
-**Smoothness loss** (jerk of the emerging trajectory):
+$$\mathcal{L}(\epsilon) = \lambda_{\text{smooth}} \,\mathcal{L}_{\text{smooth}} + \lambda_{\text{anchor}} \,\mathcal{L}_{\text{anchor}}$$
 
-$$\mathcal{L}_{\text{smooth}}(\epsilon) = \sum_{h=2}^{H-2} \|a^{0.25}[h{+}1] - 2\,a^{0.25}[h] + a^{0.25}[h{-}1]\|_2^2$$
+**Smoothness loss** (temporal roughness of the predicted trajectory):
 
-Even at 25% denoised, the gross trajectory shape is visible — smooth trajectories have low jerk even when noisy, while between-mode trajectories have high jerk (the averaging of two different motion directions creates discontinuities).
+$$\mathcal{L}_{\text{smooth}}(\epsilon) = \sum_{h=0}^{H-2} \|a^{1.0*}[h{+}1] - a^{1.0*}[h]\|_2^2$$
 
-**Temporal consistency loss** (continuity with previous chunk):
+Because the fully-extrapolated proxy is signal-dominated ($a^{1.0*} \approx \text{data}_{\text{predicted}}$), consecutive-step deltas measure actual trajectory roughness rather than noise structure. Rough predicted trajectories indicate unstable or between-mode solutions.
 
-$$\mathcal{L}_{\text{temporal}}(\epsilon) = \|a^{0.25}[0] - a_{\text{prev}}[n_{\text{exec}}]\|_2^2$$
+**Anchor consistency loss** (continuity with previous chunk's predicted-but-unexecuted tail):
 
-where $a_{\text{prev}}[n_{\text{exec}}]$ is the last executed action from the previous chunk.
+$$\mathcal{L}_{\text{anchor}}(\epsilon) = \sum_{j=0}^{n-1} w_j \,\|a^{1.0*}[j] - a_{\text{prev}}[n_{\text{exec}} + j]\|_2^2$$
+
+where $a_{\text{prev}}$ is the full denoised action tensor from the previous chunk (cached across calls, cleared on episode reset), $n_{\text{exec}}$ is the number of executed steps per chunk, $n = \min(n_{\text{exec}},\, H - n_{\text{exec}})$ is the overlap length, and $w_j = \gamma^j / \sum_i \gamma^i$ are geometrically decaying weights ($\gamma$ = `anchor_decay`, default 0.5). Step 0 of the overlap gets ~50% of the total weight, reflecting that near-horizon predictions are more reliable.
+
+Both tensors ($a^{1.0*}$ and $a_{\text{prev}}$) are action estimates in the same normalized $[-1, 1]$ space, making L2 distance a natural metric. The decay weighting focuses the gradient signal on the most trustworthy overlap region.
 
 **On-mode regularizer via gradient-norm penalty:**
 
@@ -46,9 +52,9 @@ We can detect between-mode regions through a property of the velocity field's Ja
 
 The gradient $g = \partial \mathcal{L} / \partial \epsilon$ that we already compute for the quality objective is propagated through the chain rule:
 
-$$g = \frac{\partial \mathcal{L}}{\partial a^{0.25}} \cdot \frac{\partial a^{0.25}}{\partial \epsilon} = \frac{\partial \mathcal{L}}{\partial a^{0.25}} \cdot \left(I + 0.25 \cdot \frac{\partial v_0}{\partial \epsilon}\right)$$
+$$g = \frac{\partial \mathcal{L}}{\partial a^{1.0*}} \cdot \frac{\partial a^{1.0*}}{\partial \epsilon} = \frac{\partial \mathcal{L}}{\partial a^{1.0*}} \cdot \left(I + \frac{\partial v_0}{\partial \epsilon}\right)$$
 
-The term $\partial v_0 / \partial \epsilon$ is the Jacobian we care about. When this Jacobian has large eigenvalues (between modes), $\|g\|$ is large. When the Jacobian is small (on-mode), $\|g\|$ is small. So **$\|g\|$ is already an implicit on-mode signal** embedded in the gradient we're computing anyway.
+The Jacobian $\partial v_0 / \partial \epsilon$ appears with coefficient **1.0** (not the 0.25 that an $a^{0.25}$ proxy would give). This 4× amplification makes $\|g\|$ a much sharper on-mode/between-mode discriminator: between-mode regions, where the Jacobian has large eigenvalues, produce proportionally larger $\|g\|$, while on-mode regions (small Jacobian) keep $\|g\|$ small.
 
 To explicitly push toward on-mode regions, we add a gradient-norm penalty as a second-order regularizer:
 
@@ -84,7 +90,7 @@ $$a_t^{\text{final}} = \mathcal{D}_\theta(\epsilon^*) \quad \text{(standard 4-st
 
 **Variant A — 1-Step Backprop with Mode Regularizer (recommended):**
 1. Forward step 0 with grad: 1 NFE, ~24ms (with grad overhead).
-2. Compute $\mathcal{L}_{\text{quality}}$ on $a^{0.25}$.
+2. Compute fully-extrapolated proxy $a^{1.0*} = \epsilon + v_0$. Compute $\mathcal{L}_{\text{quality}}$ on $a^{1.0*}$.
 3. First backward: compute $g = \partial \mathcal{L} / \partial \epsilon$. ~24ms.
 4. Second backward (Hessian-vector product): compute $g_{\text{mode}} = \partial \|g\|^2 / \partial \epsilon$. ~24ms.
 5. Gradient step on $\epsilon$. Re-project to norm-sphere.
@@ -94,7 +100,7 @@ Memory: ~1.5GB activation cache for 1 DiT call (32 layers × 1536 dim). No gradi
 
 **Variant B — 1-Step Backprop without Mode Regularizer (simplest):**
 1. Forward step 0 with grad: 1 NFE, ~24ms.
-2. Compute $\mathcal{L}_{\text{quality}}$ on $a^{0.25}$.
+2. Compute fully-extrapolated proxy $a^{1.0*} = \epsilon + v_0$. Compute $\mathcal{L}_{\text{quality}}$ on $a^{1.0*}$.
 3. Backward: compute $g = \partial \mathcal{L} / \partial \epsilon$. ~24ms.
 4. Gradient step on $\epsilon$. Re-project.
 5. Forward 4-step Euler from $\epsilon^*$ without grad: 4 NFEs, ~64ms.
@@ -116,18 +122,21 @@ def denoise_ddto(
     lab,                         # DenoisingLab instance
     # --- Quality objective weights ---
     lambda_smooth=1.0,           # trajectory smoothness
-    lambda_temporal=0.5,         # chunk boundary continuity
+    lambda_anchor=0.5,           # anchor consistency with previous chunk
     lambda_mode=0.1,             # on-mode regularizer (0 = disable)
+    # --- Anchor parameters ---
+    anchor_decay=0.5,            # geometric decay per overlap step
+    n_exec=8,                    # action steps executed per chunk
     # --- Optimization hyperparameters ---
     eta=0.1,                     # gradient step size (after normalization)
-    # --- Optional context ---
-    prev_chunk_action=None,      # (128,) last executed action from previous chunk
+    # --- Previous chunk context ---
+    prev_actions=None,           # (B, 50, 128) full denoised actions from previous chunk
 ):
     """Differentiable Denoising Trajectory Optimization (DDTO).
 
-    Optimizes the initial noise via 1-step backprop through the DiT
-    to minimize smoothness + temporal consistency losses, with an optional
-    gradient-norm regularizer that pushes toward stable modes.
+    Optimizes the initial noise via 1-step backprop through the DiT,
+    computing quality losses on the fully-extrapolated proxy a_1.0* = ε + v_0
+    (signal-dominated, ≈ data_predicted in rectified flow).
 
     The DiT weights are completely frozen — only the noise is optimized.
 
@@ -136,6 +145,7 @@ def denoise_ddto(
     device = epsilon.device
     tau_schedule = [0, 250, 500, 750]
     dt = 0.25
+    H = epsilon.shape[1]  # 50
 
     diagnostics = {
         'quality_loss_before': None,
@@ -146,7 +156,7 @@ def denoise_ddto(
     }
 
     # ================================================================
-    # Phase 1: 1-step forward with grad → compute quality + gradient
+    # Phase 1: 1-step forward with grad → fully-extrapolated proxy
     # ================================================================
     eps = epsilon.detach().clone().requires_grad_(True)
 
@@ -159,27 +169,41 @@ def denoise_ddto(
             embodiment_id=embodiment_id,
             backbone_output=backbone_output,
         )
-        a_025 = eps + dt * v0  # partially denoised action (B, 50, 128)
+        # Fully-extrapolated proxy for scoring (signal-dominated)
+        # In rectified flow: ε + v(ε,0) ≈ data_predicted
+        a_1_star = eps + 1.0 * v0  # (B, 50, 128)
 
-        # --- Quality loss ---
+        # --- Quality loss on fully-extrapolated proxy ---
         loss = torch.tensor(0.0, device=device)
 
-        # Smoothness: jerk of emerging trajectory
-        accel = a_025[:, 2:] - 2 * a_025[:, 1:-1] + a_025[:, :-2]
-        smooth_loss = accel.pow(2).mean()
+        # Smoothness: temporal roughness of predicted trajectory
+        diffs = a_1_star[:, 1:, :] - a_1_star[:, :-1, :]
+        smooth_loss = diffs.pow(2).sum(dim=(1, 2)).mean()
         loss = loss + lambda_smooth * smooth_loss
 
-        # Temporal consistency with previous chunk
-        if prev_chunk_action is not None and lambda_temporal > 0:
-            target = prev_chunk_action.to(device)
-            if target.dim() == 1:
-                target = target.unsqueeze(0).expand_as(a_025[:, 0])
-            temp_loss = (a_025[:, 0] - target).pow(2).mean()
-            loss = loss + lambda_temporal * temp_loss
+        # Anchor consistency with previous chunk (overlap-region, decay-weighted)
+        if prev_actions is not None and lambda_anchor > 0:
+            n_overlap = min(n_exec, H - n_exec)
+            candidate_near = a_1_star[:, :n_overlap, :]                  # (B, n, D)
+            prev_tail = prev_actions[:, n_exec:n_exec + n_overlap, :]    # (B, n, D)
+
+            # Geometric decay weights: step 0 gets ~50% of total weight
+            weights = torch.tensor(
+                [anchor_decay ** j for j in range(n_overlap)],
+                device=device,
+            )
+            weights = weights / weights.sum()
+
+            sq_dist = (candidate_near - prev_tail).pow(2).sum(dim=2)  # (B, n)
+            anchor_loss = (sq_dist * weights.unsqueeze(0)).sum(dim=1).mean()
+            loss = loss + lambda_anchor * anchor_loss
 
         diagnostics['quality_loss_before'] = loss.item()
 
         # --- First backward: quality gradient ---
+        # Chain rule: g = ∂L/∂a_1.0* · (I + ∂v_0/∂ε)
+        # The Jacobian appears with coefficient 1.0, giving 4× sharper
+        # mode discrimination than the 0.25 proxy alternative.
         g = torch.autograd.grad(loss, eps, create_graph=(lambda_mode > 0))[0]
         diagnostics['gradient_norm'] = g.norm().item()
 
@@ -219,11 +243,26 @@ def denoise_ddto(
             a = a + dt * v
 
         # Evaluate quality on final output for diagnostics
-        accel_final = a[:, 2:] - 2 * a[:, 1:-1] + a[:, :-2]
-        diagnostics['quality_loss_after'] = accel_final.pow(2).mean().item()
+        diffs_final = a[:, 1:, :] - a[:, :-1, :]
+        diagnostics['quality_loss_after'] = diffs_final.pow(2).sum(dim=(1, 2)).mean().item()
 
     return a, diagnostics
 ```
+
+### Anchor Consistency Design
+
+The anchor term compares the candidate's fully-extrapolated proxy with the previous chunk's predicted-but-unexecuted tail. This reuses the same design validated in Strategy 10, adapted for gradient-based optimization:
+
+| Aspect | Detail |
+|--------|--------|
+| **What is compared** | Candidate proxy steps [0, n) vs. previous chunk steps [n_exec, n_exec + n) |
+| **Space** | Both tensors are action estimates in the same normalized [-1, 1] space |
+| **Metric** | Decay-weighted L2 distance — differentiable w.r.t. ε via the proxy |
+| **Weighting** | Geometric decay: step $j$ gets weight $\gamma^j / \sum \gamma^i$. Default $\gamma=0.5$ gives step 0 ~50% of total weight |
+| **Rationale** | Near-horizon predictions are more reliable; decay focuses the gradient signal on the most trustworthy overlap |
+| **Episode boundaries** | `prev_actions` must be cleared on episode reset to prevent cross-episode distortion |
+
+**Why overlap-region comparison instead of single-point:** The original formulation compared only $a[0]$ with the last executed action — a single scalar comparison in 128-dimensional space. The anchor consistency loss compares the full overlap region (up to `n_exec` timesteps), weighted by reliability. This provides a much richer gradient signal: the gradient $\partial \mathcal{L}_{\text{anchor}} / \partial \epsilon$ encodes how to shift ε to improve alignment across the entire overlap, not just at one point.
 
 ### How It Replaces Action Chunking
 
@@ -231,25 +270,76 @@ Action chunking is entirely unchanged. DDTO wraps around the standard denoising 
 
 **Why the compute budget is feasible:** With `n_action_steps=8` at 10Hz control, the policy is queried every $8 \times 100\text{ms} = 800\text{ms}$. Variant A (136ms) uses only 17% of this budget. The server processes the observation and computes VLM embeddings (~50ms) in parallel with the last few executed actions, so the effective budget is ~750ms. Both variants fit comfortably.
 
-**Temporal consistency across chunks:** The $\mathcal{L}_{\text{temporal}}$ component is unique to DDTO — no other strategy explicitly optimizes for smooth transitions between consecutive action chunks. By penalizing discontinuity at the chunk boundary, DDTO produces smoother long-horizon trajectories.
+**Temporal consistency across chunks:** The $\mathcal{L}_{\text{anchor}}$ component is unique to DDTO — no other strategy explicitly optimizes the gradient of temporal coherence with respect to the initial noise. By backpropagating the anchor consistency loss through the DiT, DDTO shifts ε in a direction that reduces chunk-boundary discontinuities, producing smoother long-horizon trajectories.
 
-**Composition with other strategies:** DDTO optimizes *which noise* to denoise; the remaining 4 Euler steps can use any solver — AB2 (Strategy 3), constraint guidance (Strategy 8), or horizon-prioritized gating (Strategy 9). DDTO is a noise optimizer, not a solver replacement, so it stacks cleanly on top.
+**Composition with other strategies:** DDTO optimizes *which noise* to denoise; the remaining 4 Euler steps can use any solver — AB2 (Strategy 3), constraint guidance (Strategy 8), or horizon-prioritized gating (Strategy 9). DDTO is a noise optimizer, not a solver replacement, so it stacks cleanly on top. It also composes naturally with Strategy 10: use noise-space mode selection to choose the best of $K$ candidates, then apply DDTO's gradient refinement to the winner — coarse global search followed by fine local optimization. This hybrid is worth exploring if empirical results show DDTO getting stuck in bad basins, but the mode regularizer ($\lambda_{\text{mode}}$) already pushes toward stable modes, so the standalone formulation is the right starting point.
 
 ### Analysis
 
 | Aspect | Assessment |
 |--------|------------|
-| **Expected quality** | High. DDTO is the only strategy that uses first-order gradient information to optimize noise in the 6400-dimensional space. The quality losses (smoothness, temporal consistency) are deterministic and physically meaningful — their gradients through 1 DiT call point toward genuinely better noise vectors. The on-mode regularizer ($\lambda_{\text{mode}}$) provides an additional signal: large $\|g\|$ indicates a between-mode region where the velocity field is sensitive to input perturbations, and the regularizer pushes ε toward more stable regions. However, a single gradient step on a non-convex landscape provides a local improvement, not a global optimum — the practical benefit depends on how smooth the loss landscape is around the sampled ε. |
-| **Risk** | (1) **Non-convexity:** The loss landscape through the DiT is highly non-convex. A single gradient step may not improve the final 4-step output if the landscape changes significantly between ε and ε*. This is mitigated by the normalized step size (η=0.1, a small displacement). (2) **1-step proxy vs 4-step quality:** We optimize quality at $\tau=0.25$ but care about quality at $\tau=1.0$. The correlation between step-0 quality and final quality is strong for mode-level properties (approach direction) but weak for fine details (gripper timing). (3) **Hessian-vector product cost:** The on-mode regularizer requires a second backward pass. For $\lambda_{\text{mode}} = 0$ (Variant B), this is skipped, saving ~24ms. (4) **Memory:** 1 DiT call's activation cache is ~1.5GB — manageable on L40 (48GB), but non-trivial for multi-env evaluation. |
+| **Expected quality** | High. DDTO is the only strategy that uses first-order gradient information to optimize noise in the 6400-dimensional space. The quality losses (smoothness, anchor consistency) are computed on the fully-extrapolated proxy $a_{1.0}^* \approx \text{data}_{\text{predicted}}$ — a signal-dominated estimate where gradients reflect actual action quality rather than noise structure. The on-mode regularizer ($\lambda_{\text{mode}}$) benefits from the proxy choice: the chain rule $g = \partial \mathcal{L}/\partial a^{1.0*} \cdot (I + \partial v_0 / \partial \epsilon)$ gives the velocity Jacobian 4× more influence on $\|g\|$ compared to the $a^{0.25}$ alternative, making the on-mode/between-mode discrimination sharper. However, a single gradient step on a non-convex landscape provides a local improvement, not a global optimum — the practical benefit depends on how smooth the loss landscape is around the sampled ε. |
+| **Risk** | (1) **Non-convexity:** The loss landscape through the DiT is highly non-convex. A single gradient step may not improve the final 4-step output if the landscape changes significantly between ε and ε*. This is mitigated by the normalized step size (η=0.1, a small displacement). (2) **Proxy-to-final correlation:** We optimize quality on $a_{1.0}^*$ (a 1-step extrapolation) but care about quality of the full 4-step output. The fully-extrapolated proxy is signal-dominated and correlates strongly with final output for mode-level properties (approach direction, gripper intent), though fine details (exact timing) may diverge. (3) **Hessian-vector product cost:** The on-mode regularizer requires a second backward pass. For $\lambda_{\text{mode}} = 0$ (Variant B), this is skipped, saving ~24ms. (4) **Memory:** 1 DiT call's activation cache is ~1.5GB — manageable on L40 (48GB), but non-trivial for multi-env evaluation. |
 | **Latency** | Variant A (with mode regularizer): ~136ms. Variant B (without): ~112ms. Both within the 800ms action chunking budget. |
-| **Implementation** | Moderate. The key change: call `_forward_dit()` (which returns velocity without the Euler update) under `torch.enable_grad()`, compute loss, call `torch.autograd.grad()`. The DiT supports gradient checkpointing (`_supports_gradient_checkpointing = True`). Total: ~80 lines. |
+| **Implementation** | Moderate. The key change: call `_forward_dit()` (which returns velocity without the Euler update) under `torch.enable_grad()`, compute $a_{1.0}^* = \epsilon + v_0$, compute loss on $a_{1.0}^*$, call `torch.autograd.grad()`. The DiT supports gradient checkpointing (`_supports_gradient_checkpointing = True`). Total: ~100 lines. |
 
 ### Prior Work
 
-- **Eyring et al., "Rethinking Noise Optimization of Single-Step Diffusion Models" (ReNO)** — arXiv:2410.12164 (2024). Optimized initial noise for text-to-image diffusion by backpropagating CLIP and aesthetic losses through the denoising chain. **Key differences:** ReNO uses external quality models (CLIP); DDTO uses physics-based quality losses (smoothness, temporal consistency). ReNO backprops through 50+ diffusion steps; DDTO backprops through 1 DiT call. ReNO is offline (seconds per image); DDTO is real-time (~112ms per action chunk).
+- **Eyring et al., "Rethinking Noise Optimization of Single-Step Diffusion Models" (ReNO)** — arXiv:2410.12164 (2024). Optimized initial noise for text-to-image diffusion by backpropagating CLIP and aesthetic losses through the denoising chain. **Key differences:** ReNO uses external quality models (CLIP); DDTO uses physics-based quality losses (smoothness, anchor consistency). ReNO backprops through 50+ diffusion steps; DDTO backprops through 1 DiT call. ReNO is offline (seconds per image); DDTO is real-time (~112ms per action chunk).
 - **Patil et al., "Golden Noise for Diffusion Policy" (2026)**. Pre-optimizes noise vectors offline via Monte Carlo rollouts. **Key differences:** Golden Noise is offline (minutes of pre-computation); DDTO is online (single gradient step per query). Golden Noise requires a simulator for evaluation; DDTO uses analytic quality losses.
 - **Poole et al., "DreamFusion" (2023)**. Score Distillation Sampling through diffusion models. Both DreamFusion and DDTO exploit the differentiability of the generative model — DreamFusion optimizes a NeRF, DDTO optimizes the noise input.
 
-**What makes this novel for VLAs:** DDTO is the first strategy to optimize VLA noise via exact gradients through the DiT at test time, using a 1-step backprop design that keeps the cost tractable for real-time control. The on-mode regularizer — penalizing $\|g\|^2$ to push noise toward regions where the velocity field is locally insensitive to input perturbations — is a novel mechanism for avoiding between-mode artifacts, grounded in the observation that the Jacobian $\partial v / \partial \epsilon$ has larger eigenvalues at mode boundaries than at mode centers.
+**What makes this novel for VLAs:** DDTO is the first strategy to optimize VLA noise via exact gradients through the DiT at test time, using a 1-step backprop design that keeps the cost tractable for real-time control. The fully-extrapolated proxy $a_{1.0}^* = \epsilon + v_0 \approx \text{data}_{\text{predicted}}$ ensures that gradients reflect action quality rather than noise structure — a correction validated by Strategy 10's experience. The on-mode regularizer — penalizing $\|g\|^2$ to push noise toward regions where the velocity field is locally insensitive to input perturbations — is a novel mechanism for avoiding between-mode artifacts, and the proxy choice amplifies its discriminative power by expressing the full Jacobian $\partial v_0 / \partial \epsilon$ with coefficient 1.0 in the chain rule.
+
+---
+
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main model venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/run_server.sh
+# Or with custom parameters:
+bash scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/run_server.sh \
+    --eta 0.2 --lambda-mode 0.0 --lambda-smooth 2.0
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+bash scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/run_eval.sh
+# Or with more episodes:
+bash scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from scripts.denoising_lab.eval.strategies.differentiable_denoising_trajectory_optimization.strategy import (
+    denoise_with_lab, DDTOConfig,
+)
+cfg = DDTOConfig(lambda_smooth=1.0, lambda_anchor=0.5, eta=0.1)
+actions, diagnostics = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+
+# Subsequent chunks: pass prev_actions for anchor consistency
+actions2, diag2 = denoise_with_lab(lab, features2, cfg=cfg, prev_actions=actions)
+```
+
+### Hyperparameter Tuning
+
+**Lambda grid search** (`calibrate_lambdas.py`):
+
+Loads the model once, starts a ZMQ server, and iterates over a grid of quality-loss weights and step sizes. Each config re-patches the action head and launches the eval client subprocess.
+
+```bash
+uv run python scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/calibrate_lambdas.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 400 480 \
+    --n-episodes 15 --seed 42 \
+    --lambda-smooth 0.5 1.0 \
+    --lambda-anchor 0.25 0.5 1.0 \
+    --lambda-mode 0.0 0.05 0.1 \
+    --eta 0.05 0.1 0.2 \
+    --output-dir /tmp/calibration_results/ddto
+```
 
 ---

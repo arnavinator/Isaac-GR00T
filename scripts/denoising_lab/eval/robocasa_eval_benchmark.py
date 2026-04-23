@@ -247,6 +247,8 @@ def run_benchmark_for_env(
         )
 
     for i, seed in iter_seeds:
+        if args.reset_between_episodes and i > 0:
+            client.reset()
         record = run_single_episode(env, client, seed, i, env_name)
         records.append(record)
 
@@ -596,6 +598,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="unnamed",
         help="Label for this strategy (written to summary.json)",
+    )
+    parser.add_argument(
+        "--reset-between-episodes",
+        action="store_true",
+        help="Send reset to server between episodes (clears server-side "
+             "state like cached prev_actions for anchor scoring)",
     )
     args = parser.parse_args()
     args.output_dir = Path(args.output_dir)

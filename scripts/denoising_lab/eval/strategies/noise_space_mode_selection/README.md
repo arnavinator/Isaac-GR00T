@@ -259,4 +259,44 @@ uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/p
     --output-dir /tmp/noise_sel_profile
 ```
 
+### Diagnostics Collection
+
+**Per-chunk scoring diagnostics** (`collect_diagnostics.py`):
+
+Runs a grid of configs and captures the full scoring internals at every action chunk: per-candidate score breakdowns (smoothness, magnitude, anchor weighted contributions), all K noise/velocity/proxy tensors, and the winner's intermediate denoising trajectory. Saves one pickle per config.
+
+```bash
+uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/collect_diagnostics.py \
+    --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --max-episode-steps 400 \
+    --n-episodes 5 --seed 42 \
+    --lambda-smooth 0.7 1.0 \
+    --lambda-mag 0.01 \
+    --lambda-anchor 1.0 2.0 \
+    --noise-type gaussian uniform \
+    --truncate-horizon 16 --truncate-dim 29 \
+    --output-dir ./diagnostics_results
+```
+
+Use `--truncate-horizon 16 --truncate-dim 29` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 29)`, reducing storage by ~14x.
+
+**Loading diagnostics in a notebook:**
+```python
+import pickle
+
+with open("diagnostics_results/sm1.0_mg0.01_an2.0_K8_gaus/diagnostics.pkl", "rb") as f:
+    data = pickle.load(f)
+
+ep = data["episodes"][0]
+chunk = ep["chunks"][5]
+
+print(chunk["scores_total"])          # (K,) — total score per candidate
+print(chunk["scores_smooth"])         # (K,) — smoothness component
+print(chunk["best_k"])                # which candidate won
+print(chunk["score_gap"])             # margin between best and second-best
+print(chunk["action_proxies_1star"])  # (K, H, D) — all K extrapolated proxies
+print(chunk["final_actions"])         # (H, D) — actual denoised output for the winner
+print(chunk["denoising_actions"])     # list of 3 Tensors (H, D) — winner's intermediate states
+```
+
 ---

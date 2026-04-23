@@ -267,15 +267,15 @@ Runs a grid of configs and captures the full scoring internals at every action c
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/collect_diagnostics.py \
-    --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --max-episode-steps 400 \
-    --n-episodes 5 --seed 42 \
+    --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
+    --n-episodes 4 --seed 42 \
     --lambda-smooth 0.7 1.0 \
     --lambda-mag 0.01 \
     --lambda-anchor 1.0 2.0 \
-    --noise-type gaussian uniform \
+    --noise-type gaussian \
     --truncate-horizon 16 --truncate-dim 29 \
-    --output-dir ./diagnostics_results
+    --output-dir ~/my_Isaac-GR00T/scripts/denoising_lab/eval/strategies/noise_space_mode_selection/diagnostic_results1
 ```
 
 Use `--truncate-horizon 16 --truncate-dim 29` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 29)`, reducing storage by ~14x.

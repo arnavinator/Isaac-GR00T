@@ -1,0 +1,44 @@
+{
+  "strategy_name": "noise_sel_sm1.0_mg0.1_an0.5_K8_gaus",
+  "timestamp": "2026-04-23T05:38:47.257237+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
+    ],
+    "n_episodes": 3,
+    "seed": 51,
+    "max_episode_steps": [
+      400
+    ],
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/OpenDrawer_PandaOmron_Env": {
+      "n_episodes": 3,
+      "success_rate": 0.6667,
+      "mean_reward": 0.6667,
+      "mean_length": 34.0,
+      "std_length": 11.3,
+      "mean_duration_s": 46.32,
+      "successes": [
+        true,
+        false,
+        true
+      ],
+      "seeds": [
+        51,
+        52,
+        53
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 3,
+    "total_envs": 1,
+    "overall_success_rate": 0.6667,
+    "total_wall_time_s": 159.34
+  }
+}

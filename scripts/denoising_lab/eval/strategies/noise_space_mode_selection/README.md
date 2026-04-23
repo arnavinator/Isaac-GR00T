@@ -236,15 +236,15 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of scoring w
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/calibrate_lambdas.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-    --max-episode-steps 400 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
     --K 8 \
-    --n-episodes 3 --seed 51 \
-    --lambda-smooth 1.0 \
-    --lambda-mag 0.01 0.05 0.1 \
-    --lambda-anchor 0.5 1.0 2.0 \
+    --n-episodes 3 --seed 42 \
+    --lambda-smooth 0.7 1.0 \
+    --lambda-mag 0.01 \
+    --lambda-anchor 1.0 2.0 \
     --noise-type gaussian uniform \
-    --output-dir /tmp/calibration_results/noise_space_mode_selection0
+    --output-dir ~/my_Isaac-GR00T/scripts/denoising_lab/eval/strategies/noise_space_mode_selection/noise_space_mode_selection1
 ```
 
 **Runtime profiling** (`profile_k_runtime.py`):

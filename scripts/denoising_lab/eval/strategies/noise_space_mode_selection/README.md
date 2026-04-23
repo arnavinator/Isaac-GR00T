@@ -243,9 +243,10 @@ uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/c
 
 **Runtime profiling** (`profile_k_runtime.py`):
 
-Measures inference latency for different K values using collected observations with CUDA synchronization.
+Measures inference latency for different K values.  Uses the two-venv architecture: launches `collect_obs.py` as a subprocess in the robocasa venv to gather observations, then benchmarks each K value in the model venv with CUDA synchronization.
 
 ```bash
+# From repo root, model venv (single terminal — no server needed):
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/profile_k_runtime.py \
     --K-values 3 5 8 12 \
     --n-warmup 5 --n-iters 50 \

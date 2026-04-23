@@ -1,17 +1,13 @@
 """Profile inference latency of noise-space mode selection vs. K.
 
-Loads the GR00T model ONCE, collects a small set of observations from a sim
-env using random actions, then benchmarks the action-head latency for
-K={3, 5, 8, 12} (or custom values).  No full episode rollout -- just
-repeated get_action calls on cached observations to isolate DiT throughput.
+Two-phase architecture matching the server/client venv split:
 
-Architecture:
-    - Model loads once, runs on GPU
-    - Observations collected from a short sim rollout using random actions
-    - For each K value, re-patches the action head and times N inference calls
-    - Also benchmarks baseline (no patch, K=1 equivalent) for comparison
+  Phase 1 (robocasa venv): Subprocess collects observations from a sim env
+      and pickles them to disk.
+  Phase 2 (model venv):    Main process loads the model, loads the pickled
+      observations, and benchmarks get_action latency for each K value.
 
-Usage (single terminal, model venv):
+Usage (model venv, from repo root):
     uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/profile_k_runtime.py \
         --K-values 3 5 8 12 \
         --n-warmup 5 --n-iters 50 \
@@ -22,6 +18,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,9 +31,53 @@ import torch
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from strategy import NoiseSelectionConfig, patch_action_head
+
+
+ROBOCASA_PYTHON = "gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python"
+COLLECT_OBS_SCRIPT = str(
+    Path(__file__).resolve().parent / "collect_obs.py"
+)
+
+
+# ---------------------------------------------------------------------------
+# Observation collection via subprocess
+# ---------------------------------------------------------------------------
+
+def collect_observations_subprocess(
+    env_name: str, n_obs: int, seed: int, max_episode_steps: int,
+    cache_dir: Path,
+) -> list[dict]:
+    """Launch collect_obs.py in the robocasa venv and load the results."""
+    obs_path = cache_dir / "obs_cache.pkl"
+
+    cmd = [
+        ROBOCASA_PYTHON,
+        COLLECT_OBS_SCRIPT,
+        "--env-name", env_name,
+        "--n-obs", str(n_obs),
+        "--seed", str(seed),
+        "--max-episode-steps", str(max_episode_steps),
+        "--output-path", str(obs_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("ERROR: Observation collection failed")
+        if result.stderr:
+            for line in result.stderr.strip().split("\n")[-15:]:
+                print(f"  {line}")
+        sys.exit(1)
+
+    if result.stdout:
+        for line in result.stdout.strip().split("\n"):
+            print(f"  {line}")
+
+    with open(obs_path, "rb") as f:
+        observations = pickle.load(f)
+
+    return observations
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +89,6 @@ def benchmark_get_action(policy, observations: list[dict], n_warmup: int,
     """Call get_action repeatedly and return per-call latencies in ms."""
     n_obs = len(observations)
 
-    # Warmup (not timed)
     for i in range(n_warmup):
         obs = observations[i % n_obs]
         policy.get_action(obs)
@@ -63,7 +105,7 @@ def benchmark_get_action(policy, observations: list[dict], n_warmup: int,
         torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        latencies.append((t1 - t0) * 1000)  # ms
+        latencies.append((t1 - t0) * 1000)
 
     return latencies
 
@@ -81,66 +123,6 @@ def compute_stats(latencies: list[float]) -> dict:
         "max_ms": round(float(arr.max()), 2),
         "n_iters": len(latencies),
     }
-
-
-# ---------------------------------------------------------------------------
-# Observation collection
-# ---------------------------------------------------------------------------
-
-def collect_observations(env_name: str, n_obs: int, seed: int,
-                         n_action_steps: int, max_episode_steps: int) -> list[dict]:
-    """Collect observations from a short sim rollout (single env, no server).
-
-    Uses the evaluation env infrastructure directly.  Returns a list of
-    observation dicts ready for ``policy.get_action()``.
-    """
-    from gr00t.eval.rollout_policy import (
-        MultiStepConfig,
-        VideoConfig,
-        WrapperConfigs,
-        create_eval_env,
-    )
-
-    wrapper_configs = WrapperConfigs(
-        video=VideoConfig(video_dir=None, max_episode_steps=max_episode_steps),
-        multistep=MultiStepConfig(
-            n_action_steps=n_action_steps,
-            max_episode_steps=max_episode_steps,
-            terminate_on_success=False,
-        ),
-    )
-    env = create_eval_env(
-        env_name=env_name, env_idx=0, total_n_envs=1,
-        wrapper_configs=wrapper_configs,
-    )
-
-    observations = []
-    obs, _ = env.reset(seed=seed)
-
-    # Add batch dim (policy expects batched observations)
-    def batch_obs(obs):
-        batched = {}
-        for key, val in obs.items():
-            if isinstance(val, np.ndarray):
-                batched[key] = val[np.newaxis]
-            elif isinstance(val, str):
-                batched[key] = (val,)
-            else:
-                batched[key] = val
-        return batched
-
-    observations.append(batch_obs(obs))
-
-    # Step through to collect diverse observations
-    for _ in range(n_obs - 1):
-        action = env.action_space.sample()
-        obs, _, terminated, truncated, _ = env.step(action)
-        observations.append(batch_obs(obs))
-        if terminated or truncated:
-            obs, _ = env.reset(seed=seed + len(observations))
-
-    env.close()
-    return observations
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +187,18 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Collect observations ---
+    # --- Phase 1: Collect observations (robocasa venv subprocess) ---
     print(f"Collecting {args.n_obs} observations from {args.env_name}...")
-    observations = collect_observations(
+    observations = collect_observations_subprocess(
         env_name=args.env_name,
         n_obs=args.n_obs,
         seed=42,
-        n_action_steps=8,
         max_episode_steps=args.max_episode_steps,
+        cache_dir=output_dir,
     )
-    print(f"  Collected {len(observations)} observations")
+    print(f"  Loaded {len(observations)} observations")
 
-    # --- Load model ---
+    # --- Phase 2: Load model and benchmark (model venv) ---
     print(f"\nLoading model from {args.model_path}...")
     t0 = time.monotonic()
     embodiment_tag = EmbodimentTag[args.embodiment_tag]
@@ -229,7 +211,6 @@ def main() -> None:
     load_time = time.monotonic() - t0
     print(f"  Model loaded in {load_time:.1f}s")
 
-    # Save the original get_action_with_features for restoration
     inner_policy = policy.policy
     original_fn = inner_policy.model.action_head.get_action_with_features
 
@@ -248,7 +229,6 @@ def main() -> None:
     for K in args.K_values:
         print(f"\nBenchmarking K={K} ({K}+3={K+3} NFEs)...")
 
-        # Restore original, then re-patch with new K
         inner_policy.model.action_head.get_action_with_features = original_fn
         cfg = NoiseSelectionConfig(K=K)
         _reset_fn = patch_action_head(inner_policy.model.action_head, cfg=cfg)

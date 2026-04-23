@@ -1,0 +1,48 @@
+{
+  "strategy_name": "diag_sm1.0_mg0.0_an5.0_K8_gaus",
+  "timestamp": "2026-04-23T22:55:49.333318+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/OpenDrawer_PandaOmron_Env"
+    ],
+    "n_episodes": 5,
+    "seed": 52,
+    "max_episode_steps": [
+      400
+    ],
+    "n_action_steps": 8,
+    "n_envs": 1,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/OpenDrawer_PandaOmron_Env": {
+      "n_episodes": 5,
+      "success_rate": 0.6,
+      "mean_reward": 0.6,
+      "mean_length": 36.0,
+      "std_length": 11.5,
+      "mean_duration_s": 34.65,
+      "successes": [
+        false,
+        true,
+        true,
+        false,
+        true
+      ],
+      "seeds": [
+        52,
+        53,
+        54,
+        55,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 5,
+    "total_envs": 1,
+    "overall_success_rate": 0.6,
+    "total_wall_time_s": 182.08
+  }
+}

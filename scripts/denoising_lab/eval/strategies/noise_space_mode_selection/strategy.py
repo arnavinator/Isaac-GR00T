@@ -27,6 +27,7 @@ Usage (notebook with DenoisingLab):
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from transformers.feature_extraction_utils import BatchFeature
@@ -60,6 +61,11 @@ class NoiseSelectionConfig:
 
     num_steps: int = 4
     """Number of denoising steps (remaining steps after selection)."""
+
+    noise_type: str = "gaussian"
+    """Noise distribution for candidates: ``"gaussian"`` (N(0,1), matches
+    baseline training) or ``"uniform"`` (Uniform[-sqrt(3), sqrt(3)],
+    variance-matched to N(0,1) for comparable norm statistics)."""
 
     n_exec_steps: int = 8
     """Overlap region for anchor consistency (action steps executed per chunk)."""
@@ -230,8 +236,16 @@ def denoise_with_noise_selection(
         gen = torch.Generator(device=device).manual_seed(seed)
     else:
         gen = None
-    noise_candidates = torch.randn(K, B, H, D, dtype=dtype, device=device,
-                                   generator=gen)
+
+    if cfg.noise_type == "uniform":
+        bound = math.sqrt(3.0)
+        noise_candidates = torch.rand(
+            K, B, H, D, dtype=dtype, device=device, generator=gen,
+        ) * (2 * bound) - bound
+    else:
+        noise_candidates = torch.randn(
+            K, B, H, D, dtype=dtype, device=device, generator=gen,
+        )
 
     # --- Step 2: Batch-evaluate 1 Euler step for all K candidates ---
     flat_noise = noise_candidates.reshape(K * B, H, D)

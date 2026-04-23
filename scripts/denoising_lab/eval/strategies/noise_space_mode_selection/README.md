@@ -169,9 +169,14 @@ class NoiseSelectionConfig:
     lambda_mag: float = 0.1      # velocity magnitude weight
     lambda_anchor: float = 0.5   # anchor consistency weight
     anchor_decay: float = 0.5    # geometric decay per overlap step
+    noise_type: str = "gaussian" # "gaussian" (N(0,1)) or "uniform" (variance-matched)
     num_steps: int = 4           # denoising steps
     n_exec_steps: int = 8        # action steps executed per chunk
 ```
+
+**Noise distribution options:**
+- `"gaussian"` (default): Standard normal N(0,1). Matches the distribution used during model training.
+- `"uniform"`: Uniform[-sqrt(3), sqrt(3)], variance-matched to N(0,1). Bounded support means no extreme outlier candidates; may provide more uniform coverage of the noise space for mode exploration. The per-dimension value range overlaps heavily with the Gaussian — any specific value (e.g., 0.75) is valid under both distributions.
 
 ### Analysis
 
@@ -200,7 +205,7 @@ class NoiseSelectionConfig:
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh
 # Or with custom parameters:
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh \
-    --K 8 --lambda-smooth 2.0 --anchor-decay 0.5
+    --K 8 --lambda-smooth 2.0 --anchor-decay 0.5 --noise-type uniform
 ```
 
 **Terminal 2 — Benchmark** (from repo root, robocasa venv):
@@ -238,6 +243,7 @@ uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/c
     --lambda-smooth 0.5 1.0 \
     --lambda-mag 0.0 0.02 0.05 0.1 \
     --lambda-anchor 0.5 1.0 2.0 3.0 \
+    --noise-type gaussian uniform \
     --output-dir ./calibration_results/noise_space_mode_selection
 ```
 

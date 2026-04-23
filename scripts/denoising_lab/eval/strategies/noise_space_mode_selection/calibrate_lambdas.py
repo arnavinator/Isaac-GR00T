@@ -21,6 +21,7 @@ Usage:
         --lambda-smooth 0.5 1.0 \\
         --lambda-mag 0.0 0.02 0.05 0.1 \\
         --lambda-anchor 0.5 1.0 2.0 3.0 \\
+        --noise-type gaussian uniform \\
         --output-dir ./calibration_results/noise_space_mode_selection
 """
 
@@ -53,7 +54,7 @@ def config_dirname(cfg: NoiseSelectionConfig) -> str:
     """Produce a short, filesystem-safe directory name for a config."""
     return (
         f"sm{cfg.lambda_smooth}_mg{cfg.lambda_mag}"
-        f"_an{cfg.lambda_anchor}_K{cfg.K}"
+        f"_an{cfg.lambda_anchor}_K{cfg.K}_{cfg.noise_type[:4]}"
     )
 
 
@@ -65,6 +66,7 @@ def config_dict(cfg: NoiseSelectionConfig) -> dict[str, float]:
         "lambda_mag": cfg.lambda_mag,
         "lambda_anchor": cfg.lambda_anchor,
         "anchor_decay": cfg.anchor_decay,
+        "noise_type": cfg.noise_type,
     }
 
 
@@ -163,8 +165,9 @@ def run_eval_client(
 def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
     """Build the full grid of NoiseSelectionConfig objects from CLI args."""
     configs = []
-    for ls, lm, la in itertools.product(
+    for ls, lm, la, nt in itertools.product(
         args.lambda_smooth, args.lambda_mag, args.lambda_anchor,
+        args.noise_type,
     ):
         configs.append(NoiseSelectionConfig(
             K=args.K,
@@ -172,6 +175,7 @@ def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
             lambda_mag=lm,
             lambda_anchor=la,
             anchor_decay=args.anchor_decay,
+            noise_type=nt,
         ))
     return configs
 
@@ -236,6 +240,12 @@ def parse_args() -> argparse.Namespace:
         "--anchor-decay", type=float, default=0.5,
         help="Per-step decay for distance-weighted anchor scoring",
     )
+    parser.add_argument(
+        "--noise-type", nargs="+", type=str,
+        default=["gaussian", "uniform"],
+        choices=["gaussian", "uniform"],
+        help="Noise distributions to include in the grid",
+    )
 
     # Model / server
     parser.add_argument(
@@ -299,6 +309,7 @@ def main() -> None:
     print(f"         lambda_mag={args.lambda_mag}")
     print(f"         lambda_anchor={args.lambda_anchor}")
     print(f"  Fixed: K={args.K}, anchor_decay={args.anchor_decay}")
+    print(f"  Noise types: {args.noise_type}")
     print(f"  Episodes scored: {len(eval_seeds) * len(args.env_names) * n_configs}")
     print(f"  Episodes run:    {n_actual}")
     print(f"  Seeds: {eval_seeds}")
@@ -429,6 +440,7 @@ def _write_results(
             "lambda_smooth": args.lambda_smooth,
             "lambda_mag": args.lambda_mag,
             "lambda_anchor": args.lambda_anchor,
+            "noise_type": args.noise_type,
             "K": args.K,
             "anchor_decay": args.anchor_decay,
         },
@@ -460,6 +472,7 @@ def _print_ranking(results: list[dict[str, Any]]) -> None:
     best = ranked[0]
     print(f"\nBest config: {best['config_name']}")
     print(f"  K:             {best['config']['K']}")
+    print(f"  noise_type:    {best['config']['noise_type']}")
     print(f"  lambda_smooth: {best['config']['lambda_smooth']}")
     print(f"  lambda_mag:    {best['config']['lambda_mag']}")
     print(f"  lambda_anchor: {best['config']['lambda_anchor']}")

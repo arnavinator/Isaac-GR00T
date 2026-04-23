@@ -68,6 +68,18 @@ class DDTOConfig:
     num_steps: int = 4
     """Number of denoising steps (standard 4-step Euler)."""
 
+    n_action_dims: int | None = 12
+    """Number of active action dims for loss computation.  The raw tensor is
+    padded to 128 dims for multi-embodiment support; only the first
+    ``n_action_dims`` carry signal.  Set to ``None`` to use all dims.
+    PandaOmron: 12."""
+
+    n_action_horizon: int | None = 16
+    """Number of active timesteps for loss computation.  The raw tensor is
+    padded to 50 timesteps; only the first ``n_action_horizon`` are decoded
+    into physical actions.  Set to ``None`` to use all timesteps.
+    PandaOmron: 16."""
+
 
 # ---------------------------------------------------------------------------
 # Shared helper: evaluate DiT velocity field
@@ -175,9 +187,16 @@ def denoise_ddto(
     # ================================================================
     # Phase 1: 1-step forward with grad → fully-extrapolated proxy
     # ================================================================
-    eps = epsilon.detach().clone().requires_grad_(True)
 
-    with torch.enable_grad():
+    # Need both: inference_mode(False) to exit the @torch.inference_mode()
+    # on get_action(), and enable_grad() to override the @torch.no_grad()
+    # on patched_get_action_with_features().
+    # eps MUST be created inside this block — tensors created under
+    # inference_mode are "inference tensors" that cannot participate in
+    # autograd (PyTorch raises "Inference tensors cannot be saved for
+    # backward").
+    with torch.inference_mode(False), torch.enable_grad():
+        eps = epsilon.detach().clone().requires_grad_(True)
         # Single DiT forward pass (1 NFE) — gradients tracked
         v0 = _evaluate_velocity(
             action_head, eps, 0,
@@ -188,21 +207,29 @@ def denoise_ddto(
         # In rectified flow: v(ε,0) ≈ data − ε, so ε + v(ε,0) ≈ data_predicted.
         a_1_star = eps + 1.0 * v0  # (B, H, D)
 
+        # Slice to active dims — the raw (B, 50, 128) tensor is padded for
+        # multi-embodiment support; only the first n_action_horizon timesteps
+        # and n_action_dims action dims carry signal.  Computing losses on
+        # padding wastes the gradient on meaningless dimensions.
+        h_end = cfg.n_action_horizon if cfg.n_action_horizon is not None else H
+        d_end = cfg.n_action_dims if cfg.n_action_dims is not None else D
+        a_active = a_1_star[:, :h_end, :d_end]  # (B, h_end, d_end)
+
         # --- Quality loss on the proxy ---
         loss = torch.tensor(0.0, device=device, dtype=dtype)
 
         # Smoothness: temporal roughness of predicted trajectory
-        diffs = a_1_star[:, 1:, :] - a_1_star[:, :-1, :]
+        diffs = a_active[:, 1:, :] - a_active[:, :-1, :]
         smooth_loss = diffs.pow(2).sum(dim=(1, 2)).mean()
         loss = loss + cfg.lambda_smooth * smooth_loss
 
         # Anchor consistency with previous chunk (overlap-region, decay-weighted)
         if prev_actions is not None and cfg.lambda_anchor > 0:
-            n_overlap = min(cfg.n_exec_steps, H - cfg.n_exec_steps)
+            n_overlap = min(cfg.n_exec_steps, h_end - cfg.n_exec_steps)
 
             if n_overlap > 0:
-                candidate_near = a_1_star[:, :n_overlap, :]
-                prev_tail = prev_actions[:, cfg.n_exec_steps:cfg.n_exec_steps + n_overlap, :]
+                candidate_near = a_active[:, :n_overlap, :]
+                prev_tail = prev_actions[:, cfg.n_exec_steps:cfg.n_exec_steps + n_overlap, :d_end]
 
                 weights = torch.tensor(
                     [cfg.anchor_decay ** j for j in range(n_overlap)],
@@ -278,8 +305,8 @@ def denoise_ddto(
                   f"a_norm={actions.float().norm():.4f}  "
                   f"v_norm={velocity.float().norm():.4f}")
 
-    # Diagnostics: smoothness of final output
-    diffs_final = actions[:, 1:, :] - actions[:, :-1, :]
+    # Diagnostics: smoothness of final output (active dims only)
+    diffs_final = actions[:, 1:h_end, :d_end] - actions[:, :h_end - 1, :d_end]
     diagnostics["quality_loss_after"] = (
         diffs_final.float().pow(2).sum(dim=(1, 2)).mean().item()
     )

@@ -66,6 +66,7 @@ def config_dict(cfg: NoiseSelectionConfig) -> dict:
         "lambda_anchor": cfg.lambda_anchor,
         "anchor_decay": cfg.anchor_decay,
         "noise_type": cfg.noise_type,
+        "score_dims": cfg.score_dims,
         "num_steps": cfg.num_steps,
         "n_exec_steps": cfg.n_exec_steps,
     }
@@ -227,6 +228,7 @@ def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
             lambda_anchor=la,
             anchor_decay=args.anchor_decay,
             noise_type=nt,
+            score_dims=args.score_dims,
         ))
     return configs
 
@@ -276,6 +278,8 @@ def parse_args() -> argparse.Namespace:
     # Fixed params
     parser.add_argument("--K", type=int, default=8)
     parser.add_argument("--anchor-decay", type=float, default=0.5)
+    parser.add_argument("--score-dims", type=int, default=12,
+                        help="Leading action dims to score (12 for PandaOmron)")
 
     # Truncation
     parser.add_argument(
@@ -298,6 +302,8 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     args.output_dir = Path(args.output_dir)
+    if args.score_dims is not None and args.score_dims <= 0:
+        args.score_dims = None
     return args
 
 

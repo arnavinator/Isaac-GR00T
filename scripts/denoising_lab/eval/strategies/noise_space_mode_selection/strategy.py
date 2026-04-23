@@ -19,7 +19,7 @@ Usage (server):
 
 Usage (notebook with DenoisingLab):
     from strategy import denoise_with_lab, NoiseSelectionConfig
-    cfg = NoiseSelectionConfig(K=5)
+    cfg = NoiseSelectionConfig(K=8)
     actions, best_noise, last_velocity = denoise_with_lab(lab, features, seed=42, cfg=cfg)
     decoded = lab.decode_raw_actions(actions)
 """
@@ -42,8 +42,10 @@ from transformers.feature_extraction_utils import BatchFeature
 class NoiseSelectionConfig:
     """Tunable parameters for noise-space mode selection."""
 
-    K: int = 5
-    """Number of noise candidates to evaluate."""
+    K: int = 8
+    """Number of noise candidates to evaluate.  Default 8 based on
+    ``profile_k_runtime.py`` results showing K=8 provides good mode
+    exploration with acceptable latency overhead."""
 
     lambda_smooth: float = 1.0
     """Weight for temporal smoothness score (penalises jerky actions)."""
@@ -69,6 +71,13 @@ class NoiseSelectionConfig:
 
     n_exec_steps: int = 8
     """Overlap region for anchor consistency (action steps executed per chunk)."""
+
+    score_dims: int | None = 12
+    """Number of leading action dims to use for smoothness and magnitude scoring.
+    Dims beyond this are padding in the multi-embodiment action space and carry
+    only noise (the model has no training loss on them).  Set to ``None`` to
+    score all dims.  Default 12 covers PandaOmron's meaningful dims: EEF
+    position (3) + rotation (3) + gripper (1) + base_motion (4) + control_mode (1)."""
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +172,15 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
         a = action_proxy[k].float()  # (B, H, D)
         v = velocities[k].float()    # (B, H, D)
 
+        # Slice to meaningful dims for smoothness/magnitude scoring.
+        # Padding dims beyond score_dims carry only noise (no training loss)
+        # and would dominate these metrics.
+        sd = cfg.score_dims
+        a_scored = a[:, :, :sd] if sd is not None else a
+        v_scored = v[:, :, :sd] if sd is not None else v
+
         # Temporal smoothness: penalise jerky predicted actions
-        diffs = a[:, 1:, :] - a[:, :-1, :]  # (B, H-1, D)
+        diffs = a_scored[:, 1:, :] - a_scored[:, :-1, :]  # (B, H-1, D')
         smoothness = -(diffs ** 2).sum(dim=(1, 2))  # (B,)
         smooth_contrib = cfg.lambda_smooth * smoothness
         scores[k] += smooth_contrib
@@ -172,7 +188,7 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
             bd_smooth[k] = smooth_contrib
 
         # Velocity magnitude: lower magnitude = noise was closer to manifold
-        mag = -(v ** 2).sum(dim=(1, 2))  # (B,)
+        mag = -(v_scored ** 2).sum(dim=(1, 2))  # (B,)
         mag_contrib = cfg.lambda_mag * mag
         scores[k] += mag_contrib
         if return_breakdown:
@@ -189,8 +205,9 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
             n_overlap = min(n, n_prev_tail)
 
             if n_overlap > 0:
-                candidate_near = a[:, :n_overlap, :]           # (B, n_overlap, D)
-                prev_tail = prev_actions[:, n:n + n_overlap, :].float()  # (B, n_overlap, D)
+                candidate_near = a_scored[:, :n_overlap, :]           # (B, n_overlap, D')
+                prev_scored = prev_actions[:, :, :sd].float() if sd is not None else prev_actions.float()
+                prev_tail = prev_scored[:, n:n + n_overlap, :]        # (B, n_overlap, D')
 
                 # Distance-weighted: step j gets weight decay^j
                 weights = torch.tensor(
@@ -235,7 +252,7 @@ def denoise_with_noise_selection(
         state_features: Encoded state (B, state_horizon, hidden_dim).
         embodiment_id: Embodiment IDs (B,).
         backbone_output: Full backbone output (BatchFeature).
-        cfg: NoiseSelectionConfig. Defaults to K=5.
+        cfg: NoiseSelectionConfig. Defaults to K=8.
         seed: Random seed for noise generation.
         prev_actions: Optional (B, H, D) denoised actions from previous chunk
             for action-space anchor consistency scoring.

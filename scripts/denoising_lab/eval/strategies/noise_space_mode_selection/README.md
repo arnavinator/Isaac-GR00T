@@ -1,6 +1,6 @@
 ## Strategy 10: Noise-Space Mode Selection via Velocity Preview
 
-**Category:** Novel, drop-in | **NFEs:** K + 3 (~8 for K=5) | **Retraining:** None
+**Category:** Novel, drop-in | **NFEs:** K + 3 (~11 for K=8) | **Retraining:** None
 
 ### Overview
 
@@ -41,15 +41,15 @@ Evaluate each candidate's fully-extrapolated action proxy using a quality score 
 
 $$k^* = \arg\max_k \; S\!\left(a^{(k),\, 1.0*},\; v^{(k)},\; a_{\text{prev}}\right)$$
 
-The quality proxy $S$ combines three signals (all computable from the 1-step output):
+The quality proxy $S$ combines three signals (all computable from the 1-step output). All norms are computed over the first `score_dims` action dimensions only (default 12 for PandaOmron), excluding padding dims that carry undenoised noise:
 
 $$S(a^*, v, a_{\text{prev}}) = \underbrace{-\lambda_{\text{smooth}} \sum_{j} \| a^*[j{+}1] - a^*[j] \|^2}_{\text{temporal smoothness}} + \underbrace{-\lambda_{\text{mag}} \| v \|^2}_{\text{velocity magnitude}} + \underbrace{-\lambda_{\text{anchor}} \sum_{j=0}^{n-1} w_j \| a^*[j] - a_{\text{prev}}[n_{\text{exec}} + j] \|^2}_{\text{action-space anchor consistency}}$$
 
 where $w_j = \gamma^j / \sum_i \gamma^i$ are geometrically decaying weights ($\gamma$ = `anchor_decay`, default 0.5). Step 0 of the overlap gets ~50% of the total weight.
 
-- **Smoothness**: Rough predicted actions indicate a noisy or unstable mode — penalize.
-- **Velocity magnitude**: Lower velocity suggests the noise was already closer to the action manifold — reward.
-- **Anchor consistency** (enabled after the first chunk): The candidate's predicted near-future (steps 0 to $n-1$) should align with the previous chunk's predicted-but-unexecuted tail (steps $n_{\text{exec}}$ to $n_{\text{exec}} + n - 1$). Both tensors are action estimates in the same normalized space, making L2 distance a natural metric. The decay weighting ensures nearer predictions (which are more reliable) dominate the comparison. The server patch caches the full denoised `prev_actions` across calls and clears it on episode reset.
+- **Smoothness**: Rough predicted actions indicate a noisy or unstable mode — penalize. Computed on `score_dims` meaningful dims only.
+- **Velocity magnitude**: Lower velocity suggests the noise was already closer to the action manifold — reward. Computed on `score_dims` dims only.
+- **Anchor consistency** (enabled after the first chunk): The candidate's predicted near-future (steps 0 to $n-1$) should align with the previous chunk's predicted-but-unexecuted tail (steps $n_{\text{exec}}$ to $n_{\text{exec}} + n - 1$). Both tensors are action estimates in the same normalized space, making L2 distance a natural metric. The decay weighting ensures nearer predictions (which are more reliable) dominate the comparison. Also restricted to `score_dims` dims. The server patch caches the full denoised `prev_actions` across calls and clears it on episode reset.
 
 **Step 3 — Commit and complete:**
 
@@ -61,7 +61,7 @@ $$a_t^{0.75} = a_t^{0.50} + \Delta\tau \cdot v(a_t^{0.50},\; 0.50,\; o_t,\; l_t)
 
 $$a_t^{1.0} = a_t^{0.75} + \Delta\tau \cdot v(a_t^{0.75},\; 0.75,\; o_t,\; l_t)$$
 
-Total: $K + 3$ NFEs. For $K = 5$: 8 NFEs. The step-0 evaluation is batched ($K \cdot B$ samples in one forward pass), so wall-clock latency is approximately 4 sequential DiT forward passes — **same as baseline** if the GPU has spare batch capacity.
+Total: $K + 3$ NFEs. For $K = 8$: 11 NFEs. The step-0 evaluation is batched ($K \cdot B$ samples in one forward pass), so wall-clock latency is approximately 4 sequential DiT forward passes — **same as baseline** if the GPU has spare batch capacity.
 
 ### Pseudocode
 
@@ -69,11 +69,12 @@ Total: $K + 3$ NFEs. For $K = 5$: 8 NFEs. The step-0 evaluation is batched ($K \
 def denoise_with_noise_selection(
     lab,                     # DenoisingLab instance
     features,                # BackboneFeatures
-    K=5,                     # number of noise candidates
+    K=8,                     # number of noise candidates
     lambda_smooth=1.0,
     lambda_mag=0.1,
     lambda_anchor=0.5,
     anchor_decay=0.5,        # geometric decay for distance weighting
+    score_dims=12,           # only score the first 12 meaningful action dims
     prev_actions=None,       # cached denoised actions from previous chunk (auto-managed in server)
     seed=None,
 ):
@@ -99,28 +100,30 @@ def denoise_with_noise_selection(
     velocities = velocity_0.reshape(K, B, H, D)
 
     # --- Step 3: Score each candidate using fully-extrapolated proxy ---
+    # Slice to meaningful dims only — padding dims carry undenoised noise
+    sd = score_dims
     scores = torch.zeros(K, B)
     for k in range(K):
-        a = actions_1_star[k]  # (B, H, D) — signal-dominated proxy
-        v = velocities[k]      # (B, H, D)
+        a = actions_1_star[k][:, :, :sd]  # (B, H, score_dims)
+        v = velocities[k][:, :, :sd]      # (B, H, score_dims)
 
-        # Temporal smoothness
+        # Temporal smoothness (on meaningful dims only)
         diffs = a[:, 1:, :] - a[:, :-1, :]
         scores[k] -= lambda_smooth * (diffs ** 2).sum(dim=(1, 2))
 
-        # Velocity magnitude
+        # Velocity magnitude (on meaningful dims only)
         scores[k] -= lambda_mag * (v ** 2).sum(dim=(1, 2))
 
-        # Action-space anchor consistency (distance-weighted L2)
+        # Action-space anchor consistency (distance-weighted L2, meaningful dims)
         if prev_actions is not None:
             n_overlap = min(n_exec, H - n_exec)
-            candidate_near = a[:, :n_overlap, :]                  # (B, n, D)
-            prev_tail = prev_actions[:, n_exec:n_exec+n_overlap]  # (B, n, D)
+            candidate_near = a[:, :n_overlap, :]
+            prev_tail = prev_actions[:, n_exec:n_exec+n_overlap, :sd]
 
             weights = [anchor_decay ** j for j in range(n_overlap)]
             weights = weights / sum(weights)  # normalize
 
-            sq_dist = ((candidate_near - prev_tail) ** 2).sum(dim=2)  # (B, n)
+            sq_dist = ((candidate_near - prev_tail) ** 2).sum(dim=2)
             scores[k] -= lambda_anchor * (sq_dist * weights).sum(dim=1)
 
     # --- Step 4: Select best noise per batch element ---
@@ -164,27 +167,31 @@ Action chunking is unchanged. The noise selection happens entirely before the ma
 ```python
 @dataclass
 class NoiseSelectionConfig:
-    K: int = 5               # noise candidates to evaluate
+    K: int = 8               # noise candidates (default from profile_k_runtime.py)
     lambda_smooth: float = 1.0   # temporal smoothness weight
     lambda_mag: float = 0.1      # velocity magnitude weight
     lambda_anchor: float = 0.5   # anchor consistency weight
     anchor_decay: float = 0.5    # geometric decay per overlap step
     noise_type: str = "gaussian" # "gaussian" (N(0,1)) or "uniform" (variance-matched)
-    num_steps: int = 4           # denoising steps
     n_exec_steps: int = 8        # action steps executed per chunk
+    score_dims: int | None = 12  # leading action dims to score (None = all)
+    num_steps: int = 4           # denoising steps
 ```
+
+**`score_dims` (critical for correctness):**
+GR00T's multi-embodiment action space is padded to 128 dims, but only the first `score_dims` are meaningful for a given embodiment. For PandaOmron, the 12 meaningful dims are: EEF position (3) + rotation (3) + gripper (1) + base_motion (4) + control_mode (1). Dims 12+ are padding that the model has no training loss on — they carry undenoised noise through all 4 steps. Without `score_dims`, the smoothness metric is ~100% determined by the smoothness of this padding noise, which has no task relevance. Setting `score_dims=12` restricts smoothness, magnitude, and anchor to the meaningful action dimensions.
 
 **Noise distribution options:**
 - `"gaussian"` (default): Standard normal N(0,1). Matches the distribution used during model training.
-- `"uniform"`: Uniform[-sqrt(3), sqrt(3)], variance-matched to N(0,1). Bounded support means no extreme outlier candidates; may provide more uniform coverage of the noise space for mode exploration. The per-dimension value range overlaps heavily with the Gaussian — any specific value (e.g., 0.75) is valid under both distributions.
+- `"uniform"`: Uniform[-sqrt(3), sqrt(3)], variance-matched to N(0,1). Bounded support means no extreme outlier candidates; may provide more uniform coverage of the noise space for mode exploration.
 
 ### Analysis
 
 | Aspect | Assessment |
 |--------|------------|
-| **Expected quality** | Potentially very high. Golden Ticket (Patil et al., 2026) reports up to 58% relative improvement from noise optimization alone. The fully-extrapolated proxy $a_{1.0}^*$ gives a signal-dominated estimate of the clean action, enabling meaningful quality scoring. For $K = 5$, we're selecting the best of 5 modes — in multi-modal action distributions (e.g., approach object from different directions), this can avoid catastrophically bad modes. The server patch caches `prev_actions` across calls and clears on episode reset for clean anchor consistency. |
+| **Expected quality** | Potentially very high. Golden Ticket (Patil et al., 2026) reports up to 58% relative improvement from noise optimization alone. The fully-extrapolated proxy $a_{1.0}^*$ gives a signal-dominated estimate of the clean action, enabling meaningful quality scoring. For $K = 8$, we're selecting the best of 8 modes — in multi-modal action distributions (e.g., approach object from different directions), this can avoid catastrophically bad modes. The server patch caches `prev_actions` across calls and clears on episode reset for clean anchor consistency. |
 | **Risk** | (1) The scoring function weights ($\lambda$) require tuning — use `calibrate_lambdas.py` for systematic grid search. (2) For observations with unimodal action distributions, all $K$ candidates produce similar results — the selection provides no benefit. (3) The single-step proxy is a first-order extrapolation that may diverge for highly curved velocity fields, but this only affects scoring accuracy, not the denoised output. |
-| **Latency** | $K + 3$ NFEs. For $K = 5$: the step-0 batch uses $5B$ samples in a single forward pass. On GPUs with spare batch capacity (typical for $B = 1$ inference), this costs the same wall-clock time as 1 sequential NFE. Total wall-clock: ~4 sequential forward passes. Use `profile_k_runtime.py` to measure actual latency for different $K$ values on your hardware. |
+| **Latency** | $K + 3$ NFEs. For $K = 8$: the step-0 batch uses $8B$ samples in a single forward pass. On GPUs with spare batch capacity (typical for $B = 1$ inference), this costs the same wall-clock time as 1 sequential NFE. Total wall-clock: ~4 sequential forward passes. Use `profile_k_runtime.py` to measure actual latency for different $K$ values on your hardware. |
 | **Implementation** | Moderate — requires batched forward pass with duplicated VLM features, scoring function, per-batch-element selection, and episode-reset cache clearing. |
 
 ### Prior Work and What Makes This Novel
@@ -205,7 +212,7 @@ class NoiseSelectionConfig:
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh
 # Or with custom parameters:
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh \
-    --K 8 --lambda-smooth 2.0 --anchor-decay 0.5 --noise-type uniform
+    --K 8 --lambda-smooth 2.0 --anchor-decay 0.5 --noise-type uniform --score-dims 12
 ```
 
 **Terminal 2 — Benchmark** (from repo root, robocasa venv):
@@ -220,7 +227,7 @@ bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_eval.s
 from scripts.denoising_lab.eval.strategies.noise_space_mode_selection.strategy import (
     denoise_with_lab, NoiseSelectionConfig,
 )
-cfg = NoiseSelectionConfig(K=5, lambda_smooth=1.0, lambda_mag=0.1, anchor_decay=0.5)
+cfg = NoiseSelectionConfig(K=8, lambda_smooth=1.0, lambda_mag=0.1, anchor_decay=0.5, score_dims=12)
 actions, best_noise, last_velocity = denoise_with_lab(lab, features, seed=42, cfg=cfg)
 decoded = lab.decode_raw_actions(actions)
 
@@ -238,13 +245,13 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of scoring w
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/calibrate_lambdas.py \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --max-episode-steps 480 \
-    --K 8 \
+    --K 8 --score-dims 12 \
     --n-episodes 3 --seed 42 \
     --lambda-smooth 0.7 1.0 \
     --lambda-mag 0.01 \
     --lambda-anchor 1.0 2.0 \
     --noise-type gaussian uniform \
-    --output-dir ~/my_Isaac-GR00T/scripts/denoising_lab/eval/strategies/noise_space_mode_selection/noise_space_mode_selection1
+    --output-dir ./calibration_results/noise_space_mode_selection
 ```
 
 **Runtime profiling** (`profile_k_runtime.py`):
@@ -270,15 +277,16 @@ uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/c
     --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --max-episode-steps 480 \
     --n-episodes 4 --seed 42 \
+    --score-dims 12 \
     --lambda-smooth 0.7 1.0 \
     --lambda-mag 0.01 \
     --lambda-anchor 1.0 2.0 \
     --noise-type gaussian \
-    --truncate-horizon 16 --truncate-dim 29 \
-    --output-dir ~/my_Isaac-GR00T/scripts/denoising_lab/eval/strategies/noise_space_mode_selection/diagnostic_results1
+    --truncate-horizon 16 --truncate-dim 12 \
+    --output-dir ./diagnostics_results
 ```
 
-Use `--truncate-horizon 16 --truncate-dim 29` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 29)`, reducing storage by ~14x.
+Use `--truncate-horizon 16 --truncate-dim 12` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 12)`, storing only the meaningful action dimensions.
 
 **Loading diagnostics in a notebook:**
 ```python

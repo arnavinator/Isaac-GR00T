@@ -403,3 +403,58 @@ This is exactly how human motor control works — we move quickly and confidentl
 **What makes this novel for VLAs:** To our knowledge, this is the first VLA denoising strategy that: (1) uses **phase-separated denoising** with a structural phase followed by a fixed-timestep iterative refinement phase — leveraging the empirically-discovered property that the DiT functions as a convergent iterative refiner when conditioned on a fixed late timestep; (2) computes a **per-position convergence map** from the refinement phase, revealing which horizon timesteps the model is confident about — a novel diagnostic signal with no analog in any prior denoising strategy; (3) uses the convergence map to **adaptively set the execution horizon**, feeding denoising quality directly back into the control loop — creating the first self-regulating VLA that plans cautiously when uncertain and executes confidently when certain, mirroring human motor control. The combination of multigrid-inspired phase separation, fixed-point convergence theory, diffusion forcing-inspired heterogeneous resolution, and adaptive MPC-inspired execution gating synthesizes ideas from numerical methods, dynamical systems, generative modeling, and control theory into a unified framework that is greater than the sum of its parts.
 
 ---
+
+### How to Run
+
+**1. Start the server** (Terminal 1 — main model venv):
+
+```bash
+# Default parameters (theta=0.5, K_max=6, clamp_uncertain=True)
+bash scripts/denoising_lab/eval/strategies/convergence_gated_iterative_refinement/run_server.sh
+
+# With verbose logging (shows per-chunk NFEs, convergence status, adaptive horizon)
+bash scripts/denoising_lab/eval/strategies/convergence_gated_iterative_refinement/run_server.sh --verbose
+
+# Custom parameters
+bash scripts/denoising_lab/eval/strategies/convergence_gated_iterative_refinement/run_server.sh \
+    --theta 0.3 --K-max 4 --tau-refine 750 --no-clamp-uncertain
+```
+
+**2. Run the benchmark** (Terminal 2 — robocasa sim venv):
+
+```bash
+bash scripts/denoising_lab/eval/strategies/convergence_gated_iterative_refinement/run_eval.sh
+
+# Or with more episodes
+bash scripts/denoising_lab/eval/strategies/convergence_gated_iterative_refinement/run_eval.sh --n-episodes 50
+```
+
+**3. Notebook experimentation** (DenoisingLab):
+
+```python
+from scripts.denoising_lab.eval.strategies.convergence_gated_iterative_refinement.strategy import (
+    denoise_with_lab, ConvergenceGatedConfig, RefinementDiagnostics,
+)
+
+cfg = ConvergenceGatedConfig(theta=0.5, K_max=6)
+actions, diag = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+decoded = lab.decode_raw_actions(actions)
+
+# Inspect convergence
+print(f"Converged: {diag.converged}, NFEs: {diag.total_nfe}")
+print(f"Adaptive horizon: {diag.adaptive_n_exec}/{diag.original_n_exec}")
+print(f"Position labels: {diag.position_labels}")
+```
+
+### CLI Parameters
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--theta` | 0.5 | Per-position convergence threshold |
+| `--K-max` | 6 | Max Phase 2 refinement iterations |
+| `--K-min` | 2 | Min iterations before early stopping |
+| `--tau-refine` | 750 | Fixed timestep bucket for refinement |
+| `--dt-refine` | 0.25 | Euler step size for refinement |
+| `--n-exec` | 8 | Standard execution horizon |
+| `--n-min` | 2 | Safety floor for adaptive horizon |
+| `--clamp-uncertain` / `--no-clamp-uncertain` | True | Replace uncertain tail actions with last converged action |

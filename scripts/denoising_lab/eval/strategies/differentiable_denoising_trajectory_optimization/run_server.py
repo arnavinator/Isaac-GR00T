@@ -69,6 +69,12 @@ class ServerConfig:
     num_steps: int = 4
     """Number of denoising steps."""
 
+    n_action_dims: int | None = 12
+    """Active action dims for loss computation (PandaOmron: 12). None = all."""
+
+    n_action_horizon: int | None = 16
+    """Active timesteps for loss computation (PandaOmron: 16). None = all."""
+
 
 def main(config: ServerConfig):
     variant = "A (mode reg)" if config.lambda_mode > 0 else "B (no mode reg)"
@@ -101,6 +107,8 @@ def main(config: ServerConfig):
         n_exec_steps=config.n_exec_steps,
         eta=config.eta,
         num_steps=config.num_steps,
+        n_action_dims=config.n_action_dims,
+        n_action_horizon=config.n_action_horizon,
     )
     reset_fn = patch_action_head(policy.model.action_head, cfg=cfg)
     print(f"  Strategy:   ddto (1 grad + {config.num_steps} Euler = {config.num_steps + 1} NFEs)")

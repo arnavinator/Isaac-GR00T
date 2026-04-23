@@ -48,7 +48,7 @@ class ServerConfig:
 
     # --- Noise selection parameters ---
 
-    K: int = 5
+    K: int = 8
     """Number of noise candidates to evaluate."""
 
     lambda_smooth: float = 1.0
@@ -66,6 +66,9 @@ class ServerConfig:
     noise_type: str = "gaussian"
     """Noise distribution for candidates: "gaussian" or "uniform"."""
 
+    score_dims: int | None = 12
+    """Number of leading action dims to score (None = all). Default 12 for PandaOmron."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T server with NOISE-SPACE MODE SELECTION")
@@ -75,7 +78,8 @@ def main(config: ServerConfig):
     print(f"  Host:       {config.host}:{config.port}")
     print(f"  K={config.K}  smooth={config.lambda_smooth}  "
           f"mag={config.lambda_mag}  anchor={config.lambda_anchor}  "
-          f"decay={config.anchor_decay}  noise={config.noise_type}")
+          f"decay={config.anchor_decay}  noise={config.noise_type}  "
+          f"score_dims={config.score_dims}")
 
     if config.model_path.startswith("/") and not os.path.exists(config.model_path):
         raise FileNotFoundError(f"Model path {config.model_path} does not exist")
@@ -95,6 +99,7 @@ def main(config: ServerConfig):
         lambda_anchor=config.lambda_anchor,
         anchor_decay=config.anchor_decay,
         noise_type=config.noise_type,
+        score_dims=config.score_dims,
     )
     reset_fn = patch_action_head(policy.model.action_head, cfg=cfg)
     print(f"  Strategy:   noise_space_mode_selection ({config.K}+3 NFEs)")

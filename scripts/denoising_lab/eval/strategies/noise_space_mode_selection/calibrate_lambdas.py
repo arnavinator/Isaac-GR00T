@@ -67,6 +67,7 @@ def config_dict(cfg: NoiseSelectionConfig) -> dict[str, float]:
         "lambda_anchor": cfg.lambda_anchor,
         "anchor_decay": cfg.anchor_decay,
         "noise_type": cfg.noise_type,
+        "score_dims": cfg.score_dims,
     }
 
 
@@ -176,6 +177,7 @@ def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
             lambda_anchor=la,
             anchor_decay=args.anchor_decay,
             noise_type=nt,
+            score_dims=args.score_dims,
         ))
     return configs
 
@@ -246,6 +248,11 @@ def parse_args() -> argparse.Namespace:
         choices=["gaussian", "uniform"],
         help="Noise distributions to include in the grid",
     )
+    parser.add_argument(
+        "--score-dims", type=int, default=12,
+        help="Number of leading action dims to score (12 for PandaOmron). "
+             "Use 0 or negative to score all dims.",
+    )
 
     # Model / server
     parser.add_argument(
@@ -283,6 +290,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-episode-steps must have same length as --env-names")
 
     args.output_dir = Path(args.output_dir)
+    if args.score_dims is not None and args.score_dims <= 0:
+        args.score_dims = None
     return args
 
 
@@ -443,6 +452,7 @@ def _write_results(
             "noise_type": args.noise_type,
             "K": args.K,
             "anchor_decay": args.anchor_decay,
+            "score_dims": args.score_dims,
         },
         "ranked_results": ranked,
     }
@@ -473,6 +483,7 @@ def _print_ranking(results: list[dict[str, Any]]) -> None:
     print(f"\nBest config: {best['config_name']}")
     print(f"  K:             {best['config']['K']}")
     print(f"  noise_type:    {best['config']['noise_type']}")
+    print(f"  score_dims:    {best['config']['score_dims']}")
     print(f"  lambda_smooth: {best['config']['lambda_smooth']}")
     print(f"  lambda_mag:    {best['config']['lambda_mag']}")
     print(f"  lambda_anchor: {best['config']['lambda_anchor']}")

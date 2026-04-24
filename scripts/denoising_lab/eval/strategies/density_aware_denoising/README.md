@@ -528,4 +528,69 @@ The monitor and guided modes are **nearly free** — the batch-size increase fro
 
 **What makes this novel for VLAs:** To our knowledge, **no prior work — in image generation, video generation, or robot action generation — has used velocity divergence estimation at inference time to improve the quality of generative model outputs.** The change-of-variables formula and Hutchinson estimator have been foundational tools for *training* continuous normalizing flows (Chen et al., 2018; Grathwohl et al., 2019), but their application to *inference-time quality estimation and candidate ranking* is entirely new. The reason is likely practical: in image diffusion with 50–1000 denoising steps, the accumulated divergence estimate over so many steps would be too noisy. But flow matching VLAs use only 4 coarse steps — few enough that the Euler-approximated integral is tractable and the ranking signal is preserved despite per-step noise. This is a case where the VLA's computational constraints (few steps, real-time budget) actually *enable* a technique that would be impractical in other generative domains. The result is the **first model-intrinsic log-likelihood estimator for flow matching at inference time** — a free, principled quality signal that requires no external model, no training modification, and no task-specific tuning.
 
----
+### How to Run
+
+**Terminal 1 — Server** (from repo root, main venv):
+```bash
+# Default: guided mode (divergence-guided velocity scaling, +12% latency)
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh
+
+# Monitor mode (divergence logging only, no velocity modification)
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --mode monitor
+
+# Rank mode (best-of-N by log-likelihood, N=4 default)
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --mode rank
+
+# Rank mode with more candidates
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --mode rank --N 8
+
+# Stronger guidance
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --alpha 0.25
+
+# Rank mode with anchor consistency (temporal coherence across chunks)
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --mode rank --lambda-anchor 0.5
+
+# Custom port
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --port 5556
+
+# Verbose logging (prints per-step divergence, scale factors, norms)
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_server.sh --verbose
+```
+
+**Terminal 2 — Benchmark** (from repo root, robocasa venv):
+```bash
+# Default: 15 episodes, seed 42, OpenDrawer + CoffeeServeMug
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_eval.sh
+
+# More episodes
+bash scripts/denoising_lab/eval/strategies/density_aware_denoising/run_eval.sh --n-episodes 50
+```
+
+**Notebook / DenoisingLab:**
+```python
+from strategy import denoise_with_lab, DensityAwareConfig, DensityDiagnostics
+
+# Guided mode (default)
+cfg = DensityAwareConfig(mode="guided", alpha=0.15)
+actions, diag = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+print(f"Log-likelihood: {diag.log_likelihood_estimate:.2f}")
+print(f"Trend: {diag.density_trend}")
+decoded = lab.decode_raw_actions(actions)
+
+# Monitor mode (diagnostic only)
+cfg = DensityAwareConfig(mode="monitor")
+actions, diag = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+print(f"Per-step divergences: {diag.divergences}")
+
+# Rank mode
+cfg = DensityAwareConfig(mode="rank", N=8)
+actions, diag = denoise_with_lab(lab, features, seed=42, cfg=cfg)
+print(f"Best candidate: {diag.best_candidate_idx}")
+print(f"LL spread: {diag.log_likelihood_spread:.2f}")
+
+# Calibrate D0 from multiple observations
+from strategy import calibrate_divergence_scale
+stats = calibrate_divergence_scale(lab, features_list, seeds)
+D0 = stats[2]["std"]  # use step-2 std as normalization
+cfg = DensityAwareConfig(mode="guided", D0=D0)
+```

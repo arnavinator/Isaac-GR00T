@@ -48,13 +48,13 @@ class NoiseSelectionConfig:
     ``profile_k_runtime.py`` results showing K=8 provides good mode
     exploration with acceptable latency overhead."""
 
-    lambda_smooth: float = 1.0
+    lambda_smooth: float = 0.1
     """Weight for temporal smoothness score (penalises jerky actions)."""
 
-    lambda_mag: float = 0.1
+    lambda_mag: float = 0.0
     """Weight for velocity magnitude score (lower mag = closer to manifold)."""
 
-    lambda_anchor: float = 0.5
+    lambda_anchor: float = 2.0
     """Weight for anchor consistency with previous chunk."""
 
     anchor_decay: float = 0.5
@@ -80,7 +80,7 @@ class NoiseSelectionConfig:
     score all dims.  Default 12 covers PandaOmron's meaningful dims: EEF
     position (3) + rotation (3) + gripper (1) + base_motion (4) + control_mode (1)."""
 
-    score_horizon: int | None = None
+    score_horizon: int | None = 16
     """Number of leading timesteps to use for smoothness and magnitude scoring.
     Timesteps beyond this are padding in the multi-embodiment action space.
     Set to ``None`` (default) to score all timesteps — this includes temporal

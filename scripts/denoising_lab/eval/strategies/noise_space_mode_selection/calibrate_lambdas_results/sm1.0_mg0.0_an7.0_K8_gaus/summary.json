@@ -1,0 +1,48 @@
+{
+  "strategy_name": "noise_sel_sm1.0_mg0.0_an7.0_K8_gaus",
+  "timestamp": "2026-04-24T22:16:21.756374+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 5,
+    "seed": 42,
+    "max_episode_steps": [
+      480
+    ],
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 5,
+      "success_rate": 0.6,
+      "mean_reward": 0.6,
+      "mean_length": 51.2,
+      "std_length": 11.4,
+      "mean_duration_s": 54.91,
+      "successes": [
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "seeds": [
+        42,
+        43,
+        45,
+        44,
+        46
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 5,
+    "total_envs": 1,
+    "overall_success_rate": 0.6,
+    "total_wall_time_s": 241.01
+  }
+}

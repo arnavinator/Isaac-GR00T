@@ -1,0 +1,472 @@
+{
+  "timestamp": "2026-04-24T22:47:52.767468+00:00",
+  "n_configs_evaluated": 16,
+  "eval_seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "env_names": [
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+  ],
+  "grid": {
+    "lambda_smooth": [
+      0.1,
+      1.0,
+      2.0,
+      5.0
+    ],
+    "lambda_mag": [
+      0.0
+    ],
+    "lambda_anchor": [
+      1.0,
+      2.0,
+      5.0,
+      7.0
+    ],
+    "noise_type": [
+      "gaussian"
+    ],
+    "K": 8,
+    "anchor_decay": 0.5,
+    "score_dims": 12,
+    "score_horizon": 16
+  },
+  "ranked_results": [
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 0.1,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 2.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm0.1_mg0.0_an2.0_K8_gaus",
+      "success_rate": 1.0,
+      "n_success": 5,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 1.0
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 0.1,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 7.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm0.1_mg0.0_an7.0_K8_gaus",
+      "success_rate": 0.8,
+      "n_success": 4,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.8
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 1.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 1.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm1.0_mg0.0_an1.0_K8_gaus",
+      "success_rate": 0.8,
+      "n_success": 4,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.8
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 5.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 2.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm5.0_mg0.0_an2.0_K8_gaus",
+      "success_rate": 0.8,
+      "n_success": 4,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.8
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 5.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 7.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm5.0_mg0.0_an7.0_K8_gaus",
+      "success_rate": 0.8,
+      "n_success": 4,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.8
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 1.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 2.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm1.0_mg0.0_an2.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 1.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 7.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm1.0_mg0.0_an7.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": false
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 2.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 1.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm2.0_mg0.0_an1.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 2.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 2.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm2.0_mg0.0_an2.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 2.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 5.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm2.0_mg0.0_an5.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": false
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 2.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 7.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm2.0_mg0.0_an7.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 5.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 5.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm5.0_mg0.0_an5.0_K8_gaus",
+      "success_rate": 0.6,
+      "n_success": 3,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.6
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 0.1,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 1.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm0.1_mg0.0_an1.0_K8_gaus",
+      "success_rate": 0.4,
+      "n_success": 2,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 0.1,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 5.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm0.1_mg0.0_an5.0_K8_gaus",
+      "success_rate": 0.4,
+      "n_success": 2,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 1.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 5.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm1.0_mg0.0_an5.0_K8_gaus",
+      "success_rate": 0.4,
+      "n_success": 2,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    },
+    {
+      "config": {
+        "K": 8,
+        "lambda_smooth": 5.0,
+        "lambda_mag": 0.0,
+        "lambda_anchor": 1.0,
+        "anchor_decay": 0.5,
+        "noise_type": "gaussian",
+        "score_dims": 12,
+        "score_horizon": 16,
+        "noise_keyframes": 0
+      },
+      "config_name": "sm5.0_mg0.0_an1.0_K8_gaus",
+      "success_rate": 0.4,
+      "n_success": 2,
+      "n_total": 5,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true
+      }
+    }
+  ]
+}

@@ -265,11 +265,11 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of scoring w
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/calibrate_lambdas.py \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --max-episode-steps 480 \
-    --K 8 --score-dims 12 --noise-keyframes 4 \
-    --n-episodes 3 --seed 42 \
-    --lambda-smooth 0.0 1.0 5.0 \
+    --K 8 --score-dims 12 --score-horizon 16 --noise-keyframes 0 \
+    --n-episodes 5 --seed 42 \
+    --lambda-smooth 0.1 1.0 2.0 5.0 \
     --lambda-mag 0.0 \
-    --lambda-anchor 0.0 1.0 5.0 20.0 \
+    --lambda-anchor 1.0 2.0 5.0 7.0 \
     --noise-type gaussian \
     --output-dir ./calibration_results/noise_space_mode_selection
 ```

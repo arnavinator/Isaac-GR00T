@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -78,6 +79,21 @@ class NoiseSelectionConfig:
     only noise (the model has no training loss on them).  Set to ``None`` to
     score all dims.  Default 12 covers PandaOmron's meaningful dims: EEF
     position (3) + rotation (3) + gripper (1) + base_motion (4) + control_mode (1)."""
+
+    score_horizon: int | None = None
+    """Number of leading timesteps to use for smoothness and magnitude scoring.
+    Timesteps beyond this are padding in the multi-embodiment action space.
+    Set to ``None`` (default) to score all timesteps — this includes temporal
+    padding which empirically correlates with meaningful trajectory quality
+    (Spearman rho ~0.3).  Set to 16 for PandaOmron to score only the
+    meaningful action horizon."""
+
+    noise_keyframes: int | None = None
+    """When set, generates noise at this many temporal keyframes and linearly
+    interpolates to the full action horizon.  Produces temporally smooth noise
+    candidates.  ``None`` (default) disables smoothing — standard i.i.d. noise.
+    Try 4-8 for smooth noise; 1 gives constant noise per candidate (extreme).
+    Works with both ``"gaussian"`` and ``"uniform"`` noise types."""
 
 
 # ---------------------------------------------------------------------------
@@ -172,23 +188,23 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
         a = action_proxy[k].float()  # (B, H, D)
         v = velocities[k].float()    # (B, H, D)
 
-        # Slice to meaningful dims for smoothness/magnitude scoring.
-        # Padding dims beyond score_dims carry only noise (no training loss)
-        # and would dominate these metrics.
+        # Slice to meaningful dims and horizon for smoothness/magnitude.
+        # None means "all" for that axis (PyTorch slice semantics).
         sd = cfg.score_dims
-        a_scored = a[:, :, :sd] if sd is not None else a
-        v_scored = v[:, :, :sd] if sd is not None else v
+        sh = cfg.score_horizon
+        a_scored = a[:, :sh, :sd]
+        v_scored = v[:, :sh, :sd]
 
         # Temporal smoothness: penalise jerky predicted actions
         diffs = a_scored[:, 1:, :] - a_scored[:, :-1, :]  # (B, H-1, D')
-        smoothness = -(diffs ** 2).sum(dim=(1, 2))  # (B,)
+        smoothness = -(diffs ** 2).mean(dim=(1, 2))  # (B,)
         smooth_contrib = cfg.lambda_smooth * smoothness
         scores[k] += smooth_contrib
         if return_breakdown:
             bd_smooth[k] = smooth_contrib
 
         # Velocity magnitude: lower magnitude = noise was closer to manifold
-        mag = -(v_scored ** 2).sum(dim=(1, 2))  # (B,)
+        mag = -(v_scored ** 2).mean(dim=(1, 2))  # (B,)
         mag_contrib = cfg.lambda_mag * mag
         scores[k] += mag_contrib
         if return_breakdown:
@@ -200,13 +216,13 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
         # Both tensors are action estimates in the same normalised space.
         if prev_actions is not None:
             n = cfg.n_exec_steps
-            H_total = a.shape[1]
-            n_prev_tail = H_total - n
+            H_scored = a_scored.shape[1]
+            n_prev_tail = H_scored - n
             n_overlap = min(n, n_prev_tail)
 
             if n_overlap > 0:
                 candidate_near = a_scored[:, :n_overlap, :]           # (B, n_overlap, D')
-                prev_scored = prev_actions[:, :, :sd].float() if sd is not None else prev_actions.float()
+                prev_scored = prev_actions[:, :sh, :sd].float()
                 prev_tail = prev_scored[:, n:n + n_overlap, :]        # (B, n_overlap, D')
 
                 # Distance-weighted: step j gets weight decay^j
@@ -217,7 +233,7 @@ def _score_candidates(action_proxy, velocities, K, B, cfg, prev_actions=None,
                 weights = weights / weights.sum()
 
                 sq_dist = (candidate_near - prev_tail) ** 2  # (B, n_overlap, D)
-                sq_dist_per_step = sq_dist.sum(dim=2)        # (B, n_overlap)
+                sq_dist_per_step = sq_dist.mean(dim=2)       # (B, n_overlap)
                 weighted_dist = (sq_dist_per_step * weights.unsqueeze(0)).sum(dim=1)  # (B,)
                 anchor_contrib = -cfg.lambda_anchor * weighted_dist
                 scores[k] += anchor_contrib
@@ -284,15 +300,27 @@ def denoise_with_noise_selection(
     else:
         gen = None
 
+    n_kf = cfg.noise_keyframes
+    sample_H = n_kf if (n_kf is not None and n_kf > 0 and n_kf < H) else H
+
     if cfg.noise_type == "uniform":
         bound = math.sqrt(3.0)
-        noise_candidates = torch.rand(
-            K, B, H, D, dtype=dtype, device=device, generator=gen,
+        raw_noise = torch.rand(
+            K, B, sample_H, D, dtype=dtype, device=device, generator=gen,
         ) * (2 * bound) - bound
     else:
-        noise_candidates = torch.randn(
-            K, B, H, D, dtype=dtype, device=device, generator=gen,
+        raw_noise = torch.randn(
+            K, B, sample_H, D, dtype=dtype, device=device, generator=gen,
         )
+
+    if sample_H < H:
+        # Interpolate coarse keyframes to full horizon.
+        # F.interpolate expects (N, C, L): treat dims as channels, time as length.
+        flat = raw_noise.reshape(K * B, sample_H, D).permute(0, 2, 1)  # (KB, D, n_kf)
+        smooth = F.interpolate(flat, size=H, mode="linear", align_corners=True)  # (KB, D, H)
+        noise_candidates = smooth.permute(0, 2, 1).reshape(K, B, H, D)  # (K, B, H, D)
+    else:
+        noise_candidates = raw_noise
 
     # --- Step 2: Batch-evaluate 1 Euler step for all K candidates ---
     flat_noise = noise_candidates.reshape(K * B, H, D)

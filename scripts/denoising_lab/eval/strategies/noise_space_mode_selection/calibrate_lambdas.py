@@ -68,6 +68,8 @@ def config_dict(cfg: NoiseSelectionConfig) -> dict[str, float]:
         "anchor_decay": cfg.anchor_decay,
         "noise_type": cfg.noise_type,
         "score_dims": cfg.score_dims,
+        "score_horizon": cfg.score_horizon,
+        "noise_keyframes": cfg.noise_keyframes,
     }
 
 
@@ -178,6 +180,8 @@ def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
             anchor_decay=args.anchor_decay,
             noise_type=nt,
             score_dims=args.score_dims,
+            score_horizon=args.score_horizon,
+            noise_keyframes=args.noise_keyframes,
         ))
     return configs
 
@@ -253,6 +257,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of leading action dims to score (12 for PandaOmron). "
              "Use 0 or negative to score all dims.",
     )
+    parser.add_argument(
+        "--score-horizon", type=int, default=None,
+        help="Number of leading timesteps to score (None = all). "
+             "Set to 16 for PandaOmron meaningful horizon.",
+    )
+    parser.add_argument(
+        "--noise-keyframes", type=int, default=None,
+        help="Temporal keyframes for smooth noise (None = i.i.d.). Try 4-8.",
+    )
 
     # Model / server
     parser.add_argument(
@@ -292,6 +305,8 @@ def parse_args() -> argparse.Namespace:
     args.output_dir = Path(args.output_dir)
     if args.score_dims is not None and args.score_dims <= 0:
         args.score_dims = None
+    if args.score_horizon is not None and args.score_horizon <= 0:
+        args.score_horizon = None
     return args
 
 
@@ -453,6 +468,7 @@ def _write_results(
             "K": args.K,
             "anchor_decay": args.anchor_decay,
             "score_dims": args.score_dims,
+            "score_horizon": args.score_horizon,
         },
         "ranked_results": ranked,
     }
@@ -484,6 +500,7 @@ def _print_ranking(results: list[dict[str, Any]]) -> None:
     print(f"  K:             {best['config']['K']}")
     print(f"  noise_type:    {best['config']['noise_type']}")
     print(f"  score_dims:    {best['config']['score_dims']}")
+    print(f"  score_horizon: {best['config']['score_horizon']}")
     print(f"  lambda_smooth: {best['config']['lambda_smooth']}")
     print(f"  lambda_mag:    {best['config']['lambda_mag']}")
     print(f"  lambda_anchor: {best['config']['lambda_anchor']}")

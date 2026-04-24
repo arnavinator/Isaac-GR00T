@@ -69,6 +69,13 @@ class ServerConfig:
     score_dims: int | None = 12
     """Number of leading action dims to score (None = all). Default 12 for PandaOmron."""
 
+    score_horizon: int | None = None
+    """Number of leading timesteps to score (None = all). Set to 16 for PandaOmron
+    to restrict to meaningful horizon."""
+
+    noise_keyframes: int | None = None
+    """Temporal keyframes for smooth noise (None = i.i.d.). Try 4-8."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T server with NOISE-SPACE MODE SELECTION")
@@ -78,8 +85,9 @@ def main(config: ServerConfig):
     print(f"  Host:       {config.host}:{config.port}")
     print(f"  K={config.K}  smooth={config.lambda_smooth}  "
           f"mag={config.lambda_mag}  anchor={config.lambda_anchor}  "
-          f"decay={config.anchor_decay}  noise={config.noise_type}  "
-          f"score_dims={config.score_dims}")
+          f"decay={config.anchor_decay}  noise={config.noise_type}")
+    print(f"  score_dims={config.score_dims}  score_horizon={config.score_horizon}  "
+          f"noise_keyframes={config.noise_keyframes}")
 
     if config.model_path.startswith("/") and not os.path.exists(config.model_path):
         raise FileNotFoundError(f"Model path {config.model_path} does not exist")
@@ -100,6 +108,8 @@ def main(config: ServerConfig):
         anchor_decay=config.anchor_decay,
         noise_type=config.noise_type,
         score_dims=config.score_dims,
+        score_horizon=config.score_horizon,
+        noise_keyframes=config.noise_keyframes,
     )
     reset_fn = patch_action_head(policy.model.action_head, cfg=cfg)
     print(f"  Strategy:   noise_space_mode_selection ({config.K}+3 NFEs)")

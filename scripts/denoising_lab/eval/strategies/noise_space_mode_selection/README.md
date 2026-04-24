@@ -41,9 +41,9 @@ Evaluate each candidate's fully-extrapolated action proxy using a quality score 
 
 $$k^* = \arg\max_k \; S\!\left(a^{(k),\, 1.0*},\; v^{(k)},\; a_{\text{prev}}\right)$$
 
-The quality proxy $S$ combines three signals (all computable from the 1-step output). All norms are computed over the first `score_dims` action dimensions only (default 12 for PandaOmron), excluding padding dims that carry undenoised noise:
+The quality proxy $S$ combines three signals (all computable from the 1-step output). All norms are **per-element means** (not sums) over the first `score_dims` action dimensions and first `score_horizon` timesteps, so lambda sensitivity is consistent regardless of the scoring window size:
 
-$$S(a^*, v, a_{\text{prev}}) = \underbrace{-\lambda_{\text{smooth}} \sum_{j} \| a^*[j{+}1] - a^*[j] \|^2}_{\text{temporal smoothness}} + \underbrace{-\lambda_{\text{mag}} \| v \|^2}_{\text{velocity magnitude}} + \underbrace{-\lambda_{\text{anchor}} \sum_{j=0}^{n-1} w_j \| a^*[j] - a_{\text{prev}}[n_{\text{exec}} + j] \|^2}_{\text{action-space anchor consistency}}$$
+$$S(a^*, v, a_{\text{prev}}) = \underbrace{-\lambda_{\text{smooth}} \operatorname{mean}_{j,d} \| a^*[j{+}1,d] - a^*[j,d] \|^2}_{\text{temporal smoothness}} + \underbrace{-\lambda_{\text{mag}} \operatorname{mean}_{j,d} \| v[j,d] \|^2}_{\text{velocity magnitude}} + \underbrace{-\lambda_{\text{anchor}} \sum_{j=0}^{n-1} w_j \operatorname{mean}_{d} \| a^*[j,d] - a_{\text{prev}}[n_{\text{exec}} + j, d] \|^2}_{\text{action-space anchor consistency}}$$
 
 where $w_j = \gamma^j / \sum_i \gamma^i$ are geometrically decaying weights ($\gamma$ = `anchor_decay`, default 0.5). Step 0 of the overlap gets ~50% of the total weight.
 
@@ -71,72 +71,54 @@ def denoise_with_noise_selection(
     features,                # BackboneFeatures
     K=8,                     # number of noise candidates
     lambda_smooth=1.0,
-    lambda_mag=0.1,
-    lambda_anchor=0.5,
+    lambda_mag=0.0,
+    lambda_anchor=0.0,
     anchor_decay=0.5,        # geometric decay for distance weighting
     score_dims=12,           # only score the first 12 meaningful action dims
+    score_horizon=None,      # timesteps to score (None = all, 16 = meaningful only)
+    noise_keyframes=4,       # temporal keyframes for smooth noise (None = i.i.d.)
     prev_actions=None,       # cached denoised actions from previous chunk (auto-managed in server)
     seed=None,
 ):
     """Noise-space mode selection with 1-step velocity preview."""
-    vl_embeds = features.backbone_features
-    state_features = features.state_features
-    B = vl_embeds.shape[0]
+    B = features.backbone_features.shape[0]
     n_exec = 8  # steps executed per chunk
 
     # --- Step 1: Sample K noise candidates ---
-    noise_candidates = torch.randn(K, B, H, D)  # (K, B, 50, 128)
+    if noise_keyframes is not None and noise_keyframes < H:
+        # Sample at coarse temporal resolution, interpolate to full horizon
+        coarse = torch.randn(K, B, noise_keyframes, D)  # (K, B, n_kf, D)
+        # F.interpolate expects (N, C, L): dims as channels, time as length
+        flat = coarse.reshape(K*B, noise_keyframes, D).permute(0, 2, 1)
+        smooth = F.interpolate(flat, size=H, mode="linear", align_corners=True)
+        noise_candidates = smooth.permute(0, 2, 1).reshape(K, B, H, D)
+    else:
+        noise_candidates = torch.randn(K, B, H, D)  # (K, B, 50, 128)
 
     # --- Step 2: Batch-evaluate 1 Euler step for all K candidates ---
     flat_noise = noise_candidates.reshape(K * B, H, D)
-    # (replicate VLM features K times for batched forward pass)
     velocity_0 = evaluate_velocity(flat_noise, t_bucket=0, ...)
     actions_025 = flat_noise + 0.25 * velocity_0     # for denoising continuation
     actions_1_star = flat_noise + 1.0 * velocity_0   # fully-extrapolated proxy
 
-    # Reshape back: (K, B, H, D)
-    actions_1_star = actions_1_star.reshape(K, B, H, D)
-    actions_025 = actions_025.reshape(K, B, H, D)
-    velocities = velocity_0.reshape(K, B, H, D)
-
-    # --- Step 3: Score each candidate using fully-extrapolated proxy ---
-    # Slice to meaningful dims only — padding dims carry undenoised noise
-    sd = score_dims
+    # --- Step 3: Score on meaningful portion only ---
+    sd, sh = score_dims, score_horizon
     scores = torch.zeros(K, B)
     for k in range(K):
-        a = actions_1_star[k][:, :, :sd]  # (B, H, score_dims)
-        v = velocities[k][:, :, :sd]      # (B, H, score_dims)
+        a = actions_1_star[k][:, :sh, :sd]  # (B, sh, sd) — meaningful slice
+        v = velocities[k][:, :sh, :sd]
 
-        # Temporal smoothness (on meaningful dims only)
-        diffs = a[:, 1:, :] - a[:, :-1, :]
-        scores[k] -= lambda_smooth * (diffs ** 2).sum(dim=(1, 2))
-
-        # Velocity magnitude (on meaningful dims only)
-        scores[k] -= lambda_mag * (v ** 2).sum(dim=(1, 2))
-
-        # Action-space anchor consistency (distance-weighted L2, meaningful dims)
+        # All metrics use mean (not sum) for lambda consistency across window sizes
+        scores[k] -= lambda_smooth * temporal_jerk_mean(a)
+        scores[k] -= lambda_mag * velocity_magnitude_mean(v)
         if prev_actions is not None:
-            n_overlap = min(n_exec, H - n_exec)
-            candidate_near = a[:, :n_overlap, :]
-            prev_tail = prev_actions[:, n_exec:n_exec+n_overlap, :sd]
+            scores[k] -= lambda_anchor * anchor_distance_mean(a, prev_actions, ...)
 
-            weights = [anchor_decay ** j for j in range(n_overlap)]
-            weights = weights / sum(weights)  # normalize
-
-            sq_dist = ((candidate_near - prev_tail) ** 2).sum(dim=2)
-            scores[k] -= lambda_anchor * (sq_dist * weights).sum(dim=1)
-
-    # --- Step 4: Select best noise per batch element ---
-    best_k = scores.argmax(dim=0)                                 # (B,)
-    best_actions = actions_025[best_k, torch.arange(B)]           # (B, H, D)
-
-    # --- Step 5: Complete denoising with remaining 3 steps ---
-    actions = best_actions
+    # --- Step 4-5: Select best, complete denoising ---
+    best_k = scores.argmax(dim=0)
+    actions = actions_025[best_k, ...]
     for step in range(1, 4):
-        tau_bucket = int(step / 4.0 * 1000)
-        velocity = evaluate_velocity(actions, tau_bucket, ...)
-        actions = actions + 0.25 * velocity
-
+        actions = actions + 0.25 * evaluate_velocity(actions, ...)
     return actions
 ```
 
@@ -175,6 +157,8 @@ class NoiseSelectionConfig:
     noise_type: str = "gaussian" # "gaussian" (N(0,1)) or "uniform" (variance-matched)
     n_exec_steps: int = 8        # action steps executed per chunk
     score_dims: int | None = 12  # leading action dims to score (None = all)
+    score_horizon: int | None = None  # leading timesteps to score (None = all)
+    noise_keyframes: int | None = None  # temporal keyframes for smooth noise (None = i.i.d.)
     num_steps: int = 4           # denoising steps
 ```
 
@@ -184,6 +168,42 @@ GR00T's multi-embodiment action space is padded to 128 dims, but only the first 
 **Noise distribution options:**
 - `"gaussian"` (default): Standard normal N(0,1). Matches the distribution used during model training.
 - `"uniform"`: Uniform[-sqrt(3), sqrt(3)], variance-matched to N(0,1). Bounded support means no extreme outlier candidates; may provide more uniform coverage of the noise space for mode exploration.
+
+**`score_horizon`:**
+Like `score_dims` for the temporal axis. GR00T pads to 50 timesteps, but PandaOmron uses only 16. Timesteps 16-49 are temporal padding. Diagnostics show temporal padding smoothness is weakly correlated with meaningful trajectory quality (Spearman rho ~0.3), so the default `None` (score all timesteps) retains this noisy-but-useful signal. Set to 16 to score only the meaningful horizon.
+
+**`noise_keyframes` (smooth noise generation):**
+When set, generates noise at this many temporal keyframes and linearly interpolates to the full padded action horizon H (50 timesteps for GR00T). The interpolation always targets H regardless of `score_horizon` — the DiT processes the full padded tensor, so the noise must cover all 50 timesteps. `score_horizon` only restricts which timesteps the *scoring function* evaluates.
+
+Example with `noise_keyframes=4` and H=50 (showing one dim of one candidate):
+
+```
+Step 1: Sample 4 random keyframe values
+   keyframe 0 (t=0):   +0.82
+   keyframe 1 (t=17):  -0.41
+   keyframe 2 (t=33):  +1.23
+   keyframe 3 (t=49):  -0.67
+
+Step 2: Linearly interpolate to fill all 50 timesteps
+   t= 0: +0.82  (keyframe 0)
+   t= 1: +0.75  (interpolated)
+   t= 2: +0.68
+   ...
+   t=16: -0.34
+   t=17: -0.41  (keyframe 1)
+   t=18: -0.31
+   ...
+   t=32: +1.13
+   t=33: +1.23  (keyframe 2)
+   t=34: +1.11
+   ...
+   t=48: -0.55
+   t=49: -0.67  (keyframe 3)
+```
+
+Result: a `(K, B, 50, 128)` tensor where each candidate has smooth temporal transitions — ~270x less temporal jerk than i.i.d. noise. Each of the 128 dims gets its own independent set of 4 keyframe values.
+
+The model is robust to non-Gaussian noise inputs — notebook experiments with constant tensors (`0.5 * torch.ones`) and uniform noise demonstrate the DiT denoises from these starting points successfully. Smooth noise may produce more diverse proxy predictions on the meaningful dims, improving selection quality.
 
 ### Analysis
 
@@ -212,7 +232,7 @@ GR00T's multi-embodiment action space is padded to 128 dims, but only the first 
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh
 # Or with custom parameters:
 bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_server.sh \
-    --K 8 --lambda-smooth 2.0 --anchor-decay 0.5 --noise-type uniform --score-dims 12
+    --K 8 --lambda-smooth 1.0 --score-dims 12 --noise-keyframes 4
 ```
 
 **Terminal 2 — Benchmark** (from repo root, robocasa venv):
@@ -227,7 +247,7 @@ bash scripts/denoising_lab/eval/strategies/noise_space_mode_selection/run_eval.s
 from scripts.denoising_lab.eval.strategies.noise_space_mode_selection.strategy import (
     denoise_with_lab, NoiseSelectionConfig,
 )
-cfg = NoiseSelectionConfig(K=8, lambda_smooth=1.0, lambda_mag=0.1, anchor_decay=0.5, score_dims=12)
+cfg = NoiseSelectionConfig(K=8, lambda_smooth=1.0, lambda_mag=0.0, score_dims=12, noise_keyframes=4)
 actions, best_noise, last_velocity = denoise_with_lab(lab, features, seed=42, cfg=cfg)
 decoded = lab.decode_raw_actions(actions)
 
@@ -245,12 +265,12 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of scoring w
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/calibrate_lambdas.py \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --max-episode-steps 480 \
-    --K 8 --score-dims 12 \
+    --K 8 --score-dims 12 --noise-keyframes 4 \
     --n-episodes 3 --seed 42 \
-    --lambda-smooth 0.7 1.0 \
-    --lambda-mag 0.01 \
-    --lambda-anchor 1.0 2.0 \
-    --noise-type gaussian uniform \
+    --lambda-smooth 0.0 1.0 5.0 \
+    --lambda-mag 0.0 \
+    --lambda-anchor 0.0 1.0 5.0 20.0 \
+    --noise-type gaussian \
     --output-dir ./calibration_results/noise_space_mode_selection
 ```
 
@@ -277,13 +297,13 @@ uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/c
     --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --max-episode-steps 480 \
     --n-episodes 5 --seed 42 \
-    --score-dims 12 \
+    --score-dims 12 --noise-keyframes 4 \
     --lambda-smooth 0.0 1.0 5.0 \
     --lambda-mag 0.0 \
     --lambda-anchor 0.0 1.0 5.0 20.0 \
     --noise-type gaussian \
     --truncate-horizon 16 --truncate-dim 12 \
-    --output-dir ~/my_Isaac-GR00T/scripts/denoising_lab/eval/strategies/noise_space_mode_selection/diagnostic_results_CoffeeServeMug
+    --output-dir ./diagnostics_results
 ```
 
 Use `--truncate-horizon 16 --truncate-dim 12` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 12)`, storing only the meaningful action dimensions.
@@ -306,5 +326,7 @@ print(chunk["action_proxies_1star"])  # (K, H, D) — all K extrapolated proxies
 print(chunk["final_actions"])         # (H, D) — actual denoised output for the winner
 print(chunk["denoising_actions"])     # list of 3 Tensors (H, D) — winner's intermediate states
 ```
+
+To score only the meaningful temporal horizon (excluding temporal padding), add `--score-horizon 16` to any of the above scripts.
 
 ---

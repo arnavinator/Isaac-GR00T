@@ -67,6 +67,8 @@ def config_dict(cfg: NoiseSelectionConfig) -> dict:
         "anchor_decay": cfg.anchor_decay,
         "noise_type": cfg.noise_type,
         "score_dims": cfg.score_dims,
+        "score_horizon": cfg.score_horizon,
+        "noise_keyframes": cfg.noise_keyframes,
         "num_steps": cfg.num_steps,
         "n_exec_steps": cfg.n_exec_steps,
     }
@@ -229,6 +231,8 @@ def build_grid(args: argparse.Namespace) -> list[NoiseSelectionConfig]:
             anchor_decay=args.anchor_decay,
             noise_type=nt,
             score_dims=args.score_dims,
+            score_horizon=args.score_horizon,
+            noise_keyframes=args.noise_keyframes,
         ))
     return configs
 
@@ -280,6 +284,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-decay", type=float, default=0.5)
     parser.add_argument("--score-dims", type=int, default=12,
                         help="Leading action dims to score (12 for PandaOmron)")
+    parser.add_argument("--score-horizon", type=int, default=None,
+                        help="Leading timesteps to score (None = all, 16 for PandaOmron)")
+    parser.add_argument("--noise-keyframes", type=int, default=None,
+                        help="Temporal keyframes for smooth noise (None = i.i.d.)")
 
     # Truncation
     parser.add_argument(
@@ -304,6 +312,8 @@ def parse_args() -> argparse.Namespace:
     args.output_dir = Path(args.output_dir)
     if args.score_dims is not None and args.score_dims <= 0:
         args.score_dims = None
+    if args.score_horizon is not None and args.score_horizon <= 0:
+        args.score_horizon = None
     return args
 
 

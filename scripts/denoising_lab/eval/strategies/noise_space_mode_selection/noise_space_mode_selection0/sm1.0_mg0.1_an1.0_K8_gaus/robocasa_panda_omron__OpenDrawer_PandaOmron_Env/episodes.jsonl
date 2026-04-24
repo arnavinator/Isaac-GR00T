@@ -1,3 +1,0 @@
-{"episode_idx": 0, "seed": 51, "env_name": "robocasa_panda_omron/OpenDrawer_PandaOmron_Env", "success": true, "reward": 1.0, "length": 25, "n_action_chunks": 25, "duration_s": 34.51, "timestamp": "2026-04-23T05:42:51.863803+00:00"}
-{"episode_idx": 1, "seed": 52, "env_name": "robocasa_panda_omron/OpenDrawer_PandaOmron_Env", "success": false, "reward": 0.0, "length": 50, "n_action_chunks": 50, "duration_s": 66.77, "timestamp": "2026-04-23T05:43:24.124440+00:00"}
-{"episode_idx": 2, "seed": 53, "env_name": "robocasa_panda_omron/OpenDrawer_PandaOmron_Env", "success": true, "reward": 1.0, "length": 29, "n_action_chunks": 29, "duration_s": 44.24, "timestamp": "2026-04-23T05:44:20.462322+00:00"}

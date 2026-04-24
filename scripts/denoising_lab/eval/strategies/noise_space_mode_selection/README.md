@@ -295,15 +295,12 @@ Runs a grid of configs and captures the full scoring internals at every action c
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/noise_space_mode_selection/collect_diagnostics.py \
     --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-    --max-episode-steps 480 \
-    --n-episodes 5 --seed 42 \
-    --score-dims 12 --noise-keyframes 4 \
-    --lambda-smooth 0.0 1.0 5.0 \
-    --lambda-mag 0.0 \
-    --lambda-anchor 0.0 1.0 5.0 20.0 \
+    --max-episode-steps 480 --n-episodes 5 --seed 42 \
+    --score-dims 12 --score-horizon 16 --noise-keyframes 0 \
+    --lambda-smooth 0.0 1.0 5.0 --lambda-mag 0.0 --lambda-anchor 0.0 1.0 5.0 \
     --noise-type gaussian \
     --truncate-horizon 16 --truncate-dim 12 \
-    --output-dir ./diagnostics_results
+    --output-dir scripts/denoising_lab/eval/strategies/noise_space_mode_selection/diagnostic_results_H16_A12
 ```
 
 Use `--truncate-horizon 16 --truncate-dim 12` for PandaOmron to slice away zero-padding from `(50, 128)` to `(16, 12)`, storing only the meaningful action dimensions.

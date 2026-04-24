@@ -1,0 +1,5 @@
+{"episode_idx": 0, "seed": 42, "env_name": "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env", "success": false, "reward": 0.0, "length": 60, "n_action_chunks": 60, "duration_s": 45.0, "timestamp": "2026-04-24T17:08:01.835205+00:00"}
+{"episode_idx": 1, "seed": 43, "env_name": "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env", "success": true, "reward": 1.0, "length": 42, "n_action_chunks": 42, "duration_s": 40.3, "timestamp": "2026-04-24T17:08:42.135387+00:00"}
+{"episode_idx": 2, "seed": 44, "env_name": "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env", "success": true, "reward": 1.0, "length": 41, "n_action_chunks": 41, "duration_s": 51.65, "timestamp": "2026-04-24T17:09:33.781716+00:00"}
+{"episode_idx": 3, "seed": 45, "env_name": "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env", "success": true, "reward": 1.0, "length": 42, "n_action_chunks": 42, "duration_s": 37.93, "timestamp": "2026-04-24T17:10:11.711979+00:00"}
+{"episode_idx": 4, "seed": 46, "env_name": "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env", "success": false, "reward": 0.0, "length": 60, "n_action_chunks": 60, "duration_s": 53.6, "timestamp": "2026-04-24T17:11:05.309192+00:00"}

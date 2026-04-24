@@ -35,6 +35,16 @@ from dataclasses import dataclass
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    def _math_sdp_context():
+        return sdpa_kernel(SDPBackend.MATH)
+except ImportError:
+    def _math_sdp_context():
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_math=True, enable_mem_efficient=False,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -218,11 +228,18 @@ def denoise_ddto(
         eid_grad = embodiment_id.clone()
         bo_grad = _clone_backbone_output(backbone_output)
 
-        # Single DiT forward pass (1 NFE) — gradients tracked
-        v0 = _evaluate_velocity(
-            action_head, eps, 0,
-            vl_grad, sf_grad, eid_grad, bo_grad,
-        )
+        # Single DiT forward pass (1 NFE) — gradients tracked.
+        # When lambda_mode > 0 (Variant A), the HVP requires double-backward
+        # through the DiT's attention layers.  Flash / mem-efficient SDPA
+        # kernels don't implement second-order derivatives; the math backend
+        # does.  Force it for the forward pass so the backward graph is fully
+        # differentiable.  Phase-3 Euler steps (no grad) still use the fast
+        # backend.  Applied unconditionally — negligible cost for one pass.
+        with _math_sdp_context():
+            v0 = _evaluate_velocity(
+                action_head, eps, 0,
+                vl_grad, sf_grad, eid_grad, bo_grad,
+            )
 
         # Fully-extrapolated proxy for quality scoring (signal-dominated).
         # In rectified flow: v(ε,0) ≈ data − ε, so ε + v(ε,0) ≈ data_predicted.

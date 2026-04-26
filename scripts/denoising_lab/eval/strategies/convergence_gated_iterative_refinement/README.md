@@ -20,8 +20,8 @@ This observation reveals that the DiT's timestep embedding and action state prov
 
 1. Evaluate $v_k = v(a_k, \tau_{\text{refine}})$ — the refinement velocity.
 2. Compute the **per-position velocity magnitude**: $\rho_h^{(k)} = \|v_k[h]\|_2$ for each horizon position $h$.
-3. Update only the **to-be-executed positions** (0 through $n_{\text{exec}}-1$); leave far-horizon positions at their Phase 1 state.
-4. Check convergence: if $\max_{h < n_{\text{exec}}} \rho_h^{(k)} < \theta$, **stop early** — all executed positions have converged.
+3. Update **all positions** via standard Euler (no mask), matching baseline behavior.  The previous version only updated positions 0–7, which froze far-horizon positions at their Phase 1 state and disrupted cross-attention context.
+4. Check convergence: if $\max_{h < n_{\text{refine\_horizon}}} \rho_h^{(k)} < \theta$, **stop early** — all meaningful positions have converged.
 
 **Phase 3 — Adaptive Execution Decision:** The per-position convergence map $\{\rho_h^{(\text{final})}\}$ from Phase 2 is a rich signal. Positions where the velocity converged to near-zero are ones the model is confident about; positions where it remains large are uncertain. Instead of always executing a fixed $n_{\text{action\_steps}}$, execute only the **longest prefix of converged positions**:
 
@@ -64,19 +64,19 @@ For $k = 1, 2, \ldots, K_{\max}$:
 
 $$v_k = v(a_k,\; \tau_{\text{refine}},\; o_t,\; l_t) \quad \text{with } \tau_{\text{refine}} = 750$$
 
-**Position-selective update** (only refine executed positions):
+**Full-horizon update** (matching baseline Euler — no position mask):
 
-$$(a_{k+1})_h = \begin{cases} (a_k)_h + \Delta\tau_{\text{refine}} \cdot (v_k)_h & \text{if } h < n_{\text{exec}} \\ (a_k)_h & \text{if } h \geq n_{\text{exec}} \end{cases}$$
+$$(a_{k+1})_h = (a_k)_h + \Delta\tau_{\text{refine}} \cdot (v_k)_h \quad \text{for all } h$$
 
-where $\Delta\tau_{\text{refine}} = 0.25$ (standard Euler step size — the model expects this for τ=750).
+where $\Delta\tau_{\text{refine}} = 0.25$.  All positions (including multi-embodiment padding) are updated, matching baseline Euler's behavior.  The previous version masked updates to positions $h < n_{\text{exec}}$ only, which froze far-horizon positions at their Phase 1 state and disrupted cross-attention context.
 
-**Per-position convergence metric:**
+**Per-position convergence metric** (monitored across the full meaningful horizon $n_{\text{refine\_horizon}}$):
 
-$$\rho_h^{(k)} = \|(v_k)_h\|_2 \quad \text{for } h = 0, \ldots, n_{\text{exec}} - 1$$
+$$\rho_h^{(k)} = \|(v_k)_h\|_2 \quad \text{for } h = 0, \ldots, n_{\text{refine\_horizon}} - 1$$
 
 **Early stopping criterion:**
 
-$$\max_{h < n_{\text{exec}}} \rho_h^{(k)} < \theta \quad \Longrightarrow \quad \text{STOP: all executed positions converged}$$
+$$\max_{h < n_{\text{refine\_horizon}}} \rho_h^{(k)} < \theta \quad \Longrightarrow \quad \text{STOP: all positions converged}$$
 
 **Budget cap:** If $k = K_{\max}$ without convergence, stop and proceed to Phase 3.
 
@@ -114,9 +114,9 @@ class RefinementDiagnostics:
     total_nfe: int = 2
     converged: bool = False
     convergence_iteration: int | None = None
-    # Per-position convergence map: (n_exec,) velocity norms at final iteration
+    # Per-position convergence map: (refine_h,) velocity norms at final iteration
     position_convergence: torch.Tensor | None = None
-    # Full convergence history: (K, n_exec) velocity norms per iteration
+    # Full convergence history: (K, refine_h) velocity norms per iteration
     convergence_history: list[torch.Tensor] = field(default_factory=list)
     # Adaptive execution decision
     adaptive_n_exec: int = 8
@@ -130,6 +130,7 @@ def denoise_convergence_gated(
     lab,                          # DenoisingLab
     n_exec=8,                     # standard execution horizon (n_action_steps)
     n_min=2,                      # minimum execution horizon (safety floor)
+    n_refine_horizon=16,          # meaningful action horizon to refine and monitor
     tau_refine=750,               # fixed timestep bucket for refinement phase
     dt_refine=0.25,               # Euler step size for refinement
     theta=0.5,                    # per-position convergence threshold
@@ -171,12 +172,9 @@ def denoise_convergence_gated(
     diag.phase1_nfe = 2
 
     # ================================================================
-    # Phase 2: Iterative refinement at fixed timestep
+    # Phase 2: Iterative refinement at fixed timestep (full horizon)
     # ================================================================
-    # Create a mask for position-selective updates
-    horizon = a.shape[1]  # 50 (padded)
-    position_mask = torch.zeros(1, horizon, 1, device=device, dtype=a.dtype)
-    position_mask[:, :n_exec, :] = 1.0  # only refine executed positions
+    refine_h = n_refine_horizon  # 16 for PandaOmron
 
     for k in range(K_max):
         # Evaluate velocity at fixed refinement timestep
@@ -185,23 +183,14 @@ def denoise_convergence_gated(
             a, t_discretized=tau_refine, dt=dt_refine,
             batch_size=a.shape[0], device=device,
         )
-        # Note: _denoise_step_inner returns (velocity, updated_actions).
-        # We need the velocity to apply position-selective updates.
-        # Undo the default update and apply our masked version:
-        # Actually, we need the velocity BEFORE the step. Let's compute it directly.
 
-        # Re-extract just the velocity (undo the step that _denoise_step_inner did)
-        # velocity was the first return value; the step was: updated = a + dt * v
-        # So v_refine is the velocity, and we apply it selectively:
-
-        # Position-selective Euler update
-        a = a + dt_refine * v_refine * position_mask
+        # Euler update on all positions (matching baseline — no mask)
+        a = a + dt_refine * v_refine
 
         diag.phase2_nfe += 1
 
-        # Per-position velocity magnitude for executed positions
-        # v_refine shape: (B, horizon, action_dim)
-        per_pos_rho = v_refine[:, :n_exec, :].norm(dim=-1).mean(dim=0)  # (n_exec,)
+        # Per-position velocity magnitude across the full action horizon
+        per_pos_rho = v_refine[:, :refine_h, :].norm(dim=-1).mean(dim=0)  # (refine_h,)
         diag.convergence_history.append(per_pos_rho.detach().cpu())
 
         max_rho = per_pos_rho.max().item()
@@ -215,7 +204,7 @@ def denoise_convergence_gated(
     # ================================================================
     # Phase 3: Adaptive execution horizon
     # ================================================================
-    final_rho = diag.convergence_history[-1]  # (n_exec,) — last iteration's convergence map
+    final_rho = diag.convergence_history[-1]  # (refine_h,) — last iteration's convergence map
     diag.position_convergence = final_rho
 
     # Find longest prefix of converged positions
@@ -458,3 +447,4 @@ print(f"Position labels: {diag.position_labels}")
 | `--n-exec` | 8 | Standard execution horizon |
 | `--n-min` | 2 | Safety floor for adaptive horizon |
 | `--clamp-uncertain` / `--no-clamp-uncertain` | True | Replace uncertain tail actions with last converged action |
+| `--n-refine-horizon` | 16 | Meaningful action horizon to refine and monitor for convergence |

@@ -71,6 +71,9 @@ class ServerConfig:
     clamp_uncertain: bool = True
     """Replace uncertain tail positions with last converged action."""
 
+    n_refine_horizon: int = 16
+    """Number of positions to refine and monitor (embodiment's action horizon)."""
+
 
 def main(config: ServerConfig):
     print("Starting GR00T server with CONVERGENCE-GATED ITERATIVE REFINEMENT")
@@ -81,6 +84,7 @@ def main(config: ServerConfig):
     print(f"  tau_refine={config.tau_refine}  theta={config.theta}  "
           f"K=[{config.K_min},{config.K_max}]  "
           f"n_exec={config.n_exec}  n_min={config.n_min}  "
+          f"n_refine_horizon={config.n_refine_horizon}  "
           f"clamp={config.clamp_uncertain}")
 
     if config.model_path.startswith("/") and not os.path.exists(config.model_path):
@@ -101,6 +105,7 @@ def main(config: ServerConfig):
         K_max=config.K_max,
         K_min=config.K_min,
         clamp_uncertain=config.clamp_uncertain,
+        n_refine_horizon=config.n_refine_horizon,
     )
     patch_action_head(policy.model.action_head, cfg=cfg)
     nfe_range = f"{2 + config.K_min}-{2 + config.K_max}"

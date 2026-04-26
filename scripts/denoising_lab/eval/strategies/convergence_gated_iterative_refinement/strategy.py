@@ -5,7 +5,7 @@ adaptive execution horizon.
 
 Phase 1: 2 standard Euler steps (tau=0, 250) — structural denoising.
 Phase 2: Up to K_max iterations at fixed tau_refine — iterative refinement
-         with position-selective masking and early stopping.
+         across the full action horizon with early stopping.
 Phase 3: Adaptive execution horizon from per-position convergence map.
 
 Total NFEs: 4 (easy, converges at K_min) to 2+K_max (hard, budget exhausted).
@@ -64,6 +64,11 @@ class ConvergenceGatedConfig:
     """When True, replace uncertain tail positions (beyond adaptive_n_exec)
     with the last converged action.  Server-side approximation of adaptive
     execution that works without client protocol changes."""
+
+    n_refine_horizon: int = 16
+    """Number of positions to refine and monitor for convergence.  Should
+    match the embodiment's meaningful action horizon.  Default 16 covers
+    PandaOmron.  Positions beyond this are multi-embodiment padding."""
 
 
 # ---------------------------------------------------------------------------
@@ -186,11 +191,9 @@ def denoise_convergence_gated(
     diag.phase1_nfe = 2
 
     # ==================================================================
-    # Phase 2: Iterative refinement at fixed timestep
+    # Phase 2: Iterative refinement at fixed timestep (full horizon)
     # ==================================================================
-    horizon = actions.shape[1]
-    position_mask = torch.zeros(1, horizon, 1, device=device, dtype=dtype)
-    position_mask[:, :cfg.n_exec, :] = 1.0
+    refine_h = min(cfg.n_refine_horizon, H)
 
     for k in range(cfg.K_max):
         velocity = _evaluate_velocity(
@@ -198,11 +201,11 @@ def denoise_convergence_gated(
             vl_embeds, state_features, embodiment_id, backbone_output,
         )
 
-        actions = actions + cfg.dt_refine * velocity * position_mask
+        actions = actions + cfg.dt_refine * velocity
 
         diag.phase2_nfe += 1
 
-        per_pos_rho = velocity[:, :cfg.n_exec, :].float().norm(dim=-1).mean(dim=0)
+        per_pos_rho = velocity[:, :refine_h, :].float().norm(dim=-1).mean(dim=0)
         diag.convergence_history.append(per_pos_rho.detach().cpu())
 
         max_rho = per_pos_rho.max().item()
@@ -220,7 +223,7 @@ def denoise_convergence_gated(
 
     converged_mask = final_rho < cfg.theta
     adaptive_n = 0
-    for h in range(cfg.n_exec):
+    for h in range(min(cfg.n_exec, len(converged_mask))):
         if converged_mask[h]:
             adaptive_n = h + 1
         else:
@@ -230,7 +233,7 @@ def denoise_convergence_gated(
 
     diag.position_labels = [
         "converged" if final_rho[h] < cfg.theta else "uncertain"
-        for h in range(cfg.n_exec)
+        for h in range(min(refine_h, len(final_rho)))
     ]
 
     diag.total_nfe = diag.phase1_nfe + diag.phase2_nfe

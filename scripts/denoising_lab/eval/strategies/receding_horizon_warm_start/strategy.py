@@ -2,23 +2,31 @@
 
 Exploits temporal overlap between consecutive action chunks.  Instead of
 starting every chunk from pure noise, the un-executed tail of the previous
-chunk is shifted forward, partially re-noised via rectified-flow interpolation,
-and used as the initial state for the new chunk.  This lets us skip the first
-denoising step, reducing NFEs from 4 to 3 (25 % faster) while improving
-temporal coherence.
+chunk is shifted forward and used to inform the initial state for the new
+chunk.
+
+Two warm-start modes:
+
+  partial_denoise (default) — Re-noise the shifted actions via rectified-flow
+      interpolation to tau_start, then denoise from there.  Skips the first
+      step(s), reducing NFEs.  Default tau_start=0.5 preserves 50% of the
+      warm signal and uses 2 NFEs (was 0.25 / 3 NFEs in v1).
+
+  noise_bias — Keep all 4 NFEs.  Blend the shifted actions into the initial
+      noise at strength beta, then renormalize to preserve Gaussian norm
+      statistics.  The DiT sees near-standard noise at tau=0 but biased toward
+      the warm trajectory.
 
 First chunk of each episode uses standard 4-step Euler (no prior data).
 
 Usage (server):
     from strategy import patch_action_head
-    reset_fn = patch_action_head(policy.model.action_head)
+    reset_fn = patch_action_head(policy.model.action_head, mode="partial_denoise")
     # Hook reset_fn into policy.reset() — see run_server.py
 
 Usage (notebook with DenoisingLab):
     from strategy import denoise_with_lab
-    # First call (no prior):
     actions = denoise_with_lab(lab, features, seed=42)
-    # Subsequent calls (warm start from previous prediction):
     actions = denoise_with_lab(lab, features, prev_actions=actions, seed=42)
 """
 
@@ -104,14 +112,24 @@ def _euler_denoise(action_head, vl_embeds, state_features, embodiment_id,
 # ---------------------------------------------------------------------------
 
 def denoise_warm_start(action_head, vl_embeds, state_features, embodiment_id,
-                       backbone_output, *, prev_actions=None, tau_start=0.25,
-                       n_executed=8, num_steps=4, initial_noise=None):
+                       backbone_output, *, prev_actions=None, tau_start=0.5,
+                       n_executed=8, num_steps=4, initial_noise=None,
+                       mode="partial_denoise", beta=0.15):
     """Warm-start denoising from previous chunk's un-executed actions.
 
-    When ``prev_actions`` is provided, shifts the un-executed tail forward,
-    partially re-noises to level ``tau_start``, and denoises from there
-    (skipping the first step).  When ``prev_actions`` is ``None``, falls back
-    to standard Euler.
+    Two modes:
+
+    **partial_denoise** (default): Shift un-executed tail forward, re-noise to
+    ``tau_start`` via rectified-flow interpolation, denoise from there.
+    Default ``tau_start=0.5`` preserves 50% of the warm signal and runs
+    2 NFEs.
+
+    **noise_bias**: Shift un-executed tail forward, blend into fresh Gaussian
+    noise at strength ``beta``, renormalize to preserve expected Gaussian norm,
+    then run the full 4-step Euler.  Keeps all 4 NFEs while injecting warm
+    trajectory information into the initial noise.
+
+    When ``prev_actions`` is ``None``, both modes fall back to standard Euler.
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` instance.
@@ -121,11 +139,12 @@ def denoise_warm_start(action_head, vl_embeds, state_features, embodiment_id,
         backbone_output: Full backbone output.
         prev_actions: Previous chunk's raw padded actions
             ``(B, action_horizon, action_dim)`` or ``None``.
-        tau_start: Noise level to re-noise to (default 0.25 = skip 1 step).
+        tau_start: Noise level for partial_denoise mode (default 0.5).
         n_executed: Number of steps executed from the previous chunk (default 8).
         num_steps: Total number of Euler steps for the full schedule (default 4).
-        initial_noise: Optional starting noise (used only when ``prev_actions``
-            is ``None``).
+        initial_noise: Optional starting noise (cold-start only).
+        mode: ``"partial_denoise"`` or ``"noise_bias"``.
+        beta: Blend strength for noise_bias mode (default 0.15).
 
     Returns:
         Denoised actions ``(B, action_horizon, action_dim)``.
@@ -157,38 +176,54 @@ def denoise_warm_start(action_head, vl_embeds, state_features, embodiment_id,
     # ---- Warm start from previous chunk ----
     prev = prev_actions.to(device=device, dtype=dtype)
 
-    # Snap tau_start to the nearest step boundary so the re-noising level
-    # matches the first DiT evaluation tau exactly.
-    start_step = round(tau_start * num_steps)
-    actual_tau_start = start_step / float(num_steps)
-
-    if action_head.verbose:
-        print(
-            f"[WarmStart] Warm start  tau_start={tau_start}  "
-            f"actual_tau_start={actual_tau_start}  "
-            f"n_executed={n_executed}  prev_shape={tuple(prev.shape)}"
-        )
-
     # 1. Shift: move un-executed tail (positions n_executed:) to the front
     remaining = action_horizon - n_executed
     warm = torch.randn(batch_size, action_horizon, action_dim,
                         dtype=dtype, device=device)
     warm[:, :remaining, :] = prev[:, n_executed:, :]
 
-    # 2. Partial re-noising via rectified-flow interpolation
-    #    a_tau = (1 - tau) * epsilon + tau * a_clean
-    #    Only re-noise the shifted portion; the tail is fresh noise already.
-    epsilon = torch.randn(batch_size, remaining, action_dim,
-                          dtype=dtype, device=device)
-    warm[:, :remaining, :] = (
-        (1.0 - actual_tau_start) * epsilon
-        + actual_tau_start * warm[:, :remaining, :]
-    )
+    if mode == "noise_bias":
+        # ---- Noise-bias mode: full 4 NFEs with biased initialization ----
+        epsilon = torch.randn(batch_size, action_horizon, action_dim,
+                              dtype=dtype, device=device)
+        biased = (1.0 - beta) * epsilon + beta * warm
 
-    # 3. Denoise from actual_tau_start (skip the first start_step steps)
-    #    With num_steps=4 and tau_start=0.25 the remaining steps are at
-    #    tau in {0.25, 0.50, 0.75}, each with dt=0.25.
-    actions = warm
+        # Renormalize per-sample to preserve expected Gaussian norm.
+        # This ensures the DiT sees input at tau=0 with standard statistics.
+        eps_norm = epsilon.float().flatten(1).norm(dim=1, keepdim=True).unsqueeze(-1)
+        biased_norm = biased.float().flatten(1).norm(dim=1, keepdim=True).unsqueeze(-1)
+        safe_norm = torch.clamp(biased_norm, min=1e-8)
+        actions = (biased.float() * (eps_norm / safe_norm)).to(dtype)
+
+        start_step = 0
+
+        if action_head.verbose:
+            print(
+                f"[WarmStart] Noise-bias mode  beta={beta}  "
+                f"n_executed={n_executed}  eps_norm={eps_norm.mean():.2f}  "
+                f"biased_norm={biased_norm.mean():.2f}"
+            )
+    else:
+        # ---- Partial-denoise mode: re-noise and skip early steps ----
+        start_step = round(tau_start * num_steps)
+        actual_tau_start = start_step / float(num_steps)
+
+        if action_head.verbose:
+            print(
+                f"[WarmStart] Partial-denoise mode  tau_start={tau_start}  "
+                f"actual_tau_start={actual_tau_start}  "
+                f"n_executed={n_executed}  prev_shape={tuple(prev.shape)}"
+            )
+
+        # Partial re-noising via rectified-flow interpolation
+        epsilon = torch.randn(batch_size, remaining, action_dim,
+                              dtype=dtype, device=device)
+        warm[:, :remaining, :] = (
+            (1.0 - actual_tau_start) * epsilon
+            + actual_tau_start * warm[:, :remaining, :]
+        )
+
+        actions = warm
 
     for step in range(start_step, num_steps):
         tau = step / float(num_steps)
@@ -223,7 +258,8 @@ def denoise_warm_start(action_head, vl_embeds, state_features, embodiment_id,
 # Server patch
 # ---------------------------------------------------------------------------
 
-def patch_action_head(action_head, tau_start=0.25, n_executed=8):
+def patch_action_head(action_head, tau_start=0.5, n_executed=8,
+                      mode="partial_denoise", beta=0.15):
     """Monkey-patch the action head for warm-start denoising.
 
     The patched action head caches the raw ``action_pred`` from each inference
@@ -231,8 +267,10 @@ def patch_action_head(action_head, tau_start=0.25, n_executed=8):
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` to patch in-place.
-        tau_start: Noise level for re-noising (default 0.25 → 3 NFEs).
+        tau_start: Noise level for partial_denoise mode (default 0.5 -> 2 NFEs).
         n_executed: Steps executed from each chunk (default 8).
+        mode: ``"partial_denoise"`` or ``"noise_bias"``.
+        beta: Blend strength for noise_bias mode (default 0.15).
 
     Returns:
         A ``reset()`` callable that clears the cached state.  **Must** be
@@ -254,7 +292,7 @@ def patch_action_head(action_head, tau_start=0.25, n_executed=8):
                 action_head, backbone_features, state_features,
                 embodiment_id, backbone_output,
                 prev_actions=prev, tau_start=tau_start,
-                n_executed=n_executed,
+                n_executed=n_executed, mode=mode, beta=beta,
             )
         else:
             # Cold start: delegate to original 4-step Euler
@@ -286,7 +324,8 @@ def patch_action_head(action_head, tau_start=0.25, n_executed=8):
 # ---------------------------------------------------------------------------
 
 def denoise_with_lab(lab, features, *, seed=None, prev_actions=None,
-                     tau_start=0.25, n_executed=8):
+                     tau_start=0.5, n_executed=8, mode="partial_denoise",
+                     beta=0.15):
     """Run warm-start denoising using a DenoisingLab instance.
 
     Args:
@@ -294,10 +333,11 @@ def denoise_with_lab(lab, features, *, seed=None, prev_actions=None,
         features: ``BackboneFeatures`` from ``lab.encode_features()``.
         seed: Random seed for initial noise (cold-start only).
         prev_actions: Previous chunk's raw padded actions, or ``None`` for
-            cold start.  Typically the return value of a previous
-            ``denoise_with_lab`` call.
-        tau_start: Noise level for re-noising.
+            cold start.
+        tau_start: Noise level for partial_denoise mode.
         n_executed: Steps executed from the previous chunk.
+        mode: ``"partial_denoise"`` or ``"noise_bias"``.
+        beta: Blend strength for noise_bias mode.
 
     Returns:
         ``torch.Tensor`` — raw actions ``(B, action_horizon, action_dim)``.
@@ -325,4 +365,5 @@ def denoise_with_lab(lab, features, *, seed=None, prev_actions=None,
             features.embodiment_id, features.backbone_output,
             prev_actions=prev_actions, tau_start=tau_start,
             n_executed=n_executed, initial_noise=noise,
+            mode=mode, beta=beta,
         )

@@ -2,8 +2,11 @@
 
 Same CLI interface as ``gr00t/eval/run_gr00t_server.py``.  Loads the standard
 model, patches the action head to warm-start each chunk from the previous
-chunk's un-executed actions (3 NFEs after the first cold-start chunk), and
-starts the ZMQ policy server.
+chunk's un-executed actions, and starts the ZMQ policy server.
+
+Two modes: ``partial_denoise`` (default, 2 NFEs with tau_start=0.5) or
+``noise_bias`` (4 NFEs with biased initialization).  First chunk of each
+episode always uses standard 4-step Euler.
 
 The warm-start cache is automatically cleared on ``policy.reset()`` (called
 between episodes by the rollout client).
@@ -50,11 +53,19 @@ class ServerConfig:
     verbose: bool = True
     """Enable verbose denoising step logging."""
 
-    tau_start: float = 0.25
-    """Noise level to re-noise the warm-start to (0.25 = skip 1 of 4 steps)."""
+    tau_start: float = 0.5
+    """Noise level to re-noise the warm-start to (partial_denoise mode).
+    0.5 = skip 2 of 4 steps (2 NFEs), preserving 50% of warm signal."""
 
     n_executed: int = 8
     """Number of action steps executed from each chunk before re-planning."""
+
+    mode: str = "partial_denoise"
+    """Warm-start mode: 'partial_denoise' (skip early steps) or
+    'noise_bias' (full 4 NFEs with biased initialization)."""
+
+    beta: float = 0.15
+    """Blend strength for noise_bias mode (0.0 = pure noise, 1.0 = pure warm)."""
 
 
 def main(config: ServerConfig):
@@ -65,6 +76,8 @@ def main(config: ServerConfig):
     print(f"  Host:        {config.host}:{config.port}")
     print(f"  tau_start:   {config.tau_start}")
     print(f"  n_executed:  {config.n_executed}")
+    print(f"  mode:        {config.mode}")
+    print(f"  beta:        {config.beta}")
 
     if config.model_path.startswith("/") and not os.path.exists(config.model_path):
         raise FileNotFoundError(f"Model path {config.model_path} does not exist")
@@ -81,8 +94,13 @@ def main(config: ServerConfig):
         policy.model.action_head,
         tau_start=config.tau_start,
         n_executed=config.n_executed,
+        mode=config.mode,
+        beta=config.beta,
     )
-    nfes_warm = round((1.0 - config.tau_start) * 4)
+    if config.mode == "noise_bias":
+        nfes_warm = 4
+    else:
+        nfes_warm = round((1.0 - config.tau_start) * 4)
     print(f"  Strategy:    receding_horizon_warm_start ({nfes_warm} NFEs after cold start)")
 
     # Hook reset_fn into policy.reset() so warm-start cache is cleared

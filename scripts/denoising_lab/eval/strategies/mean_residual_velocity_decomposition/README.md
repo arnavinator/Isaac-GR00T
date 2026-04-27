@@ -186,4 +186,37 @@ guided_fn = make_mean_residual_fn(rho=1.15, onset=2, energy_preserve=True)
 result = lab.denoise(features, num_steps=4, guided_fn=guided_fn, seed=42)
 ```
 
+### Hyperparameter Calibration
+
+**Grid search** (`calibrate_lambdas.py`):
+
+Loads the model once, starts a ZMQ server, and iterates over a grid of `(rho, onset, energy_preserve)` values. Each config re-patches the action head and launches the eval client subprocess. Results are ranked by combined success rate.
+
+```bash
+uv run python scripts/denoising_lab/eval/strategies/mean_residual_velocity_decomposition/calibrate_lambdas.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 400 480 \
+    --n-episodes 15 --seed 42 \
+    --rho 1.0 1.05 1.10 1.15 1.25 1.50 \
+    --onset 1 2 3 \
+    --energy-preserve True False \
+    --output-dir ./calibration_results/mean_residual
+```
+
+This sweeps 36 configs (6 rho x 3 onset x 2 energy_preserve). `rho=1.0` serves as the baseline control. To focus on hard seeds only (faster, more discriminative):
+
+```bash
+uv run python scripts/denoising_lab/eval/strategies/mean_residual_velocity_decomposition/calibrate_lambdas.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 400 480 \
+    --n-episodes 15 --seed 42 \
+    --seeds-only 42 45 46 47 49 52 \
+    --rho 1.0 1.05 1.10 1.15 1.25 1.50 \
+    --onset 1 2 3 \
+    --energy-preserve True False \
+    --output-dir ./calibration_results/mean_residual_hard_seeds
+```
+
 ---

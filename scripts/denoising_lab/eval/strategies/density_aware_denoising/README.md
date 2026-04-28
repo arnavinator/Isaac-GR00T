@@ -603,14 +603,13 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of `(alpha, 
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/density_aware_denoising/calibrate_lambdas.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-    --max-episode-steps 400 480 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
     --n-episodes 15 --seed 42 \
     --mode guided \
-    --alpha 0.05 0.08 0.10 0.15 \
+    --alpha 0.05 0.10 0.15 \
     --h 1e-3 5e-3 1e-2 \
-    --output-dir ./calibration_results/density_aware
+    --output-dir scripts/denoising_lab/eval/strategies/density_aware_denoising/calibration_results_guided
 ```
 
 This sweeps 12 configs (4 alpha x 3 h). Lower alpha (0.05-0.08) reduces the Drawer regression observed at alpha=0.15. Larger h (5e-3, 1e-2) gives more stable Hutchinson estimates in bfloat16.
@@ -619,13 +618,12 @@ To also test rank mode (best-of-N by log-likelihood, separate from guided):
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/density_aware_denoising/calibrate_lambdas.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-    --max-episode-steps 400 480 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
     --n-episodes 15 --seed 42 \
     --mode rank \
     --alpha 0.0 \
     --h 1e-3 5e-3 1e-2 \
     --N 4 \
-    --output-dir ./calibration_results/density_aware_rank
+    --output-dir scripts/denoising_lab/eval/strategies/density_aware_denoising/calibration_results_rank
 ```

@@ -1,0 +1,68 @@
+{
+  "strategy_name": "ddto_sm1.0_an0.5_md0.1_eta0.05",
+  "timestamp": "2026-04-28T05:26:24.248397+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 15,
+    "seed": 42,
+    "max_episode_steps": [
+      480
+    ],
+    "n_action_steps": 8,
+    "n_envs": 2,
+    "host": "127.0.0.1",
+    "port": 5557
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 15,
+      "success_rate": 0.4,
+      "mean_reward": 0.4,
+      "mean_length": 51.0,
+      "std_length": 15.5,
+      "mean_duration_s": 69.94,
+      "successes": [
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "seeds": [
+        43,
+        42,
+        45,
+        44,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 15,
+    "total_envs": 1,
+    "overall_success_rate": 0.4,
+    "total_wall_time_s": 785.43
+  }
+}

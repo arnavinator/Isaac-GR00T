@@ -264,16 +264,14 @@ bash scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibrat
 
 # Custom grid: sweep eta as well (3x3x3x3 = 81 configs)
 uv run python scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibrate_lambdas.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-    --max-episode-steps 400 480 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
     --n-episodes 15 --seed 42 \
-    --seeds-only 45 52 54 55 56 \
-    --lambda-smooth 0.002 0.005 0.01 \
-    --lambda-discrete 0.005 0.01 0.02 \
-    --lambda-mode 0.001 0.003 0.01 \
-    --eta 0.05 0.1 0.2 \
-    --output-dir ./my_calibration_results
+    --lambda-smooth 0.001 \
+    --lambda-discrete 0.05 \
+    --lambda-mode 0.01 \
+    --eta 0.05 0.1 0.2 0.5 \
+    --output-dir scripts/denoising_lab/eval/strategies/analytic_constraint_guidance/calibration_results_v3
 ```
 
 **Architecture:** The model loads ONCE, runs as a ZMQ server in a daemon thread,

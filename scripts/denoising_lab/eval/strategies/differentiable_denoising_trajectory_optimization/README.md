@@ -331,15 +331,12 @@ Loads the model once, starts a ZMQ server, and iterates over a grid of quality-l
 
 ```bash
 uv run python scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/calibrate_lambdas.py \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
-                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-    --max-episode-steps 400 480 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 480 \
     --n-episodes 15 --seed 42 \
     --lambda-smooth 0.5 1.0 \
-    --lambda-anchor 0.25 0.5 1.0 \
-    --lambda-mode 0.0 0.05 0.1 \
-    --eta 0.05 0.1 0.2 \
-    --output-dir /tmp/calibration_results/ddto
+    --lambda-anchor 0.5 1.0 \
+    --lambda-mode 0.05 0.1 \
+    --eta 0.1 \
+    --output-dir scripts/denoising_lab/eval/strategies/differentiable_denoising_trajectory_optimization/calibration_results
 ```
-
----

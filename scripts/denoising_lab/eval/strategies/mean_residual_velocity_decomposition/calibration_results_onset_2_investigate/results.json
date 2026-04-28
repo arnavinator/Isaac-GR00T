@@ -1,0 +1,164 @@
+{
+  "timestamp": "2026-04-28T05:05:25.266372+00:00",
+  "n_configs_evaluated": 4,
+  "eval_seeds": [
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56
+  ],
+  "env_names": [
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+  ],
+  "grid": {
+    "rho": [
+      1.1,
+      1.3,
+      1.5,
+      1.7
+    ],
+    "onset": [
+      2
+    ],
+    "energy_preserve": [
+      true
+    ]
+  },
+  "ranked_results": [
+    {
+      "config": {
+        "rho": 1.1,
+        "onset": 2,
+        "energy_preserve": true
+      },
+      "config_name": "r1.1_o2_e1",
+      "success_rate": 0.4667,
+      "n_success": 7,
+      "n_total": 15,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4667
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed47": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed48": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed49": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed50": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed51": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed52": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed53": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed54": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed55": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed56": false
+      }
+    },
+    {
+      "config": {
+        "rho": 1.3,
+        "onset": 2,
+        "energy_preserve": true
+      },
+      "config_name": "r1.3_o2_e1",
+      "success_rate": 0.4667,
+      "n_success": 7,
+      "n_total": 15,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4667
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed47": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed48": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed49": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed50": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed51": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed52": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed53": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed54": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed55": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed56": false
+      }
+    },
+    {
+      "config": {
+        "rho": 1.5,
+        "onset": 2,
+        "energy_preserve": true
+      },
+      "config_name": "r1.5_o2_e1",
+      "success_rate": 0.4667,
+      "n_success": 7,
+      "n_total": 15,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.4667
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed47": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed48": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed49": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed50": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed51": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed53": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed52": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed54": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed55": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed56": false
+      }
+    },
+    {
+      "config": {
+        "rho": 1.7,
+        "onset": 2,
+        "energy_preserve": true
+      },
+      "config_name": "r1.7_o2_e1",
+      "success_rate": 0.3333,
+      "n_success": 5,
+      "n_total": 15,
+      "env_rates": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": 0.3333
+      },
+      "seed_successes": {
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed42": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed43": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed44": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed45": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed47": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed46": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed48": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed49": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed50": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed51": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed53": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed52": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed55": true,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed54": false,
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env__seed56": false
+      }
+    }
+  ]
+}

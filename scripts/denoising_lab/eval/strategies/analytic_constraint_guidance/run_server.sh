@@ -12,5 +12,5 @@ uv run python scripts/denoising_lab/eval/strategies/analytic_constraint_guidance
     --model-path nvidia/GR00T-N1.6-3B \
     --embodiment-tag ROBOCASA_PANDA_OMRON \
     --use-sim-policy-wrapper \
-    --port 5555 \
+    --port 5556 \
     "$@"

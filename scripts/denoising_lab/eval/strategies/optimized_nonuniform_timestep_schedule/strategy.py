@@ -25,8 +25,8 @@ from transformers.feature_extraction_utils import BatchFeature
 
 
 # Default schedule — concentrate steps in the early (structure) and late
-# (refinement) phases.  Replace with empirically optimized values.
-DEFAULT_SCHEDULE: list[float] = [0.000, 0.080, 0.350, 0.820]
+# (refinement) phases.  Replace with empirically optimized values. --- DONE
+DEFAULT_SCHEDULE: list[float] = [0.0, 0.2928, 0.5965, 0.8584]
 
 
 # ---------------------------------------------------------------------------

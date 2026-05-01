@@ -44,9 +44,9 @@ class ConstraintConfig:
     """
 
     # Constraint weights
-    lambda_smooth: float = 0.005
-    lambda_discrete: float = 0.01
-    lambda_mode: float = 0.003
+    lambda_smooth: float = 0.001
+    lambda_discrete: float = 0.05
+    lambda_mode: float = 0.01
 
     # Overall guidance strength (annealed by tau)
     eta: float = 0.1

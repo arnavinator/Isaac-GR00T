@@ -181,14 +181,19 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 ```
 output_dir/
   lineage.json                        # Provenance + result
-  observations/                       # Per-step .npz (if --save-observations)
-    branch_step012_custom_00.npz      # Custom action sub-steps
-    branch_step012_custom_15.npz
-    branch_step013.npz                # Autonomous steps
+  observations/                       # Per-step .npz + .png (if --save-observations)
+    branch_step012_custom_00.npz      # Custom action sub-step 0 (1 MuJoCo sub-step)
+    branch_step012_custom_01.npz      # Custom action sub-step 1
+    ...
+    branch_step012_custom_15.npz      # Custom action sub-step 15
+    branch_step013.npz                # Autonomous step 1 (8 MuJoCo sub-steps)
+    branch_step014.npz                # Autonomous step 2
     ...
   video/                              # Video (if --video-dir)
-    ...
+    branch_from_step012.mp4
 ```
+
+The custom action phase captures every individual MuJoCo sub-step (16 frames for a full action chunk), giving full granularity on the action you're experimenting with. The autonomous phase captures one frame per action chunk (every `--n-action-steps` sub-steps, default 8), matching the granularity of `interactive_rollout.py`.
 
 ### Video recording during rollouts
 

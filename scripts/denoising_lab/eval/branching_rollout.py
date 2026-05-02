@@ -403,10 +403,6 @@ class BranchingRollout:
         print("State restored successfully.")
 
         video_frames: list[np.ndarray] = []
-        if self.video_dir is not None:
-            cam = self._collect_camera_frames(obs)
-            if cam:
-                video_frames.append(self._montage(cam))
 
         success = False
         total_reward = 0.0
@@ -522,9 +518,7 @@ class BranchingRollout:
                         video_frames.append(self._montage(cam))
 
                 if self.save_observations and not done:
-                    outer_step = self.branch_step + 1 + (
-                        1 if self.action_path else 0
-                    ) + auto_step - 1
+                    outer_step = self.branch_step + auto_step
                     self._save_branch_observation(
                         raw_obs,
                         f"branch_step{outer_step:03d}",

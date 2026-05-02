@@ -22,6 +22,7 @@ scripts/denoising_lab/
     interactive_denoising_panda.ipynb    # PandaOmron notebook — uses .npz observations from simulator
   eval/
     interactive_rollout.py               # Sim-side script (robocasa venv, CPU)
+    branching_rollout.py                 # Branch from saved state, inject action, continue (robocasa venv, CPU)
     robocasa_eval_benchmark.py           # Reproducible benchmark runner (robocasa venv, CPU)
     strategies/                          # Denoising strategy implementations
       baseline_euler/                    # Control group — stock 4-step Euler
@@ -33,6 +34,7 @@ The toolkit enforces a strict two-venv separation, matching the existing server/
 |-----------|------|-----|-------------|
 | `denoising_lab.py` + `notebooks/` | Main `.venv` | Yes | Model loading, backbone encoding, denoising experiments, visualization |
 | `eval/interactive_rollout.py` | Sim venv (`robocasa_uv/.venv`) | No | Runs the simulator, captures observations, executes actions |
+| `eval/branching_rollout.py` | Sim venv (`robocasa_uv/.venv`) | No | Branches from saved state, injects custom action, continues autonomously |
 | `eval/robocasa_eval_benchmark.py` | Sim venv (`robocasa_uv/.venv`) | No | Reproducible seeded evaluation across envs |
 
 The bridge between them is `.npz` files on disk — the rollout script saves observations, and the PandaOmron notebook loads them.
@@ -116,6 +118,77 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 ```
 
 The replay restores the sim to the exact state when the observation was captured, applies the action chunk, and saves a video of the result. You can compare different denoising strategies by replaying each and examining the videos.
+
+### Branching rollout — inject a custom action and continue autonomously
+
+The replay above executes a single action chunk and stops. A **branching rollout** goes further: it restores the sim state, executes your custom action chunk, then **continues rolling out autonomously** via the VLA server until the task succeeds or the episode budget runs out.
+
+This lets you answer questions like: "If the robot took *this* action at step 12, would it eventually succeed?"
+
+The branching rollout uses **direct MuJoCo state restoration** — the saved `.npz` already contains the full simulator state (`__sim_state__`) and kitchen layout metadata (`__ep_meta__`), so the scene at any saved step can be recreated exactly without replaying prior actions.
+
+**Step 1** — In the PandaOmron notebook, denoise and export an action chunk:
+```python
+DenoisingLab.save_action_chunk(decoded, "/tmp/action_chunks/branch_experiment.npz")
+```
+
+**Step 2** — Run the branching rollout in the sim venv (server must be running):
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/branching_rollout.py \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --obs-path /tmp/saved_observations/ep000_step012.npz \
+  --action-path /tmp/action_chunks/branch_experiment.npz \
+  --output-dir /tmp/branching_results/exp_01 \
+  --save-observations
+```
+
+**Step 3** — Inspect results:
+```bash
+cat /tmp/branching_results/exp_01/lineage.json
+```
+
+The `lineage.json` records full provenance: which `.npz` was branched from, the branch step, what custom action was injected, and whether the episode succeeded.
+
+**Baseline mode** — omit `--action-path` to see what the VLA would do from the saved state without any custom intervention:
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/branching_rollout.py \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --obs-path /tmp/saved_observations/ep000_step012.npz \
+  --output-dir /tmp/branching_results/baseline
+```
+
+**Step budget**: The branching rollout accounts for elapsed time. If you branch from step 12 with `--n-action-steps 8` and `--max-episode-steps 720`, the first 96 sub-steps (12 × 8) are counted as consumed, plus however many custom action sub-steps are executed. The autonomous phase uses the remaining budget.
+
+**CLI flags**:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--env-name` | (required) | Gymnasium env ID |
+| `--obs-path` | (required) | Saved observation `.npz` with `__sim_state__` |
+| `--action-path` | None | Custom action chunk `.npz`; omit for baseline |
+| `--host` / `--port` | `127.0.0.1` / `5555` | VLA server connection |
+| `--n-action-steps` | 8 | Sub-steps per chunk in autonomous phase |
+| `--max-episode-steps` | 720 | Total episode budget in sub-steps |
+| `--custom-action-steps` | all | How many sub-steps of custom action to execute |
+| `--output-dir` | `/tmp/branching_results` | Results directory |
+| `--save-observations` | off | Save per-step `.npz` files |
+| `--video-dir` | None | Video recording directory |
+| `--branch-step` | auto | Override branch step (auto-detected from `.npz`) |
+
+**Output structure**:
+```
+output_dir/
+  lineage.json                        # Provenance + result
+  observations/                       # Per-step .npz (if --save-observations)
+    branch_step012_custom_00.npz      # Custom action sub-steps
+    branch_step012_custom_15.npz
+    branch_step013.npz                # Autonomous steps
+    ...
+  video/                              # Video (if --video-dir)
+    ...
+```
 
 ### Video recording during rollouts
 
@@ -308,6 +381,28 @@ The replay:
 5. Steps through each sub-step of the action chunk
 6. Records all camera frames and saves an ``.mp4`` video
 
+### `BranchingRollout`
+
+Extends the replay concept: restores sim state, optionally executes a custom action chunk, then continues rolling out autonomously via the VLA server until success or episode budget exhaustion. Uses direct MuJoCo state restoration (``sim.set_state_from_flattened()``) — the same mechanism as ``ReplayRollout`` and robocasa's own ``playback_dataset.py``.
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/branching_rollout.py \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --obs-path /tmp/saved_observations/ep000_step012.npz \
+  --action-path /tmp/action_chunks/my_experiment.npz \
+  --output-dir /tmp/branching_results/exp_01
+```
+
+The branching rollout:
+1. Loads ``__sim_state__`` and ``__ep_meta__`` from the saved ``.npz``
+2. Restores the kitchen layout via ``set_ep_meta()`` + ``reset()``
+3. Restores the exact MuJoCo state via ``set_state_from_flattened()`` + ``sim.forward()``
+4. Executes custom action sub-steps on the base env (bypassing MultiStepWrapper)
+5. Synchronizes the MultiStepWrapper's internal step counter and observation deque
+6. Continues autonomous rollout via PolicyClient until success or truncation
+7. Writes ``lineage.json`` with full provenance and results
+
 ## Notebook cells
 
 Both notebooks share the same cell structure. The PandaOmron notebook has two extra cells (3b and 14):
@@ -330,6 +425,9 @@ Both notebooks share the same cell structure. The PandaOmron notebook has two ex
 | 12 | Raw denoising loop — fully editable playground mode |
 | 13 | Denoising progression visualization (noise → final trajectory) |
 | 14 | *(Panda only)* Export action chunk for replay in the simulator |
+| 15 | *(Panda only)* Save action chunk for branching rollout |
+| 16 | *(Panda only)* Launch branching rollout via subprocess |
+| 17 | *(Panda only)* Load and display branching results |
 
 ## How the denoising loop works
 

@@ -219,6 +219,15 @@ class InteractiveRollout:
                 json.dumps(ep_meta, cls=_NumpyEncoder), dtype=object
             )
 
+        save_dict["__step_info__"] = np.array(
+            json.dumps({
+                "episode": self.episode_count,
+                "step": self.step_count,
+                "n_action_steps": self.n_action_steps,
+            }),
+            dtype=object,
+        )
+
         np.savez_compressed(str(path), **save_dict)
 
         # Save camera snapshot PNG alongside the .npz

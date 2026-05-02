@@ -77,12 +77,14 @@ class InteractiveRollout:
         max_episode_steps: int = 720,
         save_dir: str = "/tmp/saved_observations",
         video_dir: str | None = None,
+        seed: int | None = None,
     ):
         self.env_name = env_name
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.n_action_steps = n_action_steps
         self.video_dir = video_dir
+        self.seed = seed
 
         # Create PolicyClient (ZMQ)
         self.client = PolicyClient(host=host, port=port, strict=False)
@@ -219,11 +221,13 @@ class InteractiveRollout:
                 json.dumps(ep_meta, cls=_NumpyEncoder), dtype=object
             )
 
+        episode_seed = self._episode_seed
         save_dict["__step_info__"] = np.array(
             json.dumps({
                 "episode": self.episode_count,
                 "step": self.step_count,
                 "n_action_steps": self.n_action_steps,
+                "seed": episode_seed,
             }),
             dtype=object,
         )
@@ -264,7 +268,10 @@ class InteractiveRollout:
             Episode info dict with success, length, etc.
         """
         self.step_count = 0
-        obs, info = self.env.reset()
+        self._episode_seed = None
+        if self.seed is not None:
+            self._episode_seed = self.seed + self.episode_count
+        obs, info = self.env.reset(seed=self._episode_seed)
 
         # Wrap obs in batch dimension for PolicyClient
         batched_obs = {}
@@ -280,6 +287,8 @@ class InteractiveRollout:
 
         print(f"\n{'='*60}")
         print(f"Episode {self.episode_count} started. Env: {self.env_name}")
+        if self._episode_seed is not None:
+            print(f"Seed: {self._episode_seed}")
         print(f"{'='*60}")
 
         # Detect language key and initialize prompt tracking
@@ -678,6 +687,13 @@ def main():
         default=1,
         help="Number of episodes to run (0 = loop until Ctrl-C)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base seed for reproducible episodes (episode i uses seed+i). "
+        "None = random.",
+    )
 
     # Replay mode arguments
     parser.add_argument(
@@ -731,6 +747,7 @@ def main():
         max_episode_steps=args.max_episode_steps,
         save_dir=args.save_dir,
         video_dir=args.video_dir,
+        seed=args.seed,
     )
 
     episode = 0

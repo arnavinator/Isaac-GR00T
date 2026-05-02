@@ -117,6 +117,7 @@ class InteractiveRollout:
 
         self.step_count = 0
         self.episode_count = 0
+        self._episode_seed = None
 
     def _get_sim_state(self) -> np.ndarray | None:
         """Try to get the MuJoCo simulation state (qpos/qvel) for replay."""
@@ -129,17 +130,20 @@ class InteractiveRollout:
             return None
 
     def _get_ep_meta(self) -> dict | None:
-        """Get robosuite episode metadata (layout_id, style_id, etc.) for replay.
-
-        The ep_meta dict captures all the random choices made during
-        ``_load_model()`` — kitchen layout, style, object assets, camera poses —
-        so that ``set_ep_meta()`` + ``reset()`` can reproduce the exact same
-        scene geometry.
-        """
+        """Get robosuite episode metadata (layout_id, style_id, etc.) for replay."""
         try:
             base_env = self.env.unwrapped
             robosuite_env = base_env.env
             return robosuite_env.get_ep_meta()
+        except (AttributeError, TypeError):
+            return None
+
+    def _get_model_xml(self) -> str | None:
+        """Get the MuJoCo model XML for exact scene reconstruction."""
+        try:
+            base_env = self.env.unwrapped
+            robosuite_env = base_env.env
+            return robosuite_env.sim.model.get_xml()
         except (AttributeError, TypeError):
             return None
 
@@ -220,6 +224,15 @@ class InteractiveRollout:
             save_dict["__ep_meta__"] = np.array(
                 json.dumps(ep_meta, cls=_NumpyEncoder), dtype=object
             )
+
+        # Save the MuJoCo model XML for exact scene reconstruction.
+        # ep_meta alone is not sufficient — reset() re-randomizes object
+        # placements and task targets within the layout. The model XML
+        # captures the exact scene as built, and reset_from_xml_string()
+        # rebuilds robosuite's internal task state to match.
+        model_xml = self._get_model_xml()
+        if model_xml is not None:
+            save_dict["__model_xml__"] = np.array(model_xml, dtype=object)
 
         episode_seed = self._episode_seed
         save_dict["__step_info__"] = np.array(
@@ -533,6 +546,11 @@ class ReplayRollout:
         if "__ep_meta__" in data:
             ep_meta = json.loads(str(data["__ep_meta__"]))
 
+        # Load model XML for exact scene reconstruction.
+        model_xml = None
+        if "__model_xml__" in data:
+            model_xml = str(data["__model_xml__"])
+
         # Load action chunk
         action_data = dict(np.load(str(self.action_path), allow_pickle=True))
         print(f"Action chunk keys: {list(action_data.keys())}")
@@ -553,6 +571,16 @@ class ReplayRollout:
         # Reset env (uses saved layout via ep_meta), then restore exact state
         print("Resetting environment...")
         obs, info = self.env.reset()
+
+        # If model XML is available, rebuild the scene from it. This ensures
+        # robosuite's internal task state (object tracking, success conditions)
+        # matches the original episode exactly.
+        if model_xml is not None:
+            xml = robosuite_env.edit_model_xml(model_xml)
+            robosuite_env.reset_from_xml_string(xml)
+            robosuite_env.sim.reset()
+            print("Restored model XML (exact scene reconstruction).")
+
         print("Restoring sim state...")
         self._restore_sim_state(sim_state)
 

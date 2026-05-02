@@ -149,14 +149,18 @@ class BranchingRollout:
         if save_observations:
             self.obs_dir = self.output_dir / "observations"
             self.obs_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir = Path(video_dir) if video_dir else None
+        if self.video_dir is not None:
+            self.video_dir.mkdir(parents=True, exist_ok=True)
 
         self.client = PolicyClient(host=host, port=port, strict=False)
 
+        # Never use VideoRecordingWrapper — it can't see Phase 2 custom
+        # action steps (which bypass the wrapper) and starts from the wrong
+        # frame (randomized reset, before state restoration). We record
+        # frames manually across all phases instead.
         wrapper_configs = WrapperConfigs(
-            video=VideoConfig(
-                video_dir=video_dir,
-                max_episode_steps=max_episode_steps,
-            ),
+            video=VideoConfig(video_dir=None),
             multistep=MultiStepConfig(
                 n_action_steps=n_action_steps,
                 max_episode_steps=max_episode_steps,
@@ -187,6 +191,10 @@ class BranchingRollout:
         self._ep_meta = None
         if "__ep_meta__" in data:
             self._ep_meta = json.loads(str(data["__ep_meta__"]))
+
+        self._model_xml = None
+        if "__model_xml__" in data:
+            self._model_xml = str(data["__model_xml__"])
 
         if self.branch_step is None and "__step_info__" in data:
             step_info = json.loads(str(data["__step_info__"]))
@@ -239,6 +247,14 @@ class BranchingRollout:
         except (AttributeError, TypeError):
             return None
 
+    def _get_model_xml(self) -> str | None:
+        try:
+            base_env = self.env.unwrapped
+            robosuite_env = base_env.env
+            return robosuite_env.sim.model.get_xml()
+        except (AttributeError, TypeError):
+            return None
+
     def _sync_wrapper_state(
         self, obs: dict[str, Any], consumed_substeps: int
     ) -> None:
@@ -281,12 +297,23 @@ class BranchingRollout:
                 json.dumps(ep_meta, cls=_NumpyEncoder), dtype=object
             )
 
+        model_xml = self._get_model_xml()
+        if model_xml is not None:
+            save_dict["__model_xml__"] = np.array(model_xml, dtype=object)
+
         np.savez_compressed(str(path), **save_dict)
 
         self._save_camera_snapshot(obs, path.with_suffix(".png"))
         return path
 
     def _save_camera_snapshot(self, obs: dict[str, Any], path: Path) -> None:
+        frames = self._collect_camera_frames(obs)
+        if not frames:
+            return
+        montage = self._montage(frames)
+        cv2.imwrite(str(path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
+
+    def _collect_camera_frames(self, obs: dict[str, Any]) -> list[np.ndarray]:
         frames = []
         for key in sorted(obs.keys()):
             if not key.startswith("video.") or "res512" in key:
@@ -298,10 +325,9 @@ class BranchingRollout:
             while img.ndim > 3:
                 img = img[0]
             frames.append(img)
+        return frames
 
-        if not frames:
-            return
-
+    def _montage(self, frames: list[np.ndarray]) -> np.ndarray:
         target_h = min(f.shape[0] for f in frames)
         resized = []
         for f in frames:
@@ -310,8 +336,31 @@ class BranchingRollout:
                 new_w = int(f.shape[1] * scale)
                 f = cv2.resize(f, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
             resized.append(f)
-        montage = np.concatenate(resized, axis=1)
-        cv2.imwrite(str(path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
+        return np.concatenate(resized, axis=1)
+
+    def _write_video(self, frames: list[np.ndarray], path: Path) -> None:
+        import av
+
+        if not frames:
+            return
+        h, w = frames[0].shape[:2]
+        h = h - (h % 2)
+        w = w - (w % 2)
+        container = av.open(str(path), mode="w")
+        stream = container.add_stream("h264", rate=10)
+        stream.width = w
+        stream.height = h
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.options = {"crf": "18"}
+        for frame_arr in frames:
+            if frame_arr.shape[:2] != (h, w):
+                frame_arr = cv2.resize(frame_arr, (w, h))
+            frame = av.VideoFrame.from_ndarray(frame_arr, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
 
     # -- main run ----------------------------------------------------------
 
@@ -331,10 +380,33 @@ class BranchingRollout:
 
         print("Resetting environment...")
         self.env.reset()
+
+        if self._model_xml is not None:
+            # Rebuild the scene from the saved model XML. This ensures
+            # robosuite's internal task state (object tracking, success
+            # conditions) matches the original episode — not the randomized
+            # scene from reset(). Follows playback_dataset.py:reset_to().
+            xml = robosuite_env.edit_model_xml(self._model_xml)
+            robosuite_env.reset_from_xml_string(xml)
+            robosuite_env.sim.reset()
+            print("Restored model XML (exact scene reconstruction).")
+        else:
+            print(
+                "WARNING: No __model_xml__ in saved observation. "
+                "Task state may not match the original episode. "
+                "Re-save observations with the updated interactive_rollout.py."
+            )
+
         print("Restoring sim state...")
         self._restore_sim_state(self._sim_state)
         obs = self._read_observation_after_restore()
         print("State restored successfully.")
+
+        video_frames: list[np.ndarray] = []
+        if self.video_dir is not None:
+            cam = self._collect_camera_frames(obs)
+            if cam:
+                video_frames.append(self._montage(cam))
 
         success = False
         total_reward = 0.0
@@ -371,6 +443,11 @@ class BranchingRollout:
                 total_reward += float(reward)
                 custom_substeps_executed += 1
                 print(f"  Custom step {t}: reward={reward:.3f} success={step_success}")
+
+                if self.video_dir is not None:
+                    cam = self._collect_camera_frames(base_obs)
+                    if cam:
+                        video_frames.append(self._montage(cam))
 
                 if self.save_observations:
                     self._save_branch_observation(
@@ -437,11 +514,17 @@ class BranchingRollout:
                         f"reward={total_reward:.3f} status={status}"
                     )
 
+                raw_obs = self.env.obs[-1]
+
+                if self.video_dir is not None:
+                    cam = self._collect_camera_frames(raw_obs)
+                    if cam:
+                        video_frames.append(self._montage(cam))
+
                 if self.save_observations and not done:
                     outer_step = self.branch_step + 1 + (
                         1 if self.action_path else 0
                     ) + auto_step - 1
-                    raw_obs = self.env.obs[-1]
                     self._save_branch_observation(
                         raw_obs,
                         f"branch_step{outer_step:03d}",
@@ -452,6 +535,11 @@ class BranchingRollout:
 
         # ---- Phase 5: Save Results ---------------------------------------
         duration = time.monotonic() - t0
+
+        if self.video_dir is not None and video_frames:
+            video_path = self.video_dir / f"branch_from_step{self.branch_step:03d}.mp4"
+            self._write_video(video_frames, video_path)
+            print(f"Video saved: {video_path} ({len(video_frames)} frames)")
 
         termination_reason = "success" if success else "truncated"
         if success and custom_substeps_executed > 0 and auto_step == 0:

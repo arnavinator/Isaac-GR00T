@@ -602,7 +602,8 @@ class DenoisingLab:
         """Load an observation dict from a ``.npz`` file saved by ``save_observation``.
 
         Returns a flat dict with keys like ``video.cam``, ``state.joints``, etc.
-        Internal keys (``__metadata__``, ``__sim_state__``, ``__ep_meta__``) are excluded.
+        Internal keys (``__metadata__``, ``__sim_state__``, ``__ep_meta__``,
+        ``__model_xml__``, ``__step_info__``) are excluded.
         """
         import json
 
@@ -615,6 +616,8 @@ class DenoisingLab:
         # Remove internal keys
         data.pop("__sim_state__", None)
         data.pop("__ep_meta__", None)
+        data.pop("__model_xml__", None)
+        data.pop("__step_info__", None)
 
         result: dict[str, Any] = {}
         for key, arr in data.items():

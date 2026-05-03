@@ -765,6 +765,7 @@ class TrajectoryVisualizer:
         show_gripper: bool = False,
         frame_scale: float | None = None,
         frame_stride: int = 1,
+        max_legend: int = 20,
     ) -> plt.Figure:
         """3D plot of all accumulated EEF trajectories.
 
@@ -857,7 +858,8 @@ class TrajectoryVisualizer:
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
-        ax.legend()
+        if len(self.trajectories) <= max_legend:
+            ax.legend()
         if title:
             ax.set_title(title)
 
@@ -879,6 +881,7 @@ class TrajectoryVisualizer:
         self,
         title: str | None = None,
         figsize: tuple[int, int] = (14, 5),
+        max_legend: int = 20,
     ) -> plt.Figure:
         """Plot X, Y, Z components over timesteps for all trajectories."""
         fig, axes = plt.subplots(1, 3, figsize=figsize)
@@ -894,7 +897,8 @@ class TrajectoryVisualizer:
             ax.set_xlabel("Timestep")
             ax.set_ylabel(lbl)
             ax.set_title(f"EEF {lbl}")
-            ax.legend(fontsize=7)
+            if len(self.trajectories) <= max_legend:
+                ax.legend(fontsize=7)
             ax.grid(True, alpha=0.3)
 
         if title:

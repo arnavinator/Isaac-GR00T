@@ -268,7 +268,7 @@ class BranchingRollout:
     # -- observation saving ------------------------------------------------
 
     def _save_branch_observation(
-        self, obs: dict[str, Any], label: str
+        self, obs: dict[str, Any], label: str, step: int,
     ) -> Path:
         path = self.obs_dir / f"{label}.npz"
         save_dict: dict[str, Any] = {}
@@ -300,6 +300,16 @@ class BranchingRollout:
         model_xml = self._get_model_xml()
         if model_xml is not None:
             save_dict["__model_xml__"] = np.array(model_xml, dtype=object)
+
+        save_dict["__step_info__"] = np.array(
+            json.dumps({
+                "step": step,
+                "n_action_steps": self.n_action_steps,
+                "parent_obs_path": str(self.obs_path),
+                "branch_step": self.branch_step,
+            }),
+            dtype=object,
+        )
 
         np.savez_compressed(str(path), **save_dict)
 
@@ -449,6 +459,7 @@ class BranchingRollout:
                     self._save_branch_observation(
                         base_obs,
                         f"branch_step{self.branch_step:03d}_custom_{t:02d}",
+                        step=self.branch_step,
                     )
 
                 if step_success:
@@ -522,6 +533,7 @@ class BranchingRollout:
                     self._save_branch_observation(
                         raw_obs,
                         f"branch_step{outer_step:03d}",
+                        step=outer_step,
                     )
 
                 if not done:

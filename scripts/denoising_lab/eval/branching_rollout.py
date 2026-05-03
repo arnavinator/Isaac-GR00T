@@ -368,6 +368,12 @@ class BranchingRollout:
             if frame_arr.shape[:2] != (h, w):
                 frame_arr = cv2.resize(frame_arr, (w, h))
             frame_arr = frame_arr.copy()
+            (tw, th), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2,
+            )
+            cv2.rectangle(
+                frame_arr, (8, 8), (14 + tw, 34 + baseline), (0, 0, 0), cv2.FILLED,
+            )
             cv2.putText(
                 frame_arr, label, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,

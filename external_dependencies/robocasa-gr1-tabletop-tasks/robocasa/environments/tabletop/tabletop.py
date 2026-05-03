@@ -1338,7 +1338,21 @@ class Tabletop(ManipulationEnv, metaclass=TabletopEnvMeta):
                 new_joint = "mobilebase0_" + old_joint[6:]
                 elem.set("joint", new_joint)
 
-        # result = ET.tostring(root, encoding="utf8").decode("utf8")
+        # Fix Panda gripper actuator params to match real Franka Hand specs
+        # (70 N continuous / 140 N peak). Robosuite defaults to ±20 N and
+        # kp=1000, which lets inertial forces from fast arm motions pry the
+        # fingers open during manipulation.
+        for elem in find_elements(
+            root=actuator,
+            tags=["general"],
+            return_first=False,
+        ):
+            name = elem.get("name", "")
+            if "gripper_finger_joint" in name:
+                elem.set("forcerange", "-70 70")
+                elem.set("gainprm", "5000")
+                elem.set("biasprm", "0 -5000")
+
         result = ET.tostring(root).decode("utf8")
 
         # replace with generative textures

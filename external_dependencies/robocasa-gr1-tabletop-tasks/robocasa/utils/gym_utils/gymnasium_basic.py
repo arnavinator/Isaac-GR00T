@@ -24,6 +24,39 @@ ALLOWED_LANGUAGE_CHARSET = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ,.\n\t[]{}()!?'_:"
 )
 
+# ---------------------------------------------------------------------------
+# Realistic Panda gripper parameters
+# ---------------------------------------------------------------------------
+# Real Franka Hand specs: 70 N continuous / 140 N peak grip force.
+# Default robosuite XML uses forcerange=±20 N and kp=1000 N/m, which lets
+# inertial forces from fast arm motions pry the fingers open.  The values
+# below match the real hardware's continuous rating.
+PANDA_GRIPPER_FORCERANGE = 70.0   # Newtons (continuous)
+PANDA_GRIPPER_KP = 5000.0         # N/m — gives ~50 N at 1 cm displacement
+
+
+def patch_panda_gripper_realism(
+    robosuite_env,
+    forcerange: float = PANDA_GRIPPER_FORCERANGE,
+    kp: float = PANDA_GRIPPER_KP,
+) -> int:
+    """Override Panda gripper actuator params on a live MuJoCo model.
+
+    Finds actuators whose name contains both ``gripper`` and ``finger``,
+    then sets *forcerange* and *gainprm/biasprm* (position-control kp).
+
+    Returns the number of actuators patched (typically 2 for Panda).
+    """
+    model = robosuite_env.sim.model
+    patched = 0
+    for i, name in enumerate(model.actuator_names):
+        if "gripper_finger_joint" in name:
+            model.actuator_forcerange[i] = [-forcerange, forcerange]
+            model.actuator_gainprm[i, 0] = kp
+            model.actuator_biasprm[i, 1] = -kp
+            patched += 1
+    return patched
+
 
 def create_env_robosuite(
     env_name,
@@ -217,7 +250,7 @@ class RoboCasaEnv(gym.Env):
             np.random.seed(seed)
             self.env.rng = np.random.default_rng(seed)
         raw_obs = self.env.reset()
-        # return obs
+        patch_panda_gripper_realism(self.env)
         obs = self.get_basic_observation(raw_obs)
 
         info = {}

@@ -276,7 +276,8 @@ class BranchingRollout:
 
         for key, val in obs.items():
             if isinstance(val, np.ndarray):
-                save_dict[key] = val[np.newaxis] if val.ndim < 3 else val
+                val = val[np.newaxis, np.newaxis]
+                save_dict[key] = val
             elif isinstance(val, (tuple, list)):
                 metadata[key] = (
                     "|".join(str(v) for v in val) if len(val) > 1 else str(val[0])

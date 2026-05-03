@@ -348,12 +348,14 @@ class BranchingRollout:
             resized.append(f)
         return np.concatenate(resized, axis=1)
 
-    def _write_video(self, frames: list[np.ndarray], path: Path) -> None:
+    def _write_video(
+        self, frames: list[tuple[str, np.ndarray]], path: Path
+    ) -> None:
         import av
 
         if not frames:
             return
-        h, w = frames[0].shape[:2]
+        h, w = frames[0][1].shape[:2]
         h = h - (h % 2)
         w = w - (w % 2)
         container = av.open(str(path), mode="w")
@@ -362,9 +364,15 @@ class BranchingRollout:
         stream.height = h
         stream.pix_fmt = "yuv420p"
         stream.codec_context.options = {"crf": "18"}
-        for frame_arr in frames:
+        for label, frame_arr in frames:
             if frame_arr.shape[:2] != (h, w):
                 frame_arr = cv2.resize(frame_arr, (w, h))
+            frame_arr = frame_arr.copy()
+            cv2.putText(
+                frame_arr, label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                cv2.LINE_AA,
+            )
             frame = av.VideoFrame.from_ndarray(frame_arr, format="rgb24")
             for packet in stream.encode(frame):
                 container.mux(packet)
@@ -453,7 +461,7 @@ class BranchingRollout:
                 if self.video_dir is not None:
                     cam = self._collect_camera_frames(base_obs)
                     if cam:
-                        video_frames.append(self._montage(cam))
+                        video_frames.append((f"custom {t}/{n_custom}", self._montage(cam)))
 
                 if self.save_observations:
                     self._save_branch_observation(
@@ -526,7 +534,8 @@ class BranchingRollout:
                 if self.video_dir is not None:
                     cam = self._collect_camera_frames(raw_obs)
                     if cam:
-                        video_frames.append(self._montage(cam))
+                        label = f"auto {auto_step} (step {self.branch_step + auto_step})"
+                        video_frames.append((label, self._montage(cam)))
 
                 if self.save_observations and not done:
                     outer_step = self.branch_step + auto_step

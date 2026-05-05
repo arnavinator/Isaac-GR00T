@@ -47,22 +47,22 @@ class ServerConfig:
 
     # --- Consensus parameters ---
 
-    K: int = 8
+    K: int = 12
     """Number of noise candidates to evaluate."""
 
-    num_steps: int = 4
-    """Number of Euler denoising steps (all K candidates go through all D)."""
+    num_steps: int = 1
+    """Number of Euler denoising steps (all K candidates go through all num_steps)."""
 
     lambda_pos: float = 1.0
     """Weight for EEF position closeness-to-mean score."""
 
-    lambda_rot: float = 0.5
+    lambda_rot: float = 0.1
     """Weight for EEF rotation closeness-to-mean score."""
 
-    lambda_jerk: float = 0.1
+    lambda_jerk: float = 0.0
     """Weight for jerk minimization score."""
 
-    action_horizon: int = 16
+    action_horizon: int = 8
     """Meaningful timesteps for scoring (PandaOmron=16)."""
 
 

@@ -48,13 +48,13 @@ class ServerConfig:
 
     # --- Constraint guidance parameters ---
 
-    lambda_smooth: float = 0.005
+    lambda_smooth: float = 0.001
     """Weight for temporal smoothness constraint (jerk minimisation)."""
 
-    lambda_discrete: float = 0.01
+    lambda_discrete: float = 0.05
     """Weight for discrete decisiveness constraint (gripper + control mode)."""
 
-    lambda_mode: float = 0.003
+    lambda_mode: float = 0.01
     """Weight for control-mode temporal consistency constraint."""
 
     eta: float = 0.1

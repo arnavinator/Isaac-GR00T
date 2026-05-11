@@ -119,7 +119,7 @@ def main(config: ServerConfig):
     _original_reset = policy.reset
 
     def _patched_reset(options=None):
-        reset_fn()
+        reset_fn(options)
         return _original_reset(options)
 
     policy.reset = _patched_reset

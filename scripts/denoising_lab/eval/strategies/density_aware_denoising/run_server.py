@@ -119,7 +119,7 @@ def main(config: ServerConfig):
 
     original_reset = policy.reset
     def augmented_reset(options=None):
-        reset_fn()
+        reset_fn(options)
         return original_reset(options)
     policy.reset = augmented_reset
 

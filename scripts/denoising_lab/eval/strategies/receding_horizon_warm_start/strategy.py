@@ -263,7 +263,8 @@ def patch_action_head(action_head, tau_start=0.5, n_executed=8,
     """Monkey-patch the action head for warm-start denoising.
 
     The patched action head caches the raw ``action_pred`` from each inference
-    call and uses it to warm-start the next call.
+    call and uses it to warm-start the next call.  State is keyed by
+    ``client_id`` so multiple clients can share one server safely.
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` to patch in-place.
@@ -273,19 +274,23 @@ def patch_action_head(action_head, tau_start=0.5, n_executed=8,
         beta: Blend strength for noise_bias mode (default 0.15).
 
     Returns:
-        A ``reset()`` callable that clears the cached state.  **Must** be
+        A ``reset(options)`` callable that clears the cached state.  **Must** be
         hooked into the policy's ``reset()`` method — see ``run_server.py``.
     """
-    action_head._warm_start_prev = None
+    _client_state: dict = {}  # client_id -> prev_actions tensor
 
     # Save original method for cold-start fallback
     _original_fn = action_head.get_action_with_features
+
+    def _get_cid():
+        return getattr(action_head, "_current_client_id", None)
 
     @torch.no_grad()
     def warm_start_get_action_with_features(
         backbone_features, state_features, embodiment_id, backbone_output,
     ):
-        prev = action_head._warm_start_prev
+        cid = _get_cid()
+        prev = _client_state.get(cid)
 
         if prev is not None:
             actions = denoise_warm_start(
@@ -302,7 +307,7 @@ def patch_action_head(action_head, tau_start=0.5, n_executed=8,
             actions = result["action_pred"]
 
         # Cache for next call
-        action_head._warm_start_prev = actions.clone()
+        _client_state[cid] = actions.clone()
 
         return BatchFeature(data={
             "action_pred": actions,
@@ -312,9 +317,13 @@ def patch_action_head(action_head, tau_start=0.5, n_executed=8,
 
     action_head.get_action_with_features = warm_start_get_action_with_features
 
-    def reset():
+    def reset(options=None):
         """Clear warm-start cache (call on episode reset)."""
-        action_head._warm_start_prev = None
+        cid = options.get("client_id") if options else None
+        if cid is not None:
+            _client_state.pop(cid, None)
+        else:
+            _client_state.clear()
 
     return reset
 

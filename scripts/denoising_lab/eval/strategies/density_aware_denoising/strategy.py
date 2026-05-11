@@ -525,7 +525,8 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
     """Monkey-patch the action head to use density-aware denoising.
 
     Replaces ``get_action_with_features()`` in-place.  Caches denoised
-    actions for cross-chunk anchor consistency in rank mode.
+    actions for cross-chunk anchor consistency in rank mode.  State is
+    keyed by ``client_id`` so multiple clients can share one server safely.
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` to patch in-place.
@@ -533,32 +534,38 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
         diagnostics_log: Optional list to collect per-chunk diagnostics.
 
     Returns:
-        A ``reset()`` callable that clears cached state.  Must be hooked
+        A ``reset(options)`` callable that clears cached state.  Must be hooked
         into the policy's ``reset()`` method so stale actions from a
         previous episode don't distort anchor scoring.
     """
     if cfg is None:
         cfg = DensityAwareConfig()
 
-    _prev_actions = [None]
-    _chunk_idx = [0]
+    _client_state: dict = {}  # client_id -> {"prev_actions": ..., "chunk_idx": ...}
+
+    def _get_state():
+        cid = getattr(action_head, "_current_client_id", None)
+        if cid not in _client_state:
+            _client_state[cid] = {"prev_actions": None, "chunk_idx": 0}
+        return _client_state[cid], cid
 
     @torch.no_grad()
     def density_get_action_with_features(
         backbone_features, state_features, embodiment_id, backbone_output,
     ):
+        cs, _ = _get_state()
         actions, diag = denoise_density_aware(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output,
             cfg=cfg,
-            prev_actions=_prev_actions[0],
+            prev_actions=cs["prev_actions"],
             diagnostics_log=diagnostics_log,
         )
-        _prev_actions[0] = actions.detach()
+        cs["prev_actions"] = actions.detach()
 
         if diagnostics_log is not None and len(diagnostics_log) > 0:
-            diagnostics_log[-1]["chunk_idx"] = _chunk_idx[0]
-        _chunk_idx[0] += 1
+            diagnostics_log[-1]["chunk_idx"] = cs["chunk_idx"]
+        cs["chunk_idx"] += 1
 
         return BatchFeature(data={
             "action_pred": actions,
@@ -568,9 +575,12 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
 
     action_head.get_action_with_features = density_get_action_with_features
 
-    def reset():
-        _prev_actions[0] = None
-        _chunk_idx[0] = 0
+    def reset(options=None):
+        cid = options.get("client_id") if options else None
+        if cid is not None:
+            _client_state.pop(cid, None)
+        else:
+            _client_state.clear()
 
     return reset
 

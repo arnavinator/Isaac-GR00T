@@ -312,7 +312,7 @@ def patch_action_head(action_head, cfg=None):
 
     action_head.get_action_with_features = patched_get_action_with_features
 
-    def reset():
+    def reset(options=None):
         pass
 
     return reset

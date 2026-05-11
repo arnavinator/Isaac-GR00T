@@ -339,6 +339,10 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        # Expose client_id to strategy patches on the action head
+        cid = options.get("client_id") if options else None
+        self.model.action_head._current_client_id = cid
+
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
             model_pred = self.model.get_action(**collated_inputs)

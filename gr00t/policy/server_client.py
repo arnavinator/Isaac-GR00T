@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import io
+import uuid
 from typing import Any, Callable
 
 import msgpack
@@ -162,6 +163,7 @@ class PolicyClient(BasePolicy):
         self.port = port
         self.timeout_ms = timeout_ms
         self.api_token = api_token
+        self.client_id = str(uuid.uuid4())
         self._init_socket()
 
     def _init_socket(self):
@@ -218,12 +220,18 @@ class PolicyClient(BasePolicy):
     def _get_action(
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if options is None:
+            options = {}
+        options.setdefault("client_id", self.client_id)
         response = self.call_endpoint(
             "get_action", {"observation": observation, "options": options}
         )
         return tuple(response)  # Convert list (from msgpack) to tuple of (action, info)
 
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        if options is None:
+            options = {}
+        options.setdefault("client_id", self.client_id)
         return self.call_endpoint("reset", {"options": options})
 
     def get_modality_config(self) -> dict[str, ModalityConfig]:

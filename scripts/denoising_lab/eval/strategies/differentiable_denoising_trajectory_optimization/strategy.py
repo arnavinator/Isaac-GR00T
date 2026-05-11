@@ -367,17 +367,21 @@ def patch_action_head(action_head, cfg=None):
     """Monkey-patch the action head to use DDTO.
 
     Replaces ``get_action_with_features()`` in-place.  Caches the denoised
-    actions across calls to enable anchor consistency scoring.
+    actions across calls to enable anchor consistency scoring.  State is
+    keyed by ``client_id`` so multiple clients can share one server safely.
 
     Returns:
-        A ``reset()`` callable that clears the cached state.  **Must** be
+        A ``reset(options)`` callable that clears the cached state.  **Must** be
         hooked into the policy's ``reset()`` method so that stale actions
         from a previous episode don't distort anchor scoring.
     """
     if cfg is None:
         cfg = DDTOConfig()
 
-    _prev_actions = [None]  # mutable closure state for cross-chunk caching
+    _client_state: dict = {}  # client_id -> prev_actions tensor
+
+    def _get_cid():
+        return getattr(action_head, "_current_client_id", None)
 
     @torch.no_grad()
     def patched_get_action_with_features(
@@ -385,12 +389,13 @@ def patch_action_head(action_head, cfg=None):
     ):
         # torch.enable_grad() inside denoise_ddto Phase 1 overrides
         # the outer no_grad for the 1-step backprop.
+        cid = _get_cid()
         actions, _diagnostics = denoise_ddto(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output, cfg=cfg,
-            prev_actions=_prev_actions[0],
+            prev_actions=_client_state.get(cid),
         )
-        _prev_actions[0] = actions.detach()
+        _client_state[cid] = actions.detach()
         return BatchFeature(data={
             "action_pred": actions,
             "backbone_features": backbone_features,
@@ -399,9 +404,13 @@ def patch_action_head(action_head, cfg=None):
 
     action_head.get_action_with_features = patched_get_action_with_features
 
-    def reset():
+    def reset(options=None):
         """Clear cached prev_actions (call on episode reset)."""
-        _prev_actions[0] = None
+        cid = options.get("client_id") if options else None
+        if cid is not None:
+            _client_state.pop(cid, None)
+        else:
+            _client_state.clear()
 
     return reset
 

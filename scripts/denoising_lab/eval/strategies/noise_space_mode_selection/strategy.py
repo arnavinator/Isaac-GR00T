@@ -436,6 +436,8 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
 
     Replaces ``get_action_with_features()`` in-place.  Caches the denoised
     actions across calls to enable action-space anchor consistency scoring.
+    State is keyed by ``client_id`` so multiple clients can share one server
+    safely.
 
     Args:
         action_head: ``Gr00tN1d6ActionHead`` to patch in-place.
@@ -443,31 +445,37 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
         diagnostics_log: Optional list to collect per-chunk diagnostics into.
 
     Returns:
-        A ``reset()`` callable that clears the cached state.  **Must** be
+        A ``reset(options)`` callable that clears the cached state.  **Must** be
         hooked into the policy's ``reset()`` method so that stale actions
         from a previous episode don't distort anchor scoring.
     """
     if cfg is None:
         cfg = NoiseSelectionConfig()
 
-    _prev_actions = [None]  # mutable closure state for cross-chunk caching
-    _chunk_idx = [0]
+    _client_state: dict = {}  # client_id -> {"prev_actions": ..., "chunk_idx": ...}
+
+    def _get_state():
+        cid = getattr(action_head, "_current_client_id", None)
+        if cid not in _client_state:
+            _client_state[cid] = {"prev_actions": None, "chunk_idx": 0}
+        return _client_state[cid], cid
 
     @torch.no_grad()
     def patched_get_action_with_features(
         backbone_features, state_features, embodiment_id, backbone_output,
     ):
+        cs, _ = _get_state()
         actions, _best_noise, last_velocity = denoise_with_noise_selection(
             action_head, backbone_features, state_features,
             embodiment_id, backbone_output, cfg=cfg,
-            prev_actions=_prev_actions[0],
+            prev_actions=cs["prev_actions"],
             diagnostics_log=diagnostics_log,
         )
-        _prev_actions[0] = actions.detach()
+        cs["prev_actions"] = actions.detach()
 
         if diagnostics_log is not None and len(diagnostics_log) > 0:
-            diagnostics_log[-1]["chunk_idx"] = _chunk_idx[0]
-        _chunk_idx[0] += 1
+            diagnostics_log[-1]["chunk_idx"] = cs["chunk_idx"]
+        cs["chunk_idx"] += 1
 
         return BatchFeature(data={
             "action_pred": actions,
@@ -477,10 +485,13 @@ def patch_action_head(action_head, cfg=None, diagnostics_log=None):
 
     action_head.get_action_with_features = patched_get_action_with_features
 
-    def reset():
+    def reset(options=None):
         """Clear cached prev_actions (call on episode reset)."""
-        _prev_actions[0] = None
-        _chunk_idx[0] = 0
+        cid = options.get("client_id") if options else None
+        if cid is not None:
+            _client_state.pop(cid, None)
+        else:
+            _client_state.clear()
 
     return reset
 

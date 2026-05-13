@@ -394,9 +394,15 @@ class GRPOTrainer:
 
         # DiT is already in eval mode from setup / after _grpo_update; do not flip
         # modes here or the current-pass in _grpo_update will drift from ref.
+        #
+        # We use torch.no_grad() (not torch.inference_mode()) because this pass
+        # ALSO caches per-chunk backbone/state features onto the chunks for
+        # reuse during _grpo_update. inference_mode() produces tensors that
+        # cannot participate in a later autograd graph, which would break
+        # _grpo_update; no_grad tensors can be used freely as non-grad inputs.
 
         n_computed = 0
-        with torch.inference_mode():
+        with torch.no_grad():
             for start in range(0, len(chunks), batch_size):
                 batch = chunks[start:start + batch_size]
                 result = self._prepare_batch(batch)
@@ -428,7 +434,13 @@ class GRPOTrainer:
                     n_samples=K,
                 )
 
-                # Store back into chunks
+                # --- Cache per-chunk encoded features for _grpo_update reuse ---
+                # The Eagle backbone + state encoder are frozen, so their output
+                # is identical across all GRPO epochs. We only need to run them
+                # once per iteration (here) instead of once per minibatch.
+                self._cache_encoded_features(valid_batch, batch_data)
+
+                # Store ref log-prob and the (tau, eps)-samples used for it
                 tau_cpu = timesteps.cpu().numpy()  # [K, B]
                 for i, chunk in enumerate(valid_batch):
                     chunk.ref_log_prob = ref_lp[i].item()
@@ -436,6 +448,43 @@ class GRPOTrainer:
                 n_computed += len(valid_batch)
 
         print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
+
+    def _cache_encoded_features(self, valid_batch, batch_data):
+        """Store per-chunk slices of the batched backbone/state output onto
+        each chunk, so _prepare_batch can rebuild batches without re-running
+        the backbone. Called from within _compute_ref_log_probs' no_grad block.
+
+        We slice each batch tensor along the batch axis and detach()+clone()
+        so the chunk owns its own storage — the large batch tensor can then be
+        garbage-collected once the batch goes out of scope.
+        """
+        backbone_features = batch_data["backbone_output"]["backbone_features"]      # [B, seq, D]
+        backbone_attn_mask = batch_data["backbone_output"].get("backbone_attention_mask")
+        image_mask = batch_data["backbone_output"].get("image_mask")
+        state_features = batch_data["state_features"]                               # [B, state_hz, 1536]
+        embodiment_id = batch_data["embodiment_id"]                                 # [B]
+
+        for i, chunk in enumerate(valid_batch):
+            # Unpad to the chunk's true seq_len using its attention mask.
+            # This keeps per-chunk cache as small as the chunk actually needs,
+            # instead of carrying the batch-level padding forever.
+            if backbone_attn_mask is not None:
+                valid_len = int(backbone_attn_mask[i].sum().item())
+                chunk.cached_backbone_features = backbone_features[i, :valid_len].detach().clone()
+                chunk.cached_backbone_attn_mask = backbone_attn_mask[i, :valid_len].detach().clone()
+                if image_mask is not None:
+                    chunk.cached_image_mask = image_mask[i, :valid_len].detach().clone()
+                else:
+                    chunk.cached_image_mask = None
+            else:
+                chunk.cached_backbone_features = backbone_features[i].detach().clone()
+                chunk.cached_backbone_attn_mask = None
+                chunk.cached_image_mask = (
+                    image_mask[i].detach().clone() if image_mask is not None else None
+                )
+
+            chunk.cached_state_features = state_features[i].detach().clone()
+            chunk.cached_embodiment_id = embodiment_id[i].detach().clone()
 
     def _grpo_update(self) -> dict:
         """Run GRPO clipped surrogate policy gradient update on collected episodes.
@@ -658,17 +707,39 @@ class GRPOTrainer:
         )  # [B]
 
         # --- Encode observations through backbone ---
-        # Follows the DenoisingLab pattern (denoising_lab.py:190-202):
-        #   backbone_inputs, action_inputs = model.prepare_input(**collated)
-        #   backbone_output = backbone(backbone_inputs)
-        #   features = action_head._encode_features(backbone_output, action_inputs)
-        with torch.no_grad():
-            encode_result = self._encode_observations(valid_batch)
+        # Fast path: if _compute_ref_log_probs has already cached per-chunk
+        # encoded features for every chunk in this batch, rebuild the batch
+        # tensors directly from cache and skip the backbone forward. The Eagle
+        # backbone + state encoder are frozen (no LoRA), so their output is
+        # identical regardless of LoRA weight updates in between — the cache
+        # is semantically valid for the whole iteration.
+        #
+        # Slow path (fallback): re-encode observations. Taken when the cache
+        # is not yet populated (first call from _compute_ref_log_probs) or
+        # when any chunk is missing cached features.
+        all_cached = all(
+            c.cached_backbone_features is not None
+            and c.cached_state_features is not None
+            and c.cached_embodiment_id is not None
+            for c in valid_batch
+        )
 
-        if encode_result is None:
-            return None
+        if all_cached:
+            backbone_output, state_features, embodiment_id = (
+                self._rebuild_encoded_from_cache(valid_batch)
+            )
+        else:
+            # Follows the DenoisingLab pattern (denoising_lab.py:190-202):
+            #   backbone_inputs, action_inputs = model.prepare_input(**collated)
+            #   backbone_output = backbone(backbone_inputs)
+            #   features = action_head._encode_features(backbone_output, action_inputs)
+            with torch.no_grad():
+                encode_result = self._encode_observations(valid_batch)
 
-        backbone_output, state_features, embodiment_id = encode_result
+            if encode_result is None:
+                return None
+
+            backbone_output, state_features, embodiment_id = encode_result
 
         return {
             "actions": actions,
@@ -679,6 +750,63 @@ class GRPOTrainer:
             "state_features": state_features,
             "embodiment_id": embodiment_id,
         }, valid_batch
+
+    def _rebuild_encoded_from_cache(self, valid_batch: list[ActionChunk]):
+        """Restack per-chunk cached features into batched tensors.
+
+        Each chunk stores its features UNPADDED (at its own seq_len). To put
+        them in a minibatch we pad them all to the minibatch's max seq_len.
+        This mirrors what the backbone's internal padding does, so the output
+        has the same shape contract as _encode_observations() would produce.
+        """
+        B = len(valid_batch)
+
+        # Determine padding target
+        seq_lens = [c.cached_backbone_features.shape[0] for c in valid_batch]
+        max_seq = max(seq_lens)
+        D = valid_batch[0].cached_backbone_features.shape[1]
+        feat_dtype = valid_batch[0].cached_backbone_features.dtype
+
+        backbone_features = torch.zeros(B, max_seq, D, device=self.device, dtype=feat_dtype)
+        backbone_attn_mask = None
+        image_mask = None
+
+        any_attn = any(c.cached_backbone_attn_mask is not None for c in valid_batch)
+        any_img = any(c.cached_image_mask is not None for c in valid_batch)
+
+        if any_attn:
+            backbone_attn_mask = torch.zeros(
+                B, max_seq, device=self.device,
+                dtype=valid_batch[0].cached_backbone_attn_mask.dtype,
+            )
+        if any_img:
+            image_mask = torch.zeros(
+                B, max_seq, device=self.device,
+                dtype=valid_batch[0].cached_image_mask.dtype,
+            )
+
+        for i, c in enumerate(valid_batch):
+            sl = seq_lens[i]
+            backbone_features[i, :sl] = c.cached_backbone_features
+            if backbone_attn_mask is not None and c.cached_backbone_attn_mask is not None:
+                backbone_attn_mask[i, :sl] = c.cached_backbone_attn_mask
+            if image_mask is not None and c.cached_image_mask is not None:
+                image_mask[i, :sl] = c.cached_image_mask
+
+        state_features = torch.stack(
+            [c.cached_state_features for c in valid_batch], dim=0
+        )
+        embodiment_id = torch.stack(
+            [c.cached_embodiment_id for c in valid_batch], dim=0
+        )
+
+        backbone_output = {
+            "backbone_features": backbone_features,
+            "image_mask": image_mask,
+            "backbone_attention_mask": backbone_attn_mask,
+        }
+
+        return backbone_output, state_features, embodiment_id
 
     def _encode_observations(self, batch: list[ActionChunk]):
         """Run Eagle backbone on a batch of observations.

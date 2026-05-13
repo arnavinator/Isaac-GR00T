@@ -74,6 +74,24 @@ class ActionChunk:
     # Timestep samples used for ref_log_prob computation (reused during training)
     tau_samples: np.ndarray | None = None  # (K,) float32
 
+    # --- Encoded-observation cache (populated in _compute_ref_log_probs) ----
+    # The Eagle backbone and state encoder are frozen (no LoRA), so their outputs
+    # are identical across all training epochs/minibatches. We run them once
+    # during the ref log-prob pass and stash per-chunk slices here; _prepare_batch
+    # then rebuilds a batched tensor from these slices instead of re-running the
+    # backbone. Cleared with the rest of the chunk when buffer.clear() runs.
+    # Shapes (unpadded, per-chunk):
+    #   cached_backbone_features:  (seq_len, 2048)  bfloat16
+    #   cached_backbone_attn_mask: (seq_len,)       bool
+    #   cached_image_mask:         (seq_len,)       bool  (None if not provided)
+    #   cached_state_features:     (state_horizon, 1536)  bfloat16
+    #   cached_embodiment_id:      ()               long scalar tensor
+    cached_backbone_features: "torch.Tensor | None" = None
+    cached_backbone_attn_mask: "torch.Tensor | None" = None
+    cached_image_mask: "torch.Tensor | None" = None
+    cached_state_features: "torch.Tensor | None" = None
+    cached_embodiment_id: "torch.Tensor | None" = None
+
 
 @dataclass
 class GRPOEpisode:

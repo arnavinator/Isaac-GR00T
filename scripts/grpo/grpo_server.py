@@ -1,21 +1,21 @@
 """Extended GR00T policy server for GRPO training.
 
 This server extends the standard PolicyServer (gr00t/policy/server_client.py) to:
-1. Return the noise seed used during each denoising call
-2. Optionally run density-aware diagnostics during inference (+12% overhead)
+1. Capture the initial noise tensor used during denoising (via torch.randn hook)
+2. Capture the raw normalized action tensor (50×128) from the DiT output
 
-Why noise seeds matter for GRPO:
-- The FM log-prob surrogate requires evaluating the model on the EXACT same noise
-  that was used during collection
-- Without the seed, we can't reconstruct the denoising trajectory
-- The DenoisingLab (denoising_lab.py:287-296) already demonstrates this pattern:
-      gen = torch.Generator(device=device).manual_seed(seed)
-      actions = torch.randn(..., generator=gen)
+Why initial_noise matters for GRPO:
+- The FM log-prob surrogate evaluates the velocity field along an interpolation path
+  x_τ = (1-τ)ε + τ*action. Using the SAME ε for both current and ref models ensures
+  the importance ratio reflects only the model difference, not estimation noise.
+- We capture ε₀ (the actual noise that was denoised into the action) so training
+  can evaluate along the true path the model took, rather than random paths.
 
 Implementation approach:
-- Use a counter-based seed (iteration * max_chunks + chunk_idx) for determinism
-- Before each get_action() call, set torch.manual_seed(seed)
-- Return the seed alongside the action in the response
+- Monkey-patch torch.randn for the duration of the policy call
+- Capture the first 3D tensor (the denoising noise in get_action_with_features)
+- Also hook get_action_with_features to capture the raw action before decoding
+- Restore both patches in a try/finally block
 
 This file runs in the MAIN VENV (GPU) alongside the model.
 
@@ -27,7 +27,6 @@ Usage:
 """
 
 import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -57,9 +56,6 @@ class GRPOServerConfig:
     port: int = 5555
 
     # GRPO extensions
-    # Starting seed for noise generation (incremented per call)
-    initial_seed: int = 0
-
     # Whether to use density-aware diagnostics during inference
     use_density_diagnostics: bool = False
 
@@ -74,44 +70,37 @@ class GRPOServerConfig:
 
 
 class GRPOPolicyWrapper:
-    """Wraps the GR00T policy to capture and return noise seeds.
+    """Wraps the GR00T policy to capture the initial denoising noise and raw action.
 
-    This is the key GRPO extension: before each inference call, we set a
-    deterministic seed on the GPU RNG so that the initial noise in the
-    denoising loop (torch.randn at gr00t_n1d6.py:311) is reproducible.
-
-    The seed is returned alongside the action so the training loop can
-    reconstruct the exact noise for FM log-prob computation.
+    This is the key GRPO extension. Before each inference call:
+    1. Patch torch.randn to capture the first 3D tensor (the denoising noise)
+    2. Hook get_action_with_features to capture the raw normalized action output
+    Both are returned in the info dict for the collector to store per chunk.
     """
 
-    def __init__(self, policy, initial_seed: int = 0, device: str = "cuda"):
+    def __init__(self, policy, device: str = "cuda", action_mask: np.ndarray | None = None):
         """
         Args:
             policy: The underlying Gr00tPolicy or Gr00tSimPolicyWrapper.
-            initial_seed: Starting seed value (incremented per call).
-            device: Device for torch RNG seeding.
+            device: Device for the model (used to identify action_head).
+            action_mask: Pre-computed (max_horizon, max_dim) mask with 1s for valid
+                dims of the current embodiment, 0s for padding. If None, attempts
+                to derive it from the wrapped policy's processor/modality_configs.
         """
         self.policy = policy
         self.device = device
-
-        # Atomic counter for seed generation (thread-safe for server use)
-        self._seed_counter = initial_seed
-        self._lock = threading.Lock()
-
-        # Store the most recent seeds for client retrieval
-        self._last_seeds: list[int] = []
+        self.action_mask = action_mask if action_mask is not None else compute_action_mask(policy)
 
     def get_action(self, observation, options=None):
-        """Get action with deterministic noise seeding and raw action capture.
+        """Get action with initial noise and raw action capture.
 
-        Mirrors the standard policy.get_action() interface but additionally:
-        1. Sets a deterministic RNG seed before inference
-        2. Captures the raw normalized action tensor (50×128) via hook
-        3. Returns noise seeds and raw action in the info dict
+        Extends the standard policy.get_action() interface to additionally capture:
+        1. The initial noise tensor used to start the denoising loop
+        2. The raw normalized action tensor (50×128) from the model output
 
-        The raw normalized action is needed for FM log-prob computation during
-        GRPO training. Without it, we'd need to re-normalize decoded actions
-        (lossy due to clipping/thresholding).
+        Both are returned in the info dict for the collector to store. During
+        GRPO training, the initial noise is used as the shared ε for FM log-prob
+        evaluation (evaluating the model along the actual denoising path).
 
         Args:
             observation: Batched observation dict from the environment.
@@ -119,22 +108,10 @@ class GRPOPolicyWrapper:
 
         Returns:
             Tuple of (action_dict, info_dict) where info_dict contains:
-                - 'noise_seeds': list of int seeds used for denoising
-                - 'raw_actions': numpy array (B, 50, 128) of normalized actions
+                - 'initial_noise': numpy array (B, 50, 128) — the noise that was denoised
+                - 'raw_actions': numpy array (B, 50, 128) — normalized model output
         """
-        # Generate deterministic seed for this call
-        with self._lock:
-            seed = self._seed_counter
-            self._seed_counter += 1
-
-        # Determine batch size from observation
-        batch_size = self._get_batch_size(observation)
-        seeds = [seed * 1000 + i for i in range(batch_size)]
-        self._last_seeds = seeds
-
-        # Install a hook on the action head to capture raw normalized actions
-        # The action head's get_action_with_features() produces the raw (50×128) tensor
-        # at the end of the denoising loop, before decode_action() is called by the policy.
+        # Navigate to the action head for hooking
         inner_policy = self.policy.policy if hasattr(self.policy, "policy") else self.policy
         if hasattr(inner_policy, "model"):
             action_head = inner_policy.model.action_head
@@ -143,39 +120,53 @@ class GRPOPolicyWrapper:
         else:
             action_head = None
 
-        captured_raw_action = [None]  # Mutable container for closure
+        captured_raw_action = [None]
+        captured_initial_noise = [None]
 
         if action_head is not None:
             original_method = action_head.get_action_with_features
 
             def capturing_get_action_with_features(*args, **kwargs):
                 result = original_method(*args, **kwargs)
-                # Capture the raw normalized action tensor before it's decoded
                 captured_raw_action[0] = result["action_pred"].detach().cpu().numpy()
                 return result
 
-            action_head.get_action_with_features = capturing_get_action_with_features
+            # Patch torch.randn to capture the initial noise tensor.
+            # In get_action_with_features(), the first 3D randn call is the denoising
+            # starting noise: torch.randn(batch_size, action_horizon, action_dim)
+            _original_randn = torch.randn
 
-        # Set the PyTorch RNG state for reproducible noise generation
-        # This affects the torch.randn() call in get_action_with_features() (line 311)
-        torch.manual_seed(seed)
-        if self.device != "cpu":
-            torch.cuda.manual_seed(seed)
+            def _capturing_randn(*args, **kwargs):
+                result = _original_randn(*args, **kwargs)
+                # Capture the first 3D tensor produced (the denoising noise)
+                if captured_initial_noise[0] is None and result.dim() == 3:
+                    captured_initial_noise[0] = result.detach().cpu().numpy()
+                return result
+
+            action_head.get_action_with_features = capturing_get_action_with_features
+            torch.randn = _capturing_randn
 
         # Call the underlying policy
         try:
             action, info = self.policy.get_action(observation, options)
         finally:
-            # Restore original method to avoid accumulating closures
+            # Always restore originals
             if action_head is not None:
                 action_head.get_action_with_features = original_method
+                torch.randn = _original_randn
 
-        # Attach noise seeds and raw action to info for client retrieval
+        # Attach captured data to info for client retrieval
         if not isinstance(info, dict):
             info = {}
-        info["noise_seeds"] = seeds
         if captured_raw_action[0] is not None:
             info["raw_actions"] = captured_raw_action[0]
+        if captured_initial_noise[0] is not None:
+            info["initial_noise"] = captured_initial_noise[0]
+        if self.action_mask is not None and captured_raw_action[0] is not None:
+            B = captured_raw_action[0].shape[0]
+            info["action_mask"] = np.broadcast_to(
+                self.action_mask[np.newaxis], (B,) + self.action_mask.shape
+            ).copy()
 
         return action, info
 
@@ -196,17 +187,48 @@ class GRPOPolicyWrapper:
             return self.policy.get_modality_config()
         return {}
 
-    def _get_batch_size(self, observation) -> int:
-        """Infer batch size from observation structure."""
-        if isinstance(observation, dict):
-            for key, value in observation.items():
-                if hasattr(value, "shape"):
-                    return value.shape[0]
-                elif isinstance(value, dict):
-                    for v in value.values():
-                        if hasattr(v, "shape"):
-                            return v.shape[0]
-        return 1
+
+def compute_action_mask(policy) -> np.ndarray | None:
+    """Compute the per-embodiment action mask from a wrapped policy.
+
+    The model always outputs a padded (max_action_horizon, max_action_dim) tensor.
+    For a given embodiment, only a sub-rectangle corresponds to valid action dims.
+    This mask lets FM log-prob ignore the padded region during training.
+
+    Args:
+        policy: Gr00tPolicy, Gr00tSimPolicyWrapper, or an _InPlacePolicy wrapping
+            a Gr00tN1d6 model. The inner policy must expose `.processor`,
+            `.modality_configs` (per-embodiment sub-dict), and `.embodiment_tag`.
+
+    Returns:
+        Float32 ndarray of shape (max_action_horizon, max_action_dim), or None
+        if the required attributes cannot be resolved.
+    """
+    inner = getattr(policy, "policy", policy)
+    if not (hasattr(inner, "processor") and hasattr(inner, "modality_configs")
+            and hasattr(inner, "embodiment_tag")):
+        return None
+
+    try:
+        processor = inner.processor
+        modality_configs = inner.modality_configs
+        embodiment_tag = inner.embodiment_tag
+
+        action_horizon = len(modality_configs["action"].delta_indices)
+        # Note: processor.action_dim is only populated when set_statistics() is
+        # called explicitly; it is NOT populated by from_pretrained. Use the
+        # state_action_processor accessor, which is always populated when
+        # statistics are loaded from the checkpoint.
+        action_dim = int(processor.state_action_processor.get_action_dim(embodiment_tag.value))
+
+        max_horizon = int(getattr(processor, "max_action_horizon", 50))
+        max_dim = int(getattr(processor, "max_action_dim", 128))
+
+        mask = np.zeros((max_horizon, max_dim), dtype=np.float32)
+        mask[:action_horizon, :action_dim] = 1.0
+        return mask
+    except (AttributeError, KeyError, TypeError):
+        return None
 
 
 def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
@@ -225,7 +247,7 @@ def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
 
     print(f"Loading model from {config.model_path}...")
     policy = Gr00tPolicy(
-        embodiment_tag=EmbodimentTag(config.embodiment_tag),
+        embodiment_tag=EmbodimentTag[config.embodiment_tag],
         model_path=config.model_path,
         device=config.device,
     )
@@ -250,7 +272,6 @@ def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
     # Wrap with GRPO seed-tracking policy
     grpo_policy = GRPOPolicyWrapper(
         policy=policy,
-        initial_seed=config.initial_seed,
         device=config.device,
     )
 

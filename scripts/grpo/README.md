@@ -31,15 +31,15 @@ The DiT action head has 1.1B parameters. Full RL finetuning would be unstable an
 │  └────────────────────────────────────────────────────┘ │
 │                    │                                     │
 │  ┌─────────────────┼─────────────────────────────────┐  │
-│  │ DiT + LoRA      │   Reference DiT (frozen copy)   │  │
-│  │ (trainable)     │   (for importance ratio)        │  │
+│  │ DiT + LoRA      │   Pre-computed ref_log_probs    │  │
+│  │ (trainable)     │   (per-chunk scalars)           │  │
 │  │                 │                                  │  │
 │  │  32 transformer blocks × LoRA(r=16) ≈ 20M params  │  │
 │  └─────────────────┼─────────────────────────────────┘  │
 │                    │                                     │
 │  ┌─────────────────┼───────────┐                        │
 │  │ ZMQ Server (port 5555)     │ ← serves actions +     │
-│  │ + noise seed tracking      │    returns noise seeds  │
+│  │ + initial noise capture    │    returns initial noise │
 │  └─────────────────┬──────────┘                         │
 └────────────────────┼────────────────────────────────────┘
                      │
@@ -51,7 +51,7 @@ The DiT action head has 1.1B parameters. Full RL finetuning would be unstable an
 │  │ (PolicyClient)  │          │  │ (SyncVectorEnv)   │  │
 │  └────────────────────────────┘  └───────────────────┘  │
 │                                                          │
-│  Saves per episode: obs, actions, rewards, noise seeds   │
+│  Saves per episode: obs, actions, raw_actions, initial_noise  │
 │  → .npz files on disk                                    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -63,12 +63,13 @@ The DiT action head has 1.1B parameters. Full RL finetuning would be unstable an
 2. COLLECT    → For each of num_groups groups:
                   Reset group_size envs with the SAME seed (identical initial state)
                   Run all to completion (different outcomes from policy noise)
-3. ADVANTAGE  → Group-relative normalization WITHIN each group
-4. UPDATE     → update_epochs × minibatches of clipped ratio + KL loss
-5. LOG        → TensorBoard/wandb metrics, save checkpoint
+3. ADVANTAGE  → Group-relative normalization WITHIN each group (time-scaled rewards)
+4. REF LOGP   → Pre-compute reference log-probs for all chunks (single no-grad pass)
+5. UPDATE     → update_epochs × minibatches of clipped ratio + KL loss
+6. LOG        → TensorBoard/wandb metrics, save checkpoint
 ```
 
-Each iteration trains on ONE task. With 7 tasks and 200 iterations, each task gets ~28 updates. Groups compare rollouts from the same initial state, isolating the effect of policy noise from environmental randomness.
+Each iteration trains on ONE task. With 8 tasks and 200 iterations, each task gets ~25 updates. Groups compare rollouts from the same initial state, isolating the effect of policy noise from environmental randomness.
 
 ### Fast-Forward Branching (Optional)
 
@@ -100,7 +101,7 @@ fast_forward_pct=0.5 means:
 | `episode_buffer.py` | Episode storage + group-relative advantages | main venv |
 | `dense_reward.py` | Extract progress metrics from RoboCasa envs | robocasa venv |
 | `collect_episodes.py` | Episode collector subprocess | robocasa venv |
-| `grpo_server.py` | Extended model server (returns noise seeds) | main venv |
+| `grpo_server.py` | Extended model server (captures initial noise + raw action) | main venv |
 | `train_grpo.py` | Main training orchestrator | main venv |
 
 ## Quick Start
@@ -114,19 +115,19 @@ fast_forward_pct=0.5 means:
 ### Run Training
 
 ```bash
-# Full training (all 7 tasks, 200 iterations, ~17 hours)
-# Each iteration: 1 task × 12 groups × 5 rollouts = 60 episodes
+# Full training (8 tasks, 200 iterations, ~17 hours)
+# Each iteration: 1 task × 5 groups × 5 rollouts = 25 episodes
 uv run python scripts/grpo/train_grpo.py \
     --model-path nvidia/GR00T-N1.6-3B \
     --embodiment-tag ROBOCASA_PANDA_OMRON \
     --num-iterations 200 \
     --group-size 5 \
-    --num-groups 12
+    --num-groups 5
 
 # Quick smoke test (1 task, 3 iterations, small groups)
 uv run python scripts/grpo/train_grpo.py \
     --model-path nvidia/GR00T-N1.6-3B \
-    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --num-iterations 3 \
     --group-size 3 \
     --num-groups 4
@@ -154,6 +155,12 @@ uv run python scripts/grpo/episode_buffer.py
 
 # Test dense reward classification
 uv run python scripts/grpo/dense_reward.py
+
+# Test observation key round-trip (no GPU)
+uv run python scripts/grpo/test_key_roundtrip.py
+
+# Test SimWrapper compatibility (no GPU)
+uv run python scripts/grpo/test_sim_wrapper.py
 ```
 
 ## Hyperparameters
@@ -163,9 +170,9 @@ uv run python scripts/grpo/dense_reward.py
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | `group_size` | 5 | G = rollouts per group (parallel envs with same seed). More = tighter advantage estimates |
-| `num_groups` | 12 | Groups per iteration (different initial states). More = diverse gradients |
+| `num_groups` | 5 | Groups per iteration (different initial states). More = diverse gradients |
 | `learning_rate` | 1e-5 | Lower = more stable, higher = faster but risks collapse |
-| `kl_coef` | 0.01 | Higher = stays closer to pretrained, lower = more exploration |
+| `kl_coef` | 0.005 | Higher = stays closer to pretrained, lower = more exploration |
 | `clip_eps` | 0.2 | Clipping range for surrogate objective (0.1-0.3 typical) |
 | `lora_rank` | 16 | Higher = more expressive (~20M params at r=16) |
 
@@ -174,23 +181,26 @@ uv run python scripts/grpo/dense_reward.py
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | `update_epochs` | 10 | More epochs = more updates per data, risk overfitting |
-| `n_fm_samples` | 4 | Timestep samples per action (matches 4 inference steps) |
-| `success_weight` | 0.7 | Balance binary reward vs dense progress signal |
-| `ref_update_interval` | 5 | How often reference model catches up to current |
-| `max_grad_norm` | 1.0 | Gradient clipping threshold |
-| `fast_forward_steps` | 0 | Outer steps to skip before branching (0=disabled, per-env list OK) |
+| `tau_centers` | [0, .25, .35, .5, .6, .75] | τ eval points for FM log-prob (K = len(list)) |
+| `success_weight` | 1.0 | Balance binary reward vs dense progress signal (1.0 = binary only) |
+| `max_grad_norm` | 0.5 | Gradient clipping threshold |
+| `fast_forward_steps` | 10 | Outer steps to skip before branching (0=disabled, per-env list OK) |
 | `fast_forward_pct` | 0.5 | Fraction of groups using fast-forward (rest start normally) |
 
 ## Reward Shaping
 
-The shaped reward combines binary task success with continuous progress:
+The shaped reward combines binary task success with continuous progress, then time-scales to reward faster solutions:
 
 ```
-reward = 0.7 * success + 0.3 * max_progress
+shaped_reward = success_weight * success + (1 - success_weight) * max_progress
+time_scaled_reward = shaped_reward / num_steps * max_episode_steps
 ```
 
 - **success** (0 or 1): Did the robot complete the task?
 - **max_progress** (0 to 1): How far did it get? (e.g., drawer opened 60%)
+- **time_scaling**: Faster solutions get proportionally higher reward, creating variance even in all-success groups
+
+With `success_weight=1.0` (default), the reward is purely binary but time-scaled: a success in 200 steps gets 2.6x the reward of a success in 520 steps.
 
 Task-specific progress extraction:
 - **Door/drawer**: Joint position from `get_door_state()` (0=closed, 1=fully open)
@@ -212,13 +222,13 @@ log π(a|s) ≈ -(1/K) Σ_k ||v_θ(x_τk, τk | s) - (a - ε)||²
 where:
 - `ε` is a single noise vector (one per action chunk evaluation)
 - `x_τ = (1-τ)ε + τ*a` is the noisy interpolation at timestep τ
-- `τk` are K=4 samples from tight Gaussians centered on the inference schedule (0, 0.25, 0.5, 0.75)
+- `τk` are K=6 samples from tight Gaussians centered on [0, 0.25, 0.35, 0.5, 0.6, 0.75]
 - `v_θ` is the model's predicted velocity field
 
 **Key design choices:**
 - **Single ε, multiple τ**: Each action was generated from one denoising trajectory. We evaluate the velocity field at multiple points along that one path, not across unrelated random paths.
 - **Inference-aligned τ**: Sampling near the actual denoising timesteps (0, 0.25, 0.5, 0.75) evaluates the model where it matters most for action quality.
-- **Shared (τ, ε) for ratio**: Both `π_θ` and `π_ref` use the same (τ, ε), so the importance ratio reflects only the model quality difference.
+- **Shared (τ, ε) for ratio**: The reference log-prob is pre-computed with specific (τ, ε) values, and the current policy is evaluated with the SAME (τ, ε), so the importance ratio reflects only the model quality difference.
 
 ## Troubleshooting
 
@@ -229,13 +239,12 @@ where:
 
 ### VRAM OOM
 - Reduce `mini_batch_size` (default 8 → try 4 or 2)
-- Reduce `n_fm_samples` (default 4 → try 2)
+- Reduce number of τ centers in `tau_centers` (e.g., down to [0.25, 0.5, 0.75])
 - Lower `lora_rank` (16 → 8)
 
 ### KL divergence explodes
-- Increase `kl_coef` (0.01 → 0.05)
+- Increase `kl_coef` (0.005 → 0.02)
 - Decrease `learning_rate`
-- Increase `ref_update_interval` (slower reference drift)
 - Check for NaN in loss (gradient clipping issue)
 
 ### Collection is slow

@@ -39,6 +39,9 @@ TASK_TYPE_MAP = {
     # Drawer tasks
     "OpenDrawer": "open_drawer",
     "CloseDrawer": "close_drawer",
+    # Coffee tasks (PnP-style: pick mug, place on target fixture)
+    "CoffeeServeMug": "pnp",
+    "CoffeeSetupMug": "pnp",
     # Pick-and-place tasks (all PnP* environments)
     "PnP": "pnp",
     # Stove tasks
@@ -212,9 +215,14 @@ def _get_pnp_progress(base_env) -> float:
     """
     try:
         # Get the manipulated object's position
-        # RoboCasa PnP envs store the object reference
-        if hasattr(base_env, "objects") and len(base_env.objects) > 0:
-            obj = base_env.objects[0]
+        # Kitchen stores objects as a dict {name: model}, not a list
+        if hasattr(base_env, "objects") and base_env.objects:
+            if isinstance(base_env.objects, dict):
+                obj = base_env.objects.get("obj") or list(base_env.objects.values())[0]
+            elif hasattr(base_env.objects, '__getitem__'):
+                obj = base_env.objects[0]
+            else:
+                return 0.0
             obj_pos = base_env.sim.data.body_xpos[
                 base_env.sim.model.body_name2id(obj.root_body)
             ]
@@ -226,10 +234,12 @@ def _get_pnp_progress(base_env) -> float:
             return 0.0
 
         # Get target position from the target fixture
+        # Try multiple common attribute names (different tasks use different names)
         target_fixture = getattr(base_env, "target_fixture", None)
         if target_fixture is None:
-            # Try common attribute names
             target_fixture = getattr(base_env, "placement_fixture", None)
+        if target_fixture is None:
+            target_fixture = getattr(base_env, "counter", None)
 
         if target_fixture is not None and hasattr(target_fixture, "get_int_sites"):
             # get_int_sites() returns placement site positions
@@ -330,7 +340,7 @@ def _check_success(base_env) -> bool:
 def compute_shaped_reward(
     success: bool,
     max_progress: float,
-    success_weight: float = 0.7,
+    success_weight: float = 1.0,
 ) -> float:
     """Compute shaped reward combining binary success and dense progress.
 
@@ -339,17 +349,17 @@ def compute_shaped_reward(
     Args:
         success: Whether the episode fully succeeded (binary).
         max_progress: Maximum progress achieved during the episode [0, 1].
-        success_weight: Weight for binary success term (default 0.7).
+        success_weight: Weight for binary success term (default 1.0 = pure binary).
 
     Returns:
         Shaped reward in [0, 1].
 
     Examples:
-        >>> compute_shaped_reward(True, 1.0)   # Full success
+        >>> compute_shaped_reward(True, 1.0)              # Full success
         1.0
-        >>> compute_shaped_reward(False, 0.6)  # Failed but made progress
+        >>> compute_shaped_reward(False, 0.6, 0.7)        # Failed but made progress
         0.18
-        >>> compute_shaped_reward(False, 0.0)  # Complete failure
+        >>> compute_shaped_reward(False, 0.0)             # Complete failure
         0.0
     """
     return success_weight * float(success) + (1.0 - success_weight) * max_progress
@@ -378,14 +388,18 @@ if __name__ == "__main__":
         print(f"  [{status}] {env_name} → {result} (expected {expected_type})")
 
     # Test shaped reward computation
-    print("\nShaped reward examples:")
-    print(f"  Success + full progress:  {compute_shaped_reward(True, 1.0):.3f}")
-    print(f"  Fail + 60% progress:      {compute_shaped_reward(False, 0.6):.3f}")
-    print(f"  Fail + no progress:       {compute_shaped_reward(False, 0.0):.3f}")
-    print(f"  Success + 80% progress:   {compute_shaped_reward(True, 0.8):.3f}")
+    print("\nShaped reward examples (default success_weight=1.0):")
+    print(f"  Success + full progress:           {compute_shaped_reward(True, 1.0):.3f}")
+    print(f"  Fail + 60% progress:               {compute_shaped_reward(False, 0.6):.3f}")
+    print(f"  Fail + no progress:                {compute_shaped_reward(False, 0.0):.3f}")
+    print(f"  Success + 80% progress:            {compute_shaped_reward(True, 0.8):.3f}")
+    print(f"  Fail + 60% progress (weight 0.7):  {compute_shaped_reward(False, 0.6, 0.7):.3f}")
 
+    # With success_weight=1.0 the reward is purely binary
     assert compute_shaped_reward(True, 1.0) == 1.0
     assert compute_shaped_reward(False, 0.0) == 0.0
-    assert 0 < compute_shaped_reward(False, 0.5) < 0.5
+    assert compute_shaped_reward(False, 0.5) == 0.0
+    # With success_weight<1.0, dense progress contributes
+    assert 0 < compute_shaped_reward(False, 0.5, success_weight=0.7) < 0.5
 
     print("\nAll tests PASSED.")

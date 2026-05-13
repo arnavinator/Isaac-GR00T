@@ -47,8 +47,14 @@ class GRPOConfig:
     # Effective LoRA scale = alpha / rank = 2.0
     lora_alpha: int = 32
 
-    # LoRA dropout — regularization to prevent overfitting with RL's noisy gradients
-    lora_dropout: float = 0.05
+    # LoRA dropout — regularization inside the LoRA adapter layers.
+    # Default 0.0 because the training loop keeps the DiT in eval mode for both
+    # the reference and current log-prob passes (see train_grpo._grpo_update),
+    # so any dropout you configure here is a no-op in practice. If you want
+    # dropout to actually fire, you must ALSO switch the DiT to .train() mode
+    # in BOTH _compute_ref_log_probs and _grpo_update — otherwise importance
+    # ratios are unaffected and the value here doesn't matter.
+    lora_dropout: float = 0.0
 
     # Which layers in the DiT to apply LoRA to (must be nn.Linear, NOT CategorySpecificLinear)
     # These are the module name patterns within model.action_head.model (AlternateVLDiT)
@@ -81,13 +87,13 @@ class GRPOConfig:
     # More groups = more diverse gradient signal per update.
     # Same as grpo_cont.py's args.num_groups = 5
     # Total episodes per iteration = group_size × num_groups
-    num_groups: int = 12
+    num_groups: int = 5
 
     # Maximum steps per episode before truncation (at 10Hz action rate).
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
     # 720 steps = 72 seconds of sim time. Some tasks need more/less time.
     # Example: [720, 720, 400, 480, 720, 720, 400] for 7 envs with varying difficulty.
-    max_episode_steps: int | list[int] = 720
+    max_episode_steps: int | list[int] = 520
 
     # How many steps from each 16-step action chunk to actually execute
     # Remaining steps discarded, fresh observation taken, new chunk predicted
@@ -108,7 +114,7 @@ class GRPOConfig:
     # Number of outer steps (action chunks) to fast-forward before branching.
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
     # 0 = disabled. 10 outer steps = 80 sub-steps at n_action_steps=8.
-    fast_forward_steps: int | list[int] = 0
+    fast_forward_steps: int | list[int] = 10
 
     # Fraction of groups that use fast-forward (rest start from seed normally).
     # Mixing ensures the full trajectory stays in the training distribution,
@@ -125,6 +131,7 @@ class GRPOConfig:
     # Each iteration collects ALL num_groups for a SINGLE task (not distributed across tasks).
     # With 7 tasks and 200 iterations, each task gets ~28 full training updates.
     env_names: list[str] = field(default_factory=lambda: [
+        "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env",
         "robocasa_panda_omron/PnPCounterToMicrowave_PandaOmron_Env",
         "robocasa_panda_omron/PnPMicrowaveToCounter_PandaOmron_Env",
         "robocasa_panda_omron/TurnOffStove_PandaOmron_Env",
@@ -139,12 +146,9 @@ class GRPOConfig:
 
     # ─── Reward Shaping ──────────────────────────────────────────────────────
 
-    # Whether to use dense reward shaping (strongly recommended for sparse envs)
-    use_dense_reward: bool = True
-
     # Weight of binary success signal in shaped reward
     # reward = success_weight * success + (1 - success_weight) * max_progress
-    success_weight: float = 0.7
+    success_weight: float = 1.0
 
     # ─── GRPO Algorithm ──────────────────────────────────────────────────────
     # These directly mirror grpo_cont.py's clipped objective args
@@ -153,28 +157,32 @@ class GRPOConfig:
     # Same as grpo_cont.py's args.clip_eps = 0.2
     clip_eps: float = 0.2
 
-    # Number of optimization epochs over collected data per iteration
+    # Number of optimization epochs over collected data per each iteration
+    # each epoch shuffles all action chunks from data collection
+    # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
     # Same as grpo_cont.py's args.update_epochs = 10
     update_epochs: int = 10
 
-    # Mini-batch size (in action chunks) for each gradient step
+    # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
+    # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
     # Smaller = more updates per epoch but noisier gradients
     mini_batch_size: int = 8
 
     # KL divergence penalty coefficient (regularization toward reference policy)
     # Same role as grpo_cont.py's args.kl_coef = 0.002
-    # Higher here (0.01) because FM log-prob surrogate is noisier than Gaussian
-    kl_coef: float = 0.01
+    kl_coef: float = 0.005
 
-    # How often to update the reference model (every N iterations)
-    # Reference stays frozen between updates, providing stable KL anchor
-    ref_update_interval: int = 5
-
-    # Number of timestep samples (K) for FM log-prob variance reduction
-    # Each sample adds one DiT forward pass per action chunk.
-    # K=4 matches the 4 inference denoising steps (τ = 0, 0.25, 0.5, 0.75).
-    # A single shared noise ε is used across all K timestep samples.
-    n_fm_samples: int = 4
+    # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
+    # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
+    # K = len(tau_centers) determines how many points along the noise→action interpolation
+    # path we probe to estimate how well the model predicts the velocity field.
+    # Each center gets small Gaussian jitter (std=0.02) during sampling.
+    # Default is late-biased: denser at later τ where velocity prediction errors
+    # have more impact on action quality (fewer Euler steps left to correct).
+    # Each center = one DiT forward pass. A single shared noise ε is reused across all K.
+    tau_centers: list[float] = field(default_factory=lambda: [
+        0.0, 0.25, 0.35, 0.5, 0.6, 0.75
+    ])
 
     # ─── Optimizer ───────────────────────────────────────────────────────────
 
@@ -187,7 +195,7 @@ class GRPOConfig:
 
     # Maximum gradient norm for clipping (prevents explosion from rare high-advantage samples)
     # Same role as grpo_cont.py's args.max_grad_norm = 0.5
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.5
 
     # ─── Training Loop ───────────────────────────────────────────────────────
 
@@ -211,14 +219,10 @@ class GRPOConfig:
     # ─── Logging ─────────────────────────────────────────────────────────────
 
     # Whether to use wandb for experiment tracking
-    use_wandb: bool = True
+    use_wandb: bool = False
 
     # Wandb project name
     wandb_project: str = "groot-grpo"
 
     # Wandb run name (auto-generated if None)
     wandb_run_name: Optional[str] = None
-
-    # Whether to run density-aware diagnostics during collection (+12% overhead)
-    # Provides per-chunk log-likelihood estimates for monitoring
-    use_density_diagnostics: bool = False

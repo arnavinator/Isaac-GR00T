@@ -3,7 +3,7 @@
 This script runs in the ROBOCASA VENV (separate from the main .venv) and:
 1. Connects to the GR00T model server via ZMQ (PolicyClient)
 2. Collects episodes in groups (same seed within a group, different across groups)
-3. Records observations, actions, rewards, noise seeds, and raw model outputs
+3. Records observations, actions, initial noise tensors, and raw model outputs
 4. Saves episodes as .npz files for the training loop to consume
 
 Architecture context:
@@ -77,8 +77,8 @@ def parse_args():
         help="Directory to save episode .npz files"
     )
     parser.add_argument(
-        "--success-weight", type=float, default=0.7,
-        help="Weight for binary success in shaped reward"
+        "--success-weight", type=float, default=1.0,
+        help="Weight for binary success in shaped reward (1.0 = pure binary + time-scaled)"
     )
     parser.add_argument(
         "--fast-forward-steps", type=int, default=0,
@@ -99,7 +99,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def make_env(env_name: str, seed: int, max_episode_steps: int, n_action_steps: int):
+def make_env(
+    env_name: str,
+    max_episode_steps: int,
+    n_action_steps: int,
+    video_delta_indices: np.ndarray | None = None,
+    state_delta_indices: np.ndarray | None = None,
+):
     """Create a gymnasium environment factory for SyncVectorEnv.
 
     This mirrors grpo_cont.py's make_env() (lines 178-198) but for RoboCasa.
@@ -107,13 +113,21 @@ def make_env(env_name: str, seed: int, max_episode_steps: int, n_action_steps: i
 
     Args:
         env_name: Full environment name for gym.make().
-        seed: Random seed for this environment instance.
         max_episode_steps: Episode truncation length.
         n_action_steps: Steps to execute per action chunk.
+        video_delta_indices: Temporal stacking indices for video observations.
+            Defaults to np.array([0]) (single current frame, matches PandaOmron).
+        state_delta_indices: Temporal stacking indices for state observations.
+            Defaults to np.array([0]).
 
     Returns:
         Callable that creates the environment.
     """
+    if video_delta_indices is None:
+        video_delta_indices = np.array([0])
+    if state_delta_indices is None:
+        state_delta_indices = np.array([0])
+
     def _make():
         env = gym.make(env_name, render_mode=None)
 
@@ -122,12 +136,12 @@ def make_env(env_name: str, seed: int, max_episode_steps: int, n_action_steps: i
         from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
         env = MultiStepWrapper(
             env,
+            video_delta_indices=video_delta_indices,
+            state_delta_indices=state_delta_indices,
             n_action_steps=n_action_steps,
             max_episode_steps=max_episode_steps,
             terminate_on_success=True,
         )
-
-        env.reset(seed=seed)
         return env
 
     return _make
@@ -137,12 +151,12 @@ class EpisodeCollector:
     """Collects episodes using PolicyClient + parallel envs.
 
     Each episode records:
-    - Per-chunk: observation frames, states, actions, noise seeds
+    - Per-chunk: observation frames, states, actions, initial noise, raw model output
     - Episode-level: success, max progress, total steps
 
-    The noise seed is obtained from the extended GRPO server (grpo_server.py),
-    which returns it alongside the action. This is needed to reconstruct the
-    exact noise for FM log-prob computation during training.
+    The initial noise tensor is captured from the GRPO server (grpo_server.py) via
+    a hook on torch.randn. It's the ε₀ that was denoised into the action — used during
+    training to evaluate the FM log-prob along the actual denoising path.
     """
 
     def __init__(
@@ -168,7 +182,7 @@ class EpisodeCollector:
         # Create group_size parallel environments (one per rollout in a group)
         # All will be reset with the same seed per group
         env_fns = [
-            make_env(env_name, seed, max_episode_steps, n_action_steps)
+            make_env(env_name, max_episode_steps, n_action_steps)
             for _ in range(group_size)
         ]
         self.envs = gym.vector.SyncVectorEnv(env_fns)
@@ -186,7 +200,7 @@ class EpisodeCollector:
         group_size: int,
         num_groups: int,
         base_seed: int,
-        success_weight: float = 0.7,
+        success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
     ) -> list[dict]:
@@ -301,7 +315,7 @@ class EpisodeCollector:
 
         while not all(done_flags):
             # Query model server for actions
-            actions, noise_seeds, raw_actions = self._get_actions_from_server(observations)
+            actions, initial_noise, raw_actions, action_masks_batch = self._get_actions_from_server(observations)
 
             # Record observation and action for each active env
             for i in range(group_size):
@@ -311,11 +325,18 @@ class EpisodeCollector:
                 ep["video_frames"].append(self._extract_video(observations, i))
                 ep["states"].append(self._extract_state(observations, i))
                 ep["actions"].append(self._extract_per_env(actions, i))
-                ep["noise_seeds"].append(noise_seeds[i] if i < len(noise_seeds) else self.seed)
                 if raw_actions is not None and hasattr(raw_actions, '__getitem__') and len(raw_actions) > i:
                     ep["raw_actions"].append(raw_actions[i])
                 else:
                     ep["raw_actions"].append(None)
+                if action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__') and len(action_masks_batch) > i:
+                    ep["action_masks"].append(action_masks_batch[i])
+                else:
+                    ep["action_masks"].append(None)
+                if initial_noise is not None and hasattr(initial_noise, '__getitem__') and len(initial_noise) > i:
+                    ep["initial_noises"].append(initial_noise[i])
+                else:
+                    ep["initial_noises"].append(None)
                 # Capture language from first observation (constant per episode)
                 if ep["language"] is None:
                     ep["language"] = self._extract_language(observations, i)
@@ -384,7 +405,7 @@ class EpisodeCollector:
         # The other envs' work is discarded — they'll be overwritten with env 0's state.
         consumed_substeps = 0
         for step in range(fast_forward_steps):
-            actions, _, _ = self._get_actions_from_server(observations)
+            actions, _, _, _ = self._get_actions_from_server(observations)
             observations, rewards, terms, truncs, infos = self.envs.step(actions)
             consumed_substeps += self.n_action_steps
 
@@ -424,7 +445,7 @@ class EpisodeCollector:
         done_flags = [False] * group_size
 
         while not all(done_flags):
-            actions, noise_seeds, raw_actions = self._get_actions_from_server(observations)
+            actions, initial_noise, raw_actions, action_masks_batch = self._get_actions_from_server(observations)
 
             for i in range(group_size):
                 if done_flags[i]:
@@ -433,11 +454,18 @@ class EpisodeCollector:
                 ep["video_frames"].append(self._extract_video(observations, i))
                 ep["states"].append(self._extract_state(observations, i))
                 ep["actions"].append(self._extract_per_env(actions, i))
-                ep["noise_seeds"].append(noise_seeds[i] if i < len(noise_seeds) else self.seed)
                 if raw_actions is not None and hasattr(raw_actions, '__getitem__') and len(raw_actions) > i:
                     ep["raw_actions"].append(raw_actions[i])
                 else:
                     ep["raw_actions"].append(None)
+                if action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__') and len(action_masks_batch) > i:
+                    ep["action_masks"].append(action_masks_batch[i])
+                else:
+                    ep["action_masks"].append(None)
+                if initial_noise is not None and hasattr(initial_noise, '__getitem__') and len(initial_noise) > i:
+                    ep["initial_noises"].append(initial_noise[i])
+                else:
+                    ep["initial_noises"].append(None)
                 # Capture language from first observation (constant per episode)
                 if ep["language"] is None:
                     ep["language"] = self._extract_language(observations, i)
@@ -643,9 +671,10 @@ class EpisodeCollector:
             "video_frames": [],
             "states": [],
             "actions": [],
-            "raw_actions": [],  # Raw normalized actions (50×128) for FM log-prob
-            "noise_seeds": [],
-            "language": None,  # Task instruction (extracted from first observation)
+            "raw_actions": [],       # Raw normalized actions (50x128) for FM log-prob
+            "action_masks": [],      # Proper action masks (50x128) from model config
+            "initial_noises": [],    # Initial noise tensors (50x128) used to denoise each action
+            "language": None,        # Task instruction (extracted from first observation)
             "success": False,
             "max_progress": 0.0,
             "shaped_reward": 0.0,
@@ -656,24 +685,22 @@ class EpisodeCollector:
             "env_seed": env_seed,
         }
 
-    def _get_actions_from_server(self, observations) -> tuple[np.ndarray, list[int], np.ndarray | None]:
-        """Query the GRPO server for actions and noise seeds.
+    def _get_actions_from_server(self, observations) -> tuple:
+        """Query the GRPO server for actions, raw actions, initial noise, and action mask.
 
-        The GRPO server (grpo_server.py) extends the standard PolicyServer to also
-        return the noise seed used during denoising and the raw normalized action
-        tensor (50×128) from the model's internal space.
+        The GRPO server captures the initial noise tensor, raw normalized action,
+        and proper action mask from the denoising process and returns them in the info dict.
 
         Args:
             observations: Batched observations from vectorized env.
 
         Returns:
-            Tuple of (actions, noise_seeds, raw_actions):
+            Tuple of (actions, initial_noise, raw_actions, action_masks):
                 - actions: dict or array for env.step()
-                - noise_seeds: list of int seeds per env
-                - raw_actions: (n_envs, 50, 128) normalized actions or None
+                - initial_noise: (group_size, 50, 128) initial denoising noise or None
+                - raw_actions: (group_size, 50, 128) normalized model output or None
+                - action_masks: (group_size, 50, 128) valid dimension mask or None
         """
-        # Format observations for the policy client
-        # PolicyClient.get_action() expects the same format as rollout_policy.py
         result = self.policy_client.get_action(observations)
 
         if isinstance(result, tuple) and len(result) == 2:
@@ -682,16 +709,12 @@ class EpisodeCollector:
             action_dict = result
             info = {}
 
-        # Extract actions (already in the right format for env.step())
         actions = action_dict
-
-        # Extract noise seeds from server response
-        noise_seeds = info.get("noise_seeds", [self.seed] * self.group_size)
-
-        # Extract raw normalized actions (50×128) for FM log-prob computation
+        initial_noise = info.get("initial_noise", None)
         raw_actions = info.get("raw_actions", None)
+        action_masks = info.get("action_mask", None)
 
-        return actions, noise_seeds, raw_actions
+        return actions, initial_noise, raw_actions, action_masks
 
     def _extract_per_env(self, data, env_idx: int):
         """Extract per-environment data from batched structure.
@@ -707,23 +730,35 @@ class EpisodeCollector:
         return data
 
     def _extract_video(self, observations, env_idx: int) -> dict[str, np.ndarray]:
-        """Extract video frames for one environment from batched observations."""
+        """Extract video frames for one environment from batched observations.
+
+        Strips the 'video.' prefix so keys match VLAStepData/processor expectations
+        (e.g., 'video.res256_image_side_0' → 'res256_image_side_0').
+        """
         frames = {}
         if isinstance(observations, dict):
             for key, value in observations.items():
                 if "image" in key or "video" in key:
                     if hasattr(value, '__getitem__') and len(value) > env_idx:
-                        frames[key] = np.array(value[env_idx])
+                        clean_key = key.removeprefix("video.")
+                        frames[clean_key] = np.array(value[env_idx])
         return frames
 
     def _extract_state(self, observations, env_idx: int) -> dict[str, np.ndarray]:
-        """Extract state values for one environment from batched observations."""
+        """Extract state values for one environment from batched observations.
+
+        Strips the 'state.' prefix so keys match VLAStepData/processor expectations
+        (e.g., 'state.gripper_qpos' → 'gripper_qpos'). Filters out annotation keys.
+        """
         state = {}
         if isinstance(observations, dict):
             for key, value in observations.items():
                 if "image" not in key and "video" not in key and "language" not in key:
+                    if "annotation" in key:
+                        continue
                     if hasattr(value, '__getitem__') and len(value) > env_idx:
-                        state[key] = np.array(value[env_idx])
+                        clean_key = key.removeprefix("state.")
+                        state[clean_key] = np.array(value[env_idx])
         return state
 
     def _extract_language(self, observations, env_idx: int) -> str:
@@ -804,26 +839,29 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
             # Action (decoded physical action for env stepping)
             save_dict[f"action_{chunk_idx}"] = ep["actions"][chunk_idx]
 
-            # Raw normalized action (50×128 tensor from model, for FM log-prob)
-            # This is the critical data for GRPO training — the action in the
-            # model's internal space, before decode_action() slices and denormalizes
+            # Raw normalized action (50x128 tensor from model, for FM log-prob)
             if chunk_idx < len(ep.get("raw_actions", [])):
                 raw_action = ep["raw_actions"][chunk_idx]
                 if raw_action is not None:
                     save_dict[f"raw_action_{chunk_idx}"] = raw_action
-                    # Create action mask from raw action (non-zero columns indicate valid dims)
-                    save_dict[f"action_mask_{chunk_idx}"] = np.ones_like(raw_action)
-                else:
-                    # Fallback: create mask from decoded action shape
-                    action = ep["actions"][chunk_idx]
-                    if isinstance(action, np.ndarray):
-                        save_dict[f"action_mask_{chunk_idx}"] = np.ones_like(action)
-                    else:
-                        save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128))
-            else:
-                save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128))
 
-            save_dict[f"noise_seed_{chunk_idx}"] = ep["noise_seeds"][chunk_idx]
+            # Action mask from model (proper per-embodiment mask, not all-ones)
+            if chunk_idx < len(ep.get("action_masks", [])):
+                mask = ep["action_masks"][chunk_idx]
+                if mask is not None:
+                    save_dict[f"action_mask_{chunk_idx}"] = mask
+                elif chunk_idx < len(ep.get("raw_actions", [])) and ep["raw_actions"][chunk_idx] is not None:
+                    save_dict[f"action_mask_{chunk_idx}"] = np.ones_like(ep["raw_actions"][chunk_idx])
+                else:
+                    save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128), dtype=np.float32)
+            else:
+                save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128), dtype=np.float32)
+
+            # Initial noise tensor (50×128) — the ε₀ that was denoised into this action
+            if chunk_idx < len(ep.get("initial_noises", [])):
+                ini_noise = ep["initial_noises"][chunk_idx]
+                if ini_noise is not None:
+                    save_dict[f"initial_noise_{chunk_idx}"] = ini_noise
 
         np.savez_compressed(output_path / f"episode_{idx:04d}.npz", **save_dict)
 

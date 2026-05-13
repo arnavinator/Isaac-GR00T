@@ -19,7 +19,6 @@ Reference:
 - DenoisingLab uses the same model loading pattern (denoising_lab.py:114-118)
 """
 
-import copy
 from pathlib import Path
 
 import torch
@@ -31,7 +30,7 @@ def apply_lora_to_dit(
     model: nn.Module,
     rank: int = 16,
     alpha: int = 32,
-    dropout: float = 0.05,
+    dropout: float = 0.0,
     target_modules: list[str] | None = None,
 ) -> nn.Module:
     """Inject LoRA adapters into the DiT (AlternateVLDiT) inside the action head.
@@ -85,67 +84,9 @@ def apply_lora_to_dit(
     # model.action_head.model is the AlternateVLDiT (32-layer diffusion transformer)
     # This avoids touching CategorySpecificLinear in state_encoder/action_encoder/action_decoder
     dit = model.action_head.model
-    inject_adapter_in_model(dit, lora_config, adapter_name="default")
+    inject_adapter_in_model(lora_config, dit, adapter_name="default")
 
     return model
-
-
-def create_reference_dit(model: nn.Module) -> nn.Module:
-    """Create a frozen copy of the action head for computing reference log-probs.
-
-    The reference shares the Eagle backbone with the main model (frozen, identical)
-    but has its own copy of the action head. Since LoRA B matrices are initialized
-    to zero, the copy produces identical output to the base model at creation time.
-    After training, it's periodically refreshed via update_reference_dit().
-
-    In the GRPO importance ratio:  rho = pi_theta(a|s) / pi_ref(a|s)
-    The reference model provides pi_ref — a stable anchor to prevent policy collapse.
-
-    Args:
-        model: The full Gr00tN1d6 model (with LoRA already applied to DiT).
-
-    Returns:
-        A frozen deep copy of the action head (includes LoRA layers at zero init).
-    """
-    # Deep copy the entire action head (DiT + encoders/decoders)
-    # This captures the base weights before LoRA modification
-    ref_action_head = copy.deepcopy(model.action_head)
-
-    # Remove LoRA adapters from the copy (keep only base weights)
-    # After inject_adapter_in_model, LoRA layers are added but base weights remain
-    # We need to merge LoRA into base, then strip LoRA layers
-    # Actually for reference: we want the ORIGINAL weights (before any LoRA training)
-    # So we just freeze the copy as-is (LoRA adapters initialized to zero don't affect output)
-    for param in ref_action_head.parameters():
-        param.requires_grad = False
-
-    ref_action_head.eval()
-    return ref_action_head
-
-
-def update_reference_dit(ref_action_head: nn.Module, model: nn.Module) -> None:
-    """Update reference model with current policy weights (periodic refresh).
-
-    Called every `ref_update_interval` iterations to prevent the reference from
-    becoming too stale (which would make KL penalty meaningless).
-
-    Copies the full action head state dict (base weights + LoRA params) into the
-    reference model. After this, both models produce identical output and the
-    importance ratio resets to ~1.0.
-
-    Args:
-        ref_action_head: The frozen reference action head to update.
-        model: The current model with trained LoRA adapters.
-    """
-    # Copy current action head state (includes LoRA-modified forward behavior)
-    with torch.no_grad():
-        ref_state = model.action_head.state_dict()
-        ref_action_head.load_state_dict(ref_state)
-
-    # Ensure reference stays frozen
-    for param in ref_action_head.parameters():
-        param.requires_grad = False
-    ref_action_head.eval()
 
 
 def save_lora_checkpoint(model: nn.Module, path: str | Path) -> None:

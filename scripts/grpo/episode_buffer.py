@@ -13,8 +13,10 @@ The advantage computation directly mirrors grpo_cont.py lines 325-364:
 Key difference from grpo_cont.py:
 - grpo_cont.py computes per-step rewards, then discounts them into a trajectory reward
 - We use episodic rewards (binary success + dense progress) — no discounting needed
-- Each episode gets ONE advantage value, broadcast to all action chunks in that episode
-  (same as grpo_cont.py line 369: advantages / num_steps, then expand)
+- Each episode gets ONE advantage, which is then divided by num_chunks and
+  broadcast to each chunk in _build_chunks (mirroring grpo_cont.py:368-369).
+  The division preserves the group-zero-sum invariant at the chunk level so
+  every trajectory contributes equal gradient weight regardless of length.
 """
 
 from dataclasses import dataclass, field
@@ -32,8 +34,10 @@ class ActionChunk:
     One episode produces multiple action chunks (e.g., 720 steps / 8 exec steps = 90 chunks).
     Each chunk is one "token" for GRPO — analogous to one timestep in grpo_cont.py.
 
-    The advantage is the SAME for all chunks in an episode (episodic reward).
-    This matches grpo_cont.py line 369 where advantage is broadcast to all timesteps.
+    The advantage stored here is `A_episode / num_chunks_in_episode`: the
+    per-trajectory advantage spread evenly across chunks. This matches
+    grpo_cont.py:368-369, where `advantages = advantages / num_steps` before
+    being broadcast to every timestep in the trajectory.
     """
     # Observation data (to re-encode through backbone during training)
     video_frames: dict[str, np.ndarray]   # {camera_name: (H, W, 3) uint8}
@@ -50,9 +54,10 @@ class ActionChunk:
     # Action mask for valid dimensions (handles multi-embodiment padding)
     action_mask: np.ndarray               # (50, 128) float32 when raw_action available
 
-    # Noise seed used by the server during denoising for this chunk
-    # Required to reconstruct the exact noise for FM log-prob computation
-    noise_seed: int
+    # Initial noise tensor used during denoising to produce this action chunk.
+    # This is the ε₀ in x_τ = (1-τ)ε₀ + τ*action — used during training to evaluate
+    # the FM log-prob along the actual denoising path (not a random path).
+    initial_noise: np.ndarray | None      # (50, 128) float32, or None if not available
 
     # GRPO advantage (same for all chunks in this episode)
     advantage: float
@@ -62,6 +67,12 @@ class ActionChunk:
     chunk_idx: int
     episode_reward: float
     episode_success: bool
+
+    # Pre-computed reference log-prob (set after collection, before GRPO update)
+    ref_log_prob: float | None = None
+
+    # Timestep samples used for ref_log_prob computation (reused during training)
+    tau_samples: np.ndarray | None = None  # (K,) float32
 
 
 @dataclass
@@ -80,7 +91,7 @@ class GRPOEpisode:
     actions: list[np.ndarray]                    # len = num_chunks, each (horizon, dim)
     raw_actions: list[np.ndarray | None]         # len = num_chunks, each (50, 128) or None
     action_masks: list[np.ndarray]               # len = num_chunks
-    noise_seeds: list[int]                       # len = num_chunks
+    initial_noises: list[np.ndarray | None]      # len = num_chunks, each (50, 128) or None
 
     # Episode-level reward signals
     success: bool                                # Binary task completion
@@ -149,7 +160,7 @@ class EpisodeBuffer:
             - state_{key}_{chunk_idx}: (dim,) float32
             - action_{chunk_idx}: (horizon, dim) float32
             - action_mask_{chunk_idx}: (horizon, dim) float32
-            - noise_seed_{chunk_idx}: scalar int
+            - initial_noise_{chunk_idx}: (50, 128) float32
             - language: string
             - success: bool
             - max_progress: float
@@ -178,7 +189,7 @@ class EpisodeBuffer:
         actions = []
         raw_actions = []
         action_masks = []
-        noise_seeds = []
+        initial_noises = []
 
         # Identify camera names from keys
         camera_names = set()
@@ -217,10 +228,12 @@ class EpisodeBuffer:
             # Action and mask
             actions.append(data[f"action_{i}"])
             action_masks.append(data[f"action_mask_{i}"])
-            noise_seeds.append(int(data[f"noise_seed_{i}"]))
             # Raw normalized action (may not exist in older collections)
             raw_key = f"raw_action_{i}"
             raw_actions.append(data[raw_key] if raw_key in data else None)
+            # Initial noise tensor (may not exist in older collections)
+            noise_key = f"initial_noise_{i}"
+            initial_noises.append(data[noise_key] if noise_key in data else None)
 
         return GRPOEpisode(
             video_frames=video_frames,
@@ -229,7 +242,7 @@ class EpisodeBuffer:
             actions=actions,
             raw_actions=raw_actions,
             action_masks=action_masks,
-            noise_seeds=noise_seeds,
+            initial_noises=initial_noises,
             success=success,
             max_progress=max_progress,
             shaped_reward=0.0,  # Computed in compute_advantages()
@@ -240,8 +253,8 @@ class EpisodeBuffer:
             env_seed=env_seed,
         )
 
-    def compute_advantages(self, success_weight: float = 0.7) -> np.ndarray:
-        """Compute group-relative advantages for all episodes.
+    def compute_advantages(self, success_weight: float = 1.0, max_episode_steps: int = 520) -> np.ndarray:
+        """Compute group-relative advantages for all episodes (one per episode).
 
         This is the CORE GRPO computation, mirroring grpo_cont.py lines 362-364:
             means = final_group_reward.mean(dim=1, keepdim=True)
@@ -252,12 +265,21 @@ class EpisodeBuffer:
         group_id / env_seed). This compares rollouts from the same initial state,
         isolating the effect of policy noise from environmental randomness.
 
+        After shaped reward computation, rewards are time-scaled: faster solutions
+        get higher reward (reward / num_steps * max_episode_steps). This creates
+        variance even in all-success groups where binary rewards are identical.
+
+        Note: this returns ONE advantage per episode. The per-chunk division
+        (A_episode / num_chunks, matching grpo_cont.py:368-369) happens later in
+        _build_chunks when episodes are flattened into ActionChunks.
+
         Args:
             success_weight: Weight for binary success in shaped reward.
                 reward = success_weight * success + (1 - success_weight) * max_progress
+            max_episode_steps: Maximum episode steps (used for time-scaling normalization).
 
         Returns:
-            advantages: [num_episodes] array of normalized advantages.
+            advantages: [num_episodes] array of group-relative normalized per-episode advantages.
         """
         if not self.episodes:
             self.advantages = np.array([])
@@ -268,6 +290,11 @@ class EpisodeBuffer:
             success_weight * float(ep.success) + (1 - success_weight) * ep.max_progress
             for ep in self.episodes
         ])
+
+        # Step 1b: Time-scale rewards (faster solutions get higher reward)
+        for i, ep in enumerate(self.episodes):
+            if ep.num_steps > 0:
+                rewards[i] = rewards[i] / ep.num_steps * max_episode_steps
 
         # Store shaped rewards in episodes
         for ep, r in zip(self.episodes, rewards):
@@ -304,9 +331,17 @@ class EpisodeBuffer:
     def _build_chunks(self) -> list[ActionChunk]:
         """Flatten episodes into individual action chunks for mini-batching.
 
-        Each episode becomes N chunks (one per action query), all sharing the
-        same advantage. This mirrors grpo_cont.py line 369:
-            advantages = advantages / args.num_steps  (broadcast to all timesteps)
+        Each episode becomes N chunks (one per action query). Each chunk gets
+        `A_episode / N` as its advantage — mirroring grpo_cont.py:368-369, which
+        divides the per-trajectory advantage by `num_steps` before broadcasting
+        to each timestep.
+
+        Why divide: group-relative normalization guarantees Σ A_episode = 0
+        within a group. Dividing by num_chunks preserves this invariant at the
+        chunk level (Σ_chunks A_chunk = Σ_episodes A_episode = 0), so every
+        trajectory contributes equal total gradient weight regardless of length.
+        Without the division, long episodes would dominate the gradient purely
+        by having more chunks.
         """
         if self._chunks is not None:
             return self._chunks
@@ -317,6 +352,8 @@ class EpisodeBuffer:
         for ep_idx, (episode, advantage) in enumerate(
             zip(self.episodes, self.advantages)
         ):
+            n_chunks = max(episode.num_chunks, 1)
+            per_chunk_advantage = float(advantage) / n_chunks
             for chunk_idx in range(episode.num_chunks):
                 chunk = ActionChunk(
                     video_frames=episode.video_frames[chunk_idx],
@@ -325,8 +362,8 @@ class EpisodeBuffer:
                     action=episode.actions[chunk_idx],
                     raw_action=episode.raw_actions[chunk_idx] if chunk_idx < len(episode.raw_actions) else None,
                     action_mask=episode.action_masks[chunk_idx],
-                    noise_seed=episode.noise_seeds[chunk_idx],
-                    advantage=float(advantage),
+                    initial_noise=episode.initial_noises[chunk_idx] if chunk_idx < len(episode.initial_noises) else None,
+                    advantage=per_chunk_advantage,
                     episode_idx=ep_idx,
                     chunk_idx=chunk_idx,
                     episode_reward=episode.shaped_reward,
@@ -436,10 +473,10 @@ if __name__ == "__main__":
             video_frames=[{}],
             states=[{}],
             language="test task",
-            actions=[np.zeros((16, 29))],
+            actions=[np.zeros((16, 12))],
             raw_actions=[np.zeros((50, 128))],
             action_masks=[np.ones((50, 128))],
-            noise_seeds=[42],
+            initial_noises=[np.zeros((50, 128))],
             success=(i % 5 >= 2) if group_id == 0 else (i % 5 == 0),
             max_progress=(i % 5) / 5.0,
             shaped_reward=0.0,
@@ -478,8 +515,8 @@ if __name__ == "__main__":
     buffer2 = EpisodeBuffer()
     buffer2.episodes.append(GRPOEpisode(
         video_frames=[{}], states=[{}], language="test",
-        actions=[np.zeros((16,29))], raw_actions=[np.zeros((50,128))],
-        action_masks=[np.ones((50,128))], noise_seeds=[0],
+        actions=[np.zeros((16, 12))], raw_actions=[np.zeros((50,128))],
+        action_masks=[np.ones((50,128))], initial_noises=[np.zeros((50, 128))],
         success=True, max_progress=1.0, shaped_reward=0.0,
         env_name="test", episode_idx=0, num_steps=8,
         group_id=0, env_seed=42,

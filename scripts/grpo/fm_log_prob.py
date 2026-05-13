@@ -98,6 +98,16 @@ def compute_fm_log_prob(
     # (action, noise) pair, not the interpolation point)
     velocity_target = actions - eps
 
+    # Validate the action mask once — it's invariant across the k-loop.
+    # An all-zero mask for any sample means compute_action_mask / the caller
+    # produced a degenerate mask (bug upstream). Fail loudly here rather than
+    # silently zero out a sample's log-prob contribution.
+    valid_elements_per_sample = action_mask.sum(dim=(1, 2))
+    assert (valid_elements_per_sample > 0).all(), (
+        f"action_mask has sample(s) with zero valid elements: "
+        f"{valid_elements_per_sample.tolist()}"
+    )
+
     # Access masks safely for the DiT forward pass
     _image_mask = backbone_output.get("image_mask") if hasattr(backbone_output, "get") else getattr(backbone_output, "image_mask", None)
     _backbone_attn_mask = backbone_output.get("backbone_attention_mask") if hasattr(backbone_output, "get") else getattr(backbone_output, "backbone_attention_mask", None)
@@ -137,6 +147,13 @@ def compute_fm_log_prob(
         sa_embs = torch.cat((state_features, action_features), dim=1)
 
         if action_head.config.use_alternate_vl_dit:
+            # NOTE: This call signature mirrors the model's pretraining forward()
+            # (gr00t_n1d6.py:225-233), so the FM log-prob surrogate evaluates the
+            # exact loss the model was trained with. AlternateVLDiT.forward()
+            # accepts `encoder_attention_mask` but silently ignores it — the
+            # cross-attention masks are built from `image_mask & backbone_attention_mask`
+            # internally (dit.py:322-323). We pass it anyway for parity with the
+            # pretraining forward.
             model_output, _ = action_head.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
@@ -162,7 +179,6 @@ def compute_fm_log_prob(
         # --- Per-sample MSE ---
         per_element_mse = F.mse_loss(pred_velocity, velocity_target, reduction="none")
         masked_mse = per_element_mse * action_mask
-        valid_elements_per_sample = action_mask.sum(dim=(1, 2)).clamp(min=1.0)
         per_sample_mse = masked_mse.sum(dim=(1, 2)) / valid_elements_per_sample
 
         log_probs_accumulated += (-per_sample_mse).float()
@@ -173,123 +189,44 @@ def compute_fm_log_prob(
     return log_probs
 
 
-def _sample_inference_jittered_timesteps(
-    n_steps: int,
+def _sample_jittered_timesteps(
+    tau_centers: list[float],
     B: int,
     noise_s: float,
     device: torch.device,
     dtype: torch.dtype,
     jitter_std: float = 0.02,
 ) -> torch.Tensor:
-    """Sample timesteps from tight Gaussians centered on the inference schedule.
+    """Sample timesteps from tight Gaussians centered on user-specified τ values.
 
-    The inference denoising uses deterministic timesteps (0, 0.25, 0.5, 0.75).
-    These are the points where the velocity field prediction matters most for
-    actual action generation. We add small Gaussian jitter for stochasticity
-    (prevents overfitting to exact grid points) while staying close.
+    Each center gets Gaussian jitter (std=0.02, so 95% within ±0.04). Choose centers
+    to weight the FM log-prob evaluation toward the most important τ values.
+
+    Example: Late-biased schedule [0, 0.25, 0.35, 0.5, 0.6, 0.75] has denser
+    coverage in [0.5, 0.75] where velocity prediction errors have more impact
+    (fewer Euler steps remaining to correct the action).
 
     Args:
-        n_steps: Number of inference timesteps (typically 4).
+        tau_centers: List of τ values in [0, noise_s]. K = len(tau_centers).
         B: Batch size.
         noise_s: Maximum timestep value (0.999 from model config).
         device: Torch device.
         dtype: Torch dtype.
-        jitter_std: Std of the Gaussian jitter (0.02 → 95% within ±0.04).
+        jitter_std: Std of the Gaussian jitter (default 0.02).
 
     Returns:
-        timesteps: [K, B] tensor, one jittered timestep per inference step.
+        timesteps: [K, B] tensor, one jittered timestep per center.
     """
-    # Inference schedule: 0, 1/N, 2/N, ..., (N-1)/N
-    centers = torch.arange(n_steps, device=device, dtype=dtype) / n_steps  # [K]
+    centers = torch.tensor(tau_centers, device=device, dtype=dtype)  # [K]
+    K = centers.shape[0]
 
     # Sample from N(center, jitter_std) independently for each batch element
-    jitter = torch.randn(n_steps, B, device=device, dtype=dtype) * jitter_std
+    jitter = torch.randn(K, B, device=device, dtype=dtype) * jitter_std
     timesteps = centers[:, None] + jitter  # [K, B]
 
-    # Clamp to valid range: must be >= 0 (especially for the τ=0 center)
-    # and <= noise_s (the model's maximum training timestep)
+    # Clamp to valid range
     timesteps = timesteps.clamp(min=0.0, max=noise_s)
 
     return timesteps
 
 
-def compute_fm_log_prob_pair(
-    current_action_head: nn.Module,
-    ref_action_head: nn.Module,
-    backbone_output: dict,
-    state_features: torch.Tensor,
-    embodiment_id: torch.Tensor,
-    actions: torch.Tensor,
-    action_mask: torch.Tensor,
-    n_samples: int = 4,
-    noise_s: float | None = None,
-    jitter_std: float = 0.02,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute FM log-probs for both current and reference policy simultaneously.
-
-    Uses a SINGLE shared noise vector and K shared timesteps for both models.
-    Timesteps are sampled from tight Gaussians centered on the inference schedule
-    (0, 0.25, 0.5, 0.75) — the actual denoising points where velocity prediction
-    quality matters most for action generation.
-
-    Args:
-        current_action_head: Model being trained (with LoRA adapters).
-        ref_action_head: Frozen reference model (for KL anchor).
-        backbone_output: Shared backbone features (same for both models).
-        state_features: Shared state embeddings (same for both models).
-        embodiment_id: [B] embodiment IDs.
-        actions: [B, action_horizon, action_dim] actions to evaluate.
-        action_mask: [B, action_horizon, action_dim] valid dimension mask.
-        n_samples: Number of timestep samples (K=4 matches the 4 inference steps).
-        noise_s: Timestep scaling factor. If None, reads from config.
-        jitter_std: Std of Gaussian jitter around inference timesteps (default 0.02).
-
-    Returns:
-        Tuple of (current_log_probs, ref_log_probs), each [B] tensors.
-    """
-    B = actions.shape[0]
-    device = actions.device
-    dtype = actions.dtype
-
-    config = current_action_head.config
-    if noise_s is None:
-        noise_s = getattr(config, "noise_s", 0.999)
-
-    # Timesteps: jittered around the 4 inference denoising points
-    timesteps = _sample_inference_jittered_timesteps(
-        n_steps=n_samples, B=B, noise_s=noise_s,
-        device=device, dtype=dtype, jitter_std=jitter_std,
-    )  # [K, B]
-
-    # ONE shared noise vector — evaluates both models along the
-    # same interpolation path, so the ratio isolates model quality difference
-    shared_noise = torch.randn_like(actions)  # [B, action_horizon, action_dim]
-
-    # Compute log-probs with shared (timesteps, noise)
-    current_log_probs = compute_fm_log_prob(
-        action_head=current_action_head,
-        backbone_output=backbone_output,
-        state_features=state_features,
-        embodiment_id=embodiment_id,
-        actions=actions,
-        action_mask=action_mask,
-        timesteps=timesteps,
-        noise=shared_noise,
-        n_samples=n_samples,
-    )
-
-    # Reference model: no gradient needed (frozen)
-    with torch.no_grad():
-        ref_log_probs = compute_fm_log_prob(
-            action_head=ref_action_head,
-            backbone_output=backbone_output,
-            state_features=state_features,
-            embodiment_id=embodiment_id,
-            actions=actions,
-            action_mask=action_mask,
-            timesteps=timesteps,
-            noise=shared_noise,
-            n_samples=n_samples,
-        )
-
-    return current_log_probs, ref_log_probs

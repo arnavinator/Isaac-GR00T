@@ -2,28 +2,20 @@
 
 This is the orchestrator that ties everything together:
 1. Loads model + applies LoRA
-2. Creates frozen reference model
-3. Iterates: collect episodes → compute advantages → policy update
-
-Structure mirrors grpo_cont.py's outer loop (lines 242-457):
-    for update in range(1, num_updates+1):
-        # Collect data (lines 253-312)
-        # Compute advantages (lines 325-364)
-        # GRPO policy update (lines 379-439)
-        # Log metrics (lines 446-455)
+2. Iterates: collect episodes → compute advantages → pre-compute ref log-probs → policy update
 
 Key differences from grpo_cont.py:
 - Episode collection is via subprocess (robocasa venv) + ZMQ server
 - Log-prob uses FM surrogate instead of Gaussian distribution
-- Advantages are episodic (group-relative on shaped rewards)
-- Reference model used instead of stored old log-probs
+- Advantages are episodic (group-relative on time-scaled rewards)
+- Reference log-probs pre-computed per iteration (no deep-copied reference model)
 
 Usage:
     uv run python scripts/grpo/train_grpo.py \\
         --model-path nvidia/GR00T-N1.6-3B \\
-        --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \\
+        --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \\
         --num-iterations 200 \\
-        --group-size 5 --num-groups 12
+        --group-size 5 --num-groups 5
 
 Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 """
@@ -45,13 +37,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from grpo_config import GRPOConfig
 from lora_dit import (
     apply_lora_to_dit,
-    create_reference_dit,
-    update_reference_dit,
     save_lora_checkpoint,
     load_lora_checkpoint,
     print_trainable_params,
 )
-from fm_log_prob import compute_fm_log_prob_pair
+from fm_log_prob import compute_fm_log_prob, _sample_jittered_timesteps
 from episode_buffer import EpisodeBuffer, ActionChunk
 
 
@@ -59,16 +49,12 @@ class GRPOTrainer:
     """GRPO training loop for GR00T N1.6 DiT with LoRA.
 
     This class manages the full training pipeline:
-    - Model setup (LoRA injection, reference model creation)
+    - Model setup (LoRA injection, persistent server)
     - Episode collection (launches collector subprocess)
+    - Reference log-prob pre-computation (single no-grad pass)
     - Advantage computation (group-relative normalization)
     - Policy gradient update (clipped surrogate + KL penalty)
-    - Evaluation and checkpointing
-
-    The training logic directly mirrors grpo_cont.py's structure:
-    - Outer loop: collect → advantage → update
-    - Inner loop (policy update): multiple epochs × minibatches
-    - Loss: -min(ratio*A, clip(ratio)*A) + kl_coef * KL
+    - Checkpointing
     """
 
     def __init__(self, config: GRPOConfig):
@@ -82,7 +68,6 @@ class GRPOTrainer:
 
         # Will be set in setup()
         self.model = None
-        self.ref_action_head = None
         self.optimizer = None
         self.iteration = 0
 
@@ -93,7 +78,7 @@ class GRPOTrainer:
         self.writer = None  # TensorBoard/wandb writer
 
     def setup(self):
-        """Load model, apply LoRA, create reference, setup optimizer.
+        """Load model, apply LoRA, setup optimizer, start server.
 
         This is separate from __init__ so that config can be modified before setup.
         """
@@ -105,7 +90,7 @@ class GRPOTrainer:
         print("=" * 60)
 
         # --- Step 1: Load pretrained model ---
-        print(f"\n[1/5] Loading model from {self.config.model_path}...")
+        print(f"\n[1/4] Loading model from {self.config.model_path}...")
         self.model = AutoModel.from_pretrained(self.config.model_path)
         self.model.to(device=self.device, dtype=torch.bfloat16)
         self.model.eval()  # Start in eval mode (we manually control train/eval per component)
@@ -115,7 +100,7 @@ class GRPOTrainer:
         self.processor.eval()
 
         # --- Step 2: Apply LoRA to DiT ---
-        print(f"\n[2/5] Applying LoRA (rank={self.config.lora_rank})...")
+        print(f"\n[2/4] Applying LoRA (rank={self.config.lora_rank})...")
         self.model = apply_lora_to_dit(
             self.model,
             rank=self.config.lora_rank,
@@ -138,16 +123,8 @@ class GRPOTrainer:
                 print(f"  Continuing from iteration {start_iteration}")
         self._start_iteration = start_iteration
 
-        # --- Step 3: Create frozen reference model ---
-        # The reference shares the Eagle backbone (frozen, identical) but has
-        # its own DiT copy for computing reference log-probs in the importance ratio.
-        # If resuming, the reference starts at the same trained state as the current model.
-        print("\n[3/5] Creating frozen reference action head...")
-        self.ref_action_head = create_reference_dit(self.model)
-        self.ref_action_head.to(device=self.device, dtype=torch.bfloat16)
-
-        # --- Step 4: Setup optimizer (only LoRA params) ---
-        print("\n[4/5] Setting up optimizer...")
+        # --- Step 3: Setup optimizer (only LoRA params) ---
+        print("\n[3/4] Setting up optimizer...")
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = optim.AdamW(
             trainable_params,
@@ -170,8 +147,8 @@ class GRPOTrainer:
         print(f"  AdamW: lr={self.config.learning_rate}, wd={self.config.weight_decay}")
         print(f"  Trainable params in optimizer: {sum(p.numel() for p in trainable_params):,}")
 
-        # --- Step 5: Setup logging ---
-        print("\n[5/5] Setting up logging...")
+        # --- Step 4: Setup logging ---
+        print("\n[4/4] Setting up logging...")
         if self.config.use_wandb:
             try:
                 import wandb
@@ -195,9 +172,21 @@ class GRPOTrainer:
         # Create checkpoint directory
         Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
+        # --- Start persistent server ---
+        # The server shares self.model, so LoRA weight updates are reflected automatically
+        self._server_handle = self._start_server_thread()
+
         print("\n" + "=" * 60)
         print("Setup complete. Ready to train.")
         print("=" * 60)
+
+    def shutdown(self):
+        """Clean up resources (server thread, tensorboard writer)."""
+        if hasattr(self, '_server_handle') and self._server_handle is not None:
+            self._stop_server_thread(self._server_handle)
+            self._server_handle = None
+        if self.writer is not None:
+            self.writer.close()
 
     def train(self):
         """Main training loop.
@@ -250,7 +239,10 @@ class GRPOTrainer:
 
             # ═══ Phase 2: Compute advantages ═══
             phase2_start = time.time()
-            self.buffer.compute_advantages(success_weight=self.config.success_weight)
+            self.buffer.compute_advantages(
+                success_weight=self.config.success_weight,
+                max_episode_steps=max_steps,
+            )
             stats = self.buffer.stats()
             phase2_time = time.time() - phase2_start
 
@@ -260,17 +252,15 @@ class GRPOTrainer:
                 self._log_metrics(iteration, stats, skip_reason="no_signal")
                 continue
 
+            # ═══ Phase 2b: Pre-compute reference log-probs ═══
+            self._compute_ref_log_probs()
+
             # ═══ Phase 3: GRPO Policy Update ═══
             phase3_start = time.time()
             update_stats = self._grpo_update()
             phase3_time = time.time() - phase3_start
 
-            # ═══ Phase 4: Reference model update ═══
-            if iteration % self.config.ref_update_interval == 0:
-                print(f"  Updating reference model (every {self.config.ref_update_interval} iters)")
-                update_reference_dit(self.ref_action_head, self.model)
-
-            # ═══ Phase 5: Logging and checkpointing ═══
+            # ═══ Phase 4: Logging and checkpointing ═══
             iter_time = time.time() - iter_start
             self._log_metrics(iteration, stats, update_stats, lr, iter_time)
 
@@ -307,81 +297,168 @@ class GRPOTrainer:
         episode_dir = Path(self.config.episode_dir) / f"iter_{self.iteration:04d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
 
-        # Start the ZMQ server in a background thread
-        server_handle = self._start_server_thread()
+        # Launch collector subprocess in robocasa venv
+        robocasa_python = str(
+            Path(__file__).parent.parent.parent
+            / "gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python"
+        )
 
+        collector_script = str(Path(__file__).parent / "collect_episodes.py")
+
+        # Resolve per-task fast_forward_steps (same pattern as max_episode_steps)
+        if isinstance(self.config.fast_forward_steps, list):
+            ff_steps = self.config.fast_forward_steps[task_idx]
+        else:
+            ff_steps = self.config.fast_forward_steps
+
+        cmd = [
+            robocasa_python,
+            collector_script,
+            "--env-name", env_name,
+            "--group-size", str(self.config.group_size),
+            "--num-groups", str(self.config.num_groups),
+            "--max-episode-steps", str(max_steps),
+            "--n-action-steps", str(self.config.n_action_steps),
+            "--fast-forward-steps", str(ff_steps),
+            "--fast-forward-pct", str(self.config.fast_forward_pct),
+            "--success-weight", str(self.config.success_weight),
+            "--server-host", self.config.server_host,
+            "--server-port", str(self.config.server_port),
+            "--output-dir", str(episode_dir),
+            "--seed", str(self.config.seed + self.iteration * 1000),
+        ]
+
+        total_episodes = self.config.group_size * self.config.num_groups
+        print(f"  Collecting {self.config.num_groups} groups × {self.config.group_size} = {total_episodes} episodes...")
+
+        # Stream collector output line-by-line so the user sees progress instead
+        # of waiting for the whole subprocess to finish. Mirror the collector's
+        # stdout/stderr to the trainer log with a "[collector]" prefix.
+        # A background Timer enforces the 600s wall clock even if the subprocess
+        # hangs on stdout with no output (otherwise the blocking read could wait
+        # forever).
+        timeout_s = 600
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        import threading as _threading
+        timed_out = {"v": False}
+        def _kill_on_timeout():
+            if proc.poll() is None:
+                timed_out["v"] = True
+                proc.kill()
+        killer = _threading.Timer(timeout_s, _kill_on_timeout)
+        killer.daemon = True
+        killer.start()
         try:
-            # Launch collector subprocess in robocasa venv
-            robocasa_python = str(
-                Path(__file__).parent.parent.parent
-                / "gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python"
-            )
-
-            collector_script = str(Path(__file__).parent / "collect_episodes.py")
-
-            # Resolve per-task fast_forward_steps (same pattern as max_episode_steps)
-            if isinstance(self.config.fast_forward_steps, list):
-                ff_steps = self.config.fast_forward_steps[task_idx]
-            else:
-                ff_steps = self.config.fast_forward_steps
-
-            cmd = [
-                robocasa_python,
-                collector_script,
-                "--env-name", env_name,
-                "--group-size", str(self.config.group_size),
-                "--num-groups", str(self.config.num_groups),
-                "--max-episode-steps", str(max_steps),
-                "--n-action-steps", str(self.config.n_action_steps),
-                "--fast-forward-steps", str(ff_steps),
-                "--fast-forward-pct", str(self.config.fast_forward_pct),
-                "--success-weight", str(self.config.success_weight),
-                "--server-host", self.config.server_host,
-                "--server-port", str(self.config.server_port),
-                "--output-dir", str(episode_dir),
-                "--seed", str(self.config.seed + self.iteration * 1000),
-            ]
-
-            total_episodes = self.config.group_size * self.config.num_groups
-            print(f"  Collecting {self.config.num_groups} groups × {self.config.group_size} = {total_episodes} episodes...")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-
-            if result.returncode != 0:
-                print(f"  WARNING: Collector failed with code {result.returncode}")
-                print(f"  stderr: {result.stderr[:500]}")
-                return
-
+            for line in proc.stdout:
+                sys.stdout.write(f"    [collector] {line}")
+                sys.stdout.flush()
+            proc.wait()
         finally:
-            self._stop_server_thread(server_handle)
+            killer.cancel()
+
+        if timed_out["v"]:
+            print(f"  WARNING: Collector exceeded {timeout_s}s timeout; killed")
+            return
+        if proc.returncode != 0:
+            print(f"  WARNING: Collector failed with code {proc.returncode}")
+            return
 
         # Load collected episodes into buffer
         n_loaded = self.buffer.load_episodes(episode_dir)
         print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
 
+    def _compute_ref_log_probs(self):
+        """Pre-compute reference log-probs for all chunks using the current model.
+
+        This replaces the deep-copied reference model. Since this runs BEFORE the
+        GRPO update, the current model IS the reference (it hasn't been updated yet
+        for this iteration). We store per-chunk ref_log_prob and tau_samples so the
+        GRPO update can reuse the exact same timesteps.
+
+        This matches grpo_cont.py's pattern where logprob_old is collected from the
+        current policy at the start of each iteration.
+        """
+        chunks = self.buffer._build_chunks()
+        if not chunks:
+            return
+
+        batch_size = self.config.mini_batch_size * 2  # Larger batches OK (no grad)
+        K = len(self.config.tau_centers)
+        noise_s = getattr(self.model.action_head.config, "noise_s", 0.999)
+
+        # DiT is already in eval mode from setup / after _grpo_update; do not flip
+        # modes here or the current-pass in _grpo_update will drift from ref.
+
+        n_computed = 0
+        with torch.inference_mode():
+            for start in range(0, len(chunks), batch_size):
+                batch = chunks[start:start + batch_size]
+                result = self._prepare_batch(batch)
+                if result is None:
+                    continue
+                batch_data, valid_batch = result
+
+                B = batch_data["actions"].shape[0]
+
+                # Sample jittered timesteps for this batch
+                timesteps = _sample_jittered_timesteps(
+                    tau_centers=self.config.tau_centers,
+                    B=B,
+                    noise_s=noise_s,
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                )  # [K, B]
+
+                # Compute log-probs using current model (= reference before update)
+                ref_lp = compute_fm_log_prob(
+                    action_head=self.model.action_head,
+                    backbone_output=batch_data["backbone_output"],
+                    state_features=batch_data["state_features"],
+                    embodiment_id=batch_data["embodiment_id"],
+                    actions=batch_data["actions"],
+                    action_mask=batch_data["action_masks"],
+                    timesteps=timesteps,
+                    noise=batch_data["initial_noise"],
+                    n_samples=K,
+                )
+
+                # Store back into chunks
+                tau_cpu = timesteps.cpu().numpy()  # [K, B]
+                for i, chunk in enumerate(valid_batch):
+                    chunk.ref_log_prob = ref_lp[i].item()
+                    chunk.tau_samples = tau_cpu[:, i].astype(np.float32)
+                n_computed += len(valid_batch)
+
+        print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
+
     def _grpo_update(self) -> dict:
         """Run GRPO clipped surrogate policy gradient update on collected episodes.
 
-        This directly mirrors grpo_cont.py lines 379-439:
-            for epoch in range(update_epochs):
-                for start in range(0, grouped_batch_size, minibatch_size):
-                    # Compute new log-probs
-                    # Compute ratio and clipped loss
-                    # Backward + step
+        Uses pre-computed ref_log_probs (from _compute_ref_log_probs) and stored
+        tau_samples for each chunk. Only the current model's log-prob is computed
+        with gradients enabled.
 
-        Key adaptations for flow-matching:
-        - log_prob computed via FM surrogate (fm_log_prob.py) instead of Gaussian
-        - Reference model used instead of stored old log-probs
-        - Backbone features cached (expensive, only run once per unique observation)
+        The DiT stays in eval mode so that dropout (LoRA + attention) is consistent
+        with the reference log-prob pass. If you want to enable dropout, match the
+        mode between _compute_ref_log_probs and this method.
 
         Returns:
             Dict of update statistics (loss, clipfrac, kl, etc.)
         """
-        # Put DiT in training mode (LoRA layers need dropout)
-        self.model.action_head.model.train()
+        # Keep DiT in eval mode to match _compute_ref_log_probs; gradients still flow
+        # through LoRA params because requires_grad is set at the parameter level.
+        self.model.action_head.model.eval()
 
         total_loss = 0.0
         total_clip_loss = 0.0
         total_kl = 0.0
+        total_ratio = 0.0
         clipfracs = []
         n_updates = 0
 
@@ -393,60 +470,108 @@ class GRPOTrainer:
                 seed=self.config.seed + self.iteration * 100 + epoch,
             ):
                 # --- Prepare batch tensors ---
-                batch_data = self._prepare_batch(batch)
-                if batch_data is None:
+                result = self._prepare_batch(batch)
+                if result is None:
                     continue
+                batch_data, valid_batch = result
 
                 actions = batch_data["actions"]           # [B, horizon, dim]
                 action_masks = batch_data["action_masks"] # [B, horizon, dim]
+                initial_noise = batch_data["initial_noise"]  # [B, horizon, dim] or None
                 advantages = batch_data["advantages"]     # [B]
                 backbone_output = batch_data["backbone_output"]
                 state_features = batch_data["state_features"]
                 embodiment_id = batch_data["embodiment_id"]
 
                 # --- Compute importance ratio ---
-                # This is the FM-surrogate equivalent of grpo_cont.py line 409:
-                #   log_ratio = logprob_new - logprob_old
-                current_log_probs, ref_log_probs = compute_fm_log_prob_pair(
-                    current_action_head=self.model.action_head,
-                    ref_action_head=self.ref_action_head,
-                    backbone_output=backbone_output,
-                    state_features=state_features,
-                    embodiment_id=embodiment_id,
-                    actions=actions,
-                    action_mask=action_masks,
-                    n_samples=self.config.n_fm_samples,
+                # Use pre-computed ref_log_probs (from _compute_ref_log_probs)
+                # and stored tau_samples for consistency
+                # Filter to chunks that have ref_log_prob computed
+                ready_batch = [c for c in valid_batch if c.ref_log_prob is not None and c.tau_samples is not None]
+                if not ready_batch:
+                    continue
+
+                # If all chunks are ready, use tensors as-is (common case)
+                if len(ready_batch) == len(valid_batch):
+                    ready_actions = actions
+                    ready_masks = action_masks
+                    ready_noise = initial_noise
+                    ready_advantages = advantages
+                    ready_backbone = backbone_output
+                    ready_state_features = state_features
+                    ready_embodiment_id = embodiment_id
+                else:
+                    # Re-index tensors to match ready_batch subset
+                    ready_indices = [valid_batch.index(c) for c in ready_batch]
+                    idx = torch.tensor(ready_indices, device=self.device)
+                    ready_actions = actions[idx]
+                    ready_masks = action_masks[idx]
+                    ready_noise = initial_noise[idx] if initial_noise is not None else None
+                    ready_advantages = advantages[idx]
+                    ready_backbone = {
+                        k: v[idx] if v is not None and hasattr(v, '__getitem__') else v
+                        for k, v in backbone_output.items()
+                    }
+                    ready_state_features = state_features[idx]
+                    ready_embodiment_id = embodiment_id[idx]
+
+                ref_log_probs = torch.tensor(
+                    [c.ref_log_prob for c in ready_batch],
+                    device=self.device, dtype=torch.float32,
+                )
+
+                # Reconstruct timesteps from stored per-chunk tau_samples
+                tau_np = np.stack([c.tau_samples for c in ready_batch], axis=1)  # [K, B]
+                timesteps = torch.from_numpy(tau_np).to(
+                    device=self.device, dtype=torch.bfloat16
+                )
+
+                # Only compute current model's log-prob (with gradient)
+                current_log_probs = compute_fm_log_prob(
+                    action_head=self.model.action_head,
+                    backbone_output=ready_backbone,
+                    state_features=ready_state_features,
+                    embodiment_id=ready_embodiment_id,
+                    actions=ready_actions,
+                    action_mask=ready_masks,
+                    timesteps=timesteps,
+                    noise=ready_noise,
+                    n_samples=len(self.config.tau_centers),
                 )
 
                 log_ratio = current_log_probs - ref_log_probs
                 ratio = log_ratio.exp()
 
+                # --- Per-minibatch advantage renormalization (matches grpo_cont.py:413-417) ---
+                # After the A_episode/num_chunks division in _build_chunks, per-chunk
+                # advantages have small, heterogeneous magnitudes (varying with
+                # episode length). Re-normalizing within the minibatch stabilizes
+                # gradient scale across iterations and keeps the effective clip
+                # threshold meaningful relative to the advantage magnitude.
+                if ready_advantages.numel() > 1:
+                    ready_advantages = (
+                        (ready_advantages - ready_advantages.mean())
+                        / (ready_advantages.std() + 1e-8)
+                    )
+
                 # --- Clipped surrogate loss ---
-                # Mirrors grpo_cont.py lines 421-424:
-                #   min1 = advs * ratio
-                #   min2 = advs * torch.clamp(ratio, 1-clip_eps, 1+clip_eps)
-                #   loss_clip = torch.min(min1, min2).mean()
-                surr1 = advantages * ratio
-                surr2 = advantages * torch.clamp(
+                surr1 = ready_advantages * ratio
+                surr2 = ready_advantages * torch.clamp(
                     ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps
                 )
                 clip_loss = -torch.min(surr1, surr2).mean()
 
                 # --- KL divergence penalty ---
-                # Mirrors grpo_cont.py line 430:
-                #   loss_kl = (logprob_old - logprob_new).mean()
                 kl_loss = self.config.kl_coef * (ref_log_probs - current_log_probs).mean()
 
                 # --- Total loss ---
-                # Mirrors grpo_cont.py line 434:
-                #   loss = -loss_clip + kl_coef * loss_kl
                 loss = clip_loss + kl_loss
 
                 # --- Backward pass ---
                 self.optimizer.zero_grad()
                 loss.backward()
 
-                # Gradient clipping (mirrors grpo_cont.py line 437)
+                # Gradient clipping
                 nn.utils.clip_grad_norm_(
                     [p for p in self.model.parameters() if p.requires_grad],
                     self.config.max_grad_norm,
@@ -460,11 +585,10 @@ class GRPOTrainer:
                     total_loss += loss.item()
                     total_clip_loss += clip_loss.item()
                     total_kl += kl_loss.item()
+                    total_ratio += ratio.mean().item()
                     n_updates += 1
 
-        # Back to eval mode
-        self.model.action_head.model.eval()
-
+        # Model remains in eval mode (it never left)
         if n_updates == 0:
             return {}
 
@@ -473,15 +597,15 @@ class GRPOTrainer:
             "clip_loss": total_clip_loss / n_updates,
             "kl_loss": total_kl / n_updates,
             "clipfrac": np.mean(clipfracs) if clipfracs else 0,
+            "mean_ratio": total_ratio / n_updates,
             "n_updates": n_updates,
-            "mean_ratio": ratio.mean().item() if 'ratio' in dir() else 0,
         }
 
-    def _prepare_batch(self, batch: list[ActionChunk]) -> Optional[dict]:
+    def _prepare_batch(self, batch: list[ActionChunk]) -> Optional[tuple[dict, list[ActionChunk]]]:
         """Convert a list of ActionChunks into GPU tensors for training.
 
         This handles:
-        - Using raw normalized actions (50×128) for FM log-prob computation
+        - Using raw normalized actions (50x128) for FM log-prob computation
         - Re-encoding observations through the backbone
         - Creating embodiment ID tensors
 
@@ -493,7 +617,7 @@ class GRPOTrainer:
             batch: List of ActionChunk objects from the episode buffer.
 
         Returns:
-            Dict of tensors ready for the GRPO update, or None if batch is invalid.
+            Tuple of (tensor_dict, valid_batch_list), or None if batch is invalid.
         """
         if not batch:
             return None
@@ -515,6 +639,17 @@ class GRPOTrainer:
         action_masks = torch.stack([
             torch.from_numpy(chunk.action_mask).float() for chunk in valid_batch
         ]).to(self.device, dtype=torch.bfloat16)  # [B, 50, 128]
+
+        # --- Initial noise (the ε₀ that was denoised into these actions) ---
+        # If available, evaluates FM log-prob along the actual denoising path.
+        # Falls back to random noise if not stored (older collections).
+        has_noise = all(c.initial_noise is not None for c in valid_batch)
+        if has_noise:
+            initial_noise = torch.stack([
+                torch.from_numpy(chunk.initial_noise).float() for chunk in valid_batch
+            ]).to(self.device, dtype=torch.bfloat16)  # [B, 50, 128]
+        else:
+            initial_noise = None
 
         # --- Advantages ---
         advantages = torch.tensor(
@@ -538,11 +673,12 @@ class GRPOTrainer:
         return {
             "actions": actions,
             "action_masks": action_masks,
+            "initial_noise": initial_noise,
             "advantages": advantages,
             "backbone_output": backbone_output,
             "state_features": state_features,
             "embodiment_id": embodiment_id,
-        }
+        }, valid_batch
 
     def _encode_observations(self, batch: list[ActionChunk]):
         """Run Eagle backbone on a batch of observations.
@@ -561,64 +697,49 @@ class GRPOTrainer:
             - state_features: [B, state_horizon, 1536] encoded state
             - embodiment_id: [B] tensor of embodiment IDs
         """
-        try:
-            from gr00t.data.types import VLAStepData, MessageType
-            from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.data.types import VLAStepData, MessageType
+        from gr00t.data.embodiment_tags import EmbodimentTag
 
-            embodiment_tag = EmbodimentTag(self.config.embodiment_tag)
+        embodiment_tag = EmbodimentTag[self.config.embodiment_tag]
 
-            # Step 1-2: Build VLAStepData for each chunk and process
-            processed_inputs = []
-            for chunk in batch:
-                vla = VLAStepData(
-                    images=chunk.video_frames,
-                    states=chunk.state,
-                    actions={},  # No ground-truth actions needed for feature encoding
-                    text=chunk.language,
-                    embodiment=embodiment_tag,
-                )
-                messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla}]
-                processed_inputs.append(self.processor(messages))
-
-            # Step 3: Collate into batch
-            collated = self.processor.collator(processed_inputs)
-
-            # Note: model.prepare_input() handles device/dtype conversion internally
-            # (it uses tree.map_structure to move all tensors to model device + dtype)
-
-            # Step 4: model.prepare_input() splits into backbone and action head inputs
-            # The collator returns {"inputs": batch_dict}, so **collated unpacks to
-            # prepare_input(inputs=batch_dict) matching the method signature
-            backbone_inputs, action_inputs = self.model.prepare_input(**collated)
-
-            # Step 5: Run backbone (frozen)
-            backbone_output = self.model.backbone(backbone_inputs)
-
-            # Step 6: Encode features (applies vlln + state encoder)
-            features = self.model.action_head._encode_features(
-                backbone_output, action_inputs
+        # Step 1-2: Build VLAStepData for each chunk and process
+        processed_inputs = []
+        for chunk in batch:
+            vla = VLAStepData(
+                images=chunk.video_frames,
+                states=chunk.state,
+                actions={},  # No ground-truth actions needed for feature encoding
+                text=chunk.language,
+                embodiment=embodiment_tag,
             )
+            messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla}]
+            processed_inputs.append(self.processor(messages))
 
-            # Extract what we need
-            # features has: backbone_features (processed vl_embeds), state_features
-            # backbone_output has: image_mask, backbone_attention_mask (for DiT cross-attn)
-            embodiment_id = action_inputs.embodiment_id
+        # Step 3: Collate into batch
+        collated = self.processor.collator(processed_inputs)
 
-            # Build the backbone_output dict that fm_log_prob expects
-            # It needs: backbone_features (processed), image_mask, backbone_attention_mask
-            fm_backbone_output = {
-                "backbone_features": features.backbone_features,
-                "image_mask": getattr(backbone_output, "image_mask", None),
-                "backbone_attention_mask": getattr(backbone_output, "backbone_attention_mask", None),
-            }
+        # Step 4: model.prepare_input() splits into backbone and action head inputs
+        backbone_inputs, action_inputs = self.model.prepare_input(**collated)
 
-            return fm_backbone_output, features.state_features, embodiment_id
+        # Step 5: Run backbone (frozen)
+        backbone_output = self.model.backbone(backbone_inputs)
 
-        except Exception as e:
-            print(f"  WARNING: Failed to encode observations: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        # Step 6: Encode features (applies vlln + state encoder)
+        features = self.model.action_head._encode_features(
+            backbone_output, action_inputs
+        )
+
+        # Extract what we need
+        embodiment_id = action_inputs.embodiment_id
+
+        # Build the backbone_output dict that fm_log_prob expects
+        fm_backbone_output = {
+            "backbone_features": features.backbone_features,
+            "image_mask": getattr(backbone_output, "image_mask", None),
+            "backbone_attention_mask": getattr(backbone_output, "backbone_attention_mask", None),
+        }
+
+        return fm_backbone_output, features.state_features, embodiment_id
 
     def _start_server_thread(self):
         """Start the GRPO server in a background thread for collection.
@@ -646,7 +767,7 @@ class GRPOTrainer:
                 self.strict = False
                 self.model = trainer_ref.model
                 self.processor = trainer_ref.processor
-                self.embodiment_tag = EmbodimentTag(trainer_ref.config.embodiment_tag)
+                self.embodiment_tag = EmbodimentTag[trainer_ref.config.embodiment_tag]
                 self.modality_configs = self.processor.get_modality_configs()[
                     self.embodiment_tag.value
                 ]
@@ -718,9 +839,6 @@ class GRPOTrainer:
             def reset(self, options=None):
                 return {}
 
-            def get_modality_config(self):
-                return self.processor.get_modality_configs()
-
         # Create policy → sim wrapper → GRPO wrapper
         # strict=False avoids observation validation during collection
         # (the collector may send slightly different formats)
@@ -729,7 +847,6 @@ class GRPOTrainer:
 
         grpo_wrapper = GRPOPolicyWrapper(
             policy=sim_wrapper,
-            initial_seed=self.iteration * 10000,
             device=str(self.device),
         )
 
@@ -741,7 +858,8 @@ class GRPOTrainer:
 
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
-        time.sleep(1)  # Give server time to bind
+        # PolicyServer binds in __init__ (server_client.py), so the port is
+        # ready as soon as PolicyServer(...) returns — no need to wait here.
         return server, thread
 
     def _stop_server_thread(self, server_and_thread):
@@ -801,6 +919,7 @@ class GRPOTrainer:
             self.writer.add_scalar("train/clip_loss", update_stats.get("clip_loss", 0), iteration)
             self.writer.add_scalar("train/kl_loss", update_stats.get("kl_loss", 0), iteration)
             self.writer.add_scalar("train/clipfrac", update_stats.get("clipfrac", 0), iteration)
+            self.writer.add_scalar("train/mean_ratio", update_stats.get("mean_ratio", 1), iteration)
 
         if lr is not None:
             self.writer.add_scalar("train/learning_rate", lr, iteration)
@@ -855,7 +974,10 @@ def main():
     # Create trainer and run
     trainer = GRPOTrainer(config)
     trainer.setup()
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        trainer.shutdown()
 
 
 if __name__ == "__main__":

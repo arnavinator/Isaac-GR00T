@@ -32,6 +32,7 @@ Usage:
 
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -123,7 +124,13 @@ class GRPOPolicyWrapper:
     Both are returned in the info dict for the collector to store per chunk.
     """
 
-    def __init__(self, policy, device: str = "cuda", action_mask: np.ndarray | None = None):
+    def __init__(
+        self,
+        policy,
+        device: str = "cuda",
+        action_mask: np.ndarray | None = None,
+        model_lock: "threading.RLock | None" = None,
+    ):
         """
         Args:
             policy: The underlying Gr00tPolicy or Gr00tSimPolicyWrapper.
@@ -131,10 +138,17 @@ class GRPOPolicyWrapper:
             action_mask: Pre-computed (max_horizon, max_dim) mask with 1s for valid
                 dims of the current embodiment, 0s for padding. If None, attempts
                 to derive it from the wrapped policy's processor/modality_configs.
+            model_lock: Optional re-entrant lock serializing model forward/backward
+                across the server thread and a sibling training thread. When set,
+                the entire get_action body (including monkey-patching and the
+                underlying denoising call) runs inside the lock so the trainer
+                can safely take the same lock during _grpo_update / backward
+                passes. If None, no locking is applied (standalone-server use).
         """
         self.policy = policy
         self.device = device
         self.action_mask = action_mask if action_mask is not None else compute_action_mask(policy)
+        self.model_lock = model_lock
 
     def get_action(self, observation, options=None):
         """Get action with initial noise and raw action capture.
@@ -168,36 +182,65 @@ class GRPOPolicyWrapper:
         captured_raw_action = [None]
         capture_ctx = {"noise": None}
 
-        if action_head is not None:
-            original_method = action_head.get_action_with_features
+        # Serialize model access with the trainer's update loop when sharing the
+        # same Gr00tN1d6 instance across threads (see train_grpo.GRPOTrainer).
+        # nullcontext for the standalone-server case (no sibling trainer thread).
+        lock_ctx = self.model_lock if self.model_lock is not None else nullcontext()
 
-            def capturing_get_action_with_features(*args, **kwargs):
-                # Scope noise capture to ONLY the denoising call. torch.randn
-                # calls outside this window (from other threads, or from earlier
-                # stages of this call) are pass-through.
-                _grpo_tls.capture = capture_ctx
-                try:
-                    result = original_method(*args, **kwargs)
-                finally:
-                    _grpo_tls.capture = None
-                # action_pred inherits vl_embeds.dtype (bfloat16). numpy has no
-                # native bfloat16, so convert via float32 before .numpy().
-                captured_raw_action[0] = (
-                    result["action_pred"].detach().float().cpu().numpy()
-                )
-                return result
-
-            action_head.get_action_with_features = capturing_get_action_with_features
-
-        # Call the underlying policy
-        try:
-            action, info = self.policy.get_action(observation, options)
-        finally:
-            # Always restore the original method (capture context is already
-            # cleared inside capturing_get_action_with_features, so nothing
-            # else to undo here).
+        with lock_ctx:
             if action_head is not None:
-                action_head.get_action_with_features = original_method
+                original_method = action_head.get_action_with_features
+
+                def capturing_get_action_with_features(*args, **kwargs):
+                    # Scope noise capture to ONLY the denoising call. torch.randn
+                    # calls outside this window (from other threads, or from earlier
+                    # stages of this call) are pass-through.
+                    _grpo_tls.capture = capture_ctx
+                    try:
+                        result = original_method(*args, **kwargs)
+                    finally:
+                        _grpo_tls.capture = None
+                    # action_pred inherits vl_embeds.dtype (bfloat16). numpy has no
+                    # native bfloat16, so convert via float32 before .numpy().
+                    captured_raw_action[0] = (
+                        result["action_pred"].detach().float().cpu().numpy()
+                    )
+                    return result
+
+                action_head.get_action_with_features = capturing_get_action_with_features
+
+            # Call the underlying policy
+            try:
+                action, info = self.policy.get_action(observation, options)
+            finally:
+                # Always restore the original method (capture context is already
+                # cleared inside capturing_get_action_with_features, so nothing
+                # else to undo here).
+                if action_head is not None:
+                    action_head.get_action_with_features = original_method
+
+        # Fail loudly if a refactor breaks capture. Silent-None propagation
+        # would later surface as a hard error in _prepare_batch (missing
+        # initial_noise) — but it's cleaner to fail at the capture site so the
+        # offending call is obvious. Only assert when the action_head could
+        # actually be hooked; with action_head=None we never had a chance to
+        # capture and the caller presumably doesn't need GRPO-specific data.
+        if action_head is not None:
+            if captured_raw_action[0] is None:
+                raise RuntimeError(
+                    "GRPOPolicyWrapper: raw_action capture failed. "
+                    "capturing_get_action_with_features did not see a "
+                    "result['action_pred'] — did get_action_with_features's "
+                    "return contract change?"
+                )
+            if capture_ctx["noise"] is None:
+                raise RuntimeError(
+                    "GRPOPolicyWrapper: initial_noise capture failed. "
+                    "No 3-D torch.randn call was observed during denoising — "
+                    "did gr00t_n1d6.get_action_with_features switch to "
+                    "torch.randn_like or a pre-allocated buffer? The "
+                    "_grpo_capturing_randn hook intercepts torch.randn only."
+                )
 
         # Attach captured data to info for client retrieval
         if not isinstance(info, dict):
@@ -314,8 +357,13 @@ def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
         print("LoRA weights loaded.")
 
     # Wrap with sim policy wrapper if needed (handles flat ↔ nested observation format)
+    # strict=False to match train_grpo.py's in-process server setup
+    # (train_grpo.py:_start_server_thread constructs the wrapper the same way).
+    # Standalone runs also disable validation because the collector sends obs
+    # that are already in the flat sim format and exact dtype/shape matches
+    # to the validator aren't guaranteed across embodiments.
     if config.use_sim_policy_wrapper:
-        policy = Gr00tSimPolicyWrapper(policy)
+        policy = Gr00tSimPolicyWrapper(policy, strict=False)
 
     # Enable verbose denoising logs if requested
     if config.verbose:

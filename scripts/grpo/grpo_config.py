@@ -126,7 +126,7 @@ class GRPOConfig:
     # RoboCasa environment names to train on.
     # Tasks are selected round-robin: iteration 1 → task 0, iteration 2 → task 1, etc.
     # Each iteration collects ALL num_groups for a SINGLE task (not distributed across tasks).
-    # With 7 tasks and 200 iterations, each task gets ~28 full training updates.
+    # With 8 tasks and 200 iterations, each task gets 25 full training updates.
     env_names: list[str] = field(default_factory=lambda: [
         "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env",
         "robocasa_panda_omron/PnPCounterToMicrowave_PandaOmron_Env",

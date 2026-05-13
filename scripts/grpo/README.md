@@ -252,6 +252,13 @@ where:
 - Ensure server and collector are on same machine (ZMQ latency)
 - Check if MuJoCo rendering is accidentally enabled
 
+### `RuntimeError: GRPOPolicyWrapper: raw_action / initial_noise capture failed`
+`grpo_server.py` hooks `get_action_with_features` (to grab the raw 50×128 action) and `torch.randn` (to grab the 3-D initial noise). This error fires when one of those captures produced `None` at the end of a `get_action` call:
+- **raw_action None** → `get_action_with_features` no longer returns `BatchFeature({"action_pred": …})`. Check for a model refactor on the action head return contract.
+- **initial_noise None** → the denoising loop stopped calling `torch.randn(...)` with a 3-D size (e.g., switched to `torch.randn_like` or a pre-allocated buffer). Only `torch.randn` is intercepted.
+
+Either fix the capture hook in `grpo_server.py` or update the model to restore the expected contract. This is a hard-fail by design — a silent `None` would propagate as a missing-`initial_noise` error in `_prepare_batch`, which is less obvious to debug.
+
 ### Verifying fast-forward branching
 ```bash
 # Run with debug mode — saves montage PNGs showing all envs after branch point

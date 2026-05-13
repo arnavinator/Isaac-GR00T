@@ -21,6 +21,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 """
 
 import sys
+import threading
 import time
 import subprocess
 from pathlib import Path
@@ -76,6 +77,18 @@ class GRPOTrainer:
 
         # Logging
         self.writer = None  # TensorBoard/wandb writer
+
+        # Re-entrant lock serializing ALL model forward/backward passes
+        # between the server thread (serving inference for the collector
+        # subprocess) and the main thread (reference log-prob pass,
+        # _grpo_update). Normally the collector subprocess has finished by
+        # the time training phases run, but a late/stuck ZMQ request would
+        # otherwise let the server thread fire a forward pass through the
+        # model while the trainer is mid-backward(). Both paths take this
+        # lock, so one waits for the other. RLock because each path takes
+        # it at most once per call, but RLock costs nothing and guards
+        # against accidental nesting in future edits.
+        self._model_lock = threading.RLock()
 
     def setup(self):
         """Load model, apply LoRA, setup optimizer, start server.
@@ -218,7 +231,7 @@ class GRPOTrainer:
 
             # --- Select task for this iteration (round-robin across env_names) ---
             # Each iteration focuses on ONE task and collects all num_groups for it.
-            # With 7 tasks and 200 iterations, each task gets ~28 full training updates.
+            # With 8 tasks and 200 iterations, each task gets 25 full training updates.
             # This keeps group-relative advantages meaningful (same task within a group).
             task_idx = (iteration - 1) % len(self.config.env_names)
             env_name = self.config.env_names[task_idx]
@@ -293,9 +306,18 @@ class GRPOTrainer:
         """
         self.buffer.clear()
 
-        # Output directory for this iteration's episodes
+        # Output directory for this iteration's episodes.
+        # Remove any leftover episode_*.npz from a previous run before the
+        # collector writes new files — without this, load_episodes() would
+        # glob in stale data (e.g., if this iteration's config collects fewer
+        # episodes than the previous one, old files would survive the
+        # overwrite and contaminate advantage computation).
+        # We do NOT rmtree the whole directory so debug outputs like
+        # debug_ff/*.png are preserved for post-mortem inspection.
         episode_dir = Path(self.config.episode_dir) / f"iter_{self.iteration:04d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
+        for stale in episode_dir.glob("episode_*.npz"):
+            stale.unlink()
 
         # Launch collector subprocess in robocasa venv
         robocasa_python = str(
@@ -400,9 +422,13 @@ class GRPOTrainer:
         # reuse during _grpo_update. inference_mode() produces tensors that
         # cannot participate in a later autograd graph, which would break
         # _grpo_update; no_grad tensors can be used freely as non-grad inputs.
+        #
+        # Take the model lock: the server thread is likely idle (collector
+        # subprocess has finished), but a stuck/late ZMQ request would
+        # otherwise race our forward pass.
 
         n_computed = 0
-        with torch.no_grad():
+        with self._model_lock, torch.no_grad():
             for start in range(0, len(chunks), batch_size):
                 batch = chunks[start:start + batch_size]
                 result = self._prepare_batch(batch)
@@ -500,6 +526,15 @@ class GRPOTrainer:
         Returns:
             Dict of update statistics (loss, clipfrac, kl, etc.)
         """
+        # Hold the model lock for the entire update — no server-thread inference
+        # requests can fire forward passes through the same model while we
+        # accumulate/apply gradients (which would corrupt autograd state).
+        # Re-entrant so the surrounding no-op is safe if called from a context
+        # that already holds the lock.
+        with self._model_lock:
+            return self._grpo_update_inner()
+
+    def _grpo_update_inner(self) -> dict:
         # Keep DiT in eval mode to match _compute_ref_log_probs; gradients still flow
         # through LoRA params because requires_grad is set at the parameter level.
         self.model.action_head.model.eval()
@@ -1021,6 +1056,7 @@ class GRPOTrainer:
         grpo_wrapper = GRPOPolicyWrapper(
             policy=sim_wrapper,
             device=str(self.device),
+            model_lock=self._model_lock,
         )
 
         server = PolicyServer(

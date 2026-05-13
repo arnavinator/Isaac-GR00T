@@ -146,10 +146,27 @@ class EpisodeBuffer:
         self._chunks: list[ActionChunk] | None = None
 
     def clear(self):
-        """Clear buffer for next iteration."""
+        """Clear buffer for next iteration.
+
+        Explicitly nulls out per-chunk cached GPU tensors before dropping the
+        chunk list. Without this, the tensors linger in the CUDA caching
+        allocator's pool until the next allocator pass and can inflate
+        observed GPU memory usage across iterations. After the fields are
+        dropped, an empty_cache() hint encourages the allocator to release
+        unused blocks back to the driver.
+        """
+        if self._chunks is not None:
+            for chunk in self._chunks:
+                chunk.cached_backbone_features = None
+                chunk.cached_backbone_attn_mask = None
+                chunk.cached_image_mask = None
+                chunk.cached_state_features = None
+                chunk.cached_embodiment_id = None
         self.episodes = []
         self.advantages = None
         self._chunks = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def load_episodes(self, episode_dir: str | Path) -> int:
         """Load all episode .npz files from a directory.

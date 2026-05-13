@@ -1,7 +1,7 @@
 """Extended GR00T policy server for GRPO training.
 
 This server extends the standard PolicyServer (gr00t/policy/server_client.py) to:
-1. Capture the initial noise tensor used during denoising (via torch.randn hook)
+1. Capture the initial noise tensor used during denoising
 2. Capture the raw normalized action tensor (50×128) from the DiT output
 
 Why initial_noise matters for GRPO:
@@ -12,10 +12,14 @@ Why initial_noise matters for GRPO:
   can evaluate along the true path the model took, rather than random paths.
 
 Implementation approach:
-- Monkey-patch torch.randn for the duration of the policy call
-- Capture the first 3D tensor (the denoising noise in get_action_with_features)
-- Also hook get_action_with_features to capture the raw action before decoding
-- Restore both patches in a try/finally block
+- At module import, install a thread-local-aware wrapper around torch.randn
+  exactly once. Other threads see a pass-through; only the thread that sets
+  a thread-local capture context gets its first 3D randn recorded.
+- During GRPOPolicyWrapper.get_action, monkey-patch the action head's
+  get_action_with_features. The wrapper sets/clears the thread-local context
+  so noise capture is strictly scoped to the denoising call; it also converts
+  the raw action tensor to float32 before numpy (bfloat16 has no numpy dtype).
+- Restore the action head attribute in a try/finally block.
 
 This file runs in the MAIN VENV (GPU) alongside the model.
 
@@ -27,6 +31,7 @@ Usage:
 """
 
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -40,6 +45,40 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from gr00t.policy.server_client import PolicyServer
 from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
 from gr00t.data.embodiment_tags import EmbodimentTag
+
+
+# ---------------------------------------------------------------------------
+# Thread-local noise capture
+# ---------------------------------------------------------------------------
+# The denoising noise is created via torch.randn inside Gr00tN1d6ActionHead.
+# We need to capture it, but patching torch.randn globally for every
+# GRPOPolicyWrapper.get_action call is a concurrency hazard: if the main
+# training thread's torch.randn collides with the server thread's patch, the
+# main thread ends up routing through our capture function and gets wrong
+# semantics.
+#
+# Instead, install the torch.randn override ONCE at module load and route
+# capture state through threading.local(). Other threads see a pass-through;
+# only the thread that set _grpo_tls.capture gets its first 3D randn recorded.
+_grpo_tls = threading.local()
+_original_randn = torch.randn
+
+
+def _grpo_capturing_randn(*args, **kwargs):
+    result = _original_randn(*args, **kwargs)
+    ctx = getattr(_grpo_tls, "capture", None)
+    if ctx is not None and ctx.get("noise") is None and result.dim() == 3:
+        # Convert to float32 first: numpy has no native bfloat16 representation,
+        # so .cpu().numpy() on a bfloat16 tensor raises TypeError. The captured
+        # noise is eventually stacked back into bfloat16 on the GPU for training,
+        # so the round-trip through float32 numpy is lossless.
+        ctx["noise"] = result.detach().float().cpu().numpy()
+    return result
+
+
+# Install exactly once; subsequent imports are no-ops.
+if torch.randn is not _grpo_capturing_randn:
+    torch.randn = _grpo_capturing_randn
 
 
 @dataclass
@@ -56,11 +95,17 @@ class GRPOServerConfig:
     port: int = 5555
 
     # GRPO extensions
-    # Whether to use density-aware diagnostics during inference
-    use_density_diagnostics: bool = False
 
     # LoRA checkpoint to load (None = use base model)
     lora_checkpoint: Optional[str] = None
+
+    # LoRA architecture — must match the rank/alpha/targets used at training time.
+    # A mismatch silently drops checkpoint keys (load_lora_checkpoint only warns),
+    # leaving the server running the base model.
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    lora_target_modules: Optional[list[str]] = None  # None = use lora_dit defaults
 
     # Whether to use the sim policy wrapper (flat keys ↔ nested format)
     use_sim_policy_wrapper: bool = True
@@ -121,47 +166,46 @@ class GRPOPolicyWrapper:
             action_head = None
 
         captured_raw_action = [None]
-        captured_initial_noise = [None]
+        capture_ctx = {"noise": None}
 
         if action_head is not None:
             original_method = action_head.get_action_with_features
 
             def capturing_get_action_with_features(*args, **kwargs):
-                result = original_method(*args, **kwargs)
-                captured_raw_action[0] = result["action_pred"].detach().cpu().numpy()
-                return result
-
-            # Patch torch.randn to capture the initial noise tensor.
-            # In get_action_with_features(), the first 3D randn call is the denoising
-            # starting noise: torch.randn(batch_size, action_horizon, action_dim)
-            _original_randn = torch.randn
-
-            def _capturing_randn(*args, **kwargs):
-                result = _original_randn(*args, **kwargs)
-                # Capture the first 3D tensor produced (the denoising noise)
-                if captured_initial_noise[0] is None and result.dim() == 3:
-                    captured_initial_noise[0] = result.detach().cpu().numpy()
+                # Scope noise capture to ONLY the denoising call. torch.randn
+                # calls outside this window (from other threads, or from earlier
+                # stages of this call) are pass-through.
+                _grpo_tls.capture = capture_ctx
+                try:
+                    result = original_method(*args, **kwargs)
+                finally:
+                    _grpo_tls.capture = None
+                # action_pred inherits vl_embeds.dtype (bfloat16). numpy has no
+                # native bfloat16, so convert via float32 before .numpy().
+                captured_raw_action[0] = (
+                    result["action_pred"].detach().float().cpu().numpy()
+                )
                 return result
 
             action_head.get_action_with_features = capturing_get_action_with_features
-            torch.randn = _capturing_randn
 
         # Call the underlying policy
         try:
             action, info = self.policy.get_action(observation, options)
         finally:
-            # Always restore originals
+            # Always restore the original method (capture context is already
+            # cleared inside capturing_get_action_with_features, so nothing
+            # else to undo here).
             if action_head is not None:
                 action_head.get_action_with_features = original_method
-                torch.randn = _original_randn
 
         # Attach captured data to info for client retrieval
         if not isinstance(info, dict):
             info = {}
         if captured_raw_action[0] is not None:
             info["raw_actions"] = captured_raw_action[0]
-        if captured_initial_noise[0] is not None:
-            info["initial_noise"] = captured_initial_noise[0]
+        if capture_ctx["noise"] is not None:
+            info["initial_noise"] = capture_ctx["noise"]
         if self.action_mask is not None and captured_raw_action[0] is not None:
             B = captured_raw_action[0].shape[0]
             info["action_mask"] = np.broadcast_to(
@@ -255,8 +299,17 @@ def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
     # Apply LoRA if checkpoint provided
     if config.lora_checkpoint:
         from lora_dit import apply_lora_to_dit, load_lora_checkpoint
-        print(f"Loading LoRA checkpoint from {config.lora_checkpoint}...")
-        apply_lora_to_dit(policy.model)
+        print(
+            f"Loading LoRA checkpoint from {config.lora_checkpoint} "
+            f"(rank={config.lora_rank}, alpha={config.lora_alpha})..."
+        )
+        apply_lora_to_dit(
+            policy.model,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+        )
         load_lora_checkpoint(policy.model, config.lora_checkpoint)
         print("LoRA weights loaded.")
 
@@ -286,7 +339,6 @@ def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:
     print(f"  Model: {config.model_path}")
     print(f"  Embodiment: {config.embodiment_tag}")
     print(f"  LoRA: {'loaded' if config.lora_checkpoint else 'none (base model)'}")
-    print(f"  Density diagnostics: {config.use_density_diagnostics}")
 
     return server
 

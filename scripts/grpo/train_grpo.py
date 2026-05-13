@@ -334,10 +334,10 @@ class GRPOTrainer:
         # Stream collector output line-by-line so the user sees progress instead
         # of waiting for the whole subprocess to finish. Mirror the collector's
         # stdout/stderr to the trainer log with a "[collector]" prefix.
-        # A background Timer enforces the 600s wall clock even if the subprocess
+        # A background Timer enforces the wall clock even if the subprocess
         # hangs on stdout with no output (otherwise the blocking read could wait
         # forever).
-        timeout_s = 600
+        timeout_s = 1800
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -508,6 +508,7 @@ class GRPOTrainer:
         total_clip_loss = 0.0
         total_kl = 0.0
         total_ratio = 0.0
+        total_log_ratio_abs = 0.0
         clipfracs = []
         n_updates = 0
 
@@ -534,11 +535,19 @@ class GRPOTrainer:
 
                 # --- Compute importance ratio ---
                 # Use pre-computed ref_log_probs (from _compute_ref_log_probs)
-                # and stored tau_samples for consistency
-                # Filter to chunks that have ref_log_prob computed
-                ready_batch = [c for c in valid_batch if c.ref_log_prob is not None and c.tau_samples is not None]
-                if not ready_batch:
+                # and stored tau_samples for consistency.
+                # Build ready_indices directly instead of calling list.index(c):
+                # ActionChunk is a @dataclass(eq=True) with ndarray fields, and
+                # comparing numpy arrays raises "truth value is ambiguous", so
+                # relying on .index() is fragile even if CPython's identity
+                # short-circuit currently masks it.
+                ready_indices = [
+                    i for i, c in enumerate(valid_batch)
+                    if c.ref_log_prob is not None and c.tau_samples is not None
+                ]
+                if not ready_indices:
                     continue
+                ready_batch = [valid_batch[i] for i in ready_indices]
 
                 # If all chunks are ready, use tensors as-is (common case)
                 if len(ready_batch) == len(valid_batch):
@@ -550,8 +559,6 @@ class GRPOTrainer:
                     ready_state_features = state_features
                     ready_embodiment_id = embodiment_id
                 else:
-                    # Re-index tensors to match ready_batch subset
-                    ready_indices = [valid_batch.index(c) for c in ready_batch]
                     idx = torch.tensor(ready_indices, device=self.device)
                     ready_actions = actions[idx]
                     ready_masks = action_masks[idx]
@@ -635,6 +642,11 @@ class GRPOTrainer:
                     total_clip_loss += clip_loss.item()
                     total_kl += kl_loss.item()
                     total_ratio += ratio.mean().item()
+                    # log_ratio magnitude is the primary diagnostic for DPPO-style
+                    # FM log-prob surrogates: large values mean the MSE-based
+                    # log-prob is noisy enough that most updates will clip, which
+                    # caps the effective gradient signal.
+                    total_log_ratio_abs += log_ratio.abs().mean().item()
                     n_updates += 1
 
         # Model remains in eval mode (it never left)
@@ -647,6 +659,7 @@ class GRPOTrainer:
             "kl_loss": total_kl / n_updates,
             "clipfrac": np.mean(clipfracs) if clipfracs else 0,
             "mean_ratio": total_ratio / n_updates,
+            "mean_log_ratio_abs": total_log_ratio_abs / n_updates,
             "n_updates": n_updates,
         }
 
@@ -690,15 +703,23 @@ class GRPOTrainer:
         ]).to(self.device, dtype=torch.bfloat16)  # [B, 50, 128]
 
         # --- Initial noise (the ε₀ that was denoised into these actions) ---
-        # If available, evaluates FM log-prob along the actual denoising path.
-        # Falls back to random noise if not stored (older collections).
-        has_noise = all(c.initial_noise is not None for c in valid_batch)
-        if has_noise:
-            initial_noise = torch.stack([
-                torch.from_numpy(chunk.initial_noise).float() for chunk in valid_batch
-            ]).to(self.device, dtype=torch.bfloat16)  # [B, 50, 128]
-        else:
-            initial_noise = None
+        # GRPO requires evaluating the FM log-prob along the ACTUAL denoising
+        # path for both the reference and current passes; the shared ε is what
+        # makes the importance ratio a model-quality signal rather than noise.
+        # Falling back to a freshly-sampled noise here would break that
+        # invariant (ref and current would use different ε), so we hard-fail
+        # instead of silently degrading training.
+        missing_noise = [c for c in valid_batch if c.initial_noise is None]
+        if missing_noise:
+            raise RuntimeError(
+                f"{len(missing_noise)}/{len(valid_batch)} chunks are missing "
+                "initial_noise. GRPO requires captured initial noise from "
+                "grpo_server.py; check that GRPOPolicyWrapper is wrapping the "
+                "policy and that the bfloat16→numpy conversion succeeded."
+            )
+        initial_noise = torch.stack([
+            torch.from_numpy(chunk.initial_noise).float() for chunk in valid_batch
+        ]).to(self.device, dtype=torch.bfloat16)  # [B, 50, 128]
 
         # --- Advantages ---
         advantages = torch.tensor(
@@ -758,6 +779,14 @@ class GRPOTrainer:
         them in a minibatch we pad them all to the minibatch's max seq_len.
         This mirrors what the backbone's internal padding does, so the output
         has the same shape contract as _encode_observations() would produce.
+
+        We require the image_mask and backbone_attention_mask cache state to
+        be uniform across a minibatch: if some chunks have a mask and others
+        don't, zero-filling the missing rows would silently turn their image
+        tokens into non-image tokens (changing the cross-attention routing in
+        AlternateVLDiT). All chunks come from the same iteration's collection,
+        so this should always be uniform — a mismatch means upstream caching
+        went wrong and we'd rather fail loudly than train on corrupted masks.
         """
         B = len(valid_batch)
 
@@ -768,18 +797,34 @@ class GRPOTrainer:
         feat_dtype = valid_batch[0].cached_backbone_features.dtype
 
         backbone_features = torch.zeros(B, max_seq, D, device=self.device, dtype=feat_dtype)
+
+        # Enforce uniformity: either all chunks have the mask or none do.
+        # Explicit raise (not assert) because `python -O` strips asserts and
+        # silently zero-filling a missing mask would corrupt image-token routing.
+        attn_present = [c.cached_backbone_attn_mask is not None for c in valid_batch]
+        img_present = [c.cached_image_mask is not None for c in valid_batch]
+        if not (all(attn_present) or not any(attn_present)):
+            raise RuntimeError(
+                f"Inconsistent cached_backbone_attn_mask across minibatch: {attn_present}. "
+                "All chunks must have the same mask cache state."
+            )
+        if not (all(img_present) or not any(img_present)):
+            raise RuntimeError(
+                f"Inconsistent cached_image_mask across minibatch: {img_present}. "
+                "All chunks must have the same mask cache state."
+            )
+        has_attn = all(attn_present)
+        has_img = all(img_present)
+
         backbone_attn_mask = None
         image_mask = None
 
-        any_attn = any(c.cached_backbone_attn_mask is not None for c in valid_batch)
-        any_img = any(c.cached_image_mask is not None for c in valid_batch)
-
-        if any_attn:
+        if has_attn:
             backbone_attn_mask = torch.zeros(
                 B, max_seq, device=self.device,
                 dtype=valid_batch[0].cached_backbone_attn_mask.dtype,
             )
-        if any_img:
+        if has_img:
             image_mask = torch.zeros(
                 B, max_seq, device=self.device,
                 dtype=valid_batch[0].cached_image_mask.dtype,
@@ -788,9 +833,9 @@ class GRPOTrainer:
         for i, c in enumerate(valid_batch):
             sl = seq_lens[i]
             backbone_features[i, :sl] = c.cached_backbone_features
-            if backbone_attn_mask is not None and c.cached_backbone_attn_mask is not None:
+            if has_attn:
                 backbone_attn_mask[i, :sl] = c.cached_backbone_attn_mask
-            if image_mask is not None and c.cached_image_mask is not None:
+            if has_img:
                 image_mask[i, :sl] = c.cached_image_mask
 
         state_features = torch.stack(
@@ -1048,6 +1093,11 @@ class GRPOTrainer:
             self.writer.add_scalar("train/kl_loss", update_stats.get("kl_loss", 0), iteration)
             self.writer.add_scalar("train/clipfrac", update_stats.get("clipfrac", 0), iteration)
             self.writer.add_scalar("train/mean_ratio", update_stats.get("mean_ratio", 1), iteration)
+            self.writer.add_scalar(
+                "train/mean_log_ratio_abs",
+                update_stats.get("mean_log_ratio_abs", 0),
+                iteration,
+            )
 
         if lr is not None:
             self.writer.add_scalar("train/learning_rate", lr, iteration)

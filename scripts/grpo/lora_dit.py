@@ -26,6 +26,23 @@ import torch.nn as nn
 from peft import LoraConfig, inject_adapter_in_model
 
 
+# Single source of truth for the default LoRA target module list. Imported by
+# grpo_config.GRPOConfig.lora_target_modules and used as the fallback here when
+# the caller passes target_modules=None. Keep these names in sync with the
+# AlternateVLDiT structure (diffusers Attention + FeedForward inside
+# BasicTransformerBlock, plus the DiT-level proj_out_1/proj_out_2).
+DEFAULT_LORA_TARGET_MODULES: list[str] = [
+    "attn1.to_q",      # Self/cross-attention query projection [1536, 1536] or [2048, 1536]
+    "attn1.to_k",      # Self/cross-attention key projection
+    "attn1.to_v",      # Self/cross-attention value projection
+    "attn1.to_out.0",  # Attention output projection [1536, 1536]
+    "ff.net.0.proj",   # FeedForward GEGLU gate projection [1536, 2*inner_dim]
+    "ff.net.2",        # FeedForward output projection [inner_dim, 1536]
+    "proj_out_1",      # DiT conditioning projection [1536, 3072]
+    "proj_out_2",      # DiT final output projection [1536, 1024]
+]
+
+
 def apply_lora_to_dit(
     model: nn.Module,
     rank: int = 16,
@@ -44,7 +61,7 @@ def apply_lora_to_dit(
         alpha: LoRA scaling factor. Standard: alpha = 2 * rank.
         dropout: Dropout on LoRA layers for regularization.
         target_modules: List of module name patterns to target within the DiT.
-            Must be nn.Linear layers. If None, uses default attention + FF targets.
+            Must be nn.Linear layers. If None, uses DEFAULT_LORA_TARGET_MODULES.
 
     Returns:
         The same model object (modified in-place) with LoRA adapters injected.
@@ -56,16 +73,7 @@ def apply_lora_to_dit(
         >>> print_trainable_params(model)  # ~20M trainable out of ~3B total
     """
     if target_modules is None:
-        target_modules = [
-            "attn1.to_q",
-            "attn1.to_k",
-            "attn1.to_v",
-            "attn1.to_out.0",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "proj_out_1",
-            "proj_out_2",
-        ]
+        target_modules = list(DEFAULT_LORA_TARGET_MODULES)
 
     # Step 1: Freeze everything (backbone + action head + all submodules)
     for param in model.parameters():

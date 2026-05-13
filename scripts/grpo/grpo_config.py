@@ -16,6 +16,8 @@ Usage:
 from dataclasses import dataclass, field
 from typing import Optional
 
+from lora_dit import DEFAULT_LORA_TARGET_MODULES
+
 
 @dataclass
 class GRPOConfig:
@@ -57,17 +59,12 @@ class GRPOConfig:
     lora_dropout: float = 0.0
 
     # Which layers in the DiT to apply LoRA to (must be nn.Linear, NOT CategorySpecificLinear)
-    # These are the module name patterns within model.action_head.model (AlternateVLDiT)
-    lora_target_modules: list[str] = field(default_factory=lambda: [
-        "attn1.to_q",      # Self/cross-attention query projection [1536, 1536] or [2048, 1536]
-        "attn1.to_k",      # Self/cross-attention key projection
-        "attn1.to_v",      # Self/cross-attention value projection
-        "attn1.to_out.0",  # Attention output projection [1536, 1536]
-        "ff.net.0.proj",   # FeedForward GEGLU gate projection [1536, 2*inner_dim]
-        "ff.net.2",        # FeedForward output projection [inner_dim, 1536]
-        "proj_out_1",      # DiT conditioning projection [1536, 3072]
-        "proj_out_2",      # DiT final output projection [1536, 1024]
-    ])
+    # These are the module name patterns within model.action_head.model (AlternateVLDiT).
+    # The default list is sourced from lora_dit.DEFAULT_LORA_TARGET_MODULES to keep
+    # grpo_config, lora_dit, and grpo_server in sync.
+    lora_target_modules: list[str] = field(
+        default_factory=lambda: list(DEFAULT_LORA_TARGET_MODULES)
+    )
 
     # Device for model training (typically "cuda" or "cuda:0")
     device: str = "cuda"

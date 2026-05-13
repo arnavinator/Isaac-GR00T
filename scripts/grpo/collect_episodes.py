@@ -309,7 +309,7 @@ class EpisodeCollector:
 
         # Track episodes for this group
         episodes_in_progress = [
-            self._new_episode(i, group_id, group_seed) for i in range(group_size)
+            self._new_episode(group_id, group_seed) for _ in range(group_size)
         ]
         done_flags = [False] * group_size
 
@@ -440,7 +440,7 @@ class EpisodeCollector:
 
         # Phase 6: Continue all envs independently (same logic as _collect_one_group)
         episodes_in_progress = [
-            self._new_episode(i, group_id, group_seed) for i in range(group_size)
+            self._new_episode(group_id, group_seed) for _ in range(group_size)
         ]
         done_flags = [False] * group_size
 
@@ -665,8 +665,14 @@ class EpisodeCollector:
         except Exception as e:
             print(f"    [DEBUG] Could not render montage: {e}")
 
-    def _new_episode(self, env_idx: int, group_id: int = 0, env_seed: int = 0) -> dict:
-        """Initialize a new episode tracking dict."""
+    def _new_episode(self, group_id: int = 0, env_seed: int = 0) -> dict:
+        """Initialize a new episode tracking dict.
+
+        We deliberately do NOT store a within-group env index: it collides
+        across groups (each group has env indices 0..G-1) and adds no
+        information beyond group_id + env_seed, which together uniquely
+        identify the rollout.
+        """
         return {
             "video_frames": [],
             "states": [],
@@ -680,7 +686,6 @@ class EpisodeCollector:
             "shaped_reward": 0.0,
             "env_name": self.env_name,
             "num_steps": 0,
-            "env_idx": env_idx,
             "group_id": group_id,
             "env_seed": env_seed,
         }

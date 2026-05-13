@@ -117,7 +117,7 @@ class GRPOConfig:
     # Mixing ensures the full trajectory stays in the training distribution,
     # preventing approach-phase drift from lack of gradient signal.
     # 0.0 = never fast-forward, 1.0 = always fast-forward.
-    fast_forward_pct: float = 0.5
+    fast_forward_pct: float = 0.9
 
     # ZMQ server host and port for model inference during collection
     server_host: str = "127.0.0.1"
@@ -129,13 +129,13 @@ class GRPOConfig:
     # With 8 tasks and 200 iterations, each task gets 25 full training updates.
     env_names: list[str] = field(default_factory=lambda: [
         "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env",
-        "robocasa_panda_omron/PnPCounterToMicrowave_PandaOmron_Env",
-        "robocasa_panda_omron/PnPMicrowaveToCounter_PandaOmron_Env",
-        "robocasa_panda_omron/TurnOffStove_PandaOmron_Env",
-        "robocasa_panda_omron/OpenDoubleDoor_PandaOmron_Env",
-        "robocasa_panda_omron/PnPCounterToSink_PandaOmron_Env",
-        "robocasa_panda_omron/PnPCounterToStove_PandaOmron_Env",
-        "robocasa_panda_omron/TurnOnStove_PandaOmron_Env",
+        # "robocasa_panda_omron/PnPCounterToMicrowave_PandaOmron_Env",
+        # "robocasa_panda_omron/PnPMicrowaveToCounter_PandaOmron_Env",
+        # "robocasa_panda_omron/TurnOffStove_PandaOmron_Env",
+        # "robocasa_panda_omron/OpenDoubleDoor_PandaOmron_Env",
+        # "robocasa_panda_omron/PnPCounterToSink_PandaOmron_Env",
+        # "robocasa_panda_omron/PnPCounterToStove_PandaOmron_Env",
+        # "robocasa_panda_omron/TurnOnStove_PandaOmron_Env",
     ])
 
     # Directory to store collected episode .npz files

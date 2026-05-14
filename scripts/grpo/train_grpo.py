@@ -102,6 +102,15 @@ class GRPOTrainer:
         print("GRPO Training Setup")
         print("=" * 60)
 
+        # Seed RNGs at the START of setup so LoRA-A's Kaiming init via
+        # torch.randn (inside inject_adapter_in_model) is reproducible across
+        # runs. main() already seeds before constructing the trainer, but
+        # re-seeding here makes setup() self-contained — calling it from a
+        # notebook or a custom entry point that forgot to seed will still
+        # produce deterministic LoRA initialization.
+        torch.manual_seed(self.config.seed)
+        np.random.seed(self.config.seed)
+
         # --- Step 1: Load pretrained model ---
         print(f"\n[1/4] Loading model from {self.config.model_path}...")
         self.model = AutoModel.from_pretrained(self.config.model_path)
@@ -546,6 +555,7 @@ class GRPOTrainer:
         total_log_ratio_abs = 0.0
         clipfracs = []
         n_updates = 0
+        n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
 
         for epoch in range(self.config.update_epochs):
             # Iterate over mini-batches (shuffled each epoch)
@@ -658,6 +668,17 @@ class GRPOTrainer:
                 # --- Total loss ---
                 loss = clip_loss + kl_loss
 
+                # NaN/Inf guard: a single bad batch (e.g., bf16 overflow in
+                # ratio = log_ratio.exp() when log_ratio is large, or NaN
+                # creeping in from numerical edge cases in the backbone)
+                # would otherwise propagate through optimizer.step() and
+                # silently corrupt the LoRA weights. clip_grad_norm_ does NOT
+                # rescue NaN gradients; it only bounds finite norms.
+                # Skip this minibatch and log a counter instead.
+                if not torch.isfinite(loss):
+                    n_skipped_nonfinite += 1
+                    continue
+
                 # --- Backward pass ---
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -686,7 +707,13 @@ class GRPOTrainer:
 
         # Model remains in eval mode (it never left)
         if n_updates == 0:
-            return {}
+            return {"n_skipped_nonfinite": n_skipped_nonfinite} if n_skipped_nonfinite else {}
+
+        if n_skipped_nonfinite > 0:
+            print(
+                f"  WARNING: skipped {n_skipped_nonfinite} minibatch(es) for "
+                f"non-finite loss (NaN/Inf) — likely bf16 ratio overflow"
+            )
 
         return {
             "loss": total_loss / n_updates,
@@ -696,6 +723,7 @@ class GRPOTrainer:
             "mean_ratio": total_ratio / n_updates,
             "mean_log_ratio_abs": total_log_ratio_abs / n_updates,
             "n_updates": n_updates,
+            "n_skipped_nonfinite": n_skipped_nonfinite,
         }
 
     def _prepare_batch(self, batch: list[ActionChunk]) -> Optional[tuple[dict, list[ActionChunk]]]:
@@ -1018,18 +1046,43 @@ class GRPOTrainer:
                 return {k: v.astype(np.float32) for k, v in unnormalized.items()}, {}
 
             def _unbatch_observation(self, observation):
-                """Split batched observation into list of single observations."""
-                batch_size = 1
-                for mod_val in observation.values():
-                    if isinstance(mod_val, dict):
-                        for v in mod_val.values():
+                """Split batched observation into list of single observations.
+
+                Batch size is inferred explicitly from the `video` modality
+                (first axis of any video array). Relying on dict insertion
+                order — picking "the first dict modality value" — is fragile:
+                if Gr00tSimPolicyWrapper or any future caller ever inserts
+                language first, language values are list[list[str]] (no
+                .shape) and the fallback `batch_size = 1` silently drops
+                most observations. Video is always present for ROBOCASA_PANDA_OMRON
+                and shaped (B, T, H, W, C), so it's a reliable anchor.
+                """
+                batch_size = None
+                video_dict = observation.get("video")
+                if isinstance(video_dict, dict) and video_dict:
+                    for v in video_dict.values():
+                        if hasattr(v, "shape") and len(v.shape) > 0:
+                            batch_size = v.shape[0]
+                            break
+
+                # Fallback: try state, then any other ndarray-like value.
+                # Should never trigger for Panda Omron but kept defensive.
+                if batch_size is None:
+                    state_dict = observation.get("state")
+                    if isinstance(state_dict, dict) and state_dict:
+                        for v in state_dict.values():
                             if hasattr(v, "shape") and len(v.shape) > 0:
                                 batch_size = v.shape[0]
                                 break
-                        break
-                    elif hasattr(mod_val, "shape") and len(mod_val.shape) > 0:
-                        batch_size = mod_val.shape[0]
-                        break
+
+                if batch_size is None:
+                    raise RuntimeError(
+                        "_unbatch_observation: could not determine batch size "
+                        "from video or state modalities. Got top-level keys: "
+                        f"{list(observation.keys())}. Expected a "
+                        "Gr00tPolicy-style nested observation with a non-empty "
+                        "'video' or 'state' dict of ndarrays."
+                    )
 
                 unbatched = []
                 for i in range(batch_size):
@@ -1046,6 +1099,16 @@ class GRPOTrainer:
 
             def reset(self, options=None):
                 return {}
+
+            def get_modality_config(self):
+                """Return the per-embodiment modality config dict.
+
+                PolicyServer registers a `get_modality_config` endpoint that
+                forwards to the wrapped policy. The chain ends at
+                _InPlacePolicy, so without this method any client call would
+                AttributeError. Mirrors `Gr00tPolicy.get_modality_config`.
+                """
+                return self.modality_configs
 
         # Create policy → sim wrapper → GRPO wrapper
         # strict=False avoids observation validation during collection
@@ -1118,7 +1181,12 @@ class GRPOTrainer:
 
         # Episode stats
         self.writer.add_scalar("episode/success_rate", stats.get("success_rate", 0), iteration)
-        self.writer.add_scalar("episode/mean_progress", stats.get("mean_progress", 0), iteration)
+        # mean_progress is only meaningful when dense progress actually fed into
+        # the shaped reward. With success_weight=1.0 (default) the collector
+        # skips compute_dense_progress entirely, so max_progress is a constant 0
+        # and logging it here would just produce a flat zero curve.
+        if self.config.success_weight < 1.0:
+            self.writer.add_scalar("episode/mean_progress", stats.get("mean_progress", 0), iteration)
         self.writer.add_scalar("episode/mean_reward", stats.get("mean_reward", 0), iteration)
         self.writer.add_scalar("episode/std_reward", stats.get("std_reward", 0), iteration)
 
@@ -1132,6 +1200,14 @@ class GRPOTrainer:
             self.writer.add_scalar(
                 "train/mean_log_ratio_abs",
                 update_stats.get("mean_log_ratio_abs", 0),
+                iteration,
+            )
+            # Track NaN/Inf-skipped minibatches; sustained nonzero values
+            # indicate ratio overflow or numerical instability worth tuning
+            # (lower lr or alpha, or cast MSE to fp32).
+            self.writer.add_scalar(
+                "train/n_skipped_nonfinite",
+                update_stats.get("n_skipped_nonfinite", 0),
                 iteration,
             )
 

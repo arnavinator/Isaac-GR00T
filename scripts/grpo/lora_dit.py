@@ -127,7 +127,18 @@ def load_lora_checkpoint(model: nn.Module, path: str | Path) -> None:
     """Load LoRA adapter weights into an already-injected model.
 
     The model must already have LoRA adapters injected (via apply_lora_to_dit).
-    Uses partial state_dict update — only LoRA keys are overwritten.
+    Performs a TWO-SIDED diff:
+      - Saved LoRA keys not present in the current model (e.g., target_modules
+        list shrank) are warned about and skipped.
+      - Current LoRA keys not present in the saved checkpoint (e.g.,
+        target_modules list grew, leaving some adapters at random init) are
+        warned about — without this warning the user would silently train
+        partially-initialized adapters, which can take many iterations to
+        notice via degraded training curves.
+
+    The actual load uses ``strict=False`` so the warned-about mismatches
+    don't crash the load — we want training to be able to start, but with
+    a clear log line documenting what diverged.
 
     Args:
         model: Full model with LoRA adapters already injected.
@@ -136,18 +147,46 @@ def load_lora_checkpoint(model: nn.Module, path: str | Path) -> None:
     path = Path(path)
     lora_state = torch.load(path / "lora_weights.pt", map_location="cpu")
 
-    # Update only LoRA parameters in the DiT
+    # Determine the model's LoRA keys (filter to "lora_" substring inside
+    # the DiT, mirroring save_lora_checkpoint's filter).
     dit = model.action_head.model
     current_state = dit.state_dict()
+    model_lora_keys = {k for k in current_state if "lora_" in k}
+    saved_lora_keys = set(lora_state.keys())
 
-    # Verify all saved keys exist in the model
-    missing = [k for k in lora_state if k not in current_state]
-    if missing:
-        print(f"  WARNING: {len(missing)} LoRA keys not found in model: {missing[:3]}...")
+    extra_in_save = saved_lora_keys - model_lora_keys
+    extra_in_model = model_lora_keys - saved_lora_keys
 
-    current_state.update(lora_state)
-    dit.load_state_dict(current_state)
-    print(f"  Loaded {len(lora_state)} LoRA parameters from {path}")
+    if extra_in_save:
+        print(
+            f"  WARNING: {len(extra_in_save)} LoRA keys in checkpoint not found "
+            f"in model — these will be IGNORED (target_modules list shrank?). "
+            f"Examples: {sorted(extra_in_save)[:3]}"
+        )
+
+    if extra_in_model:
+        # This is the dangerous case: we have LoRA layers in the model that
+        # the checkpoint doesn't know about, so they stay at their random
+        # Kaiming init while training resumes. Loud warning so the user can
+        # decide whether to continue or restart from a fresh checkpoint.
+        print(
+            f"  WARNING: {len(extra_in_model)} LoRA keys in model not found "
+            f"in checkpoint — these will REMAIN AT RANDOM INIT (target_modules "
+            f"list grew since this checkpoint was saved?). Training will "
+            f"effectively start partial-zero on these adapters. "
+            f"Examples: {sorted(extra_in_model)[:3]}"
+        )
+
+    # Filter to keys the model actually has, then load with strict=False
+    # so any other shape mismatches surface (rather than silently dropping).
+    filtered_state = {k: v for k, v in lora_state.items() if k in model_lora_keys}
+    missing, unexpected = dit.load_state_dict(filtered_state, strict=False)
+    # `missing` here are non-LoRA model keys not in our (LoRA-only) state
+    # dict — that's expected. `unexpected` should be empty since we filtered.
+    if unexpected:
+        print(f"  WARNING: load_state_dict reported unexpected keys: {unexpected[:3]}")
+
+    print(f"  Loaded {len(filtered_state)} LoRA parameters from {path}")
 
 
 def merge_lora_weights(model: nn.Module) -> nn.Module:

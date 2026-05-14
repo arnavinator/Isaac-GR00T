@@ -303,7 +303,12 @@ class EpisodeCollector:
             f"({total_episodes/elapsed*60:.0f} eps/min)"
         )
         print(f"Success rate: {successes}/{total_episodes} ({100*successes/total_episodes:.0f}%)")
-        print(f"Mean progress: {np.mean([e['max_progress'] for e in all_episodes]):.3f}")
+        # Only report dense progress when it actually contributed to the shaped
+        # reward — with success_weight=1.0 (the default) the progress term is
+        # multiplied by (1 - success_weight) = 0, so max_progress stays at the
+        # per-episode init value of 0.0 and reporting it would be misleading.
+        if success_weight < 1.0:
+            print(f"Mean progress: {np.mean([e['max_progress'] for e in all_episodes]):.3f}")
 
         return all_episodes
 
@@ -318,74 +323,109 @@ class EpisodeCollector:
 
         All environments are reset with the SAME seed, producing identical
         initial configurations. The policy's denoising noise causes different
-        trajectories and outcomes. One batch = one group (no sub-batching needed).
-        """
-        # Reset ALL envs with the SAME seed — identical initial states
-        reset_seeds = [group_seed] * self.group_size
-        observations, infos = self.envs.reset(seed=reset_seeds)
+        trajectories and outcomes.
 
-        # Track episodes for this group
+        Per-env stepping (NOT SyncVectorEnv batched step) is used for two
+        correctness reasons:
+
+          1. SyncVectorEnv autoreset: when one env in the group terminates
+             before another, gymnasium's NEXT_STEP / SAME_STEP autoreset
+             modes produce mismatched-shape per-env info dicts (multi-substep
+             arrays from active envs vs. length-1 from just-reset envs),
+             which silently corrupts subsequent batching of info["success"].
+          2. Skipping done envs: with per-env stepping we can simply omit
+             done envs from each iteration's batch — no autoreset, no stale
+             obs from a freshly-reset terminal env getting fed back to the
+             policy.
+
+        We still build a single batched observation for the server call
+        (containing only the active envs) so denoising amortizes across
+        the parallel rollouts.
+        """
+        # Reset each env individually with the SAME seed → identical initial
+        # state. We bypass self.envs.reset(seed=...) to avoid any vectorized
+        # info-batching, but the per-env reset behavior is unchanged.
+        observations_per_env: list[dict] = []
+        for env in self.envs.envs:
+            obs, _ = env.reset(seed=group_seed)
+            observations_per_env.append(obs)
+
         episodes_in_progress = [
             self._new_episode(group_id, group_seed) for _ in range(group_size)
         ]
         done_flags = [False] * group_size
 
         while not all(done_flags):
-            # Query model server for actions
-            actions, initial_noise, raw_actions, action_masks_batch = self._get_actions_from_server(observations)
+            # Build a batched observation for the server from ACTIVE envs only.
+            # `j` indexes into the batch (0..len(active_indices)-1); `env_idx`
+            # is the original env's slot in [0, group_size).
+            active_indices = [i for i, d in enumerate(done_flags) if not d]
+            active_obs = [observations_per_env[i] for i in active_indices]
+            batched_obs = self._batch_per_env_obs(active_obs)
 
-            # Record observation and action for each active env
-            for i in range(group_size):
-                if done_flags[i]:
-                    continue
-                ep = episodes_in_progress[i]
-                ep["video_frames"].append(self._extract_video(observations, i))
-                ep["states"].append(self._extract_state(observations, i))
-                ep["actions"].append(self._extract_per_env(actions, i))
-                if raw_actions is not None and hasattr(raw_actions, '__getitem__') and len(raw_actions) > i:
-                    ep["raw_actions"].append(raw_actions[i])
+            actions, initial_noise, raw_actions, action_masks_batch = (
+                self._get_actions_from_server(batched_obs)
+            )
+
+            # Process each active env: record its observation/action, step it
+            # individually, and harvest results.
+            for j, env_idx in enumerate(active_indices):
+                ep = episodes_in_progress[env_idx]
+                obs = observations_per_env[env_idx]
+                action_j = self._extract_per_env(actions, j)
+
+                # --- Record observation, action chunk, and capture data ---
+                ep["video_frames"].append(self._extract_video_single(obs))
+                ep["states"].append(self._extract_state_single(obs))
+                ep["actions"].append(action_j)
+                if (raw_actions is not None and hasattr(raw_actions, '__getitem__')
+                        and len(raw_actions) > j):
+                    ep["raw_actions"].append(raw_actions[j])
                 else:
                     ep["raw_actions"].append(None)
-                if action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__') and len(action_masks_batch) > i:
-                    ep["action_masks"].append(action_masks_batch[i])
+                if (action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__')
+                        and len(action_masks_batch) > j):
+                    ep["action_masks"].append(action_masks_batch[j])
                 else:
                     ep["action_masks"].append(None)
-                if initial_noise is not None and hasattr(initial_noise, '__getitem__') and len(initial_noise) > i:
-                    ep["initial_noises"].append(initial_noise[i])
+                if (initial_noise is not None and hasattr(initial_noise, '__getitem__')
+                        and len(initial_noise) > j):
+                    ep["initial_noises"].append(initial_noise[j])
                 else:
                     ep["initial_noises"].append(None)
-                # Capture language from first observation (constant per episode)
                 if ep["language"] is None:
-                    ep["language"] = self._extract_language(observations, i)
+                    ep["language"] = self._extract_language_single(obs)
 
-            # Step all environments
-            next_observations, rewards, terminations, truncations, infos = self.envs.step(actions)
+                # --- Step this env individually ---
+                env = self.envs.envs[env_idx]
+                next_obs, reward, terminated, truncated, info = env.step(action_j)
+                observations_per_env[env_idx] = next_obs
 
-            # Check for completions
-            dones = terminations | truncations
-            for i in range(group_size):
-                if done_flags[i]:
-                    continue
+                # H3 fix: count ACTUAL substeps run, not n_action_steps.
+                # MultiStepWrapper.step early-breaks on termination, so a
+                # chunk may have run fewer substeps than n_action_steps.
+                # info["dones"] is the per-substep done array (length = actual
+                # substeps); using its length avoids over-counting fast
+                # successes, which previously biased time-scaled rewards low.
+                if "dones" in info and hasattr(info["dones"], "__len__"):
+                    substeps_run = len(info["dones"])
+                else:
+                    substeps_run = self.n_action_steps  # fallback
+                ep["num_steps"] += substeps_run
 
-                ep = episodes_in_progress[i]
-                ep["num_steps"] += self.n_action_steps
+                # Dense progress (only when it actually contributes to reward)
+                if success_weight < 1.0:
+                    progress = compute_dense_progress(env, self.task_type)
+                    ep["max_progress"] = max(ep["max_progress"], progress)
 
-                # Track max progress
-                progress = compute_dense_progress(
-                    self.envs.envs[i] if hasattr(self.envs, 'envs') else self.envs,
-                    self.task_type,
-                )
-                ep["max_progress"] = max(ep["max_progress"], progress)
-
-                if dones[i]:
-                    done_flags[i] = True
-                    success = self._extract_success(infos, i)
+                # Termination handling
+                if terminated or truncated:
+                    done_flags[env_idx] = True
+                    success = self._reduce_success(info)
                     ep["success"] = success
                     ep["shaped_reward"] = compute_shaped_reward(
                         success, ep["max_progress"], success_weight
                     )
-
-            observations = next_observations
 
         return episodes_in_progress
 
@@ -405,113 +445,149 @@ class EpisodeCollector:
         Phases:
           1. Reset all envs with the same seed
           2. Fast-forward env 0 for fast_forward_steps outer steps using the policy
+             (only env 0 is stepped — the others will be overwritten)
           3. Save env 0's MuJoCo sim state at the branch point
           4. Restore that state into envs 1..G-1 (all now at identical branch point)
           5. Sync each env's MultiStepWrapper internal state
-          6. Continue all envs independently until done (diverge via policy noise)
+          6. Continue all envs independently until done (per-env stepping)
 
         If env 0 terminates during fast-forward (task solved early or error),
         falls back to normal collection from the seed.
         """
-        # Phase 1: Reset all envs with same seed
-        reset_seeds = [group_seed] * self.group_size
-        observations, infos = self.envs.reset(seed=reset_seeds)
+        # Phase 1: Reset all envs (per-env, matching _collect_one_group)
+        observations_per_env: list[dict] = []
+        for env in self.envs.envs:
+            obs, _ = env.reset(seed=group_seed)
+            observations_per_env.append(obs)
 
-        # Phase 2: Fast-forward env 0 only
-        # We step ALL envs (vectorized env requires it), but only env 0's trajectory matters.
-        # The other envs' work is discarded — they'll be overwritten with env 0's state.
+        # Phase 2: Fast-forward env 0 ONLY. The OLD code stepped all envs in
+        # lockstep then discarded the others — wasted compute and risked
+        # autoreset-cascade if any env terminated. Per-env stepping makes the
+        # FF phase trivially "step env 0" with no batching ambiguity.
         consumed_substeps = 0
         for step in range(fast_forward_steps):
-            actions, _, _, _ = self._get_actions_from_server(observations)
-            observations, rewards, terms, truncs, infos = self.envs.step(actions)
-            consumed_substeps += self.n_action_steps
+            # Server batch contains only env 0
+            batched_obs = self._batch_per_env_obs([observations_per_env[0]])
+            actions, _, _, _ = self._get_actions_from_server(batched_obs)
+            action_0 = self._extract_per_env(actions, 0)
 
-            # If env 0 terminated during fast-forward, can't branch — fall back
-            if terms[0] or truncs[0]:
-                print(f"    Env 0 terminated at step {step} during fast-forward, falling back to normal collection")
-                return self._collect_one_group(group_seed, group_size, group_id, success_weight)
+            next_obs, _, terminated, truncated, info = self.envs.envs[0].step(action_0)
+            observations_per_env[0] = next_obs
+
+            # Use actual substep count (matching H3 fix in main collect loop)
+            if "dones" in info and hasattr(info["dones"], "__len__"):
+                consumed_substeps += len(info["dones"])
+            else:
+                consumed_substeps += self.n_action_steps
+
+            if terminated or truncated:
+                print(
+                    f"    Env 0 terminated at step {step} during fast-forward, "
+                    "falling back to normal collection"
+                )
+                return self._collect_one_group(
+                    group_seed, group_size, group_id, success_weight
+                )
 
         # Phase 3: Save env 0's MuJoCo sim state
         sim_state = self._get_sim_state(env_idx=0)
         if sim_state is None:
             print("    WARNING: Could not save sim state, falling back to normal collection")
-            return self._collect_one_group(group_seed, group_size, group_id, success_weight)
+            return self._collect_one_group(
+                group_seed, group_size, group_id, success_weight
+            )
 
         # Phase 4: Restore env 0's state into envs 1..G-1
         for i in range(1, group_size):
             self._restore_sim_state(env_idx=i, sim_state=sim_state)
 
         # Phase 5: Sync each restored env's MultiStepWrapper internal state
-        # Read fresh observation from each restored env and update its wrapper
         for i in range(1, group_size):
             restored_obs = self._read_obs_after_restore(env_idx=i)
             self._sync_wrapper(env_idx=i, obs=restored_obs, consumed_substeps=consumed_substeps)
 
-        # Re-read the vectorized observation (env 0 is already correct,
-        # envs 1..G-1 now have matching state)
-        observations = self._read_vectorized_obs()
+        # Re-read each env's observation from its now-synced wrapper state
+        for i in range(group_size):
+            wrapper = self.envs.envs[i]
+            observations_per_env[i] = wrapper._get_obs(
+                wrapper.video_delta_indices, wrapper.state_delta_indices
+            )
 
         # Debug: verify all envs have identical state after branching
         if self.debug_fast_forward:
             self._verify_branch_point(group_id, group_seed, fast_forward_steps)
 
-        # Phase 6: Continue all envs independently (same logic as _collect_one_group)
+        # Phase 6: Continue all envs independently — same per-env loop as
+        # _collect_one_group, with the only difference being initial num_steps
+        # accounting. We deliberately do NOT pre-load consumed_substeps into
+        # episodes_in_progress[i].num_steps: time-scaled rewards within a
+        # group should compare post-branch effort fairly across the rollouts
+        # in that group, so the FF prefix is excluded for all of them. Mixing
+        # FF and non-FF groups via fast_forward_pct < 1.0 means cross-group
+        # comparisons (e.g., logged mean_reward) will favor branched groups
+        # numerically — this is a known artifact of FF; group-relative
+        # advantages are unaffected since they normalize WITHIN each group.
         episodes_in_progress = [
             self._new_episode(group_id, group_seed) for _ in range(group_size)
         ]
         done_flags = [False] * group_size
 
         while not all(done_flags):
-            actions, initial_noise, raw_actions, action_masks_batch = self._get_actions_from_server(observations)
+            active_indices = [i for i, d in enumerate(done_flags) if not d]
+            active_obs = [observations_per_env[i] for i in active_indices]
+            batched_obs = self._batch_per_env_obs(active_obs)
 
-            for i in range(group_size):
-                if done_flags[i]:
-                    continue
-                ep = episodes_in_progress[i]
-                ep["video_frames"].append(self._extract_video(observations, i))
-                ep["states"].append(self._extract_state(observations, i))
-                ep["actions"].append(self._extract_per_env(actions, i))
-                if raw_actions is not None and hasattr(raw_actions, '__getitem__') and len(raw_actions) > i:
-                    ep["raw_actions"].append(raw_actions[i])
+            actions, initial_noise, raw_actions, action_masks_batch = (
+                self._get_actions_from_server(batched_obs)
+            )
+
+            for j, env_idx in enumerate(active_indices):
+                ep = episodes_in_progress[env_idx]
+                obs = observations_per_env[env_idx]
+                action_j = self._extract_per_env(actions, j)
+
+                ep["video_frames"].append(self._extract_video_single(obs))
+                ep["states"].append(self._extract_state_single(obs))
+                ep["actions"].append(action_j)
+                if (raw_actions is not None and hasattr(raw_actions, '__getitem__')
+                        and len(raw_actions) > j):
+                    ep["raw_actions"].append(raw_actions[j])
                 else:
                     ep["raw_actions"].append(None)
-                if action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__') and len(action_masks_batch) > i:
-                    ep["action_masks"].append(action_masks_batch[i])
+                if (action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__')
+                        and len(action_masks_batch) > j):
+                    ep["action_masks"].append(action_masks_batch[j])
                 else:
                     ep["action_masks"].append(None)
-                if initial_noise is not None and hasattr(initial_noise, '__getitem__') and len(initial_noise) > i:
-                    ep["initial_noises"].append(initial_noise[i])
+                if (initial_noise is not None and hasattr(initial_noise, '__getitem__')
+                        and len(initial_noise) > j):
+                    ep["initial_noises"].append(initial_noise[j])
                 else:
                     ep["initial_noises"].append(None)
-                # Capture language from first observation (constant per episode)
                 if ep["language"] is None:
-                    ep["language"] = self._extract_language(observations, i)
+                    ep["language"] = self._extract_language_single(obs)
 
-            next_observations, rewards, terminations, truncations, infos = self.envs.step(actions)
+                env = self.envs.envs[env_idx]
+                next_obs, reward, terminated, truncated, info = env.step(action_j)
+                observations_per_env[env_idx] = next_obs
 
-            dones = terminations | truncations
-            for i in range(group_size):
-                if done_flags[i]:
-                    continue
+                if "dones" in info and hasattr(info["dones"], "__len__"):
+                    substeps_run = len(info["dones"])
+                else:
+                    substeps_run = self.n_action_steps
+                ep["num_steps"] += substeps_run
 
-                ep = episodes_in_progress[i]
-                ep["num_steps"] += self.n_action_steps
+                if success_weight < 1.0:
+                    progress = compute_dense_progress(env, self.task_type)
+                    ep["max_progress"] = max(ep["max_progress"], progress)
 
-                progress = compute_dense_progress(
-                    self.envs.envs[i] if hasattr(self.envs, 'envs') else self.envs,
-                    self.task_type,
-                )
-                ep["max_progress"] = max(ep["max_progress"], progress)
-
-                if dones[i]:
-                    done_flags[i] = True
-                    success = self._extract_success(infos, i)
+                if terminated or truncated:
+                    done_flags[env_idx] = True
+                    success = self._reduce_success(info)
                     ep["success"] = success
                     ep["shaped_reward"] = compute_shaped_reward(
                         success, ep["max_progress"], success_weight
                     )
-
-            observations = next_observations
 
         return episodes_in_progress
 
@@ -550,11 +626,21 @@ class EpisodeCollector:
     def _sync_wrapper(self, env_idx: int, obs: dict, consumed_substeps: int) -> None:
         """Sync a sub-env's MultiStepWrapper state after sim restoration.
 
-        The MultiStepWrapper tracks an obs deque, reward list, and done list.
-        After restoring the MuJoCo state (which the wrapper doesn't know about),
-        we must update these so _get_obs() produces valid stacked observations.
+        The MultiStepWrapper tracks an obs deque, reward list, done list, and
+        an `info` defaultdict-of-deques. After restoring the MuJoCo state
+        (which the wrapper doesn't know about), we must update all of these
+        so subsequent step() calls produce clean info dicts.
+
+        Why `wrapper.info` matters: MultiStepWrapper.step() appends each
+        substep's info into per-key deques (maxlen=n_action_steps+1) and
+        then dict_take_last_n's them. If we leave stale FF substep info in
+        these deques, the first 1–8 outer steps after the branch read a
+        mix of pre-branch (FF env 0) and post-branch info — silently
+        corrupting fields like `info["success"]` until the deques refill.
+        Re-initializing the defaultdict matches MultiStepWrapper.reset()'s
+        behavior (multistep_wrapper.py:240).
         """
-        from collections import deque as _deque
+        from collections import defaultdict, deque as _deque
         wrapper = self.envs.envs[env_idx]
         wrapper.reward = [0.0] * consumed_substeps
         wrapper.done = [False] * consumed_substeps
@@ -562,32 +648,9 @@ class EpisodeCollector:
             [obs] * (wrapper.max_steps_needed + 1),
             maxlen=wrapper.max_steps_needed + 1,
         )
-
-    def _read_vectorized_obs(self) -> dict:
-        """Read stacked observations from all sub-envs and batch them.
-
-        After restoring state in individual sub-envs, the SyncVectorEnv's
-        cached observations are stale. This reads fresh observations from
-        each sub-env's MultiStepWrapper and combines them into the batched
-        format that the policy server expects.
-        """
-        all_obs = []
-        for i in range(self.group_size):
-            wrapper = self.envs.envs[i]
-            obs = wrapper._get_obs(wrapper.video_delta_indices, wrapper.state_delta_indices)
-            all_obs.append(obs)
-
-        # Stack into batched format: {key: (group_size, ...)}
-        batched = {}
-        for key in all_obs[0]:
-            vals = [obs[key] for obs in all_obs]
-            if isinstance(vals[0], np.ndarray):
-                batched[key] = np.stack(vals, axis=0)
-            elif isinstance(vals[0], str):
-                batched[key] = tuple(vals)
-            else:
-                batched[key] = vals
-        return batched
+        wrapper.info = defaultdict(
+            lambda: _deque(maxlen=wrapper.n_action_steps + 1)
+        )
 
     def _verify_branch_point(self, group_id: int, group_seed: int, ff_steps: int) -> None:
         """Debug verification: confirm all envs have identical state after branching.
@@ -751,70 +814,87 @@ class EpisodeCollector:
             return np.array(data[env_idx])
         return data
 
-    def _extract_video(self, observations, env_idx: int) -> dict[str, np.ndarray]:
-        """Extract video frames for one environment from batched observations.
+    def _batch_per_env_obs(self, obs_list: list[dict]) -> dict:
+        """Stack a list of single-env observation dicts into a batched dict.
 
-        Strips the 'video.' prefix so keys match VLAStepData/processor expectations
-        (e.g., 'video.res256_image_side_0' → 'res256_image_side_0').
+        Used to construct the input to the policy server when we're stepping
+        each env individually (no SyncVectorEnv batched step). The output
+        format matches what SyncVectorEnv would produce: ndarrays gain a
+        leading batch axis, language strings become a tuple per env.
+        """
+        if not obs_list:
+            return {}
+        batched = {}
+        for key in obs_list[0]:
+            vals = [obs[key] for obs in obs_list]
+            if isinstance(vals[0], np.ndarray):
+                batched[key] = np.stack(vals, axis=0)
+            elif isinstance(vals[0], str):
+                batched[key] = tuple(vals)
+            else:
+                batched[key] = vals
+        return batched
+
+    def _extract_video_single(self, obs: dict) -> dict[str, np.ndarray]:
+        """Extract video frames from a single-env observation dict.
+
+        Per-env counterpart to _extract_video — no batch-axis indexing.
+        Strips the 'video.' prefix to match VLAStepData/processor expectations.
         """
         frames = {}
-        if isinstance(observations, dict):
-            for key, value in observations.items():
+        if isinstance(obs, dict):
+            for key, value in obs.items():
                 if "image" in key or "video" in key:
-                    if hasattr(value, '__getitem__') and len(value) > env_idx:
-                        clean_key = key.removeprefix("video.")
-                        frames[clean_key] = np.array(value[env_idx])
+                    clean_key = key.removeprefix("video.")
+                    frames[clean_key] = np.array(value)
         return frames
 
-    def _extract_state(self, observations, env_idx: int) -> dict[str, np.ndarray]:
-        """Extract state values for one environment from batched observations.
+    def _extract_state_single(self, obs: dict) -> dict[str, np.ndarray]:
+        """Extract state values from a single-env observation dict.
 
-        Strips the 'state.' prefix so keys match VLAStepData/processor expectations
-        (e.g., 'state.gripper_qpos' → 'gripper_qpos'). Filters out annotation keys.
+        Per-env counterpart to _extract_state. Strips the 'state.' prefix
+        and filters annotation/language keys.
         """
         state = {}
-        if isinstance(observations, dict):
-            for key, value in observations.items():
+        if isinstance(obs, dict):
+            for key, value in obs.items():
                 if "image" not in key and "video" not in key and "language" not in key:
                     if "annotation" in key:
                         continue
-                    if hasattr(value, '__getitem__') and len(value) > env_idx:
-                        clean_key = key.removeprefix("state.")
-                        state[clean_key] = np.array(value[env_idx])
+                    clean_key = key.removeprefix("state.")
+                    state[clean_key] = np.array(value)
         return state
 
-    def _extract_language(self, observations, env_idx: int) -> str:
-        """Extract task language instruction for one env from batched observations.
-
-        The language key in RoboCasa flat observations is typically
-        'annotation.human.action.task_description' — a tuple/list of strings (one per env).
-        Returns the string instruction (e.g., "open the drawer").
-        """
-        if isinstance(observations, dict):
-            for key, value in observations.items():
+    def _extract_language_single(self, obs: dict) -> str:
+        """Extract task language instruction from a single-env observation dict."""
+        if isinstance(obs, dict):
+            for key, value in obs.items():
                 if "language" in key or "annotation" in key or "task_description" in key:
-                    if isinstance(value, (tuple, list)) and len(value) > env_idx:
-                        return str(value[env_idx])
+                    if isinstance(value, (tuple, list)) and len(value) > 0:
+                        return str(value[0])
                     elif isinstance(value, str):
                         return value
         return self.env_name.split("/")[-1]  # Fallback to env name
 
-    def _extract_success(self, infos: dict, env_idx: int) -> bool:
-        """Extract success flag from environment info dict."""
-        # Try multiple locations where RoboCasa stores success
-        if "success" in infos:
-            val = infos["success"]
-            if hasattr(val, '__getitem__'):
-                return bool(val[env_idx])
-            return bool(val)
+    def _reduce_success(self, info: dict) -> bool:
+        """Reduce a single env's MultiStepWrapper info["success"] to a bool.
 
-        if "final_info" in infos:
-            final = infos["final_info"]
-            if isinstance(final, (list, np.ndarray)) and len(final) > env_idx:
-                if isinstance(final[env_idx], dict):
-                    return bool(final[env_idx].get("success", False))
+        MultiStepWrapper packs per-substep success bools into info["success"]
+        as an array of length up to n_action_steps (multistep_wrapper.py:282).
+        We treat the chunk as successful if ANY substep succeeded — same
+        convention used by gr00t/eval/rollout_policy.py:303-313.
 
-        return False
+        Critically, naïve `bool(env_success)` would either raise (for
+        multi-element arrays — "ambiguous truth value") or return True for
+        any non-empty list (incl. all-False), so the np.any reduction is
+        load-bearing for correctness, not a stylistic choice.
+        """
+        if "success" not in info:
+            return False
+        env_success = info["success"]
+        if isinstance(env_success, (list, np.ndarray)):
+            return bool(np.any(env_success))
+        return bool(env_success)
 
     def close(self):
         """Clean up environments."""

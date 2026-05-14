@@ -355,11 +355,18 @@ class EpisodeBuffer:
             else:
                 mean_r = group_rewards.mean()
                 std_r = group_rewards.std(ddof=1)
-                if std_r < 1e-8:
-                    # All same reward within group — no signal
+                # Threshold of 1e-4 (not 1e-8) prevents micro-std groups from
+                # amplifying noise into giant advantages: with rewards ~ O(1)
+                # and std=1e-6, the division produces ±1e6 advantages that
+                # then dominate the per-minibatch z-score. With time-scaled
+                # binary rewards (1.0 / num_steps * max_steps in [~1, ~5]),
+                # any group_std < 1e-4 means the group is effectively
+                # all-same-reward and provides no useful gradient signal.
+                if std_r < 1e-4:
+                    # No meaningful signal within group
                     self.advantages[mask] = 0.0
                 else:
-                    self.advantages[mask] = (group_rewards - mean_r) / (std_r + 1e-8)
+                    self.advantages[mask] = (group_rewards - mean_r) / std_r
 
         return self.advantages
 

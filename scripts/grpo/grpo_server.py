@@ -275,12 +275,18 @@ class GRPOPolicyWrapper:
         return {}
 
 
-def compute_action_mask(policy) -> np.ndarray | None:
+def compute_action_mask(policy) -> np.ndarray:
     """Compute the per-embodiment action mask from a wrapped policy.
 
     The model always outputs a padded (max_action_horizon, max_action_dim) tensor.
     For a given embodiment, only a sub-rectangle corresponds to valid action dims.
     This mask lets FM log-prob ignore the padded region during training.
+
+    A wrong/missing mask silently corrupts the training signal (the FM loss would
+    include the padded region, which is meaningless for the current embodiment),
+    so this function raises rather than returning None on any error path —
+    GRPOPolicyWrapper will then refuse to construct, and the user gets a clear
+    error at server-start instead of degraded training quality.
 
     Args:
         policy: Gr00tPolicy, Gr00tSimPolicyWrapper, or an _InPlacePolicy wrapping
@@ -288,13 +294,24 @@ def compute_action_mask(policy) -> np.ndarray | None:
             `.modality_configs` (per-embodiment sub-dict), and `.embodiment_tag`.
 
     Returns:
-        Float32 ndarray of shape (max_action_horizon, max_action_dim), or None
-        if the required attributes cannot be resolved.
+        Float32 ndarray of shape (max_action_horizon, max_action_dim).
+
+    Raises:
+        RuntimeError: if any required attribute is missing or statistics are not
+            loaded on the processor.
     """
     inner = getattr(policy, "policy", policy)
-    if not (hasattr(inner, "processor") and hasattr(inner, "modality_configs")
-            and hasattr(inner, "embodiment_tag")):
-        return None
+    missing = [
+        attr for attr in ("processor", "modality_configs", "embodiment_tag")
+        if not hasattr(inner, attr)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"compute_action_mask: policy is missing required attribute(s) "
+            f"{missing}. Expected a Gr00tPolicy/Gr00tSimPolicyWrapper-shaped "
+            f"object exposing processor, modality_configs, embodiment_tag. "
+            f"Got policy of type {type(policy).__name__}."
+        )
 
     try:
         processor = inner.processor
@@ -314,8 +331,14 @@ def compute_action_mask(policy) -> np.ndarray | None:
         mask = np.zeros((max_horizon, max_dim), dtype=np.float32)
         mask[:action_horizon, :action_dim] = 1.0
         return mask
-    except (AttributeError, KeyError, TypeError):
-        return None
+    except (AttributeError, KeyError, TypeError) as e:
+        raise RuntimeError(
+            f"compute_action_mask: failed to derive mask for "
+            f"embodiment={getattr(inner, 'embodiment_tag', '?')}. Most common "
+            f"cause: processor statistics not loaded (set_statistics not called "
+            f"or checkpoint missing norm_params). Original error: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 def create_grpo_server(config: GRPOServerConfig) -> PolicyServer:

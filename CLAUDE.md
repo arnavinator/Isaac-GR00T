@@ -8,7 +8,7 @@ GR00T N1.6 is NVIDIA's 3B-parameter vision-language-action (VLA) model for robot
 gr00t/
   model/gr00t_n1d6/
     gr00t_n1d6.py               # Gr00tN1d6 (full model) + Gr00tN1d6ActionHead (DiT denoising)
-    processing_gr00t_n1d6.py    # Processor: obs→model input, decode_action (50,128)→(16,29)
+    processing_gr00t_n1d6.py    # Processor: obs→model input, decode_action (50,128)→(16,12) for Panda
   model/modules/
     dit.py                      # DiT / AlternateVLDiT (32-layer diffusion transformer)
     eagle_backbone.py           # Eagle VLM backbone (encodes images + language)
@@ -57,7 +57,7 @@ scripts/explore_vla_pipeline.py   # Single-process VLA explorer (model-only, no 
 - 4 Euler steps with `dt=0.25`, timestep schedule: 0 → 250 → 500 → 750
 - Each step: DiT predicts velocity, `actions = actions + 0.25 * velocity`
 - Raw output shape: `(B, 50, 128)` — padded for multi-embodiment support
-- `decode_action()` slices to per-embodiment dims: e.g., Panda → `(B, 16, 29)`
+- `decode_action()` slices to per-embodiment dims: e.g., Panda → `(B, 16, 12)` (16 horizon × 12 action dims; see Action Format table below for the 12-dim breakdown)
 
 ### Training vs Inference
 - **`forward()`** (training): single random timestep, MSE loss on predicted vs true velocity. Ground-truth actions required.

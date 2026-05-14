@@ -176,12 +176,27 @@ def compute_fm_log_prob(
         pred = action_head.action_decoder(model_output, embodiment_id)
         pred_velocity = pred[:, -actions.shape[1]:]
 
-        # --- Per-sample MSE ---
-        per_element_mse = F.mse_loss(pred_velocity, velocity_target, reduction="none")
-        masked_mse = per_element_mse * action_mask
-        per_sample_mse = masked_mse.sum(dim=(1, 2)) / valid_elements_per_sample
+        # --- Per-sample MSE in fp32 ---
+        # Cast pred_velocity, velocity_target, and the mask to float32 BEFORE
+        # computing MSE. Doing this in bf16 has two precision problems:
+        #   1. bf16 has only 8 mantissa bits → element-wise (pred-target)^2 is
+        #      noisy, and the noise floor swamps the small signal differences
+        #      between the current LoRA-adapted policy and the reference.
+        #   2. Summing ~192 (Panda 16×12) bf16 values accumulates rounding
+        #      error that can drown the policy-quality difference between
+        #      ref and current — making log_ratio noisy and inflating
+        #      clipfrac and mean_log_ratio_abs.
+        # The fp32 cast is cheap (a few hundred KB per minibatch) and keeps
+        # gradients differentiable wrt the LoRA-adapted bf16 output.
+        pred_v_f32 = pred_velocity.float()
+        target_v_f32 = velocity_target.float()
+        mask_f32 = action_mask.float()
 
-        log_probs_accumulated += (-per_sample_mse).float()
+        per_element_mse = F.mse_loss(pred_v_f32, target_v_f32, reduction="none")
+        masked_mse = per_element_mse * mask_f32
+        per_sample_mse = masked_mse.sum(dim=(1, 2)) / valid_elements_per_sample.float()
+
+        log_probs_accumulated += -per_sample_mse  # already fp32
 
     # Average across K timestep samples
     log_probs = log_probs_accumulated / n_samples

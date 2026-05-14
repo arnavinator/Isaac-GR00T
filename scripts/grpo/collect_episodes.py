@@ -129,7 +129,24 @@ def make_env(
         state_delta_indices = np.array([0])
 
     def _make():
-        env = gym.make(env_name, render_mode=None)
+        # Trigger robocasa's gymnasium env registration. The for-loop at the
+        # bottom of robocasa/utils/gym_utils/gymnasium_groot.py calls
+        # gym.register() for every (env, robot) pair (e.g.,
+        # robocasa_panda_omron/OpenDrawer_PandaOmron_Env). Without these
+        # imports, gym.make() raises NamespaceNotFound. Imports are inside
+        # the factory to mirror the working pattern in
+        # gr00t/eval/rollout_policy.py:82-90 (also works under AsyncVectorEnv,
+        # where each subprocess has its own import state).
+        import os
+        import robocasa  # noqa: F401
+        from robocasa.utils.gym_utils import GrootRoboCasaEnv  # noqa: F401
+        import robosuite  # noqa: F401
+
+        # Headless MuJoCo rendering on Linux GPU hosts. egl is the standard
+        # backend when there's no X display; matches rollout_policy.py.
+        os.environ.setdefault("MUJOCO_GL", "egl")
+
+        env = gym.make(env_name)
 
         # Apply MultiStepWrapper for action chunking
         # This executes n_action_steps from each predicted chunk

@@ -467,7 +467,7 @@ class GRPOTrainer:
                 self._cache_encoded_features(valid_batch, batch_data)
 
                 # Store ref log-prob and the (tau, eps)-samples used for it
-                tau_cpu = timesteps.cpu().numpy()  # [K, B]
+                tau_cpu = timesteps.float().cpu().numpy()  # [K, B]
                 for i, chunk in enumerate(valid_batch):
                     chunk.ref_log_prob = ref_lp[i].item()
                     chunk.tau_samples = tau_cpu[:, i].astype(np.float32)

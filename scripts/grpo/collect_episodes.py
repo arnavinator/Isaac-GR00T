@@ -437,115 +437,82 @@ class EpisodeCollector:
         fast_forward_steps: int,
         success_weight: float,
     ) -> list[dict]:
-        """Collect one group with fast-forward branching.
+        """Collect one group with lockstep fast-forward.
 
-        Focuses GRPO signal on the critical manipulation phase by skipping the
-        early approach trajectory. Adapted from branching_rollout.py.
+        Focuses GRPO signal on the critical manipulation phase by skipping
+        the early approach trajectory.
 
         Phases:
-          1. Reset all envs with the same seed
-          2. Fast-forward env 0 for fast_forward_steps outer steps using the policy
-             (only env 0 is stepped — the others will be overwritten)
-          3. Save env 0's MuJoCo sim state at the branch point
-          4. Restore that state into envs 1..G-1 (all now at identical branch point)
-          5. Sync each env's MultiStepWrapper internal state
-          6. Continue all envs independently until done (per-env stepping)
+          1. Reset all envs with the same seed → identical initial states.
+          2. Lockstep fast-forward: query the server once per outer step
+             (using env 0's obs — all G envs are in the same state) and
+             apply the resulting chunk to every env. MuJoCo determinism
+             keeps them bit-identical throughout the FF prefix.
+          3. Continue all envs independently until done (per-env stepping).
+             Within-group diversity then arises from the policy's denoising
+             noise on each post-branch action chunk.
 
-        If env 0 terminates during fast-forward (task solved early or error),
-        falls back to normal collection from the seed.
+        If any env terminates during fast-forward (task solved early or
+        error), falls back to normal collection from the seed.
+
+        Determinism: this relies on RoboCasa's MuJoCo step being
+        deterministic given identical (state, action). If per-step
+        randomization is ever introduced upstream, the lockstep envs
+        could diverge silently — use --debug-fast-forward to numerically
+        verify sim states stay bit-identical across the group.
         """
-        # Phase 1: Reset all envs (per-env, matching _collect_one_group)
+        # Phase 1: Reset all envs with the same seed
         observations_per_env: list[dict] = []
         for env in self.envs.envs:
             obs, _ = env.reset(seed=group_seed)
             observations_per_env.append(obs)
 
-        # Phase 2: Fast-forward env 0 ONLY. The OLD code stepped all envs in
-        # lockstep then discarded the others — wasted compute and risked
-        # autoreset-cascade if any env terminated. Per-env stepping makes the
-        # FF phase trivially "step env 0" with no batching ambiguity.
-        consumed_substeps = 0
+        # Phase 2: Lockstep fast-forward.
+        #
+        # We send env 0's observation to the server (any env's would be
+        # identical) and apply the returned chunk to every env. We use
+        # per-env stepping rather than SyncVectorEnv's batched .step() to
+        # stay consistent with _collect_one_group and to avoid the
+        # autoreset-cascade hazard if any env terminates.
         for step in range(fast_forward_steps):
-            # Server batch contains only env 0
             batched_obs = self._batch_per_env_obs([observations_per_env[0]])
             actions, _, _, _ = self._get_actions_from_server(batched_obs)
-            action_0 = self._extract_per_env(actions, 0)
+            action = self._extract_per_env(actions, 0)
 
-            next_obs, _, terminated, truncated, info = self.envs.envs[0].step(action_0)
-            observations_per_env[0] = next_obs
+            any_done = False
+            for i in range(group_size):
+                next_obs, _, terminated, truncated, _ = self.envs.envs[i].step(action)
+                observations_per_env[i] = next_obs
+                if terminated or truncated:
+                    any_done = True
 
-            # Use actual substep count (matching H3 fix in main collect loop)
-            if "dones" in info and hasattr(info["dones"], "__len__"):
-                consumed_substeps += len(info["dones"])
-            else:
-                consumed_substeps += self.n_action_steps
-
-            if terminated or truncated:
+            if any_done:
                 print(
-                    f"    Env 0 terminated at step {step} during fast-forward, "
+                    f"    Env terminated at step {step} during fast-forward, "
                     "falling back to normal collection"
                 )
                 return self._collect_one_group(
                     group_seed, group_size, group_id, success_weight
                 )
 
-        # Phase 3: Save env 0's MuJoCo sim state
-        sim_state = self._get_sim_state(env_idx=0)
-        if sim_state is None:
-            print("    WARNING: Could not save sim state, falling back to normal collection")
-            return self._collect_one_group(
-                group_seed, group_size, group_id, success_weight
-            )
-
-        # Phase 4: Restore env 0's state into envs 1..G-1
-        for i in range(1, group_size):
-            self._restore_sim_state(env_idx=i, sim_state=sim_state)
-
-        # Phase 4b: Reset robot controllers across ALL G envs.
-        # ``set_state_from_flattened`` restores MuJoCo qpos/qvel/act, but the
-        # OperationalSpaceController's Python-side state (goal_pos, goal_ori,
-        # any integrator accumulators) is NOT in the flattened MjSimState. After
-        # restore, envs 1..G-1 carry whatever controller goals they had at the
-        # last reset (likely the seed-zero pose), while env 0 carries the goals
-        # accumulated over fast_forward_steps of FF policy actions. Without a
-        # reset, the first post-branch action delta would be applied to an OSC
-        # target that doesn't match the actual EEF pose → motion immediately
-        # diverges from env 0 even though the sim states are bit-identical.
-        # We reset env 0 too so all G envs start the post-branch phase with
-        # controllers re-primed to the (now identical) current EEF pose; the
-        # alternative — copying env 0's controller state into envs 1..G-1 —
-        # would require touching robosuite-version-specific controller internals.
-        # Resetting is semantically equivalent for FF correctness because the
-        # very next action is a delta from the current pose.
-        for i in range(group_size):
-            self._reset_robot_controllers(env_idx=i)
-
-        # Phase 5: Sync each restored env's MultiStepWrapper internal state
-        for i in range(1, group_size):
-            restored_obs = self._read_obs_after_restore(env_idx=i)
-            self._sync_wrapper(env_idx=i, obs=restored_obs, consumed_substeps=consumed_substeps)
-
-        # Re-read each env's observation from its now-synced wrapper state
-        for i in range(group_size):
-            wrapper = self.envs.envs[i]
-            observations_per_env[i] = wrapper._get_obs(
-                wrapper.video_delta_indices, wrapper.state_delta_indices
-            )
-
-        # Debug: verify all envs have identical state after branching
+        # Debug: verify all envs really are at the same state after the
+        # lockstep prefix. With deterministic MuJoCo this is a regression
+        # check rather than a correctness concern.
         if self.debug_fast_forward:
-            self._verify_branch_point(group_id, group_seed, fast_forward_steps)
+            self._verify_branch_point(
+                group_id, group_seed, fast_forward_steps, observations_per_env
+            )
 
-        # Phase 6: Continue all envs independently — same per-env loop as
-        # _collect_one_group, with the only difference being initial num_steps
-        # accounting. We deliberately do NOT pre-load consumed_substeps into
-        # episodes_in_progress[i].num_steps: time-scaled rewards within a
-        # group should compare post-branch effort fairly across the rollouts
-        # in that group, so the FF prefix is excluded for all of them. Mixing
-        # FF and non-FF groups via fast_forward_pct < 1.0 means cross-group
-        # comparisons (e.g., logged mean_reward) will favor branched groups
-        # numerically — this is a known artifact of FF; group-relative
-        # advantages are unaffected since they normalize WITHIN each group.
+        # Phase 3: Continue all envs independently — same per-env loop as
+        # _collect_one_group. We deliberately do NOT count the FF prefix
+        # in episodes_in_progress[i].num_steps: time-scaled rewards within
+        # a group should compare post-branch effort fairly across the
+        # rollouts in that group, so the FF prefix is excluded for all of
+        # them. Mixing FF and non-FF groups via fast_forward_pct < 1.0
+        # means cross-group comparisons (e.g., logged mean_reward) will
+        # favor branched groups numerically — this is a known artifact of
+        # FF; group-relative advantages are unaffected since they
+        # normalize WITHIN each group.
         episodes_in_progress = [
             self._new_episode(group_id, group_seed) for _ in range(group_size)
         ]
@@ -610,11 +577,14 @@ class EpisodeCollector:
 
         return episodes_in_progress
 
-    # ─── MuJoCo state save/restore helpers ───────────────────────────────
-    # Adapted from branching_rollout.py:214-266
+    # ─── Debug helpers ───────────────────────────────────────────────────
 
     def _get_sim_state(self, env_idx: int) -> np.ndarray | None:
-        """Save the MuJoCo sim state from a sub-env as a flat array."""
+        """Read a sub-env's MuJoCo sim state as a flat array.
+
+        Used by _verify_branch_point to numerically confirm that the G envs
+        in a group are bit-identical after the lockstep FF prefix.
+        """
         try:
             wrapper = self.envs.envs[env_idx]
             robosuite_env = wrapper.unwrapped.env
@@ -622,89 +592,25 @@ class EpisodeCollector:
         except (AttributeError, TypeError, IndexError):
             return None
 
-    def _restore_sim_state(self, env_idx: int, sim_state: np.ndarray) -> None:
-        """Restore a saved MuJoCo sim state into a sub-env."""
-        wrapper = self.envs.envs[env_idx]
-        robosuite_env = wrapper.unwrapped.env
-        robosuite_env.sim.set_state_from_flattened(sim_state)
-        robosuite_env.sim.forward()
-        if hasattr(robosuite_env, "update_state"):
-            robosuite_env.update_state()
-        elif hasattr(robosuite_env, "update_sites"):
-            robosuite_env.update_sites()
+    def _verify_branch_point(
+        self,
+        group_id: int,
+        group_seed: int,
+        ff_steps: int,
+        observations_per_env: list[dict],
+    ) -> None:
+        """Debug verification: confirm all envs are at an identical state
+        after the lockstep fast-forward prefix.
 
-    def _reset_robot_controllers(self, env_idx: int) -> None:
-        """Reset each robot's controller after a sim state restore.
+        With deterministic MuJoCo, the G envs see the same (state, action)
+        pairs throughout the FF loop, so they should be bit-identical here.
+        This routine is a regression check that fails loudly if upstream
+        introduces step-time non-determinism (e.g., domain randomization)
+        which would silently break the lockstep assumption.
 
-        ``set_state_from_flattened`` only restores MuJoCo's MjSimState (qpos,
-        qvel, act, time, udd_state). It does NOT restore the OperationalSpaceController's
-        Python-side fields (goal_pos, goal_ori, any integrator accumulators).
-        Without resetting, the controller targets the *previous* goal_pos
-        while the robot's actual EEF is now at the post-restore pose →
-        the next action delta is added to a stale target → motion diverges.
-
-        We probe the modern (composite_controller) and legacy (controller)
-        attribute paths so this works across robosuite versions. Both expose
-        ``reset()`` which re-syncs the controller's internal goals to the
-        current robot state.
-        """
-        wrapper = self.envs.envs[env_idx]
-        robosuite_env = wrapper.unwrapped.env
-        robots = getattr(robosuite_env, "robots", None)
-        if not robots:
-            return
-        for robot in robots:
-            ctrl = getattr(robot, "composite_controller", None)
-            if ctrl is None:
-                ctrl = getattr(robot, "controller", None)
-            if ctrl is not None and hasattr(ctrl, "reset"):
-                ctrl.reset()
-
-    def _read_obs_after_restore(self, env_idx: int) -> dict:
-        """Read a fresh observation from a sub-env after state restoration."""
-        wrapper = self.envs.envs[env_idx]
-        base_env = wrapper.unwrapped
-        robosuite_env = base_env.env
-        raw_obs = robosuite_env._get_observations()
-        basic_obs = base_env.get_basic_observation(raw_obs)
-        return base_env.get_groot_observation(basic_obs)
-
-    def _sync_wrapper(self, env_idx: int, obs: dict, consumed_substeps: int) -> None:
-        """Sync a sub-env's MultiStepWrapper state after sim restoration.
-
-        The MultiStepWrapper tracks an obs deque, reward list, done list, and
-        an `info` defaultdict-of-deques. After restoring the MuJoCo state
-        (which the wrapper doesn't know about), we must update all of these
-        so subsequent step() calls produce clean info dicts.
-
-        Why `wrapper.info` matters: MultiStepWrapper.step() appends each
-        substep's info into per-key deques (maxlen=n_action_steps+1) and
-        then dict_take_last_n's them. If we leave stale FF substep info in
-        these deques, the first 1–8 outer steps after the branch read a
-        mix of pre-branch (FF env 0) and post-branch info — silently
-        corrupting fields like `info["success"]` until the deques refill.
-        Re-initializing the defaultdict matches MultiStepWrapper.reset()'s
-        behavior (multistep_wrapper.py:240).
-        """
-        from collections import defaultdict, deque as _deque
-        wrapper = self.envs.envs[env_idx]
-        wrapper.reward = [0.0] * consumed_substeps
-        wrapper.done = [False] * consumed_substeps
-        wrapper.obs = _deque(
-            [obs] * (wrapper.max_steps_needed + 1),
-            maxlen=wrapper.max_steps_needed + 1,
-        )
-        wrapper.info = defaultdict(
-            lambda: _deque(maxlen=wrapper.n_action_steps + 1)
-        )
-
-    def _verify_branch_point(self, group_id: int, group_seed: int, ff_steps: int) -> None:
-        """Debug verification: confirm all envs have identical state after branching.
-
-        Saves a montage image showing camera views from all envs side-by-side,
-        plus numerical comparison of sim states. If the branch worked correctly,
-        all envs should show the exact same robot pose, object positions, and
-        kitchen scene.
+        Saves a montage image showing camera views from all envs side-by-
+        side, plus a numerical comparison of sim states and the wrapper-
+        level observations the policy actually sees.
 
         Output saved to: {output_dir}/debug_ff/group{group_id}_seed{group_seed}.png
 
@@ -737,17 +643,17 @@ class EpisodeCollector:
             else:
                 print(f"    [DEBUG] FAIL: sim states differ!")
 
-        # 2. Compare observations numerically
-        observations = []
-        for i in range(self.group_size):
-            obs = self._read_obs_after_restore(i)
-            observations.append(obs)
-
-        ref_obs = observations[0]
+        # 2. Compare wrapper observations numerically. These are what the
+        # policy actually sees, so this is the more faithful obs check than
+        # poking the underlying robosuite env directly.
+        ref_obs = observations_per_env[0]
         for i in range(1, self.group_size):
             for key in ref_obs:
                 if isinstance(ref_obs[key], np.ndarray):
-                    diff = np.abs(ref_obs[key].astype(float) - observations[i][key].astype(float)).max()
+                    diff = np.abs(
+                        ref_obs[key].astype(float)
+                        - observations_per_env[i][key].astype(float)
+                    ).max()
                     if diff > 1e-5:
                         print(f"    [DEBUG] obs key '{key}' differs: env 0 vs env {i}, max_diff={diff:.6f}")
 
@@ -755,7 +661,7 @@ class EpisodeCollector:
         try:
             all_frames = []
             for i in range(self.group_size):
-                obs = observations[i]
+                obs = observations_per_env[i]
                 env_frames = []
                 for key in sorted(obs.keys()):
                     if not (key.startswith("video.") and "res256" in key):
@@ -771,9 +677,9 @@ class EpisodeCollector:
                     all_frames.append(row)
 
             if all_frames:
-                # Stack envs vertically: each row = one env's camera views
-                # Top row = env 0 (source), rows below = restored envs
-                # All rows should look identical if branch worked correctly
+                # Stack envs vertically: each row = one env's camera views.
+                # All rows should be pixel-identical when lockstep FF is
+                # working correctly.
                 montage = np.concatenate(all_frames, axis=0)
                 out_path = debug_dir / f"group{group_id:03d}_seed{group_seed}_ff{ff_steps}.png"
 
@@ -782,7 +688,7 @@ class EpisodeCollector:
                     cv2.imwrite(str(out_path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
                     print(f"    [DEBUG] Montage saved: {out_path}")
                     print(f"    [DEBUG] Layout: {self.group_size} rows (envs) × {len(env_frames)} cols (cameras)")
-                    print(f"    [DEBUG] All rows should look identical if branch is correct")
+                    print(f"    [DEBUG] All rows should look identical if lockstep is correct")
                 except ImportError:
                     # Fall back to saving as .npy if cv2 not available
                     npy_path = out_path.with_suffix(".npy")

@@ -959,16 +959,31 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
                     save_dict[f"raw_action_{chunk_idx}"] = raw_action
 
             # Action mask from model (proper per-embodiment mask, not all-ones).
-            if chunk_idx < len(ep.get("action_masks", [])):
-                mask = ep["action_masks"][chunk_idx]
-                if mask is not None:
-                    save_dict[f"action_mask_{chunk_idx}"] = mask
-                elif chunk_idx < len(ep.get("raw_actions", [])) and ep["raw_actions"][chunk_idx] is not None:
-                    save_dict[f"action_mask_{chunk_idx}"] = np.ones_like(ep["raw_actions"][chunk_idx])
-                else:
-                    save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128), dtype=np.float32)
-            else:
-                save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128), dtype=np.float32)
+            # Hard-fail if missing: the GRPO server always attaches a per-
+            # embodiment mask (grpo_server.py:252-256, with compute_action_mask
+            # raising on derivation failure). A None mask reaching here means
+            # the upstream contract broke (vanilla PolicyServer instead of
+            # GRPOPolicyWrapper, or capture failure). Falling back to all-ones
+            # would silently average FM-MSE over the padded region (e.g., 6400
+            # elements instead of 192 valid for PandaOmron — ~33× underestimate),
+            # which corrupts the log-prob signal without any visible error.
+            if chunk_idx >= len(ep.get("action_masks", [])):
+                raise RuntimeError(
+                    f"Episode {idx} chunk {chunk_idx}: action_masks list is "
+                    f"shorter than actions list (len={len(ep.get('action_masks', []))} "
+                    f"vs {len(ep['actions'])}). The collector is misconfigured."
+                )
+            mask = ep["action_masks"][chunk_idx]
+            if mask is None:
+                raise RuntimeError(
+                    f"Episode {idx} chunk {chunk_idx}: action_mask is None. "
+                    f"The GRPO server (grpo_server.py) must attach a per-"
+                    f"embodiment mask to info['action_mask']. Check that the "
+                    f"server is wrapped in GRPOPolicyWrapper (not vanilla "
+                    f"PolicyServer) and that compute_action_mask succeeded at "
+                    f"server startup."
+                )
+            save_dict[f"action_mask_{chunk_idx}"] = mask
 
             # Initial noise tensor (50x128) — the ε₀ that was denoised into this action.
             if chunk_idx < len(ep.get("initial_noises", [])):

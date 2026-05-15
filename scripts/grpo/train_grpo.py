@@ -179,6 +179,31 @@ class GRPOTrainer:
             dropout=self.config.lora_dropout,
             target_modules=self.config.lora_target_modules,
         )
+
+        # Cast trainable LoRA params from bf16 → fp32 for training.
+        # Why: AdamW stores its momentum buffers (exp_avg, exp_avg_sq) in the
+        # same dtype as the params. With bf16 LoRA at lr=1e-5, most Adam
+        # updates are smaller than the bf16 ULP (~2^-7 × |param| ≈ 1e-4 for
+        # typical LoRA values ~0.01) and round to zero, so the policy barely
+        # moves regardless of gradient magnitude. Standard PEFT practice keeps
+        # LoRA params in fp32 even when the base model is bf16.
+        # Memory cost: ~80 MB extra (~20M LoRA params × 2 extra bytes), tiny
+        # vs the ~6 GB frozen bf16 base. The frozen base model stays bf16 —
+        # only trainable params (LoRA A/B) are upcast.
+        # Forward pass: PEFT's LoraLayer.forward() handles dtype mismatch by
+        # casting x to lora_A.weight.dtype (fp32) inside the LoRA branch and
+        # casting the LoRA delta back to the base layer's dtype before the
+        # residual add (peft/tuners/lora/layer.py); the base linear path
+        # stays bf16-clean.
+        n_upcast = 0
+        for p in self.model.parameters():
+            if p.requires_grad and p.dtype != torch.float32:
+                p.data = p.data.float()
+                n_upcast += 1
+        if n_upcast > 0:
+            print(f"  Upcast {n_upcast} trainable LoRA params from bf16 → fp32 "
+                  f"(prevents Adam moment underflow at lr={self.config.learning_rate})")
+
         stats = print_trainable_params(self.model)
 
         # --- Step 2b: Load LoRA checkpoint if resuming ---
@@ -196,7 +221,20 @@ class GRPOTrainer:
 
         # --- Step 3: Setup optimizer (only LoRA params) ---
         print("\n[3/4] Setting up optimizer...")
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        # Capture (name, param) pairs in the SAME order that
+        # model.parameters() yields. PyTorch documents named_parameters() and
+        # parameters() as iterating in identical order (insertion order via
+        # _parameters / _modules dicts), and the optimizer is constructed from
+        # that order — so this list IS the optimizer's positional ordering.
+        # Persisted alongside optimizer.pt (see _save_checkpoint) so resume
+        # can detect a position permutation that the shape-only validation
+        # in _validate_optimizer_state would otherwise miss.
+        named_trainable = [
+            (n, p) for n, p in self.model.named_parameters() if p.requires_grad
+        ]
+        self._lora_param_names = [n for n, _ in named_trainable]
+        trainable_params = [p for _, p in named_trainable]
+
         self.optimizer = optim.AdamW(
             trainable_params,
             lr=self.config.learning_rate,
@@ -208,7 +246,25 @@ class GRPOTrainer:
         if self.config.resume_from:
             opt_path = Path(self.config.resume_from) / "optimizer.pt"
             if opt_path.exists():
-                saved = torch.load(opt_path, map_location=self.device)
+                payload = torch.load(opt_path, map_location=self.device)
+                # New format wraps state_dict + param-name metadata. Legacy
+                # format is the raw state_dict (pre-fix checkpoints).
+                if (
+                    isinstance(payload, dict)
+                    and "optimizer_state" in payload
+                    and "param_names" in payload
+                ):
+                    saved = payload["optimizer_state"]
+                    self._validate_optimizer_param_names(payload["param_names"])
+                else:
+                    print(
+                        "  WARNING: optimizer.pt was saved by an older trainer "
+                        "version without parameter-name metadata. Falling back "
+                        "to shape-only validation; same-shape param permutations "
+                        "(from a peft/torch version bump between save and load) "
+                        "could go undetected."
+                    )
+                    saved = payload
                 self._validate_optimizer_state(saved)
                 self.optimizer.load_state_dict(saved)
                 print(f"  Optimizer state restored from {opt_path}")
@@ -642,22 +698,66 @@ class GRPOTrainer:
             return self.config.max_episode_steps[idx]
         return self.config.max_episode_steps
 
+    def _validate_optimizer_param_names(self, saved_names: list[str]) -> None:
+        """Verify the saved optimizer's param order matches the current model.
+
+        AdamW serializes its state by integer position (an index into
+        param_groups[i]['params']), and load_state_dict re-attaches by the
+        SAME positional index. With many same-shape LoRA matrices in the DiT
+        (32 layers × 8 target modules → ~512 LoRA tensors, with most
+        ``lora_A.default.weight`` shapes identical at ``(rank, in_features)``),
+        a position permutation between save and load — caused by a peft or
+        torch version bump altering module traversal order — would silently
+        mis-attach Adam moments (exp_avg, exp_avg_sq) to the wrong tensors.
+        The shape-based check in ``_validate_optimizer_state`` cannot catch
+        this. Compare the persisted name list to the current order to detect
+        such permutations.
+
+        Raises with an actionable message identifying the first mismatched
+        position so the operator can correlate against checkpoints.
+        """
+        current_names = self._lora_param_names
+        if saved_names == current_names:
+            return  # Exact match — safe to load.
+
+        if len(saved_names) != len(current_names):
+            raise RuntimeError(
+                f"Optimizer parameter count mismatch on resume: saved "
+                f"{len(saved_names)} params, current {len(current_names)}. "
+                f"Likely cause: lora_target_modules or lora_rank differs from "
+                f"the checkpoint."
+            )
+
+        # Same length, different order — find the first divergence so the
+        # error message is actionable.
+        for i, (sn, cn) in enumerate(zip(saved_names, current_names)):
+            if sn != cn:
+                same_set = set(saved_names) == set(current_names)
+                raise RuntimeError(
+                    f"Optimizer parameter ORDER mismatch on resume at position "
+                    f"{i}: saved name = '{sn}', current name = '{cn}'. "
+                    f"Name SETS are {'identical' if same_set else 'different'}. "
+                    f"Likely cause: a peft or torch version bump changed the "
+                    f"LoRA module traversal order between save and load. "
+                    f"Loading would silently mis-attach Adam moments "
+                    f"(exp_avg, exp_avg_sq) to the wrong LoRA tensors. Either "
+                    f"pin peft/torch versions across save and load, or restart "
+                    f"training from scratch."
+                )
+
     def _validate_optimizer_state(self, saved: dict) -> None:
         """Verify a saved optimizer state_dict matches the current optimizer's param layout.
 
-        AdamW's state is keyed by param-id INDEX (an int counter assigned at save
-        time, indexed into param_groups[i]['params'] in order). On
-        ``load_state_dict``, PyTorch attaches state[i] to the i-th tensor in the
-        current optimizer's params list — by POSITION, not by name. If the
-        ordering of trainable LoRA params differs from save time (e.g., PEFT
-        version bump changes module traversal order), Adam's exp_avg/exp_avg_sq
-        re-attach to the wrong tensors. With many same-shape LoRA matrices, the
-        mis-attach can be silent (no shape error, just garbage moments).
+        Defense-in-depth shape and group-count check. The PRIMARY safeguard
+        against silent positional mis-attachment lives in
+        ``_validate_optimizer_param_names`` (compares the persisted name list
+        to the current order). This method covers (a) legacy checkpoints
+        without name metadata and (b) the case where names match but a shape
+        regression slipped through (rank changed without a corresponding
+        target_modules change).
 
-        We catch the silent case by comparing each saved exp_avg's shape against
-        the corresponding current param's shape. Saved state may be empty if
-        the checkpoint was written before any optimizer.step() — that's fine,
-        no validation needed.
+        Saved state may be empty if the checkpoint was written before any
+        optimizer.step() — that's fine, no validation needed.
         """
         saved_groups = saved.get("param_groups", [])
         curr_groups = self.optimizer.param_groups
@@ -1601,9 +1701,16 @@ class GRPOTrainer:
         ckpt_dir = Path(self.config.checkpoint_dir) / f"iter_{iteration:04d}"
         save_lora_checkpoint(self.model, ckpt_dir)
 
-        # Also save optimizer state for resuming
+        # Save optimizer state with the param-name list alongside it. The
+        # name list is REQUIRED for resume to detect a positional permutation
+        # of same-shape LoRA params (see _validate_optimizer_param_names).
+        # Wrapping into a dict instead of writing two files keeps the load
+        # atomic and removes any risk of mismatched sidecar files.
         torch.save(
-            self.optimizer.state_dict(),
+            {
+                "optimizer_state": self.optimizer.state_dict(),
+                "param_names": self._lora_param_names,
+            },
             ckpt_dir / "optimizer.pt",
         )
         print(f"  Checkpoint saved: {ckpt_dir}")

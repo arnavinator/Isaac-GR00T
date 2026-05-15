@@ -21,6 +21,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 """
 
 import sys
+import shutil
 import threading
 import time
 import subprocess
@@ -89,6 +90,16 @@ class GRPOTrainer:
         # it at most once per call, but RLock costs nothing and guards
         # against accidental nesting in future edits.
         self._model_lock = threading.RLock()
+
+        # Consecutive collector failures since the last successful collection.
+        # We treat (subprocess timeout / non-zero exit / zero episodes loaded)
+        # as failure modes and abort training after MAX_CONSECUTIVE_COLLECT_FAILURES
+        # in a row. Without this guard, a misconfigured robocasa venv or a stuck
+        # MuJoCo init would leave the trainer in a silent infinite no-op:
+        # collector exits early → empty buffer → std_reward<1e-8 → iter skipped
+        # → repeat forever, with the user discovering it hours later.
+        self._consecutive_collect_failures = 0
+        self._max_consecutive_collect_failures = 3
 
     def setup(self):
         """Load model, apply LoRA, setup optimizer, start server.
@@ -159,9 +170,9 @@ class GRPOTrainer:
         if self.config.resume_from:
             opt_path = Path(self.config.resume_from) / "optimizer.pt"
             if opt_path.exists():
-                self.optimizer.load_state_dict(
-                    torch.load(opt_path, map_location=self.device)
-                )
+                saved = torch.load(opt_path, map_location=self.device)
+                self._validate_optimizer_state(saved)
+                self.optimizer.load_state_dict(saved)
                 print(f"  Optimizer state restored from {opt_path}")
             else:
                 print(f"  WARNING: No optimizer.pt found at {opt_path}, starting fresh optimizer")
@@ -393,16 +404,142 @@ class GRPOTrainer:
         finally:
             killer.cancel()
 
+        # Determine the failure reason (if any) before deciding whether to
+        # abort or continue with an empty buffer.
+        failure_reason = None
+        n_loaded = 0
         if timed_out["v"]:
-            print(f"  WARNING: Collector exceeded {timeout_s}s timeout; killed")
-            return
-        if proc.returncode != 0:
-            print(f"  WARNING: Collector failed with code {proc.returncode}")
+            failure_reason = f"timeout after {timeout_s}s (subprocess killed)"
+        elif proc.returncode != 0:
+            failure_reason = f"non-zero exit code {proc.returncode}"
+        else:
+            # Load collected episodes into buffer.
+            n_loaded = self.buffer.load_episodes(episode_dir)
+            if n_loaded == 0:
+                failure_reason = "zero episodes loaded (subprocess exited cleanly but produced no .npz files)"
+
+        if failure_reason is not None:
+            self._consecutive_collect_failures += 1
+            print(
+                f"  WARNING: Collector failure ({self._consecutive_collect_failures}"
+                f"/{self._max_consecutive_collect_failures} consecutive): {failure_reason}"
+            )
+            if self._consecutive_collect_failures >= self._max_consecutive_collect_failures:
+                # Aborting rather than silently looping: empty buffer →
+                # advantages are all-zero → iteration skipped → next iter
+                # repeats the same failure mode. Without this guard the user
+                # would discover the silent stall hours later.
+                raise RuntimeError(
+                    f"Collector failed {self._consecutive_collect_failures} consecutive "
+                    f"iterations. Last reason: {failure_reason}. "
+                    f"Common causes: robocasa venv path wrong, server port stuck in "
+                    f"TIME_WAIT, MUJOCO_GL backend missing, model OOM during inference. "
+                    f"Check the [collector] log lines above this message."
+                )
             return
 
-        # Load collected episodes into buffer
-        n_loaded = self.buffer.load_episodes(episode_dir)
+        # Successful collection — reset the failure counter.
+        self._consecutive_collect_failures = 0
         print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
+
+        # Bound disk usage: prune old iter_*/ subdirs beyond the keep window.
+        # Done AFTER load_episodes succeeded for the current iter, so we never
+        # delete a directory we're actively reading from.
+        self._prune_old_episode_dirs()
+
+    def _validate_optimizer_state(self, saved: dict) -> None:
+        """Verify a saved optimizer state_dict matches the current optimizer's param layout.
+
+        AdamW's state is keyed by param-id INDEX (an int counter assigned at save
+        time, indexed into param_groups[i]['params'] in order). On
+        ``load_state_dict``, PyTorch attaches state[i] to the i-th tensor in the
+        current optimizer's params list — by POSITION, not by name. If the
+        ordering of trainable LoRA params differs from save time (e.g., PEFT
+        version bump changes module traversal order), Adam's exp_avg/exp_avg_sq
+        re-attach to the wrong tensors. With many same-shape LoRA matrices, the
+        mis-attach can be silent (no shape error, just garbage moments).
+
+        We catch the silent case by comparing each saved exp_avg's shape against
+        the corresponding current param's shape. Saved state may be empty if
+        the checkpoint was written before any optimizer.step() — that's fine,
+        no validation needed.
+        """
+        saved_groups = saved.get("param_groups", [])
+        curr_groups = self.optimizer.param_groups
+
+        if len(saved_groups) != len(curr_groups):
+            raise RuntimeError(
+                f"Optimizer state mismatch on resume: saved has "
+                f"{len(saved_groups)} param groups, current has "
+                f"{len(curr_groups)}. Likely cause: LoRA architecture differs "
+                f"between checkpoint and current config (rank, alpha, target_modules)."
+            )
+
+        for gi, (sg, cg) in enumerate(zip(saved_groups, curr_groups)):
+            n_saved = len(sg.get("params", []))
+            n_curr = len(cg["params"])
+            if n_saved != n_curr:
+                raise RuntimeError(
+                    f"Optimizer param count mismatch in group {gi}: saved "
+                    f"{n_saved} params, current {n_curr}. Likely cause: "
+                    f"lora_target_modules differs from checkpoint."
+                )
+
+        # Shape check via Adam's exp_avg tensors. Empty state (no .step() yet)
+        # is valid and skipped.
+        saved_state = saved.get("state", {})
+        if not saved_state:
+            return
+
+        for gi, (sg, cg) in enumerate(zip(saved_groups, curr_groups)):
+            for i, (sid, cp) in enumerate(zip(sg["params"], cg["params"])):
+                if sid not in saved_state:
+                    continue  # this param was never stepped; nothing to validate
+                exp_avg = saved_state[sid].get("exp_avg")
+                if exp_avg is None:
+                    continue
+                if tuple(exp_avg.shape) != tuple(cp.shape):
+                    raise RuntimeError(
+                        f"Optimizer state shape mismatch at group {gi}, "
+                        f"position {i}: saved exp_avg shape "
+                        f"{tuple(exp_avg.shape)}, current param shape "
+                        f"{tuple(cp.shape)}. This means the trainable parameter "
+                        f"order changed between save and load (e.g., PEFT or "
+                        f"PyTorch version bump altered module traversal order). "
+                        f"Loading would silently mis-attach Adam moments to the "
+                        f"wrong tensors. Either pin peft/torch versions across "
+                        f"save and load, or restart training from scratch."
+                    )
+
+    def _prune_old_episode_dirs(self):
+        """Delete iter_*/ subdirs older than (current_iter - keep + 1).
+
+        The current iteration's directory is always preserved. With
+        episode_dirs_to_keep=3 and self.iteration=10, keeps iter_0008,
+        iter_0009, iter_0010 and removes iter_0001..iter_0007.
+        """
+        keep = self.config.episode_dirs_to_keep
+        if keep <= 0:
+            return  # disabled
+        base = Path(self.config.episode_dir)
+        if not base.is_dir():
+            return
+        cutoff = self.iteration - keep + 1  # inclusive lower bound to keep
+        n_pruned = 0
+        for d in base.iterdir():
+            if not (d.is_dir() and d.name.startswith("iter_")):
+                continue
+            try:
+                n = int(d.name[len("iter_"):])
+            except ValueError:
+                continue  # not an iter_NNNN dir, skip
+            if n < cutoff:
+                # ignore_errors=True so a stale-handle ENOTEMPTY on one dir
+                # doesn't prevent us from pruning the others.
+                shutil.rmtree(d, ignore_errors=True)
+                n_pruned += 1
+        if n_pruned > 0:
+            print(f"  Pruned {n_pruned} old episode dirs (kept last {keep})")
 
     def _compute_ref_log_probs(self):
         """Pre-compute reference log-probs for all chunks using the current model.
@@ -662,8 +799,21 @@ class GRPOTrainer:
                 )
                 clip_loss = -torch.min(surr1, surr2).mean()
 
-                # --- KL divergence penalty ---
-                kl_loss = self.config.kl_coef * (ref_log_probs - current_log_probs).mean()
+                # --- KL divergence penalty (Schulman k3 estimator) ---
+                # KL(ref || current) ≈ E[exp(ref - current) - (ref - current) - 1]
+                # Identity: e^x - x - 1 ≥ 0 for all x, with equality iff x=0.
+                # Properties vs the naive (ref - current).mean():
+                #   - Non-negative POINTWISE, not just in expectation.
+                #   - Minimum at current ≡ ref → gradient pulls policies together
+                #     symmetrically (the naive estimator's gradient was one-sided
+                #     and could *reward* current >> ref).
+                #   - Same expected value (still estimates KL(ref||current)).
+                #   - Lower variance.
+                # See Schulman 2020 "Approximating KL Divergence" for the derivation.
+                inv_log_ratio = ref_log_probs - current_log_probs  # = -log_ratio
+                kl_loss = self.config.kl_coef * (
+                    inv_log_ratio.exp() - inv_log_ratio - 1.0
+                ).mean()
 
                 # --- Total loss ---
                 loss = clip_loss + kl_loss

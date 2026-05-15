@@ -127,22 +127,27 @@ def load_lora_checkpoint(model: nn.Module, path: str | Path) -> None:
     """Load LoRA adapter weights into an already-injected model.
 
     The model must already have LoRA adapters injected (via apply_lora_to_dit).
-    Performs a TWO-SIDED diff:
-      - Saved LoRA keys not present in the current model (e.g., target_modules
-        list shrank) are warned about and skipped.
-      - Current LoRA keys not present in the saved checkpoint (e.g.,
-        target_modules list grew, leaving some adapters at random init) are
-        warned about — without this warning the user would silently train
-        partially-initialized adapters, which can take many iterations to
-        notice via degraded training curves.
+    Performs a strict TWO-SIDED match and HARD-FAILS on any divergence:
+      - Saved LoRA keys not present in the current model (target_modules shrank)
+        → RuntimeError. Loading would silently drop those weights, leaving the
+        previously-trained adapter behavior unrepresented in the resumed run.
+      - Current LoRA keys not present in the saved checkpoint (target_modules
+        grew) → RuntimeError. Loading would leave some adapters at random init
+        while the optimizer state attaches to them, silently corrupting training.
+      - Per-key shape mismatch (rank changed) → RuntimeError. ``strict=True``
+        loading would catch most of these but the explicit message points at
+        the likely cause.
 
-    The actual load uses ``strict=False`` so the warned-about mismatches
-    don't crash the load — we want training to be able to start, but with
-    a clear log line documenting what diverged.
+    Hard-failing is intentional: the previous warn-and-continue behavior could
+    silently turn a resume into a from-scratch run on the affected layers,
+    discoverable only hours later via degraded training curves.
 
     Args:
         model: Full model with LoRA adapters already injected.
         path: Directory containing lora_weights.pt.
+
+    Raises:
+        RuntimeError: If saved and current LoRA layouts don't match exactly.
     """
     path = Path(path)
     lora_state = torch.load(path / "lora_weights.pt", map_location="cpu")
@@ -158,35 +163,43 @@ def load_lora_checkpoint(model: nn.Module, path: str | Path) -> None:
     extra_in_model = model_lora_keys - saved_lora_keys
 
     if extra_in_save:
-        print(
-            f"  WARNING: {len(extra_in_save)} LoRA keys in checkpoint not found "
-            f"in model — these will be IGNORED (target_modules list shrank?). "
-            f"Examples: {sorted(extra_in_save)[:3]}"
+        raise RuntimeError(
+            f"LoRA checkpoint contains {len(extra_in_save)} keys not present "
+            f"in the current model. Likely cause: lora_target_modules in your "
+            f"config is a SUBSET of the modules targeted at save time. "
+            f"First few unmatched saved keys: {sorted(extra_in_save)[:3]}. "
+            f"Either expand lora_target_modules to match the checkpoint, or "
+            f"restart training from scratch."
         )
 
     if extra_in_model:
-        # This is the dangerous case: we have LoRA layers in the model that
-        # the checkpoint doesn't know about, so they stay at their random
-        # Kaiming init while training resumes. Loud warning so the user can
-        # decide whether to continue or restart from a fresh checkpoint.
-        print(
-            f"  WARNING: {len(extra_in_model)} LoRA keys in model not found "
-            f"in checkpoint — these will REMAIN AT RANDOM INIT (target_modules "
-            f"list grew since this checkpoint was saved?). Training will "
-            f"effectively start partial-zero on these adapters. "
-            f"Examples: {sorted(extra_in_model)[:3]}"
+        raise RuntimeError(
+            f"Current model has {len(extra_in_model)} LoRA keys not present "
+            f"in the checkpoint. Likely cause: lora_target_modules in your "
+            f"config is a SUPERSET of the modules targeted at save time. "
+            f"Loading would leave these adapters at random init while the "
+            f"optimizer state attaches to them — a silent corruption. "
+            f"First few unmatched model keys: {sorted(extra_in_model)[:3]}. "
+            f"Either reduce lora_target_modules to match the checkpoint, or "
+            f"restart training from scratch."
         )
 
-    # Filter to keys the model actually has, then load with strict=False
-    # so any other shape mismatches surface (rather than silently dropping).
-    filtered_state = {k: v for k, v in lora_state.items() if k in model_lora_keys}
-    missing, unexpected = dit.load_state_dict(filtered_state, strict=False)
-    # `missing` here are non-LoRA model keys not in our (LoRA-only) state
-    # dict — that's expected. `unexpected` should be empty since we filtered.
-    if unexpected:
-        print(f"  WARNING: load_state_dict reported unexpected keys: {unexpected[:3]}")
+    # Per-key shape check — catches lora_rank mismatches with a clear message
+    # before strict=True load_state_dict would raise a less-actionable error.
+    for k in saved_lora_keys:
+        sshape = tuple(lora_state[k].shape)
+        cshape = tuple(current_state[k].shape)
+        if sshape != cshape:
+            raise RuntimeError(
+                f"LoRA shape mismatch on key '{k}': saved {sshape}, "
+                f"current {cshape}. Likely cause: lora_rank in your config "
+                f"differs from the checkpoint's training config."
+            )
 
-    print(f"  Loaded {len(filtered_state)} LoRA parameters from {path}")
+    # All keys and shapes match — apply via partial state_dict update + strict load.
+    current_state.update(lora_state)
+    dit.load_state_dict(current_state, strict=True)
+    print(f"  Loaded {len(lora_state)} LoRA parameters from {path}")
 
 
 def merge_lora_weights(model: nn.Module) -> nn.Module:

@@ -141,6 +141,14 @@ class GRPOConfig:
     # Directory to store collected episode .npz files
     episode_dir: str = "/tmp/grpo_episodes"
 
+    # How many of the most recent iter_*/ subdirs to keep under episode_dir.
+    # After each iteration's episodes are saved, older iter_*/ dirs are pruned
+    # to bound disk usage. Default 3 keeps the current iter + 2 prior for
+    # post-mortem inspection. Set to 0 to disable pruning (keep everything).
+    # At 25 episodes/iter × 90 chunks × ~250KB/chunk ≈ 0.5 GB/iter, 200 iters
+    # is ~100 GB if unpruned; /tmp on most GPU hosts is much smaller.
+    episode_dirs_to_keep: int = 3
+
     # ─── Reward Shaping ──────────────────────────────────────────────────────
 
     # Weight of binary success signal in shaped reward

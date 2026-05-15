@@ -186,6 +186,7 @@ uv run python scripts/grpo/test_sim_wrapper.py
 | `max_grad_norm` | 0.5 | Gradient clipping threshold |
 | `fast_forward_steps` | 10 | Outer steps to skip before branching (0=disabled, per-env list OK) |
 | `fast_forward_pct` | 0.5 | Fraction of groups using fast-forward (rest start normally) |
+| `episode_dirs_to_keep` | 3 | Number of recent `iter_*/` subdirs to retain under `episode_dir`; older dirs are pruned after each successful collection. Set to 0 to disable pruning. Bounds disk usage on `/tmp` over long runs. |
 
 ## Reward Shaping
 
@@ -258,6 +259,22 @@ where:
 - **initial_noise None** → the denoising loop stopped calling `torch.randn(...)` with a 3-D size (e.g., switched to `torch.randn_like` or a pre-allocated buffer). Only `torch.randn` is intercepted.
 
 Either fix the capture hook in `grpo_server.py` or update the model to restore the expected contract. This is a hard-fail by design — a silent `None` would propagate as a missing-`initial_noise` error in `_prepare_batch`, which is less obvious to debug.
+
+### `RuntimeError: Collector failed N consecutive iterations`
+The trainer aborts after 3 consecutive collection failures (timeout / non-zero subprocess exit / zero `.npz` files produced). Without this guard, a misconfigured robocasa venv or stuck MuJoCo init would leave the trainer in a silent infinite no-op. The error message includes the last failure reason; cross-check with the `[collector] ...` lines streamed above. Common causes:
+- **Robocasa venv path wrong** → `gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python` doesn't exist; rerun setup.
+- **Server port stuck** → previous server thread didn't release port 5555; wait for TIME_WAIT or change `--server-port`.
+- **MUJOCO_GL backend missing** → on a headless GPU host without `egl`, `gym.make` will hang; verify `MUJOCO_GL=egl` is set.
+- **Server-side OOM on inference** → check trainer-side stdout for CUDA OOM during the first action-server call.
+
+### `RuntimeError: LoRA checkpoint contains keys not present in the current model` (or vice versa)
+Your `lora_target_modules` (or `lora_rank`) differs between the saved checkpoint and your current config. Resuming would silently load partial weights — either dropping saved adapter behavior or leaving new adapters at random init while the optimizer attaches to them. Fix by matching the config or restarting from scratch. The error message tells you which side has extra keys.
+
+### `RuntimeError: Optimizer state shape mismatch at group 0, position N`
+PEFT or PyTorch version changed between save and resume, altering the trainable-parameter traversal order. AdamW state would silently re-attach to the wrong tensors. Pin `peft` and `torch` versions across save and load, or restart training from scratch.
+
+### `episode/kl_loss` is small but always non-negative
+Expected. The KL penalty uses Schulman's k3 unbiased estimator (`E[exp(ref-current) - (ref-current) - 1]`), which is non-negative pointwise (zero exactly when current ≡ ref). If kl_loss climbs above ~0.5–1.0, the policy is drifting from ref faster than `kl_coef` can brake — either bump `kl_coef` (0.005 → 0.01) or lower `learning_rate`.
 
 ### Verifying fast-forward branching
 ```bash

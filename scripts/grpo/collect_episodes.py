@@ -501,6 +501,25 @@ class EpisodeCollector:
         for i in range(1, group_size):
             self._restore_sim_state(env_idx=i, sim_state=sim_state)
 
+        # Phase 4b: Reset robot controllers across ALL G envs.
+        # ``set_state_from_flattened`` restores MuJoCo qpos/qvel/act, but the
+        # OperationalSpaceController's Python-side state (goal_pos, goal_ori,
+        # any integrator accumulators) is NOT in the flattened MjSimState. After
+        # restore, envs 1..G-1 carry whatever controller goals they had at the
+        # last reset (likely the seed-zero pose), while env 0 carries the goals
+        # accumulated over fast_forward_steps of FF policy actions. Without a
+        # reset, the first post-branch action delta would be applied to an OSC
+        # target that doesn't match the actual EEF pose → motion immediately
+        # diverges from env 0 even though the sim states are bit-identical.
+        # We reset env 0 too so all G envs start the post-branch phase with
+        # controllers re-primed to the (now identical) current EEF pose; the
+        # alternative — copying env 0's controller state into envs 1..G-1 —
+        # would require touching robosuite-version-specific controller internals.
+        # Resetting is semantically equivalent for FF correctness because the
+        # very next action is a delta from the current pose.
+        for i in range(group_size):
+            self._reset_robot_controllers(env_idx=i)
+
         # Phase 5: Sync each restored env's MultiStepWrapper internal state
         for i in range(1, group_size):
             restored_obs = self._read_obs_after_restore(env_idx=i)
@@ -613,6 +632,33 @@ class EpisodeCollector:
             robosuite_env.update_state()
         elif hasattr(robosuite_env, "update_sites"):
             robosuite_env.update_sites()
+
+    def _reset_robot_controllers(self, env_idx: int) -> None:
+        """Reset each robot's controller after a sim state restore.
+
+        ``set_state_from_flattened`` only restores MuJoCo's MjSimState (qpos,
+        qvel, act, time, udd_state). It does NOT restore the OperationalSpaceController's
+        Python-side fields (goal_pos, goal_ori, any integrator accumulators).
+        Without resetting, the controller targets the *previous* goal_pos
+        while the robot's actual EEF is now at the post-restore pose →
+        the next action delta is added to a stale target → motion diverges.
+
+        We probe the modern (composite_controller) and legacy (controller)
+        attribute paths so this works across robosuite versions. Both expose
+        ``reset()`` which re-syncs the controller's internal goals to the
+        current robot state.
+        """
+        wrapper = self.envs.envs[env_idx]
+        robosuite_env = wrapper.unwrapped.env
+        robots = getattr(robosuite_env, "robots", None)
+        if not robots:
+            return
+        for robot in robots:
+            ctrl = getattr(robot, "composite_controller", None)
+            if ctrl is None:
+                ctrl = getattr(robot, "controller", None)
+            if ctrl is not None and hasattr(ctrl, "reset"):
+                ctrl.reset()
 
     def _read_obs_after_restore(self, env_idx: int) -> dict:
         """Read a fresh observation from a sub-env after state restoration."""

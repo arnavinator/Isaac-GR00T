@@ -619,6 +619,7 @@ class EpisodeCollector:
         ~0).
         """
         from collections import deque as _deque
+        from copy import deepcopy as _deepcopy
 
         # Phase 1: env 0 is the reference. Reset it normally; whatever
         # scene RoboCasa picked at construction time is now the target.
@@ -633,6 +634,12 @@ class EpisodeCollector:
         env0_ep_meta = robosuite_env_0.get_ep_meta()
         env0_model_xml = robosuite_env_0.sim.model.get_xml()
         env0_sim_state = np.array(robosuite_env_0.sim.get_state().flatten())
+        # Camera randomization isn't part of MjSimState OR auto-restored from
+        # ep_meta — robocasa stores cam_configs in ep_meta (tabletop.py:1133)
+        # but only reads layout_id/style_id back during _load_model. We must
+        # copy _cam_configs by hand or env i's own random cameras will leak
+        # back in via edit_model_xml's camera-overwrite loop (see below).
+        env0_cam_configs = getattr(robosuite_env_0, "_cam_configs", None)
 
         observations_per_env: list[dict] = [obs_0]
 
@@ -657,6 +664,22 @@ class EpisodeCollector:
             # this hard reset is required because reset_from_xml_string
             # below is only a "soft" reset that doesn't reload the model.
             wrapper.reset(seed=group_seed)
+
+            # 3b'. Sync env i's _cam_configs to env 0's. Critical: tabletop
+            # edit_model_xml() (tabletop.py:1273-1306) loops over
+            # self._cam_configs and OVERWRITES every <camera pos="..."
+            # quat="..."> element in the input XML with these values.
+            # After 3b, env i's _cam_configs holds env i's own random
+            # camera offsets (rng-state mismatch: env 0 consumed RNG for
+            # layout/style picks, env i skipped them via pinned ep_meta,
+            # so the random.normal() draws in _randomize_cameras land
+            # differently). Without this assignment, edit_model_xml below
+            # would silently strip env 0's cameras out of env0_model_xml
+            # and substitute env i's — that's why all the envs 1..G-1
+            # ended up matching each other (same RNG offset) but not env
+            # 0 in the previous attempt at this fix.
+            if env0_cam_configs is not None and hasattr(robosuite_env, "_cam_configs"):
+                robosuite_env._cam_configs = _deepcopy(env0_cam_configs)
 
             # 3c. Rebuild the model from env 0's exact XML so that
             # cameras, textures, and kitchen geometry match bit-for-bit.

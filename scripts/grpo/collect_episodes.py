@@ -1,179 +1,282 @@
 """Episode collector for GRPO training.
 
 This script runs in the ROBOCASA VENV (separate from the main .venv) and:
-1. Connects to the GR00T model server via ZMQ (PolicyClient)
-2. Collects episodes in groups (same seed within a group, different across groups)
-3. Records observations, actions, initial noise tensors, and raw model outputs
-4. Saves episodes as .npz files for the training loop to consume
+1. Connects to the GR00T model server via ZMQ (PolicyClient).
+2. Collects episodes in groups (same seed within a group).
+3. Records observations, actions, initial noise tensors, and raw model outputs.
+4. Saves episodes as .npz files for the training loop to consume.
 
-Architecture context:
-- The MODEL runs on GPU in Terminal 1 (main .venv, grpo_server.py)
-- THIS SCRIPT runs on CPU in Terminal 2 (robocasa venv, collect_episodes.py)
-- Communication via ZMQ (same machine, ~0.1ms latency per call)
+Architecture:
+- The MODEL runs on GPU in Terminal 1 (main .venv, grpo_server.py).
+- THIS SCRIPT runs on CPU in Terminal 2 (robocasa venv, collect_episodes.py).
+- Communication via ZMQ (same machine, ~0.1ms latency per call).
 
-Group structure (mirrors grpo_cont.py):
-- Each group = group_size rollouts from the SAME initial state (same env seed)
-- Different outcomes arise from policy noise (denoising randomness), NOT env randomness
-- GRPO advantages compare rollouts WITHIN a group
+Group structure:
+- Each group = group_size rollouts from the SAME initial state (seed).
+- Within-group diversity comes from policy denoising noise, NOT env randomness.
+- GRPO advantages compare rollouts WITHIN a group.
+
+Vector env strategy (matches scripts/denoising_lab/eval/robocasa_eval_benchmark.py):
+- group_size > 1 → AsyncVectorEnv (subprocess workers, parallel sim across cores).
+- group_size == 1 → SyncVectorEnv (no IPC overhead).
+
+Cross-env scene replication:
+- RoboCasa picks layout/cameras/textures at env construction time using a
+  per-instance RNG; those choices live in the model XML, NOT MjSimState. So
+  parallel envs in the same group render different scenes even with identical
+  seeds. We fix this with composite RPC methods on GroupAlignmentWrapper
+  (get_scene_bundle / apply_scene_bundle), invoked across subprocess workers
+  via env.call(). Recipe mirrors robocasa's playback_dataset.py:227-258 and
+  the in-tree scripts/denoising_lab/eval/branching_rollout.py:399-427.
 
 Usage:
-    # From robocasa venv (with server already running):
     python scripts/grpo/collect_episodes.py \\
         --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \\
         --group-size 5 --num-groups 12 \\
         --output-dir /tmp/grpo_episodes/iter_001 \\
-        --server-host 127.0.0.1 \\
-        --server-port 5555
+        --server-host 127.0.0.1 --server-port 5555
 """
 
 import argparse
 import time
+from collections import defaultdict, deque
+from functools import partial
 from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 
-# These imports are available in the robocasa venv
+from gr00t.eval.rollout_policy import get_gym_env
+from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
 from gr00t.policy.server_client import PolicyClient
 
-# Dense reward extraction (also in robocasa venv)
-from dense_reward import classify_task_type, compute_dense_progress, compute_shaped_reward
+# Local module: dense reward extraction (lives next to this script).
+import dense_reward
+
+
+# ---------------------------------------------------------------------------
+# Wrapper exposing composite scene-bundle methods over env.call()
+# ---------------------------------------------------------------------------
+
+
+class GroupAlignmentWrapper(MultiStepWrapper):
+    """MultiStepWrapper extension with composite scene-bundle RPCs.
+
+    EpisodeCollector calls these via AsyncVectorEnv.call() to align all G
+    parallel envs in a group to env 0's exact scene + dynamic state. Without
+    this, RoboCasa's per-instance construction-time random choices (kitchen
+    layout, camera noise, procedural textures) cause parallel envs to render
+    different scenes even when seeded identically — those choices live in the
+    model XML, not MjSimState.
+
+    Recipe (mirrors robocasa's playback_dataset.py:227-258 and the in-tree
+    scripts/denoising_lab/eval/branching_rollout.py:399-427):
+        set_ep_meta → reset → reset_from_xml_string → set_state_from_flattened.
+
+    Also exposes get_sim_state_flat (debug verification) and
+    compute_dense_progress (used when success_weight < 1.0). Both must cross
+    the IPC boundary in async mode, so the parent process can't reach into
+    wrapper.unwrapped.env directly.
+    """
+
+    def get_scene_bundle(self) -> dict:
+        """Snapshot the underlying env's scene + dynamic state."""
+        robosuite_env = self.env.unwrapped.env
+        return {
+            "ep_meta": robosuite_env.get_ep_meta(),
+            "model_xml": robosuite_env.sim.model.get_xml(),
+            "sim_state": np.array(robosuite_env.sim.get_state().flatten()),
+        }
+
+    def apply_scene_bundle(self, bundle: dict) -> dict:
+        """Adopt a reference env's scene + dynamic state.
+
+        Returns the post-restore wrapper-stacked observation. Refreshes the
+        wrapper's internal state to match MultiStepWrapper.reset() so
+        subsequent step()s start from a clean slate.
+        """
+        base_env = self.env.unwrapped
+        robosuite_env = base_env.env
+
+        # 1. Pin metadata (newer set_ep_meta / older set_attrs_from_ep_meta).
+        if hasattr(robosuite_env, "set_attrs_from_ep_meta"):
+            robosuite_env.set_attrs_from_ep_meta(bundle["ep_meta"])
+        elif hasattr(robosuite_env, "set_ep_meta"):
+            robosuite_env.set_ep_meta(bundle["ep_meta"])
+
+        # 2. Hard reset (required before reset_from_xml_string per
+        # playback_dataset.py:239-241 — that "soft" call doesn't reload model).
+        self.env.reset()
+
+        # 3. Rebuild model from reference XML.
+        xml = robosuite_env.edit_model_xml(bundle["model_xml"])
+        robosuite_env.reset_from_xml_string(xml)
+        robosuite_env.sim.reset()
+
+        # 4. Apply reference dynamic state (qpos/qvel/act/time).
+        robosuite_env.sim.set_state_from_flattened(bundle["sim_state"])
+        robosuite_env.sim.forward()
+        if hasattr(robosuite_env, "update_state"):
+            robosuite_env.update_state()
+        elif hasattr(robosuite_env, "update_sites"):
+            robosuite_env.update_sites()
+
+        # 4b. Re-apply realistic Panda gripper params. reset_from_xml_string
+        # in step 3 builds a fresh MjModel from XML, which has the default
+        # robosuite gripper params (forcerange=20N, kp=1000). The realistic
+        # patch (70N, kp=5000) lives in patch_panda_gripper_realism — applied
+        # to the live MjModel inside RoboCasaEnv.reset() but lost during the
+        # XML reload. No-op for non-Panda robots since the patch only touches
+        # actuators whose name contains "gripper_finger_joint".
+        try:
+            from robocasa.utils.gym_utils.gymnasium_basic import (
+                patch_panda_gripper_realism,
+            )
+            patch_panda_gripper_realism(robosuite_env)
+        except ImportError:
+            pass
+
+        # 5. Read fresh obs through the standard pipeline. force_update=True
+        # is load-bearing: set_state_from_flattened changes MuJoCo physics
+        # but doesn't refresh robosuite's observable cache. Without force,
+        # _get_observations() returns the XML-loaded observation (step 3
+        # state), not the post-restore observation (step 4 state).
+        raw_obs = robosuite_env._get_observations(force_update=True)
+        basic_obs = base_env.get_basic_observation(raw_obs)
+        groot_obs = base_env.get_groot_observation(basic_obs)
+
+        # 6. Refresh wrapper state (mirrors MultiStepWrapper.reset()).
+        self.obs = deque(
+            [groot_obs] * (self.max_steps_needed + 1),
+            maxlen=self.max_steps_needed + 1,
+        )
+        self.reward = list()
+        self.done = list()
+        self.info = defaultdict(lambda: deque(maxlen=self.n_action_steps + 1))
+
+        return self._get_obs(self.video_delta_indices, self.state_delta_indices)
+
+    def get_sim_state_flat(self) -> np.ndarray:
+        """Read MuJoCo sim state as a flat array (used by debug verify)."""
+        return np.array(self.env.unwrapped.env.sim.get_state().flatten())
+
+    def compute_dense_progress(self, task_type: str) -> float:
+        """Continuous task progress in [0, 1] (used when success_weight < 1.0).
+
+        Wrapped here because in async mode we can't reach into the underlying
+        robosuite env from the parent process — this method runs in the
+        subprocess worker via env.call().
+        """
+        return dense_reward.compute_dense_progress(self, task_type)
+
+
+# ---------------------------------------------------------------------------
+# Env factory (used by AsyncVectorEnv subprocess workers)
+# ---------------------------------------------------------------------------
+
+
+def _make_collector_env(
+    env_name: str,
+    env_idx: int,
+    total_n_envs: int,
+    n_action_steps: int,
+    max_episode_steps: int,
+):
+    """Build one wrapped env. Defined at module level so spawn workers can
+    import it for unpickling.
+
+    Mirrors gr00t.eval.rollout_policy.create_eval_env's structure but uses
+    GroupAlignmentWrapper instead of plain MultiStepWrapper, which exposes
+    the composite RPCs that EpisodeCollector needs.
+    """
+    env = get_gym_env(env_name, env_idx, total_n_envs)
+    return GroupAlignmentWrapper(
+        env,
+        video_delta_indices=np.array([0]),
+        state_delta_indices=np.array([0]),
+        n_action_steps=n_action_steps,
+        max_episode_steps=max_episode_steps,
+        terminate_on_success=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Collect episodes in groups for GRPO training via PolicyClient + SyncVectorEnv"
+        description="Collect episodes in groups for GRPO training via PolicyClient + AsyncVectorEnv"
     )
     parser.add_argument(
         "--env-name", type=str, required=True,
-        help="Full env name (e.g., robocasa_panda_omron/OpenDrawer_PandaOmron_Env)"
+        help="Full env name (e.g., robocasa_panda_omron/OpenDrawer_PandaOmron_Env)",
     )
     parser.add_argument(
         "--group-size", type=int, default=5,
-        help="Number of rollouts per group (G). All share the same env seed. Also the number of parallel envs."
+        help="Rollouts per group (G). All share the same env seed; also the number of parallel envs.",
     )
     parser.add_argument(
         "--num-groups", type=int, default=12,
-        help="Number of groups (different initial states) per iteration."
+        help="Number of groups (different initial states) per iteration.",
     )
     parser.add_argument(
         "--max-episode-steps", type=int, default=720,
-        help="Maximum steps per episode before truncation"
+        help="Maximum steps per episode before truncation.",
     )
     parser.add_argument(
         "--n-action-steps", type=int, default=8,
-        help="Number of steps to execute from each action chunk"
+        help="Number of steps to execute from each action chunk.",
     )
     parser.add_argument(
-        "--server-host", type=str, default="127.0.0.1",
-        help="GR00T model server hostname"
+        "--server-host", type=str, default="127.0.0.1", help="GR00T model server hostname.",
     )
     parser.add_argument(
-        "--server-port", type=int, default=5555,
-        help="GR00T model server port"
+        "--server-port", type=int, default=5555, help="GR00T model server port.",
     )
     parser.add_argument(
-        "--output-dir", type=str, required=True,
-        help="Directory to save episode .npz files"
+        "--output-dir", type=str, required=True, help="Directory to save episode .npz files.",
     )
     parser.add_argument(
         "--success-weight", type=float, default=1.0,
-        help="Weight for binary success in shaped reward (1.0 = pure binary + time-scaled)"
+        help="Weight for binary success in shaped reward (1.0 = pure binary + time-scaled).",
     )
     parser.add_argument(
         "--fast-forward-steps", type=int, default=0,
-        help="Outer steps to fast-forward before branching (0=disabled)"
+        help="Outer steps to fast-forward before branching (0=disabled).",
     )
     parser.add_argument(
         "--fast-forward-pct", type=float, default=0.5,
-        help="Fraction of groups that use fast-forward (0.0-1.0)"
+        help="Fraction of groups that use fast-forward (0.0-1.0).",
     )
     parser.add_argument(
         "--debug-fast-forward", action="store_true",
-        help="Save verification images after each branch point to --output-dir/debug_ff/"
+        help="Save verification images after each branch point to --output-dir/debug_ff/.",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for environment initialization"
+        "--seed", type=int, default=42, help="Random seed for environment initialization.",
     )
     return parser.parse_args()
 
 
-def make_env(
-    env_name: str,
-    max_episode_steps: int,
-    n_action_steps: int,
-    video_delta_indices: np.ndarray | None = None,
-    state_delta_indices: np.ndarray | None = None,
-):
-    """Create a gymnasium environment factory for SyncVectorEnv.
-
-    This mirrors grpo_cont.py's make_env() (lines 178-198) but for RoboCasa.
-    The env is wrapped with MultiStepWrapper for action chunking.
-
-    Args:
-        env_name: Full environment name for gym.make().
-        max_episode_steps: Episode truncation length.
-        n_action_steps: Steps to execute per action chunk.
-        video_delta_indices: Temporal stacking indices for video observations.
-            Defaults to np.array([0]) (single current frame, matches PandaOmron).
-        state_delta_indices: Temporal stacking indices for state observations.
-            Defaults to np.array([0]).
-
-    Returns:
-        Callable that creates the environment.
-    """
-    if video_delta_indices is None:
-        video_delta_indices = np.array([0])
-    if state_delta_indices is None:
-        state_delta_indices = np.array([0])
-
-    def _make():
-        # Trigger robocasa's gymnasium env registration. The for-loop at the
-        # bottom of robocasa/utils/gym_utils/gymnasium_groot.py calls
-        # gym.register() for every (env, robot) pair (e.g.,
-        # robocasa_panda_omron/OpenDrawer_PandaOmron_Env). Without these
-        # imports, gym.make() raises NamespaceNotFound. Imports are inside
-        # the factory to mirror the working pattern in
-        # gr00t/eval/rollout_policy.py:82-90 (also works under AsyncVectorEnv,
-        # where each subprocess has its own import state).
-        import os
-        import robocasa  # noqa: F401
-        from robocasa.utils.gym_utils import GrootRoboCasaEnv  # noqa: F401
-        import robosuite  # noqa: F401
-
-        # Headless MuJoCo rendering on Linux GPU hosts. egl is the standard
-        # backend when there's no X display; matches rollout_policy.py.
-        os.environ.setdefault("MUJOCO_GL", "egl")
-
-        env = gym.make(env_name)
-
-        # Apply MultiStepWrapper for action chunking
-        # This executes n_action_steps from each predicted chunk
-        from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
-        env = MultiStepWrapper(
-            env,
-            video_delta_indices=video_delta_indices,
-            state_delta_indices=state_delta_indices,
-            n_action_steps=n_action_steps,
-            max_episode_steps=max_episode_steps,
-            terminate_on_success=True,
-        )
-        return env
-
-    return _make
+# ---------------------------------------------------------------------------
+# EpisodeCollector
+# ---------------------------------------------------------------------------
 
 
 class EpisodeCollector:
-    """Collects episodes using PolicyClient + parallel envs.
+    """Collects episodes using PolicyClient + AsyncVectorEnv (or Sync for G=1).
 
     Each episode records:
-    - Per-chunk: observation frames, states, actions, initial noise, raw model output
-    - Episode-level: success, max progress, total steps
+    - Per-chunk: observation frames, states, decoded actions, raw model output,
+      action mask, and the initial denoising noise tensor.
+    - Episode-level: success, max progress, total substeps.
 
-    The initial noise tensor is captured from the GRPO server (grpo_server.py) via
-    a hook on torch.randn. It's the ε₀ that was denoised into the action — used during
-    training to evaluate the FM log-prob along the actual denoising path.
+    The initial noise tensor is captured by the GRPO server (grpo_server.py)
+    via a hook on torch.randn. It's the ε₀ that was denoised into the action —
+    used during training to evaluate the FM log-prob along the actual
+    denoising path.
     """
 
     def __init__(
@@ -191,84 +294,83 @@ class EpisodeCollector:
         self.env_name = env_name
         self.group_size = group_size
         self.n_action_steps = n_action_steps
-        self.task_type = classify_task_type(env_name)
+        self.task_type = dense_reward.classify_task_type(env_name)
         self.seed = seed
         self.debug_fast_forward = debug_fast_forward
         self.output_dir = Path(output_dir)
 
-        # Create group_size parallel environments (one per rollout in a group)
-        # All will be reset with the same seed per group
         env_fns = [
-            make_env(env_name, max_episode_steps, n_action_steps)
-            for _ in range(group_size)
+            partial(
+                _make_collector_env,
+                env_name=env_name,
+                env_idx=i,
+                total_n_envs=group_size,
+                n_action_steps=n_action_steps,
+                max_episode_steps=max_episode_steps,
+            )
+            for i in range(group_size)
         ]
-        self.envs = gym.vector.SyncVectorEnv(env_fns)
 
-        # Connect to model server
+        # AsyncVectorEnv (subprocess workers, parallel MuJoCo) when G > 1;
+        # SyncVectorEnv when G == 1 (no IPC overhead). Pattern matches
+        # scripts/denoising_lab/eval/robocasa_eval_benchmark.py:336-343.
+        if group_size > 1:
+            self.envs = gym.vector.AsyncVectorEnv(
+                env_fns, shared_memory=False, context="spawn",
+            )
+            self._uses_async = True
+        else:
+            self.envs = gym.vector.SyncVectorEnv(env_fns)
+            self._uses_async = False
+
         self.policy_client = PolicyClient(host=server_host, port=server_port)
 
         print(f"Collector initialized:")
         print(f"  Env: {env_name} (task_type: {self.task_type})")
         print(f"  Group size (parallel envs): {group_size}")
+        print(f"  Vector env: {'AsyncVectorEnv' if self._uses_async else 'SyncVectorEnv'}")
         print(f"  Server: {server_host}:{server_port}")
+
+    # ─── Outer driver ─────────────────────────────────────────────────────
 
     def collect(
         self,
-        group_size: int,
         num_groups: int,
         base_seed: int,
         success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
     ) -> list[dict]:
-        """Collect episodes organized in groups for GRPO.
+        """Collect num_groups groups of self.group_size rollouts each.
 
-        Each group consists of `group_size` rollouts from the SAME initial state
-        (same env reset seed). Different groups have different seeds.
-        This mirrors grpo_cont.py's structure where each group shares a seed:
-            envs_list.append(make_env(..., seed=args.seed + ng, ...))
-
-        Within a group, different outcomes arise from the policy's denoising noise
-        (torch.randn in the action head), NOT from environmental randomness.
+        Each group consists of group_size rollouts from the SAME initial state
+        (same env reset seed). Different groups have different seeds. Within a
+        group, different outcomes arise from the policy's denoising noise
+        (torch.randn in the action head), NOT from environmental randomness;
         GRPO advantages compare these outcomes against each other.
 
-        When fast-forward is enabled for a group, one env runs solo for
-        fast_forward_steps outer steps, then all envs branch from that
-        intermediate state. This focuses gradient signal on the critical
-        manipulation phase rather than the approach trajectory.
-
-        Args:
-            group_size: Number of rollouts per group (G = "answers per question").
-            num_groups: Number of groups ("questions") to collect.
-            base_seed: Starting seed for group generation.
-            success_weight: Weight for binary success in shaped reward.
-            fast_forward_steps: Outer steps to skip before branching (0=disabled).
-            fast_forward_pct: Fraction of groups that use fast-forward.
-
-        Returns:
-            List of episode dicts ready for saving as .npz.
+        When fast-forward is enabled for a group, all envs are first stepped
+        in lockstep with env 0's action chunk for fast_forward_steps outer
+        steps, then continue independently. This focuses gradient signal on
+        the critical manipulation phase rather than the approach trajectory.
         """
-        all_episodes = []
+        all_episodes: list[dict] = []
         start_time = time.time()
-        total_episodes = group_size * num_groups
+        total_episodes = self.group_size * num_groups
         rng = np.random.default_rng(base_seed)
 
         ff_enabled = fast_forward_steps > 0 and fast_forward_pct > 0
-        print(f"\nCollecting {num_groups} groups × {group_size} rollouts = {total_episodes} episodes...")
+        print(f"\nCollecting {num_groups} groups × {self.group_size} rollouts = {total_episodes} episodes...")
         if ff_enabled:
             print(f"  Fast-forward: {fast_forward_steps} steps, {fast_forward_pct:.0%} of groups")
 
         for group_idx in range(num_groups):
-            # All rollouts in this group start from the SAME initial state
             group_seed = base_seed + group_idx
-
-            # Decide whether this group uses fast-forward
             use_ff = ff_enabled and rng.random() < fast_forward_pct
 
             if use_ff:
                 group_episodes = self._collect_one_group_with_fast_forward(
                     group_seed=group_seed,
-                    group_size=group_size,
                     group_id=group_idx,
                     fast_forward_steps=fast_forward_steps,
                     success_weight=success_weight,
@@ -277,7 +379,6 @@ class EpisodeCollector:
             else:
                 group_episodes = self._collect_one_group(
                     group_seed=group_seed,
-                    group_size=group_size,
                     group_id=group_idx,
                     success_weight=success_weight,
                 )
@@ -285,14 +386,13 @@ class EpisodeCollector:
 
             all_episodes.extend(group_episodes)
 
-            # Progress reporting
             n_done = len(all_episodes)
             elapsed = time.time() - start_time
             rate = n_done / elapsed * 60 if elapsed > 0 else 0
             group_successes = sum(e["success"] for e in group_episodes)
             print(
                 f"  Group {group_idx+1}/{num_groups} (seed={group_seed}) {ff_label}: "
-                f"{group_successes}/{group_size} success | "
+                f"{group_successes}/{self.group_size} success | "
                 f"total: {n_done}/{total_episodes} ({rate:.0f} eps/min)"
             )
 
@@ -312,285 +412,217 @@ class EpisodeCollector:
 
         return all_episodes
 
+    # ─── Per-group entry points ───────────────────────────────────────────
+
     def _collect_one_group(
         self,
         group_seed: int,
-        group_size: int,
         group_id: int,
         success_weight: float,
     ) -> list[dict]:
-        """Collect one group: group_size rollouts from the same initial state.
-
-        All environments are reset with the SAME seed, producing identical
-        initial configurations. The policy's denoising noise causes different
-        trajectories and outcomes.
-
-        Per-env stepping (NOT SyncVectorEnv batched step) is used for two
-        correctness reasons:
-
-          1. SyncVectorEnv autoreset: when one env in the group terminates
-             before another, gymnasium's NEXT_STEP / SAME_STEP autoreset
-             modes produce mismatched-shape per-env info dicts (multi-substep
-             arrays from active envs vs. length-1 from just-reset envs),
-             which silently corrupts subsequent batching of info["success"].
-          2. Skipping done envs: with per-env stepping we can simply omit
-             done envs from each iteration's batch — no autoreset, no stale
-             obs from a freshly-reset terminal env getting fed back to the
-             policy.
-
-        We still build a single batched observation for the server call
-        (containing only the active envs) so denoising amortizes across
-        the parallel rollouts.
-        """
-        # Reset each env individually with the SAME seed → identical initial
-        # state. We bypass self.envs.reset(seed=...) to avoid any vectorized
-        # info-batching, but the per-env reset behavior is unchanged.
-        observations_per_env: list[dict] = []
-        for env in self.envs.envs:
-            obs, _ = env.reset(seed=group_seed)
-            observations_per_env.append(obs)
-
-        episodes_in_progress = [
-            self._new_episode(group_id, group_seed) for _ in range(group_size)
-        ]
-        done_flags = [False] * group_size
-
-        while not all(done_flags):
-            # Build a batched observation for the server from ACTIVE envs only.
-            # `j` indexes into the batch (0..len(active_indices)-1); `env_idx`
-            # is the original env's slot in [0, group_size).
-            active_indices = [i for i, d in enumerate(done_flags) if not d]
-            active_obs = [observations_per_env[i] for i in active_indices]
-            batched_obs = self._batch_per_env_obs(active_obs)
-
-            actions, initial_noise, raw_actions, action_masks_batch = (
-                self._get_actions_from_server(batched_obs)
-            )
-
-            # Process each active env: record its observation/action, step it
-            # individually, and harvest results.
-            for j, env_idx in enumerate(active_indices):
-                ep = episodes_in_progress[env_idx]
-                obs = observations_per_env[env_idx]
-                action_j = self._extract_per_env(actions, j)
-
-                # --- Record observation, action chunk, and capture data ---
-                ep["video_frames"].append(self._extract_video_single(obs))
-                ep["states"].append(self._extract_state_single(obs))
-                ep["actions"].append(action_j)
-                if (raw_actions is not None and hasattr(raw_actions, '__getitem__')
-                        and len(raw_actions) > j):
-                    ep["raw_actions"].append(raw_actions[j])
-                else:
-                    ep["raw_actions"].append(None)
-                if (action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__')
-                        and len(action_masks_batch) > j):
-                    ep["action_masks"].append(action_masks_batch[j])
-                else:
-                    ep["action_masks"].append(None)
-                if (initial_noise is not None and hasattr(initial_noise, '__getitem__')
-                        and len(initial_noise) > j):
-                    ep["initial_noises"].append(initial_noise[j])
-                else:
-                    ep["initial_noises"].append(None)
-                if ep["language"] is None:
-                    ep["language"] = self._extract_language_single(obs)
-
-                # --- Step this env individually ---
-                env = self.envs.envs[env_idx]
-                next_obs, reward, terminated, truncated, info = env.step(action_j)
-                observations_per_env[env_idx] = next_obs
-
-                # H3 fix: count ACTUAL substeps run, not n_action_steps.
-                # MultiStepWrapper.step early-breaks on termination, so a
-                # chunk may have run fewer substeps than n_action_steps.
-                # info["dones"] is the per-substep done array (length = actual
-                # substeps); using its length avoids over-counting fast
-                # successes, which previously biased time-scaled rewards low.
-                if "dones" in info and hasattr(info["dones"], "__len__"):
-                    substeps_run = len(info["dones"])
-                else:
-                    substeps_run = self.n_action_steps  # fallback
-                ep["num_steps"] += substeps_run
-
-                # Dense progress (only when it actually contributes to reward)
-                if success_weight < 1.0:
-                    progress = compute_dense_progress(env, self.task_type)
-                    ep["max_progress"] = max(ep["max_progress"], progress)
-
-                # Termination handling
-                if terminated or truncated:
-                    done_flags[env_idx] = True
-                    success = self._reduce_success(info)
-                    ep["success"] = success
-                    ep["shaped_reward"] = compute_shaped_reward(
-                        success, ep["max_progress"], success_weight
-                    )
-
-        return episodes_in_progress
+        """Collect one group with all envs at the seed-aligned starting state."""
+        observations = self._align_envs_to_group_scene(group_seed)
+        return self._run_per_env_loop(
+            observations, group_id, group_seed, success_weight
+        )
 
     def _collect_one_group_with_fast_forward(
         self,
         group_seed: int,
-        group_size: int,
         group_id: int,
         fast_forward_steps: int,
         success_weight: float,
     ) -> list[dict]:
-        """Collect one group with lockstep fast-forward.
+        """Collect one group with a lockstep fast-forward prefix.
 
-        Focuses GRPO signal on the critical manipulation phase by skipping
-        the early approach trajectory.
+        All G envs are first aligned (same scene + dynamic state), then
+        stepped in lockstep with env 0's action chunk for fast_forward_steps
+        outer steps. After the prefix, envs continue independently and
+        within-group diversity arises from the policy's denoising noise on
+        each post-branch chunk.
 
-        Phases:
-          1. Reset all envs with the same seed → identical initial states.
-          2. Lockstep fast-forward: query the server once per outer step
-             (using env 0's obs — all G envs are in the same state) and
-             apply the resulting chunk to every env. MuJoCo determinism
-             keeps them bit-identical throughout the FF prefix.
-          3. Continue all envs independently until done (per-env stepping).
-             Within-group diversity then arises from the policy's denoising
-             noise on each post-branch action chunk.
+        Falls back to _collect_one_group if any env terminates during FF.
 
-        If any env terminates during fast-forward (task solved early or
-        error), falls back to normal collection from the seed.
-
-        Determinism: this relies on RoboCasa's MuJoCo step being
-        deterministic given identical (state, action). If per-step
-        randomization is ever introduced upstream, the lockstep envs
-        could diverge silently — use --debug-fast-forward to numerically
-        verify sim states stay bit-identical across the group.
+        We deliberately do NOT count the FF prefix in episodes[i].num_steps:
+        time-scaled rewards within a group should compare post-branch effort
+        fairly. Mixing FF and non-FF groups (fast_forward_pct < 1.0) means
+        cross-group comparisons (e.g., logged mean_reward) will favor branched
+        groups numerically — a known artifact of FF; group-relative advantages
+        are unaffected since they normalize WITHIN each group.
         """
-        # Phase 1: Reset all envs with the same seed
-        observations_per_env: list[dict] = []
-        for env in self.envs.envs:
-            obs, _ = env.reset(seed=group_seed)
-            observations_per_env.append(obs)
+        observations = self._align_envs_to_group_scene(group_seed)
 
-        # Phase 2: Lockstep fast-forward.
-        #
-        # We send env 0's observation to the server (any env's would be
-        # identical) and apply the returned chunk to every env. We use
-        # per-env stepping rather than SyncVectorEnv's batched .step() to
-        # stay consistent with _collect_one_group and to avoid the
-        # autoreset-cascade hazard if any env terminates.
         for step in range(fast_forward_steps):
-            batched_obs = self._batch_per_env_obs([observations_per_env[0]])
-            actions, _, _, _ = self._get_actions_from_server(batched_obs)
-            action = self._extract_per_env(actions, 0)
-
-            any_done = False
-            for i in range(group_size):
-                next_obs, _, terminated, truncated, _ = self.envs.envs[i].step(action)
-                observations_per_env[i] = next_obs
-                if terminated or truncated:
-                    any_done = True
-
-            if any_done:
+            new_obs = self._lockstep_step(observations)
+            if new_obs is None:
                 print(
                     f"    Env terminated at step {step} during fast-forward, "
                     "falling back to normal collection"
                 )
                 return self._collect_one_group(
-                    group_seed, group_size, group_id, success_weight
+                    group_seed, group_id, success_weight
                 )
+            observations = new_obs
 
-        # Debug: verify all envs really are at the same state after the
-        # lockstep prefix. With deterministic MuJoCo this is a regression
-        # check rather than a correctness concern.
         if self.debug_fast_forward:
             self._verify_branch_point(
-                group_id, group_seed, fast_forward_steps, observations_per_env
+                group_id, group_seed, fast_forward_steps, observations
             )
 
-        # Phase 3: Continue all envs independently — same per-env loop as
-        # _collect_one_group. We deliberately do NOT count the FF prefix
-        # in episodes_in_progress[i].num_steps: time-scaled rewards within
-        # a group should compare post-branch effort fairly across the
-        # rollouts in that group, so the FF prefix is excluded for all of
-        # them. Mixing FF and non-FF groups via fast_forward_pct < 1.0
-        # means cross-group comparisons (e.g., logged mean_reward) will
-        # favor branched groups numerically — this is a known artifact of
-        # FF; group-relative advantages are unaffected since they
-        # normalize WITHIN each group.
-        episodes_in_progress = [
-            self._new_episode(group_id, group_seed) for _ in range(group_size)
+        return self._run_per_env_loop(
+            observations, group_id, group_seed, success_weight
+        )
+
+    # ─── Vector env primitives ────────────────────────────────────────────
+
+    def _align_envs_to_group_scene(self, group_seed: int) -> list[dict]:
+        """Reset all G envs to env 0's scene + dynamic state.
+
+        Each subprocess env runs in its own MuJoCo instance with its own
+        construction-time random scene. We can't change those choices from
+        the parent process, so we use AsyncVectorEnv.call() to invoke the
+        composite RPCs on GroupAlignmentWrapper inside each worker:
+          1. Reset all envs with seed=group_seed (each ends up with its own
+             scene because the RNG choices were baked at construction).
+          2. get_scene_bundle on all envs (capture env 0's bundle).
+          3. apply_scene_bundle(env0_bundle) on all envs — envs 1..G-1 align
+             to env 0; env 0 re-applies its own (a no-op effect, but it runs
+             in parallel with the other workers so no wall-time cost).
+
+        Returns wrapper-stacked observations, one per env. Bit-identical
+        across the group when this returns (verifiable via
+        --debug-fast-forward).
+        """
+        seeds = [group_seed] * self.group_size
+        vector_obs, _ = self.envs.reset(seed=seeds)
+
+        if self.group_size == 1:
+            # Nothing to align to — just return the lone env's obs.
+            return self._unbatch_vector_obs(vector_obs)
+
+        bundles = self.envs.call("get_scene_bundle")
+        obs_tuple = self.envs.call("apply_scene_bundle", bundles[0])
+        return list(obs_tuple)
+
+    def _lockstep_step(
+        self, observations_per_env: list[dict]
+    ) -> list[dict] | None:
+        """One outer step where every env steps with env 0's action chunk.
+
+        Returns the new per-env observations, or None if any env terminated
+        (signaling _collect_one_group_with_fast_forward to fall back).
+        """
+        # All G envs are bit-identical post-alignment, so env 0's obs alone
+        # is enough for the server query.
+        batched = self._batch_per_env_obs([observations_per_env[0]])
+        actions, _, _, _ = self._get_actions_from_server(batched)
+        actions_full = self._broadcast_actions(actions, self.group_size)
+
+        next_obs, _, terms, truncs, _ = self.envs.step(actions_full)
+        if any(terms) or any(truncs):
+            return None
+        return self._unbatch_vector_obs(next_obs)
+
+    def _run_per_env_loop(
+        self,
+        observations_per_env: list[dict],
+        group_id: int,
+        group_seed: int,
+        success_weight: float,
+    ) -> list[dict]:
+        """Step every env until it finishes, recording per-chunk data.
+
+        Each outer step:
+          - Batches active envs' obs and queries the policy server.
+          - Builds a [G, T, dim] action tensor: real chunks for active envs,
+            zeros for already-done envs (gymnasium auto-resets done envs in
+            the background; we ignore the auto-reset obs by filtering on
+            active_indices).
+          - Calls vector env.step (parallel MuJoCo across subprocess workers).
+          - Reads terminal info via final_info handling so autoreset doesn't
+            clobber the terminating chunk's substep dones / success flag
+            (pattern from robocasa_eval_benchmark.py:393-402).
+
+        Episode num_steps starts at 0 in both normal and post-FF modes.
+        """
+        episodes = [
+            self._new_episode(group_id, group_seed)
+            for _ in range(self.group_size)
         ]
-        done_flags = [False] * group_size
+        done_flags = [False] * self.group_size
 
         while not all(done_flags):
             active_indices = [i for i, d in enumerate(done_flags) if not d]
             active_obs = [observations_per_env[i] for i in active_indices]
-            batched_obs = self._batch_per_env_obs(active_obs)
+            batched = self._batch_per_env_obs(active_obs)
 
-            actions, initial_noise, raw_actions, action_masks_batch = (
-                self._get_actions_from_server(batched_obs)
+            actions_active, initial_noise, raw_actions, action_masks = (
+                self._get_actions_from_server(batched)
+            )
+            actions_full = self._scatter_actions(actions_active, active_indices)
+
+            # Optional dense progress (per-env RPC; only when needed).
+            progresses = (
+                self.envs.call("compute_dense_progress", self.task_type)
+                if success_weight < 1.0
+                else None
             )
 
+            next_obs, _, terms, truncs, infos = self.envs.step(actions_full)
+
             for j, env_idx in enumerate(active_indices):
-                ep = episodes_in_progress[env_idx]
+                ep = episodes[env_idx]
                 obs = observations_per_env[env_idx]
-                action_j = self._extract_per_env(actions, j)
+                action_j = self._extract_per_env(actions_active, j)
 
                 ep["video_frames"].append(self._extract_video_single(obs))
                 ep["states"].append(self._extract_state_single(obs))
                 ep["actions"].append(action_j)
-                if (raw_actions is not None and hasattr(raw_actions, '__getitem__')
-                        and len(raw_actions) > j):
-                    ep["raw_actions"].append(raw_actions[j])
-                else:
-                    ep["raw_actions"].append(None)
-                if (action_masks_batch is not None and hasattr(action_masks_batch, '__getitem__')
-                        and len(action_masks_batch) > j):
-                    ep["action_masks"].append(action_masks_batch[j])
-                else:
-                    ep["action_masks"].append(None)
-                if (initial_noise is not None and hasattr(initial_noise, '__getitem__')
-                        and len(initial_noise) > j):
-                    ep["initial_noises"].append(initial_noise[j])
-                else:
-                    ep["initial_noises"].append(None)
+                ep["raw_actions"].append(
+                    raw_actions[j] if raw_actions is not None else None
+                )
+                ep["action_masks"].append(
+                    action_masks[j] if action_masks is not None else None
+                )
+                ep["initial_noises"].append(
+                    initial_noise[j] if initial_noise is not None else None
+                )
                 if ep["language"] is None:
                     ep["language"] = self._extract_language_single(obs)
 
-                env = self.envs.envs[env_idx]
-                next_obs, reward, terminated, truncated, info = env.step(action_j)
-                observations_per_env[env_idx] = next_obs
-
-                if "dones" in info and hasattr(info["dones"], "__len__"):
-                    substeps_run = len(info["dones"])
+                # H3 fix: count actual substeps (MultiStepWrapper.step()
+                # early-breaks on termination, so the last chunk may run
+                # fewer than n_action_steps substeps).
+                env_dones = self._info_for_env(infos, "dones", env_idx)
+                if env_dones is not None and hasattr(env_dones, "__len__"):
+                    ep["num_steps"] += len(env_dones)
                 else:
-                    substeps_run = self.n_action_steps
-                ep["num_steps"] += substeps_run
+                    ep["num_steps"] += self.n_action_steps
 
-                if success_weight < 1.0:
-                    progress = compute_dense_progress(env, self.task_type)
-                    ep["max_progress"] = max(ep["max_progress"], progress)
-
-                if terminated or truncated:
-                    done_flags[env_idx] = True
-                    success = self._reduce_success(info)
-                    ep["success"] = success
-                    ep["shaped_reward"] = compute_shaped_reward(
-                        success, ep["max_progress"], success_weight
+                if progresses is not None:
+                    ep["max_progress"] = max(
+                        ep["max_progress"], progresses[env_idx]
                     )
 
-        return episodes_in_progress
+                if terms[env_idx] or truncs[env_idx]:
+                    done_flags[env_idx] = True
+                    ep["success"] = self._success_for_env(infos, env_idx)
+                    ep["shaped_reward"] = dense_reward.compute_shaped_reward(
+                        ep["success"], ep["max_progress"], success_weight
+                    )
 
-    # ─── Debug helpers ───────────────────────────────────────────────────
+            # Update obs only for envs we'll step again next iteration. Done
+            # envs auto-reset in the background; we never consume their fresh
+            # obs since they're filtered out via active_indices.
+            for env_idx in active_indices:
+                if not done_flags[env_idx]:
+                    observations_per_env[env_idx] = self._extract_per_env(
+                        next_obs, env_idx
+                    )
 
-    def _get_sim_state(self, env_idx: int) -> np.ndarray | None:
-        """Read a sub-env's MuJoCo sim state as a flat array.
+        return episodes
 
-        Used by _verify_branch_point to numerically confirm that the G envs
-        in a group are bit-identical after the lockstep FF prefix.
-        """
-        try:
-            wrapper = self.envs.envs[env_idx]
-            robosuite_env = wrapper.unwrapped.env
-            return np.array(robosuite_env.sim.get_state().flatten())
-        except (AttributeError, TypeError, IndexError):
-            return None
+    # ─── Debug verification ───────────────────────────────────────────────
 
     def _verify_branch_point(
         self,
@@ -599,53 +631,41 @@ class EpisodeCollector:
         ff_steps: int,
         observations_per_env: list[dict],
     ) -> None:
-        """Debug verification: confirm all envs are at an identical state
-        after the lockstep fast-forward prefix.
+        """Confirm all envs are at an identical state after lockstep FF.
 
         With deterministic MuJoCo, the G envs see the same (state, action)
         pairs throughout the FF loop, so they should be bit-identical here.
-        This routine is a regression check that fails loudly if upstream
-        introduces step-time non-determinism (e.g., domain randomization)
-        which would silently break the lockstep assumption.
+        This routine fails loudly if upstream introduces step-time
+        non-determinism (e.g., domain randomization) which would silently
+        break the lockstep assumption.
 
-        Saves a montage image showing camera views from all envs side-by-
-        side, plus a numerical comparison of sim states and the wrapper-
-        level observations the policy actually sees.
+        Saves a montage image showing camera views from all envs side-by-side,
+        plus a numerical comparison of sim states and the wrapper-level
+        observations the policy actually sees.
 
-        Output saved to: {output_dir}/debug_ff/group{group_id}_seed{group_seed}.png
-
-        Usage:
-            python collect_episodes.py ... --debug-fast-forward --fast-forward-steps 10
+        Output: {output_dir}/debug_ff/group{group_id:03d}_seed{group_seed}_ff{ff_steps}.png
 
         What to look for:
-        - All camera views in the montage should be pixel-identical
-        - sim_state_max_diff should be 0.0 (or <1e-10 for float precision)
-        - obs_max_diff should be 0.0 for state keys, ~0 for video keys
+        - All camera views in the montage should be pixel-identical.
+        - sim_state max diffs should be 0.0 (or <1e-10 for float precision).
+        - obs max diffs should be 0.0 for state keys, ~0 for video keys.
         """
         debug_dir = self.output_dir / "debug_ff"
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"    [DEBUG] Verifying branch point for group {group_id} (seed={group_seed})...")
 
-        # 1. Compare sim states numerically
-        sim_states = []
-        for i in range(self.group_size):
-            state = self._get_sim_state(i)
-            if state is not None:
-                sim_states.append(state)
+        # 1. Compare sim states numerically (RPC across all workers).
+        sim_states = list(self.envs.call("get_sim_state_flat"))
+        ref = sim_states[0]
+        max_diffs = [np.abs(s - ref).max() for s in sim_states[1:]]
+        print(f"    [DEBUG] sim_state max diffs vs env 0: {max_diffs}")
+        if all(d < 1e-10 for d in max_diffs):
+            print(f"    [DEBUG] PASS: all sim states identical")
+        else:
+            print(f"    [DEBUG] FAIL: sim states differ!")
 
-        if len(sim_states) == self.group_size:
-            ref = sim_states[0]
-            max_diffs = [np.abs(s - ref).max() for s in sim_states[1:]]
-            print(f"    [DEBUG] sim_state max diffs vs env 0: {max_diffs}")
-            if all(d < 1e-10 for d in max_diffs):
-                print(f"    [DEBUG] PASS: all sim states identical")
-            else:
-                print(f"    [DEBUG] FAIL: sim states differ!")
-
-        # 2. Compare wrapper observations numerically. These are what the
-        # policy actually sees, so this is the more faithful obs check than
-        # poking the underlying robosuite env directly.
+        # 2. Compare wrapper observations (what the policy actually sees).
         ref_obs = observations_per_env[0]
         for i in range(1, self.group_size):
             for key in ref_obs:
@@ -657,7 +677,7 @@ class EpisodeCollector:
                     if diff > 1e-5:
                         print(f"    [DEBUG] obs key '{key}' differs: env 0 vs env {i}, max_diff={diff:.6f}")
 
-        # 3. Render camera views from all envs and save as montage
+        # 3. Render camera views from all envs and save as a montage.
         try:
             all_frames = []
             for i in range(self.group_size):
@@ -670,19 +690,12 @@ class EpisodeCollector:
                     while img.ndim > 3:
                         img = img[0]
                     env_frames.append(img)
-
                 if env_frames:
-                    # Concatenate cameras horizontally for this env
-                    row = np.concatenate(env_frames, axis=1)
-                    all_frames.append(row)
+                    all_frames.append(np.concatenate(env_frames, axis=1))
 
             if all_frames:
-                # Stack envs vertically: each row = one env's camera views.
-                # All rows should be pixel-identical when lockstep FF is
-                # working correctly.
                 montage = np.concatenate(all_frames, axis=0)
                 out_path = debug_dir / f"group{group_id:03d}_seed{group_seed}_ff{ff_steps}.png"
-
                 try:
                     import cv2
                     cv2.imwrite(str(out_path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
@@ -690,12 +703,13 @@ class EpisodeCollector:
                     print(f"    [DEBUG] Layout: {self.group_size} rows (envs) × {len(env_frames)} cols (cameras)")
                     print(f"    [DEBUG] All rows should look identical if lockstep is correct")
                 except ImportError:
-                    # Fall back to saving as .npy if cv2 not available
                     npy_path = out_path.with_suffix(".npy")
                     np.save(str(npy_path), montage)
                     print(f"    [DEBUG] Montage saved as numpy: {npy_path} (install cv2 for PNG)")
         except Exception as e:
             print(f"    [DEBUG] Could not render montage: {e}")
+
+    # ─── Small helpers ────────────────────────────────────────────────────
 
     def _new_episode(self, group_id: int = 0, env_seed: int = 0) -> dict:
         """Initialize a new episode tracking dict.
@@ -723,56 +737,52 @@ class EpisodeCollector:
         }
 
     def _get_actions_from_server(self, observations) -> tuple:
-        """Query the GRPO server for actions, raw actions, initial noise, and action mask.
+        """Query the GRPO server.
 
-        The GRPO server captures the initial noise tensor, raw normalized action,
-        and proper action mask from the denoising process and returns them in the info dict.
-
-        Args:
-            observations: Batched observations from vectorized env.
-
-        Returns:
-            Tuple of (actions, initial_noise, raw_actions, action_masks):
-                - actions: dict or array for env.step()
-                - initial_noise: (group_size, 50, 128) initial denoising noise or None
-                - raw_actions: (group_size, 50, 128) normalized model output or None
-                - action_masks: (group_size, 50, 128) valid dimension mask or None
+        Returns (actions, initial_noise, raw_actions, action_masks). The GRPO
+        server captures the initial noise tensor, raw normalized action, and
+        per-embodiment action mask from the denoising process and returns them
+        in the info dict; for vanilla PolicyClient those are None.
         """
         result = self.policy_client.get_action(observations)
-
         if isinstance(result, tuple) and len(result) == 2:
             action_dict, info = result
         else:
-            action_dict = result
-            info = {}
-
-        actions = action_dict
-        initial_noise = info.get("initial_noise", None)
-        raw_actions = info.get("raw_actions", None)
-        action_masks = info.get("action_mask", None)
-
-        return actions, initial_noise, raw_actions, action_masks
+            action_dict, info = result, {}
+        return (
+            action_dict,
+            info.get("initial_noise"),
+            info.get("raw_actions"),
+            info.get("action_mask"),
+        )
 
     def _extract_per_env(self, data, env_idx: int):
-        """Extract per-environment data from batched structure.
+        """Extract per-env data from a batched dict-of-arrays or array.
 
-        Handles both dict-of-arrays (e.g., {"action.eef_pos": (n_envs, 16, 3)})
-        and plain arrays (e.g., (n_envs, action_dim)).
+        Strings are preserved as bare Python strings — np.array("str") would
+        produce a 0-dim numpy string array that _batch_per_env_obs would
+        mistake for an ndarray and stack into a numpy string array instead
+        of building the tuple-of-strings format the policy server expects
+        for Text observations (annotation.human...).
         """
+        def _one(v):
+            if not hasattr(v, "__getitem__"):
+                return v
+            item = v[env_idx]
+            return item if isinstance(item, str) else np.array(item)
+
         if isinstance(data, dict):
-            return {k: np.array(v[env_idx]) if hasattr(v, '__getitem__') else v
-                    for k, v in data.items()}
-        elif hasattr(data, '__getitem__'):
-            return np.array(data[env_idx])
+            return {k: _one(v) for k, v in data.items()}
+        if hasattr(data, "__getitem__"):
+            item = data[env_idx]
+            return item if isinstance(item, str) else np.array(item)
         return data
 
     def _batch_per_env_obs(self, obs_list: list[dict]) -> dict:
-        """Stack a list of single-env observation dicts into a batched dict.
+        """Stack a list of single-env obs dicts into a vectorized dict.
 
-        Used to construct the input to the policy server when we're stepping
-        each env individually (no SyncVectorEnv batched step). The output
-        format matches what SyncVectorEnv would produce: ndarrays gain a
-        leading batch axis, language strings become a tuple per env.
+        Output format matches what gym.vector envs would produce: ndarrays
+        gain a leading batch axis, language strings become a tuple per env.
         """
         if not obs_list:
             return {}
@@ -787,10 +797,72 @@ class EpisodeCollector:
                 batched[key] = vals
         return batched
 
-    def _extract_video_single(self, obs: dict) -> dict[str, np.ndarray]:
-        """Extract video frames from a single-env observation dict.
+    def _unbatch_vector_obs(self, vector_obs: dict) -> list[dict]:
+        """Convert vector env's batched dict to a per-env list of obs dicts."""
+        return [self._extract_per_env(vector_obs, i) for i in range(self.group_size)]
 
-        Per-env counterpart to _extract_video — no batch-axis indexing.
+    def _broadcast_actions(self, actions_one: dict, dst_size: int) -> dict:
+        """Broadcast a [1, T, dim] action dict to [dst_size, T, dim].
+
+        Used by lockstep FF, where every env steps with env 0's chunk.
+        """
+        out = {}
+        for k, v in actions_one.items():
+            tiled = np.broadcast_to(v, (dst_size,) + v.shape[1:])
+            out[k] = np.array(tiled)  # copy so the array is writable
+        return out
+
+    def _scatter_actions(
+        self, actions_active: dict, active_indices: list[int]
+    ) -> dict:
+        """Build [G, T, dim] from [num_active, T, dim], padding done envs with zeros.
+
+        Done envs receive a zero action; gymnasium auto-resets them in the
+        background and the dummy step's data is ignored by the caller (filtered
+        out via active_indices). The per-env wasted compute is bounded by the
+        slowest env's remaining episode length, which is typically the
+        bottleneck anyway.
+        """
+        out = {}
+        for k, v in actions_active.items():
+            full = np.zeros((self.group_size,) + v.shape[1:], dtype=v.dtype)
+            for j, env_idx in enumerate(active_indices):
+                full[env_idx] = v[j]
+            out[k] = full
+        return out
+
+    def _info_for_env(self, infos: dict, key: str, env_idx: int):
+        """Read info[key][env_idx], preferring final_info on a terminating step.
+
+        Under gymnasium's autoreset, infos[key] for a terminated env reflects
+        the auto-reset episode's state, NOT the terminal episode's. The
+        terminal info is preserved in infos["final_info"][env_idx]. Pattern
+        from scripts/denoising_lab/eval/robocasa_eval_benchmark.py:393-402.
+        """
+        if "final_info" in infos and infos["final_info"][env_idx] is not None:
+            return infos["final_info"][env_idx].get(key)
+        if key in infos and infos[key] is not None:
+            return infos[key][env_idx]
+        return None
+
+    def _success_for_env(self, infos: dict, env_idx: int) -> bool:
+        """Reduce one env's MultiStepWrapper info["success"] to a bool.
+
+        MultiStepWrapper packs per-substep success bools into info["success"]
+        as an array of length up to n_action_steps; we treat the chunk as
+        successful if ANY substep succeeded — same convention as
+        gr00t/eval/rollout_policy.py:303-313.
+        """
+        s = self._info_for_env(infos, "success", env_idx)
+        if s is None:
+            return False
+        if isinstance(s, (list, np.ndarray)):
+            return bool(np.any(s))
+        return bool(s)
+
+    def _extract_video_single(self, obs: dict) -> dict:
+        """Extract video frames from a single-env obs dict.
+
         Strips the 'video.' prefix to match VLAStepData/processor expectations.
         """
         frames = {}
@@ -801,11 +873,10 @@ class EpisodeCollector:
                     frames[clean_key] = np.array(value)
         return frames
 
-    def _extract_state_single(self, obs: dict) -> dict[str, np.ndarray]:
-        """Extract state values from a single-env observation dict.
+    def _extract_state_single(self, obs: dict) -> dict:
+        """Extract state values from a single-env obs dict.
 
-        Per-env counterpart to _extract_state. Strips the 'state.' prefix
-        and filters annotation/language keys.
+        Strips the 'state.' prefix and filters annotation/language keys.
         """
         state = {}
         if isinstance(obs, dict):
@@ -818,39 +889,24 @@ class EpisodeCollector:
         return state
 
     def _extract_language_single(self, obs: dict) -> str:
-        """Extract task language instruction from a single-env observation dict."""
+        """Extract task language instruction from a single-env obs dict."""
         if isinstance(obs, dict):
             for key, value in obs.items():
                 if "language" in key or "annotation" in key or "task_description" in key:
                     if isinstance(value, (tuple, list)) and len(value) > 0:
                         return str(value[0])
-                    elif isinstance(value, str):
+                    if isinstance(value, str):
                         return value
         return self.env_name.split("/")[-1]  # Fallback to env name
-
-    def _reduce_success(self, info: dict) -> bool:
-        """Reduce a single env's MultiStepWrapper info["success"] to a bool.
-
-        MultiStepWrapper packs per-substep success bools into info["success"]
-        as an array of length up to n_action_steps (multistep_wrapper.py:282).
-        We treat the chunk as successful if ANY substep succeeded — same
-        convention used by gr00t/eval/rollout_policy.py:303-313.
-
-        Critically, naïve `bool(env_success)` would either raise (for
-        multi-element arrays — "ambiguous truth value") or return True for
-        any non-empty list (incl. all-False), so the np.any reduction is
-        load-bearing for correctness, not a stylistic choice.
-        """
-        if "success" not in info:
-            return False
-        env_success = info["success"]
-        if isinstance(env_success, (list, np.ndarray)):
-            return bool(np.any(env_success))
-        return bool(env_success)
 
     def close(self):
         """Clean up environments."""
         self.envs.close()
+
+
+# ---------------------------------------------------------------------------
+# Save episodes to disk
+# ---------------------------------------------------------------------------
 
 
 def save_episodes(episodes: list[dict], output_dir: str) -> None:
@@ -858,10 +914,6 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
 
     Each episode is saved as episode_{idx}.npz with keys structured for
     EpisodeBuffer.load_episodes() to parse.
-
-    Args:
-        episodes: List of episode dicts from EpisodeCollector.collect().
-        output_dir: Directory to write .npz files to.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -878,28 +930,24 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
             "env_seed": ep.get("env_seed", 0),
         }
 
-        # Save per-chunk data
         for chunk_idx in range(len(ep["actions"])):
-            # Video frames
             if chunk_idx < len(ep["video_frames"]):
                 for cam_name, frame in ep["video_frames"][chunk_idx].items():
                     save_dict[f"video_{cam_name}_{chunk_idx}"] = frame
 
-            # State
             if chunk_idx < len(ep["states"]):
                 for state_key, state_val in ep["states"][chunk_idx].items():
                     save_dict[f"state_{state_key}_{chunk_idx}"] = state_val
 
-            # Action (decoded physical action for env stepping)
             save_dict[f"action_{chunk_idx}"] = ep["actions"][chunk_idx]
 
-            # Raw normalized action (50x128 tensor from model, for FM log-prob)
+            # Raw normalized action (50x128 tensor from model, for FM log-prob).
             if chunk_idx < len(ep.get("raw_actions", [])):
                 raw_action = ep["raw_actions"][chunk_idx]
                 if raw_action is not None:
                     save_dict[f"raw_action_{chunk_idx}"] = raw_action
 
-            # Action mask from model (proper per-embodiment mask, not all-ones)
+            # Action mask from model (proper per-embodiment mask, not all-ones).
             if chunk_idx < len(ep.get("action_masks", [])):
                 mask = ep["action_masks"][chunk_idx]
                 if mask is not None:
@@ -911,7 +959,7 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
             else:
                 save_dict[f"action_mask_{chunk_idx}"] = np.ones((50, 128), dtype=np.float32)
 
-            # Initial noise tensor (50×128) — the ε₀ that was denoised into this action
+            # Initial noise tensor (50x128) — the ε₀ that was denoised into this action.
             if chunk_idx < len(ep.get("initial_noises", [])):
                 ini_noise = ep["initial_noises"][chunk_idx]
                 if ini_noise is not None:
@@ -926,13 +974,11 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+
 def main():
     args = parse_args()
-
-    # Set random seed
     np.random.seed(args.seed)
 
-    # Create collector
     collector = EpisodeCollector(
         env_name=args.env_name,
         group_size=args.group_size,
@@ -946,19 +992,14 @@ def main():
     )
 
     try:
-        # Collect episodes in groups
         episodes = collector.collect(
-            group_size=args.group_size,
             num_groups=args.num_groups,
             base_seed=args.seed,
             success_weight=args.success_weight,
             fast_forward_steps=args.fast_forward_steps,
             fast_forward_pct=args.fast_forward_pct,
         )
-
-        # Save to disk
         save_episodes(episodes, args.output_dir)
-
     finally:
         collector.close()
 

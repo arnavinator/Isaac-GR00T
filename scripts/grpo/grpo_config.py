@@ -123,6 +123,16 @@ class GRPOConfig:
     server_host: str = "127.0.0.1"
     server_port: int = 5555
 
+    # Optional long-running collector server (collector_server.py). When
+    # collector_server_host is non-empty, the trainer connects via
+    # CollectorClient instead of spawning `python collect_episodes.py` per
+    # iteration — eliminates the ~10-20s startup cost (robocasa imports +
+    # AsyncVectorEnv worker spawn). The server must be started separately
+    # with --env-names matching this config; mismatched env_names raise on
+    # the first collect() request. Empty host = subprocess fallback.
+    collector_server_host: str = ""
+    collector_server_port: int = 5556
+
     # RoboCasa environment names to train on.
     # Tasks are selected round-robin: iteration 1 → task 0, iteration 2 → task 1, etc.
     # Each iteration collects ALL num_groups for a SINGLE task (not distributed across tasks).

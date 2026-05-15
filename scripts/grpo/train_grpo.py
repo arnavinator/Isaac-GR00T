@@ -101,6 +101,46 @@ class GRPOTrainer:
         self._consecutive_collect_failures = 0
         self._max_consecutive_collect_failures = 3
 
+        # Optional long-running collector server. When configured, collection
+        # is an RPC call instead of a subprocess spawn — eliminates per-iter
+        # robocasa import + worker startup cost (~10-20s/iter). The server
+        # must be started separately (see scripts/grpo/collector_server.py).
+        # We ping at __init__ to fail fast if the server is unreachable or
+        # is missing any of our configured env_names.
+        self._collector_client = None
+        if self.config.collector_server_host:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from collector_server import CollectorClient
+            self._collector_client = CollectorClient(
+                host=self.config.collector_server_host,
+                port=self.config.collector_server_port,
+            )
+            try:
+                info = self._collector_client.ping()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not reach collector server at "
+                    f"{self.config.collector_server_host}:{self.config.collector_server_port}: "
+                    f"{type(e).__name__}: {e}. "
+                    f"Start it first with: "
+                    f"`gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python "
+                    f"scripts/grpo/collector_server.py --env-names ... "
+                    f"--max-episode-steps ... --listen-port "
+                    f"{self.config.collector_server_port}`."
+                )
+            available = set(info.get("envs", []))
+            missing = [e for e in self.config.env_names if e not in available]
+            if missing:
+                raise RuntimeError(
+                    f"Collector server is missing envs that this trainer needs: "
+                    f"{missing}. Restart the server with --env-names matching "
+                    f"this config: {self.config.env_names}"
+                )
+            print(
+                f"  Collector server: {self.config.collector_server_host}:"
+                f"{self.config.collector_server_port} (envs: {sorted(available)})"
+            )
+
     def setup(self):
         """Load model, apply LoRA, setup optimizer, start server.
 
@@ -316,13 +356,13 @@ class GRPOTrainer:
         self._save_checkpoint(self.config.num_iterations)
 
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int):
-        """Launch episode collector subprocess and load results.
+        """Collect episodes for one iteration into self.buffer.
 
-        The collector runs in the robocasa venv as a separate process,
-        communicating with our model via the ZMQ server.
-
-        This is analogous to grpo_cont.py's collection loop (lines 253-312)
-        but uses a subprocess instead of inline env stepping.
+        Dispatches to a long-running collector_server (when
+        config.collector_server_host is set) or to a fresh subprocess of
+        collect_episodes.py. Both paths write episodes as .npz files to
+        episode_dir; we then load them into self.buffer and run the same
+        failure handling for both modes.
         """
         self.buffer.clear()
 
@@ -339,19 +379,82 @@ class GRPOTrainer:
         for stale in episode_dir.glob("episode_*.npz"):
             stale.unlink()
 
-        # Launch collector subprocess in robocasa venv
-        robocasa_python = str(
-            Path(__file__).parent.parent.parent
-            / "gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python"
-        )
-
-        collector_script = str(Path(__file__).parent / "collect_episodes.py")
-
-        # Resolve per-task fast_forward_steps (same pattern as max_episode_steps)
+        # Resolve per-task fast_forward_steps (same pattern as max_episode_steps).
         if isinstance(self.config.fast_forward_steps, list):
             ff_steps = self.config.fast_forward_steps[task_idx]
         else:
             ff_steps = self.config.fast_forward_steps
+
+        total_episodes = self.config.group_size * self.config.num_groups
+        print(f"  Collecting {self.config.num_groups} groups × {self.config.group_size} = {total_episodes} episodes...")
+
+        # Run collection: RPC to long-running server if configured, else
+        # spawn a fresh subprocess.
+        if self._collector_client is not None:
+            failure_reason = self._collect_via_server(env_name, episode_dir, ff_steps)
+        else:
+            failure_reason = self._collect_via_subprocess(
+                env_name, episode_dir, max_steps, ff_steps,
+            )
+
+        # Common post-processing: load episodes, then handle any failure.
+        n_loaded = 0
+        if failure_reason is None:
+            n_loaded = self.buffer.load_episodes(episode_dir)
+            if n_loaded == 0:
+                failure_reason = (
+                    "zero episodes loaded (collector reported success but "
+                    "produced no .npz files)"
+                )
+
+        if failure_reason is not None:
+            self._consecutive_collect_failures += 1
+            print(
+                f"  WARNING: Collector failure ({self._consecutive_collect_failures}"
+                f"/{self._max_consecutive_collect_failures} consecutive): {failure_reason}"
+            )
+            if self._consecutive_collect_failures >= self._max_consecutive_collect_failures:
+                # Aborting rather than silently looping: empty buffer →
+                # advantages are all-zero → iteration skipped → next iter
+                # repeats the same failure mode. Without this guard the user
+                # would discover the silent stall hours later.
+                raise RuntimeError(
+                    f"Collector failed {self._consecutive_collect_failures} consecutive "
+                    f"iterations. Last reason: {failure_reason}. "
+                    f"Common causes: robocasa venv path wrong, server port stuck in "
+                    f"TIME_WAIT, MUJOCO_GL backend missing, model OOM during inference, "
+                    f"or (server mode) collector_server.py not running. "
+                    f"Check the [collector] log lines above this message."
+                )
+            return
+
+        # Successful collection — reset the failure counter.
+        self._consecutive_collect_failures = 0
+        print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
+
+        # Bound disk usage: prune old iter_*/ subdirs beyond the keep window.
+        # Done AFTER load_episodes succeeded for the current iter, so we never
+        # delete a directory we're actively reading from.
+        self._prune_old_episode_dirs()
+
+    def _collect_via_subprocess(
+        self,
+        env_name: str,
+        episode_dir: Path,
+        max_steps: int,
+        ff_steps: int,
+    ) -> str | None:
+        """Spawn `python collect_episodes.py` for one iteration's collection.
+
+        Returns a failure_reason string, or None on success. Pays the full
+        startup cost (robocasa imports + AsyncVectorEnv worker spawn) every
+        call — _collect_via_server is the long-running alternative.
+        """
+        robocasa_python = str(
+            Path(__file__).parent.parent.parent
+            / "gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python"
+        )
+        collector_script = str(Path(__file__).parent / "collect_episodes.py")
 
         cmd = [
             robocasa_python,
@@ -370,15 +473,12 @@ class GRPOTrainer:
             "--seed", str(self.config.seed + self.iteration * 1000),
         ]
 
-        total_episodes = self.config.group_size * self.config.num_groups
-        print(f"  Collecting {self.config.num_groups} groups × {self.config.group_size} = {total_episodes} episodes...")
-
-        # Stream collector output line-by-line so the user sees progress instead
-        # of waiting for the whole subprocess to finish. Mirror the collector's
-        # stdout/stderr to the trainer log with a "[collector]" prefix.
-        # A background Timer enforces the wall clock even if the subprocess
-        # hangs on stdout with no output (otherwise the blocking read could wait
-        # forever).
+        # Stream collector output line-by-line so the user sees progress
+        # instead of waiting for the whole subprocess to finish. Mirror the
+        # collector's stdout/stderr to the trainer log with a "[collector]"
+        # prefix. A background Timer enforces the wall clock even if the
+        # subprocess hangs on stdout with no output (otherwise the blocking
+        # read could wait forever).
         timeout_s = 1800
         proc = subprocess.Popen(
             cmd,
@@ -404,48 +504,48 @@ class GRPOTrainer:
         finally:
             killer.cancel()
 
-        # Determine the failure reason (if any) before deciding whether to
-        # abort or continue with an empty buffer.
-        failure_reason = None
-        n_loaded = 0
         if timed_out["v"]:
-            failure_reason = f"timeout after {timeout_s}s (subprocess killed)"
-        elif proc.returncode != 0:
-            failure_reason = f"non-zero exit code {proc.returncode}"
-        else:
-            # Load collected episodes into buffer.
-            n_loaded = self.buffer.load_episodes(episode_dir)
-            if n_loaded == 0:
-                failure_reason = "zero episodes loaded (subprocess exited cleanly but produced no .npz files)"
+            return f"timeout after {timeout_s}s (subprocess killed)"
+        if proc.returncode != 0:
+            return f"non-zero exit code {proc.returncode}"
+        return None
 
-        if failure_reason is not None:
-            self._consecutive_collect_failures += 1
-            print(
-                f"  WARNING: Collector failure ({self._consecutive_collect_failures}"
-                f"/{self._max_consecutive_collect_failures} consecutive): {failure_reason}"
+    def _collect_via_server(
+        self,
+        env_name: str,
+        episode_dir: Path,
+        ff_steps: int,
+    ) -> str | None:
+        """Run collection via the long-running collector_server.
+
+        Returns a failure_reason string, or None on success. The server holds
+        its own max_episode_steps per env (set at server startup), so we
+        don't pass max_steps here — if the trainer's config diverges from
+        the server's, restart the server with the new values.
+        """
+        try:
+            result = self._collector_client.collect(
+                env_name=env_name,
+                output_dir=str(episode_dir),
+                base_seed=self.config.seed + self.iteration * 1000,
+                num_groups=self.config.num_groups,
+                success_weight=self.config.success_weight,
+                fast_forward_steps=ff_steps,
+                fast_forward_pct=self.config.fast_forward_pct,
             )
-            if self._consecutive_collect_failures >= self._max_consecutive_collect_failures:
-                # Aborting rather than silently looping: empty buffer →
-                # advantages are all-zero → iteration skipped → next iter
-                # repeats the same failure mode. Without this guard the user
-                # would discover the silent stall hours later.
-                raise RuntimeError(
-                    f"Collector failed {self._consecutive_collect_failures} consecutive "
-                    f"iterations. Last reason: {failure_reason}. "
-                    f"Common causes: robocasa venv path wrong, server port stuck in "
-                    f"TIME_WAIT, MUJOCO_GL backend missing, model OOM during inference. "
-                    f"Check the [collector] log lines above this message."
-                )
-            return
+        except TimeoutError as e:
+            return f"collector_server timeout: {e}"
+        except RuntimeError as e:
+            # Server-reported error (e.g., env_name not pre-initialized).
+            return f"collector_server error: {e}"
+        except Exception as e:
+            return f"collector_server connection error ({type(e).__name__}): {e}"
 
-        # Successful collection — reset the failure counter.
-        self._consecutive_collect_failures = 0
-        print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
-
-        # Bound disk usage: prune old iter_*/ subdirs beyond the keep window.
-        # Done AFTER load_episodes succeeded for the current iter, so we never
-        # delete a directory we're actively reading from.
-        self._prune_old_episode_dirs()
+        print(
+            f"    [collector_server] {result['n_episodes']} episodes, "
+            f"{result['n_successes']} successes in {result['elapsed_s']}s"
+        )
+        return None
 
     def _validate_optimizer_state(self, saved: dict) -> None:
         """Verify a saved optimizer state_dict matches the current optimizer's param layout.

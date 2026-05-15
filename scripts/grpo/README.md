@@ -48,13 +48,15 @@ The DiT action head has 1.1B parameters. Full RL finetuning would be unstable an
 │                    │                                     │
 │  ┌─────────────────┼──────────┐  ┌───────────────────┐  │
 │  │ ZMQ Client      │          │  │ group_size envs   │  │
-│  │ (PolicyClient)  │          │  │ (SyncVectorEnv)   │  │
+│  │ (PolicyClient)  │          │  │ (AsyncVectorEnv)  │  │
 │  └────────────────────────────┘  └───────────────────┘  │
 │                                                          │
 │  Saves per episode: obs, actions, raw_actions, initial_noise  │
 │  → .npz files on disk                                    │
 └──────────────────────────────────────────────────────────┘
 ```
+
+The collector runs in a **separate Python venv** (`robocasa_uv/.venv/`) from the trainer because robocasa/robosuite/MuJoCo have version conflicts with the model deps. That venv split is why the trainer can never hold an `EpisodeCollector` directly — see [Collection Modes](#collection-modes) for how the cross-venv handshake works.
 
 ## Training Loop (per iteration)
 
@@ -91,6 +93,62 @@ fast_forward_pct=0.5 means:
   ...
 ```
 
+## Collection Modes
+
+The collector lives in the robocasa venv (separate Python interpreter from the trainer), so the trainer can't import `EpisodeCollector` directly — there's no shared address space. The trainer talks to the collector across a process boundary, in one of two modes:
+
+### Subprocess mode (default)
+Each iteration's `_collect_episodes` spawns a fresh `python collect_episodes.py` subprocess via `train_grpo.py:_collect_via_subprocess`. Simple, isolated, self-cleaning — but pays the *full startup cost every iteration*:
+- Re-imports robocasa/robosuite per worker (~5-10s each)
+- Spawns AsyncVectorEnv subprocess workers (~1-2s)
+- Builds MuJoCo models via `gym.make` per worker (~5-10s each)
+
+That's roughly **10-20s of overhead per iteration**, or 30-60 minutes wasted across a 200-iteration run.
+
+### Server mode (optional)
+A long-running `collector_server.py` holds one pre-initialized `EpisodeCollector` per task at startup (each with its own AsyncVectorEnv worker pool), then services per-iteration `collect` requests over ZMQ on port 5556. The trainer's `_collect_via_server` is a thin RPC client. **Startup cost is paid once at server boot, not per iteration.**
+
+Why a ZMQ server and not just a persistent Python object? See above — the venv split forces process separation. ZMQ is the same REQ/REP + msgpack pattern that `grpo_server.py` already uses for the model server, so the trainer just becomes a client of two services instead of one.
+
+```bash
+# Terminal 1: GRPO model server (port 5555 — unchanged)
+uv run python scripts/grpo/grpo_server.py \
+    --model-path nvidia/GR00T-N1.6-3B \
+    --embodiment-tag ROBOCASA_PANDA_OMRON
+
+# Terminal 2: Long-running collector server (port 5556)
+# Pre-initializes one EpisodeCollector per --env-name. The
+# --max-episode-steps list is matched 1:1 with --env-names.
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python scripts/grpo/collector_server.py \
+    --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+                robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --max-episode-steps 720 480 \
+    --group-size 5 --n-action-steps 8 \
+    --policy-server-host 127.0.0.1 --policy-server-port 5555 \
+    --listen-port 5556
+
+# Terminal 3: Trainer (set collector_server_host in config or via CLI flag)
+uv run python scripts/grpo/train_grpo.py \
+    --collector-server-host 127.0.0.1 --collector-server-port 5556 \
+    --num-iterations 200
+```
+
+The trainer pings the server at `__init__` to verify every `env_names` entry in the trainer config has a matching pre-initialized collector. If the server is unreachable or missing an env, the trainer raises with the exact `collector_server.py` command needed to fix it.
+
+### Trade-offs
+
+| Aspect | Subprocess mode | Server mode |
+|--------|-----------------|-------------|
+| Per-iter startup | ~10-20s overhead | ~0s overhead |
+| Setup | One terminal (trainer) | Three terminals (model server + collector server + trainer) |
+| Code reload | Each iter picks up edits to `collect_episodes.py` | Restart server to pick up edits |
+| Memory | Bounded per iter (process exits) | Slow growth across iters; restart server every ~50-100 iters |
+| Failure isolation | One collector crash = one bad iter | Collector crash = service down until restarted |
+| `max_episode_steps` change | Picked up next iter | Restart server with new `--max-episode-steps` |
+| `--debug-fast-forward` verification | Direct CLI on `collect_episodes.py` (unchanged) | Direct CLI on `collect_episodes.py` (server is bypassed) |
+
+Set `config.collector_server_host = ""` (default) for subprocess mode; set it to a non-empty host (e.g., `"127.0.0.1"`) to use the server.
+
 ## Files
 
 | File | Purpose | Runs in |
@@ -100,7 +158,8 @@ fast_forward_pct=0.5 means:
 | `fm_log_prob.py` | FM log-prob surrogate (replaces Gaussian dist.log_prob) | main venv |
 | `episode_buffer.py` | Episode storage + group-relative advantages | main venv |
 | `dense_reward.py` | Extract progress metrics from RoboCasa envs | robocasa venv |
-| `collect_episodes.py` | Episode collector subprocess | robocasa venv |
+| `collect_episodes.py` | Episode collector subprocess (one-shot CLI) | robocasa venv |
+| `collector_server.py` | Long-running episode collector service (optional, see [Collection Modes](#collection-modes)) | robocasa venv |
 | `grpo_server.py` | Extended model server (captures initial noise + raw action) | main venv |
 | `train_grpo.py` | Main training orchestrator | main venv |
 
@@ -187,6 +246,8 @@ uv run python scripts/grpo/test_sim_wrapper.py
 | `fast_forward_steps` | 10 | Outer steps to skip before branching (0=disabled, per-env list OK) |
 | `fast_forward_pct` | 0.5 | Fraction of groups using fast-forward (rest start normally) |
 | `episode_dirs_to_keep` | 3 | Number of recent `iter_*/` subdirs to retain under `episode_dir`; older dirs are pruned after each successful collection. Set to 0 to disable pruning. Bounds disk usage on `/tmp` over long runs. |
+| `collector_server_host` | `""` | Empty = subprocess mode (default). Set to a host (e.g., `"127.0.0.1"`) to use a long-running `collector_server.py` and skip the per-iter startup cost. See [Collection Modes](#collection-modes). |
+| `collector_server_port` | 5556 | Port of the long-running collector server. Only used when `collector_server_host` is non-empty. Distinct from the model server's port 5555. |
 
 ## Reward Shaping
 
@@ -248,11 +309,6 @@ where:
 - Decrease `learning_rate`
 - Check for NaN in loss (gradient clipping issue)
 
-### Collection is slow
-- Increase `group_size` (more parallel envs per group, more CPU memory)
-- Ensure server and collector are on same machine (ZMQ latency)
-- Check if MuJoCo rendering is accidentally enabled
-
 ### `RuntimeError: GRPOPolicyWrapper: raw_action / initial_noise capture failed`
 `grpo_server.py` hooks `get_action_with_features` (to grab the raw 50×128 action) and `torch.randn` (to grab the 3-D initial noise). This error fires when one of those captures produced `None` at the end of a `get_action` call:
 - **raw_action None** → `get_action_with_features` no longer returns `BatchFeature({"action_pred": …})`. Check for a model refactor on the action head return contract.
@@ -261,11 +317,19 @@ where:
 Either fix the capture hook in `grpo_server.py` or update the model to restore the expected contract. This is a hard-fail by design — a silent `None` would propagate as a missing-`initial_noise` error in `_prepare_batch`, which is less obvious to debug.
 
 ### `RuntimeError: Collector failed N consecutive iterations`
-The trainer aborts after 3 consecutive collection failures (timeout / non-zero subprocess exit / zero `.npz` files produced). Without this guard, a misconfigured robocasa venv or stuck MuJoCo init would leave the trainer in a silent infinite no-op. The error message includes the last failure reason; cross-check with the `[collector] ...` lines streamed above. Common causes:
+The trainer aborts after 3 consecutive collection failures (timeout / non-zero subprocess exit / zero `.npz` files produced / RPC error in server mode). Without this guard, a misconfigured robocasa venv or stuck MuJoCo init would leave the trainer in a silent infinite no-op. The error message includes the last failure reason; cross-check with the `[collector] ...` lines streamed above. Common causes:
 - **Robocasa venv path wrong** → `gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python` doesn't exist; rerun setup.
 - **Server port stuck** → previous server thread didn't release port 5555; wait for TIME_WAIT or change `--server-port`.
 - **MUJOCO_GL backend missing** → on a headless GPU host without `egl`, `gym.make` will hang; verify `MUJOCO_GL=egl` is set.
 - **Server-side OOM on inference** → check trainer-side stdout for CUDA OOM during the first action-server call.
+- **Server mode: `collector_server.py` died** → reason will start with `collector_server connection error` or `collector_server timeout`. Restart the server in its terminal; the trainer will reconnect on the next iteration. If the server's terminal shows a Python traceback, fix the underlying error first.
+- **Server mode: env_name mismatch** → reason starts with `collector_server error: env_name 'X' not pre-initialized`. The trainer's config has an env that wasn't passed to `--env-names` at server boot. Restart the server with the full list of env_names matching the trainer config.
+
+### Collection is slow
+- **First, check if you're paying per-iter startup cost** — see [Collection Modes](#collection-modes). Server mode eliminates ~10-20s/iter overhead.
+- Increase `group_size` (more parallel envs per group, more CPU memory)
+- Ensure server and collector are on same machine (ZMQ latency)
+- Check if MuJoCo rendering is accidentally enabled
 
 ### `RuntimeError: LoRA checkpoint contains keys not present in the current model` (or vice versa)
 Your `lora_target_modules` (or `lora_rank`) differs between the saved checkpoint and your current config. Resuming would silently load partial weights — either dropping saved adapter behavior or leaving new adapters at random init while the optimizer attaches to them. Fix by matching the config or restarting from scratch. The error message tells you which side has extra keys.

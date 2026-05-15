@@ -342,13 +342,13 @@ class EpisodeCollector:
         (containing only the active envs) so denoising amortizes across
         the parallel rollouts.
         """
-        # Reset each env with seed=group_seed AND align all G envs to env
-        # 0's scene. RoboCasa picks per-instance kitchen layout, camera
-        # noise, and textures at env construction time using each env's
-        # own RNG; those choices live in the model XML, NOT in MjSimState,
-        # so a plain seeded reset doesn't make the parallel envs match
-        # visually. See _align_envs_to_group_scene for the recipe.
-        observations_per_env = self._align_envs_to_group_scene(group_seed)
+        # Reset each env individually with the SAME seed → identical initial
+        # state. We bypass self.envs.reset(seed=...) to avoid any vectorized
+        # info-batching, but the per-env reset behavior is unchanged.
+        observations_per_env: list[dict] = []
+        for env in self.envs.envs:
+            obs, _ = env.reset(seed=group_seed)
+            observations_per_env.append(obs)
 
         episodes_in_progress = [
             self._new_episode(group_id, group_seed) for _ in range(group_size)
@@ -461,12 +461,11 @@ class EpisodeCollector:
         could diverge silently — use --debug-fast-forward to numerically
         verify sim states stay bit-identical across the group.
         """
-        # Phase 1: Reset all envs and align them to env 0's scene. The
-        # alignment is essential because lockstep stepping only produces
-        # identical observations if the underlying scenes match (sim_state
-        # alone isn't enough — cameras, textures, and kitchen geometry
-        # are construction-time choices). See _align_envs_to_group_scene.
-        observations_per_env = self._align_envs_to_group_scene(group_seed)
+        # Phase 1: Reset all envs with the same seed
+        observations_per_env: list[dict] = []
+        for env in self.envs.envs:
+            obs, _ = env.reset(seed=group_seed)
+            observations_per_env.append(obs)
 
         # Phase 2: Lockstep fast-forward.
         #
@@ -577,151 +576,6 @@ class EpisodeCollector:
                     )
 
         return episodes_in_progress
-
-    # ─── Group scene alignment ───────────────────────────────────────────
-
-    def _align_envs_to_group_scene(self, group_seed: int) -> list[dict]:
-        """Reset all G envs to the SAME scene + dynamic state.
-
-        RoboCasa picks layout, style, camera randomization, and textures
-        at env construction time using a per-instance RNG. Those choices
-        live in the model XML, NOT in MjSimState, so seeding reset()
-        doesn't make parallel envs match visually. To get true within-
-        group identity (so the only diversity in a group comes from
-        policy denoising noise), we reset env 0 normally and force envs
-        1..G-1 to adopt env 0's scene + state.
-
-        The recipe mirrors robocasa's playback_dataset.py:227-258 and
-        scripts/denoising_lab/eval/branching_rollout.py:399-427:
-
-          1. wrapper.reset(seed=group_seed) on env 0 to establish a
-             canonical scene.
-          2. Capture env 0's ep_meta + model_xml + flattened sim state
-             via the public robosuite API.
-          3. For each i in 1..G-1, on env i:
-             a. Pin env 0's ep_meta on the underlying robosuite env.
-             b. wrapper.reset(seed=group_seed) — runs the underlying
-                reset with the pinned ep_meta and re-initializes the
-                wrapper's deques.
-             c. edit_model_xml(env0_xml) + reset_from_xml_string +
-                sim.reset() — rebuilds with env 0's exact cameras /
-                textures / geometry (the construction-time randomness
-                that wasn't in MjSimState).
-             d. set_state_from_flattened(env0_sim_state) + sim.forward()
-                + update_state() — applies env 0's exact qpos/qvel/act.
-             e. Refresh wrapper.obs deque from a fresh underlying obs
-                read, since wrapper.reset's deque was populated before
-                the rebuild and is now stale.
-
-        Returns a list of wrapper-stacked observations, one per env. When
-        this function returns, the G envs are bit-identical (verifiable
-        via --debug-fast-forward; both sim_state and obs diffs should be
-        ~0).
-        """
-        from collections import deque as _deque
-        from copy import deepcopy as _deepcopy
-
-        # Phase 1: env 0 is the reference. Reset it normally; whatever
-        # scene RoboCasa picked at construction time is now the target.
-        obs_0, _ = self.envs.envs[0].reset(seed=group_seed)
-
-        if self.group_size == 1:
-            return [obs_0]
-
-        # Phase 2: capture env 0's complete scene description.
-        base_env_0 = self.envs.envs[0].unwrapped
-        robosuite_env_0 = base_env_0.env
-        env0_ep_meta = robosuite_env_0.get_ep_meta()
-        env0_model_xml = robosuite_env_0.sim.model.get_xml()
-        env0_sim_state = np.array(robosuite_env_0.sim.get_state().flatten())
-        # Camera randomization isn't part of MjSimState OR auto-restored from
-        # ep_meta — robocasa stores cam_configs in ep_meta (tabletop.py:1133)
-        # but only reads layout_id/style_id back during _load_model. We must
-        # copy _cam_configs by hand or env i's own random cameras will leak
-        # back in via edit_model_xml's camera-overwrite loop (see below).
-        env0_cam_configs = getattr(robosuite_env_0, "_cam_configs", None)
-
-        observations_per_env: list[dict] = [obs_0]
-
-        # Phase 3: realign envs 1..G-1 to env 0's scene + state.
-        for i in range(1, self.group_size):
-            wrapper = self.envs.envs[i]
-            base_env = wrapper.unwrapped
-            robosuite_env = base_env.env
-
-            # 3a. Pin env 0's metadata on the underlying robosuite env.
-            # Older robocasa exposes set_attrs_from_ep_meta; newer
-            # versions use set_ep_meta. Both apply layout_id, style_id,
-            # and any other per-episode random choices.
-            if hasattr(robosuite_env, "set_attrs_from_ep_meta"):
-                robosuite_env.set_attrs_from_ep_meta(env0_ep_meta)
-            elif hasattr(robosuite_env, "set_ep_meta"):
-                robosuite_env.set_ep_meta(env0_ep_meta)
-
-            # 3b. Hard reset with the pinned ep_meta. wrapper.reset() also
-            # re-initializes the wrapper's obs deque, reward list, done
-            # list, and info defaultdict. Per playback_dataset.py:239-241
-            # this hard reset is required because reset_from_xml_string
-            # below is only a "soft" reset that doesn't reload the model.
-            wrapper.reset(seed=group_seed)
-
-            # 3b'. Sync env i's _cam_configs to env 0's. Critical: tabletop
-            # edit_model_xml() (tabletop.py:1273-1306) loops over
-            # self._cam_configs and OVERWRITES every <camera pos="..."
-            # quat="..."> element in the input XML with these values.
-            # After 3b, env i's _cam_configs holds env i's own random
-            # camera offsets (rng-state mismatch: env 0 consumed RNG for
-            # layout/style picks, env i skipped them via pinned ep_meta,
-            # so the random.normal() draws in _randomize_cameras land
-            # differently). Without this assignment, edit_model_xml below
-            # would silently strip env 0's cameras out of env0_model_xml
-            # and substitute env i's — that's why all the envs 1..G-1
-            # ended up matching each other (same RNG offset) but not env
-            # 0 in the previous attempt at this fix.
-            if env0_cam_configs is not None and hasattr(robosuite_env, "_cam_configs"):
-                robosuite_env._cam_configs = _deepcopy(env0_cam_configs)
-
-            # 3c. Rebuild the model from env 0's exact XML so that
-            # cameras, textures, and kitchen geometry match bit-for-bit.
-            xml = robosuite_env.edit_model_xml(env0_model_xml)
-            robosuite_env.reset_from_xml_string(xml)
-            robosuite_env.sim.reset()
-
-            # 3d. Apply env 0's exact qpos/qvel/act/time. After the
-            # rebuild the sim is at the model's home pose, NOT env 0's
-            # seed-randomized post-reset pose, so this restore is what
-            # makes the dynamic state match. update_state() (or
-            # update_sites() on older versions) re-syncs robosuite's
-            # internal observation/controller state to the new sim state.
-            robosuite_env.sim.set_state_from_flattened(env0_sim_state)
-            robosuite_env.sim.forward()
-            if hasattr(robosuite_env, "update_state"):
-                robosuite_env.update_state()
-            elif hasattr(robosuite_env, "update_sites"):
-                robosuite_env.update_sites()
-
-            # 3e. Refresh the wrapper's obs deque. wrapper.reset above
-            # populated it from the pre-rebuild state, so those frames
-            # are stale. Re-read through the underlying env using the
-            # same pipeline that GrootRoboCasaEnv.reset uses internally
-            # (raw_obs → get_basic_observation → get_groot_observation).
-            raw_obs = robosuite_env._get_observations()
-            basic_obs = base_env.get_basic_observation(raw_obs)
-            groot_obs = base_env.get_groot_observation(basic_obs)
-            wrapper.obs = _deque(
-                [groot_obs] * (wrapper.max_steps_needed + 1),
-                maxlen=wrapper.max_steps_needed + 1,
-            )
-            # reward/done/info are still clean from wrapper.reset above —
-            # nothing has been step()'d since.
-
-            observations_per_env.append(
-                wrapper._get_obs(
-                    wrapper.video_delta_indices, wrapper.state_delta_indices
-                )
-            )
-
-        return observations_per_env
 
     # ─── Debug helpers ───────────────────────────────────────────────────
 

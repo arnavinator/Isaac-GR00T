@@ -18,13 +18,11 @@ Architecture:
 - Each EpisodeCollector owns its own AsyncVectorEnv (group_size workers).
 
 Usage:
-    # Terminal 1 (model venv) — start the GR00T model server
-    uv run python gr00t/eval/run_gr00t_server.py \\
-        --model-path nvidia/GR00T-N1.6-3B \\
-        --embodiment-tag ROBOCASA_PANDA_OMRON \\
-        --use-sim-policy-wrapper
-
-    # Terminal 2 (sim venv) — start the long-running collector server
+    # Terminal 1 (sim venv) — start the long-running collector server.
+    # The trainer's in-process model server (started by train_grpo.py at port
+    # 5555) serves this collector via --policy-server-port 5555. We do NOT
+    # start a separate model server here — that would conflict with the
+    # trainer's in-process bind on port 5555.
     gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \\
         scripts/grpo/collector_server.py \\
         --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \\
@@ -34,8 +32,15 @@ Usage:
         --policy-server-host 127.0.0.1 --policy-server-port 5555 \\
         --listen-port 5556
 
-    # Terminal 3 (main venv) — trainer connects via CollectorClient
-    # (set GrpoConfig.collector_server_host / collector_server_port).
+    # Terminal 2 (main venv) — trainer connects via CollectorClient, and
+    # ALSO hosts the in-process model server on --server-port (5555).
+    uv run python scripts/grpo/train_grpo.py \\
+        --collector-server-host 127.0.0.1 --collector-server-port 5556
+
+    # Optional standalone debug: to test collector_server WITHOUT the
+    # trainer, first start scripts/grpo/grpo_server.py (NOT
+    # gr00t/eval/run_gr00t_server.py — that one doesn't install the GRPO
+    # noise/raw_action capture hooks the collector relies on).
 
 Operational notes:
 - Each EpisodeCollector spawns group_size MuJoCo subprocesses; total worker
@@ -50,6 +55,7 @@ Operational notes:
 """
 
 import argparse
+import signal
 import sys
 import time
 import traceback
@@ -63,18 +69,44 @@ from collect_episodes import EpisodeCollector, save_episodes
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class FatalCollectorError(RuntimeError):
+    """Server reported an error that won't change on retry.
+
+    Currently raised for ValueError-class server-side errors — primarily
+    `env_name not pre-initialized` mismatches between trainer config and
+    server boot args. The trainer's _collect_via_server re-raises this
+    immediately rather than burning its 3-iteration retry budget.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
+
+
+# How often the run loop wakes from blocking recv() to check the running
+# flag (set by SIGTERM handler). Trades a tiny bit of CPU for signal
+# responsiveness.
+_RECV_POLL_MS = 1000
 
 
 class CollectorServer:
     """ZMQ REP server that holds one EpisodeCollector per env_name.
 
     Endpoints:
-      - ping  → {"status": "ok", "envs": [...]}
+      - ping  → {"status": "ok", "envs": [...], "group_size": int,
+                 "n_action_steps": int, "env_max_steps": {env: int}}
+        The trainer pings at __init__ to validate that its config matches
+        the server's bake-time args (n_action_steps / group_size / per-env
+        max_episode_steps). Any mismatch fails fast with the exact restart
+        command needed.
       - collect (data: env_name, output_dir, base_seed, num_groups,
         success_weight, fast_forward_steps, fast_forward_pct)
-        → {"n_episodes", "n_successes", "elapsed_s"}
+        → {"n_episodes", "n_successes", "elapsed_s", "env_name"}
       - kill  → {"status": "ok"} then exits the run loop
     """
 
@@ -87,7 +119,6 @@ class CollectorServer:
         policy_server_host: str,
         policy_server_port: int,
         listen_port: int,
-        seed: int = 42,
         debug_fast_forward: bool = False,
     ):
         if len(env_names) != len(max_episode_steps):
@@ -95,6 +126,13 @@ class CollectorServer:
                 f"--env-names ({len(env_names)}) and --max-episode-steps "
                 f"({len(max_episode_steps)}) must have the same length."
             )
+
+        # Stored for ping()-based validation by the trainer.
+        self.group_size = group_size
+        self.n_action_steps = n_action_steps
+        self.env_max_steps: dict[str, int] = dict(zip(env_names, max_episode_steps))
+        self.debug_fast_forward = debug_fast_forward
+        self.listen_port = listen_port
 
         # Pre-initialize one collector per env. Each one spawns its own
         # AsyncVectorEnv (group_size workers) — the entire startup cost is
@@ -109,36 +147,56 @@ class CollectorServer:
                 n_action_steps=n_action_steps,
                 server_host=policy_server_host,
                 server_port=policy_server_port,
-                seed=seed,
                 debug_fast_forward=debug_fast_forward,
                 output_dir="/tmp",  # overridden per-request
             )
 
-        # ZMQ REP socket
+        # ZMQ REP socket. RCVTIMEO lets the run loop wake periodically so
+        # the SIGTERM handler can request a clean shutdown.
         self.ctx = zmq.Context()
-        self.sock = self.ctx.socket(zmq.REP)
-        self.sock.bind(f"tcp://*:{listen_port}")
-        self.listen_port = listen_port
+        self.sock = self._make_rep_socket()
         self.running = True
 
         print(f"\n[collector_server] {len(self.collectors)} collector(s) ready.")
         print(f"[collector_server] Listening on tcp://*:{listen_port}")
         sys.stdout.flush()
 
+    def _make_rep_socket(self) -> zmq.Socket:
+        """Create + bind a fresh REP socket with the right options.
+
+        Used by __init__ and by the error path that has to rebuild the
+        socket if a reply-send fails (REQ/REP state machine is unrecoverable
+        once the reply phase fails mid-flight).
+        """
+        sock = self.ctx.socket(zmq.REP)
+        sock.setsockopt(zmq.RCVTIMEO, _RECV_POLL_MS)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind(f"tcp://*:{self.listen_port}")
+        return sock
+
     def run(self):
         while self.running:
             try:
                 msg = self.sock.recv()
+            except zmq.error.Again:
+                # RCVTIMEO expired — loop back to check self.running.
+                continue
             except zmq.error.ContextTerminated:
                 break
+
             try:
                 request = msgpack.unpackb(msg, raw=False)
                 endpoint = request.get("endpoint", "")
 
                 if endpoint == "ping":
-                    self.sock.send(
-                        msgpack.packb({"status": "ok", "envs": list(self.collectors)})
-                    )
+                    self.sock.send(msgpack.packb({
+                        "status": "ok",
+                        "envs": list(self.collectors),
+                        "group_size": self.group_size,
+                        "n_action_steps": self.n_action_steps,
+                        "env_max_steps": self.env_max_steps,
+                        "debug_fast_forward": self.debug_fast_forward,
+                    }))
                 elif endpoint == "kill":
                     self.sock.send(msgpack.packb({"status": "ok"}))
                     self.running = False
@@ -146,18 +204,47 @@ class CollectorServer:
                     result = self._handle_collect(request.get("data", {}))
                     self.sock.send(msgpack.packb(result))
                 else:
-                    self.sock.send(
-                        msgpack.packb({"error": f"unknown endpoint: {endpoint!r}"})
-                    )
+                    self.sock.send(msgpack.packb({
+                        "error": f"unknown endpoint: {endpoint!r}",
+                        "fatal": True,
+                    }))
             except Exception as e:
-                # Per-request error: log and reply with {"error": ...} so the
-                # client can decide whether to retry or fail. Don't crash the
-                # whole server (which would void the startup cost savings).
-                traceback.print_exc()
+                # Per-request error: log, reply with {"error": ..., "fatal": ...},
+                # then continue. ValueError-class errors are config mismatches
+                # that won't fix themselves on retry — tag them fatal so the
+                # trainer aborts immediately. Other exceptions are treated as
+                # transient (server bug, transient OOM, etc.) and the trainer
+                # may retry within its consecutive-failure budget.
+                fatal = isinstance(e, ValueError)
+                if fatal:
+                    print(
+                        f"[collector_server] config error (fatal): "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                else:
+                    traceback.print_exc()
+
+                error_payload = msgpack.packb({
+                    "error": f"{type(e).__name__}: {e}",
+                    "fatal": fatal,
+                })
                 try:
-                    self.sock.send(msgpack.packb({"error": f"{type(e).__name__}: {e}"}))
-                except zmq.error.ZMQError:
-                    pass
+                    self.sock.send(error_payload)
+                except zmq.error.ZMQError as send_err:
+                    # Reply-send failed → REP socket state-machine is dead.
+                    # Rebuild before the next recv() so the server stays alive.
+                    print(
+                        f"[collector_server] WARN: error-reply send failed "
+                        f"({send_err!r}); rebuilding REP socket on port "
+                        f"{self.listen_port}",
+                        file=sys.stderr,
+                    )
+                    try:
+                        self.sock.close(linger=0)
+                    except Exception:
+                        pass
+                    self.sock = self._make_rep_socket()
 
     def _handle_collect(self, data: dict) -> dict:
         env_name = data["env_name"]
@@ -221,6 +308,8 @@ class CollectorClient:
     """Thin ZMQ REQ client for CollectorServer.
 
     Used by train_grpo.py instead of subprocess.Popen("python collect_episodes.py").
+    Raises FatalCollectorError on server-side config errors (fail fast); all
+    other server errors raise RuntimeError for the trainer's retry path.
     """
 
     def __init__(
@@ -233,9 +322,18 @@ class CollectorClient:
         self.port = port
         self.timeout_ms = timeout_ms
         self.context = zmq.Context()
+        self.socket: zmq.Socket | None = None
         self._init_socket()
 
     def _init_socket(self):
+        # Close the prior socket before swapping it out, otherwise every
+        # timeout/ZMQError reconnect leaks an FD + zmq i/o thread (the FD
+        # cap eventually trips on long-lived clients).
+        if self.socket is not None:
+            try:
+                self.socket.close(linger=0)
+            except Exception:
+                pass
         self.socket = self.context.socket(zmq.REQ)
         self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
         self.socket.setsockopt(zmq.LINGER, 0)
@@ -277,9 +375,8 @@ class CollectorClient:
             self.socket.send(msgpack.packb(request))
             reply = self.socket.recv()
         except zmq.error.Again:
-            # Timeout: socket state is unrecoverable for REQ/REP — must
-            # rebuild it before the next call, otherwise the next send()
-            # raises EFSM.
+            # Timeout: REQ/REP socket state is unrecoverable — must rebuild
+            # before the next call, otherwise next send() raises EFSM.
             self._init_socket()
             raise TimeoutError(
                 f"Collector server did not reply within {self.timeout_ms / 1000:.0f}s "
@@ -291,12 +388,18 @@ class CollectorClient:
 
         response = msgpack.unpackb(reply, raw=False)
         if isinstance(response, dict) and "error" in response:
-            raise RuntimeError(f"Collector server error: {response['error']}")
+            err = response["error"]
+            if response.get("fatal"):
+                # Won't change on retry — let the trainer abort immediately
+                # rather than burn its consecutive-failure budget.
+                raise FatalCollectorError(err)
+            raise RuntimeError(f"Collector server error: {err}")
         return response
 
     def close(self):
         try:
-            self.socket.close(linger=0)
+            if self.socket is not None:
+                self.socket.close(linger=0)
         except Exception:
             pass
         try:
@@ -325,15 +428,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--group-size", type=int, default=5,
-        help="Rollouts per group (G). Same for all envs.",
+        help="Rollouts per group (G). Same for all envs. MUST match trainer config.",
     )
     parser.add_argument(
         "--n-action-steps", type=int, default=8,
-        help="Substeps per action chunk.",
+        help="Substeps per action chunk. MUST match trainer config.",
     )
     parser.add_argument(
         "--policy-server-host", type=str, default="127.0.0.1",
-        help="GR00T model server (run_gr00t_server.py / grpo_server.py) hostname.",
+        help="GR00T model server hostname (the trainer's in-process server, OR "
+        "scripts/grpo/grpo_server.py if running standalone).",
     )
     parser.add_argument(
         "--policy-server-port", type=int, default=5555,
@@ -342,10 +446,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--listen-port", type=int, default=5556,
         help="Port this collector server listens on for trainer requests.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Initial seed (overridden per-request via base_seed).",
     )
     parser.add_argument(
         "--debug-fast-forward", action="store_true",
@@ -364,9 +464,23 @@ def main():
         policy_server_host=args.policy_server_host,
         policy_server_port=args.policy_server_port,
         listen_port=args.listen_port,
-        seed=args.seed,
         debug_fast_forward=args.debug_fast_forward,
     )
+
+    # SIGTERM handler: just flip the running flag; the run loop polls every
+    # _RECV_POLL_MS and will exit cleanly through the finally: shutdown()
+    # below (which closes the AsyncVectorEnv worker subprocesses). Without
+    # this, kill -TERM would orphan G×N MuJoCo workers as zombies.
+    # SIGINT is left untouched so KeyboardInterrupt still works.
+    def _on_term(signum, frame):
+        print(
+            f"\n[collector_server] Received signal {signum} — shutting down",
+            file=sys.stderr,
+        )
+        server.running = False
+
+    signal.signal(signal.SIGTERM, _on_term)
+
     try:
         server.run()
     except KeyboardInterrupt:

@@ -105,8 +105,10 @@ class GRPOTrainer:
         # is an RPC call instead of a subprocess spawn — eliminates per-iter
         # robocasa import + worker startup cost (~10-20s/iter). The server
         # must be started separately (see scripts/grpo/collector_server.py).
-        # We ping at __init__ to fail fast if the server is unreachable or
-        # is missing any of our configured env_names.
+        # We ping at __init__ to fail fast if the server is unreachable, is
+        # missing any of our configured env_names, or was booted with
+        # bake-time args (group_size, n_action_steps, max_episode_steps)
+        # that don't match this trainer's config.
         self._collector_client = None
         if self.config.collector_server_host:
             sys.path.insert(0, str(Path(__file__).parent))
@@ -128,17 +130,13 @@ class GRPOTrainer:
                     f"--max-episode-steps ... --listen-port "
                     f"{self.config.collector_server_port}`."
                 )
-            available = set(info.get("envs", []))
-            missing = [e for e in self.config.env_names if e not in available]
-            if missing:
-                raise RuntimeError(
-                    f"Collector server is missing envs that this trainer needs: "
-                    f"{missing}. Restart the server with --env-names matching "
-                    f"this config: {self.config.env_names}"
-                )
+            self._validate_collector_server_config(info)
             print(
                 f"  Collector server: {self.config.collector_server_host}:"
-                f"{self.config.collector_server_port} (envs: {sorted(available)})"
+                f"{self.config.collector_server_port} "
+                f"(envs: {sorted(info.get('envs', []))}, "
+                f"group_size={info.get('group_size')}, "
+                f"n_action_steps={info.get('n_action_steps')})"
             )
 
     def setup(self):
@@ -254,10 +252,18 @@ class GRPOTrainer:
         print("=" * 60)
 
     def shutdown(self):
-        """Clean up resources (server thread, tensorboard writer)."""
+        """Clean up resources (server thread, tensorboard writer, collector client)."""
         if hasattr(self, '_server_handle') and self._server_handle is not None:
             self._stop_server_thread(self._server_handle)
             self._server_handle = None
+        # Close collector RPC client (the server itself stays running for the
+        # next trainer instance — that's the whole point of long-running mode).
+        if getattr(self, '_collector_client', None) is not None:
+            try:
+                self._collector_client.close()
+            except Exception as e:
+                print(f"WARN: failed to close collector client: {e}")
+            self._collector_client = None
         if self.writer is not None:
             self.writer.close()
 
@@ -432,6 +438,21 @@ class GRPOTrainer:
         self._consecutive_collect_failures = 0
         print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
 
+        # Surface partial-success silently passing as success. We don't
+        # increment the failure counter here (the load was technically
+        # successful and may still produce useful gradients), but a sudden
+        # drop in episode count usually points to MuJoCo worker crashes,
+        # IPC stalls, or env-side termination bugs — worth seeing in the
+        # log so the operator can investigate.
+        expected_total = self.config.group_size * self.config.num_groups
+        if n_loaded < expected_total:
+            pct = 100 * n_loaded / expected_total if expected_total > 0 else 0
+            print(
+                f"  WARNING: Only {n_loaded}/{expected_total} episodes "
+                f"({pct:.0f}%) loaded — some workers may have failed silently. "
+                f"Failure counter NOT incremented."
+            )
+
         # Bound disk usage: prune old iter_*/ subdirs beyond the keep window.
         # Done AFTER load_episodes succeeded for the current iter, so we never
         # delete a directory we're actively reading from.
@@ -522,7 +543,14 @@ class GRPOTrainer:
         its own max_episode_steps per env (set at server startup), so we
         don't pass max_steps here — if the trainer's config diverges from
         the server's, restart the server with the new values.
+
+        Distinguishes FATAL server errors (config mismatches like env_name
+        typo) from transient ones (timeouts, connection blips). Fatal errors
+        re-raise immediately rather than burning the consecutive-failure
+        retry budget — there's no point retrying when the cause won't
+        self-correct.
         """
+        from collector_server import FatalCollectorError
         try:
             result = self._collector_client.collect(
                 env_name=env_name,
@@ -533,10 +561,20 @@ class GRPOTrainer:
                 fast_forward_steps=ff_steps,
                 fast_forward_pct=self.config.fast_forward_pct,
             )
+        except FatalCollectorError as e:
+            raise RuntimeError(
+                f"Collector server reports fatal config error: {e}. This "
+                f"won't fix itself on retry — restart the collector server "
+                f"with --env-names / --max-episode-steps / --group-size / "
+                f"--n-action-steps matching this trainer's config "
+                f"(env_names={self.config.env_names}, "
+                f"group_size={self.config.group_size}, "
+                f"n_action_steps={self.config.n_action_steps})."
+            ) from e
         except TimeoutError as e:
             return f"collector_server timeout: {e}"
         except RuntimeError as e:
-            # Server-reported error (e.g., env_name not pre-initialized).
+            # Server-reported transient error.
             return f"collector_server error: {e}"
         except Exception as e:
             return f"collector_server connection error ({type(e).__name__}): {e}"
@@ -546,6 +584,63 @@ class GRPOTrainer:
             f"{result['n_successes']} successes in {result['elapsed_s']}s"
         )
         return None
+
+    def _validate_collector_server_config(self, info: dict) -> None:
+        """Check that the server's bake-time args match this trainer's config.
+
+        Mismatches mean episodes will be collected with values inconsistent
+        with what the trainer expects (advantage shape, chunking math).
+        Fail fast at __init__ with the exact restart command rather than
+        producing silently corrupt training data.
+        """
+        available_envs = set(info.get("envs", []))
+        missing_envs = [e for e in self.config.env_names if e not in available_envs]
+        if missing_envs:
+            raise RuntimeError(
+                f"Collector server is missing envs that this trainer needs: "
+                f"{missing_envs}. Restart the server with --env-names "
+                f"matching this config: {self.config.env_names}"
+            )
+
+        server_group_size = info.get("group_size")
+        if server_group_size != self.config.group_size:
+            raise RuntimeError(
+                f"group_size mismatch: trainer config = {self.config.group_size}, "
+                f"server (boot-time) = {server_group_size}. Restart the "
+                f"collector server with --group-size {self.config.group_size}."
+            )
+
+        server_n_action_steps = info.get("n_action_steps")
+        if server_n_action_steps != self.config.n_action_steps:
+            raise RuntimeError(
+                f"n_action_steps mismatch: trainer config = "
+                f"{self.config.n_action_steps}, server (boot-time) = "
+                f"{server_n_action_steps}. Restart the collector server with "
+                f"--n-action-steps {self.config.n_action_steps}."
+            )
+
+        server_env_max_steps = info.get("env_max_steps", {})
+        for env_name in self.config.env_names:
+            expected = self._resolve_max_steps_for_env(env_name)
+            actual = server_env_max_steps.get(env_name)
+            if actual != expected:
+                raise RuntimeError(
+                    f"max_episode_steps mismatch for {env_name!r}: trainer "
+                    f"config = {expected}, server (boot-time) = {actual}. "
+                    f"Restart the collector server with --max-episode-steps "
+                    f"matching the per-env values in this trainer config."
+                )
+
+    def _resolve_max_steps_for_env(self, env_name: str) -> int:
+        """Look up max_episode_steps for one env_name from the trainer config.
+
+        config.max_episode_steps can be an int (broadcast to all envs) or a
+        list parallel to config.env_names.
+        """
+        if isinstance(self.config.max_episode_steps, list):
+            idx = self.config.env_names.index(env_name)
+            return self.config.max_episode_steps[idx]
+        return self.config.max_episode_steps
 
     def _validate_optimizer_state(self, saved: dict) -> None:
         """Verify a saved optimizer state_dict matches the current optimizer's param layout.
@@ -741,7 +836,28 @@ class GRPOTrainer:
             # This keeps per-chunk cache as small as the chunk actually needs,
             # instead of carrying the batch-level padding forever.
             if backbone_attn_mask is not None:
-                valid_len = int(backbone_attn_mask[i].sum().item())
+                mask_i = backbone_attn_mask[i]
+                valid_len = int(mask_i.sum().item())
+                # Verify the mask's 1s are a contiguous prefix (left-aligned
+                # valid tokens, right-padded with 0s). If Eagle ever changes
+                # to right-padding or interleaved valid/invalid tokens, the
+                # slice below would silently keep the WRONG tokens (e.g.,
+                # padding zeros instead of real features) and the cached
+                # backbone features fed to the DiT during the GRPO update
+                # wouldn't match what the policy actually saw at inference
+                # time. Cheap to verify; load-bearing for correctness.
+                if valid_len < mask_i.shape[0]:
+                    prefix_ok = bool(mask_i[:valid_len].all().item())
+                    suffix_ok = not bool(mask_i[valid_len:].any().item())
+                    if not (prefix_ok and suffix_ok):
+                        raise RuntimeError(
+                            f"backbone_attn_mask[{i}] is not contiguous-prefix "
+                            f"(sum={valid_len}, len={mask_i.shape[0]}). This "
+                            f"trainer assumes left-aligned valid tokens; "
+                            f"Eagle backbone padding side appears to have "
+                            f"changed. Either fix the cache slicing here to "
+                            f"index by mask, or align padding side upstream."
+                        )
                 chunk.cached_backbone_features = backbone_features[i, :valid_len].detach().clone()
                 chunk.cached_backbone_attn_mask = backbone_attn_mask[i, :valid_len].detach().clone()
                 if image_mask is not None:

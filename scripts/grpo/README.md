@@ -108,17 +108,16 @@ That's roughly **10-20s of overhead per iteration**, or 30-60 minutes wasted acr
 ### Server mode (optional)
 A long-running `collector_server.py` holds one pre-initialized `EpisodeCollector` per task at startup (each with its own AsyncVectorEnv worker pool), then services per-iteration `collect` requests over ZMQ on port 5556. The trainer's `_collect_via_server` is a thin RPC client. **Startup cost is paid once at server boot, not per iteration.**
 
-Why a ZMQ server and not just a persistent Python object? See above — the venv split forces process separation. ZMQ is the same REQ/REP + msgpack pattern that `grpo_server.py` already uses for the model server, so the trainer just becomes a client of two services instead of one.
+Why a ZMQ server and not just a persistent Python object? See above — the venv split forces process separation. ZMQ is the same REQ/REP + msgpack pattern that `grpo_server.py` already uses for the model server, so the trainer just becomes a client of one extra service.
+
+The trainer's `setup()` always starts an in-process model server on `--server-port` (default 5555), so server-mode only needs **two** terminals: the long-running collector (which connects to the trainer's in-process model server) and the trainer itself. Start the collector first; it'll wait for the trainer to come up.
 
 ```bash
-# Terminal 1: GRPO model server (port 5555 — unchanged)
-uv run python scripts/grpo/grpo_server.py \
-    --model-path nvidia/GR00T-N1.6-3B \
-    --embodiment-tag ROBOCASA_PANDA_OMRON
-
-# Terminal 2: Long-running collector server (port 5556)
-# Pre-initializes one EpisodeCollector per --env-name. The
-# --max-episode-steps list is matched 1:1 with --env-names.
+# Terminal 1: Long-running collector server (port 5556).
+# Pre-initializes one EpisodeCollector per --env-name. --max-episode-steps,
+# --group-size, --n-action-steps must match the trainer config — the trainer
+# pings at __init__ and refuses to start on any mismatch. The collector
+# connects to the trainer's in-process model server on --policy-server-port.
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python scripts/grpo/collector_server.py \
     --env-names robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
                 robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
@@ -127,20 +126,22 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python scripts/grpo/collector_serv
     --policy-server-host 127.0.0.1 --policy-server-port 5555 \
     --listen-port 5556
 
-# Terminal 3: Trainer (set collector_server_host in config or via CLI flag)
+# Terminal 2: Trainer (also hosts the in-process model server on 5555).
 uv run python scripts/grpo/train_grpo.py \
     --collector-server-host 127.0.0.1 --collector-server-port 5556 \
     --num-iterations 200
 ```
 
-The trainer pings the server at `__init__` to verify every `env_names` entry in the trainer config has a matching pre-initialized collector. If the server is unreachable or missing an env, the trainer raises with the exact `collector_server.py` command needed to fix it.
+> **Don't** run `scripts/grpo/grpo_server.py` standalone alongside the trainer in server mode — both would try to bind port 5555. The trainer's in-process server already plays that role. Standalone `grpo_server.py` is only useful for debugging `collect_episodes.py` CLI without the trainer.
+
+The trainer pings the collector server at `__init__` and validates that the server's bake-time config (env_names, group_size, n_action_steps, per-env max_episode_steps) matches its own. Any mismatch raises with the exact restart command — silent collection of episodes with the wrong shape would be much worse.
 
 ### Trade-offs
 
 | Aspect | Subprocess mode | Server mode |
 |--------|-----------------|-------------|
 | Per-iter startup | ~10-20s overhead | ~0s overhead |
-| Setup | One terminal (trainer) | Three terminals (model server + collector server + trainer) |
+| Setup | One terminal (trainer) | Two terminals (collector server + trainer; trainer's in-process model server fills the third role) |
 | Code reload | Each iter picks up edits to `collect_episodes.py` | Restart server to pick up edits |
 | Memory | Bounded per iter (process exits) | Slow growth across iters; restart server every ~50-100 iters |
 | Failure isolation | One collector crash = one bad iter | Collector crash = service down until restarted |

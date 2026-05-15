@@ -287,15 +287,16 @@ class EpisodeCollector:
         n_action_steps: int,
         server_host: str,
         server_port: int,
-        seed: int = 42,
         debug_fast_forward: bool = False,
         output_dir: str = "/tmp/grpo_episodes",
     ):
         self.env_name = env_name
         self.group_size = group_size
         self.n_action_steps = n_action_steps
+        # max_episode_steps is exposed so callers (e.g., CollectorServer) can
+        # report it back to the trainer for cross-process config validation.
+        self.max_episode_steps = max_episode_steps
         self.task_type = dense_reward.classify_task_type(env_name)
-        self.seed = seed
         self.debug_fast_forward = debug_fast_forward
         self.output_dir = Path(output_dir)
 
@@ -349,10 +350,14 @@ class EpisodeCollector:
         (torch.randn in the action head), NOT from environmental randomness;
         GRPO advantages compare these outcomes against each other.
 
-        When fast-forward is enabled for a group, all envs are first stepped
-        in lockstep with env 0's action chunk for fast_forward_steps outer
-        steps, then continue independently. This focuses gradient signal on
-        the critical manipulation phase rather than the approach trajectory.
+        Fast-forward is decided ONCE per call (per training iteration), not
+        per group. With probability `fast_forward_pct`, ALL groups in this
+        call use lockstep FF; otherwise NONE do. This eliminates within-
+        iteration FF/non-FF mixing, which would distort cross-group reward
+        comparisons (FF rollouts have shorter num_steps and so larger time-
+        scaled rewards). Long-run FF fraction across iterations still
+        approaches `fast_forward_pct` because each call gets a different
+        `base_seed` from the trainer.
         """
         all_episodes: list[dict] = []
         start_time = time.time()
@@ -360,15 +365,21 @@ class EpisodeCollector:
         rng = np.random.default_rng(base_seed)
 
         ff_enabled = fast_forward_steps > 0 and fast_forward_pct > 0
+        # One Bernoulli for the whole iteration. Drawn from a base_seed-derived
+        # rng so the FF/non-FF outcome is reproducible.
+        use_ff_for_iteration = ff_enabled and rng.random() < fast_forward_pct
+
         print(f"\nCollecting {num_groups} groups × {self.group_size} rollouts = {total_episodes} episodes...")
         if ff_enabled:
-            print(f"  Fast-forward: {fast_forward_steps} steps, {fast_forward_pct:.0%} of groups")
+            if use_ff_for_iteration:
+                print(f"  Fast-forward: ALL {num_groups} groups branch at step {fast_forward_steps}")
+            else:
+                print(f"  Fast-forward: enabled (pct={fast_forward_pct:.0%}) but NOT this iteration")
 
         for group_idx in range(num_groups):
             group_seed = base_seed + group_idx
-            use_ff = ff_enabled and rng.random() < fast_forward_pct
 
-            if use_ff:
+            if use_ff_for_iteration:
                 group_episodes = self._collect_one_group_with_fast_forward(
                     group_seed=group_seed,
                     group_id=group_idx,
@@ -986,7 +997,6 @@ def main():
         n_action_steps=args.n_action_steps,
         server_host=args.server_host,
         server_port=args.server_port,
-        seed=args.seed,
         debug_fast_forward=args.debug_fast_forward,
         output_dir=args.output_dir,
     )

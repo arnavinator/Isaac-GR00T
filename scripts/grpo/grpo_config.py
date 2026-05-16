@@ -111,13 +111,13 @@ class GRPOConfig:
     # Number of outer steps (action chunks) to fast-forward before branching.
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
     # 0 = disabled. 10 outer steps = 80 sub-steps at n_action_steps=8.
-    fast_forward_steps: int | list[int] = 10
+    fast_forward_steps: int | list[int] = 16
 
     # Fraction of groups that use fast-forward (rest start from seed normally).
     # Mixing ensures the full trajectory stays in the training distribution,
     # preventing approach-phase drift from lack of gradient signal.
     # 0.0 = never fast-forward, 1.0 = always fast-forward.
-    fast_forward_pct: float = 0.9
+    fast_forward_pct: float = 0.8
 
     # ZMQ server host and port for model inference during collection
     server_host: str = "127.0.0.1"
@@ -149,7 +149,7 @@ class GRPOConfig:
     ])
 
     # Directory to store collected episode .npz files
-    episode_dir: str = "/tmp/grpo_episodes"
+    episode_dir: str = "~/my_Isaac-GR00T/grpo_data/grpo_episodes"
 
     # How many of the most recent iter_*/ subdirs to keep under episode_dir.
     # After each iteration's episodes are saved, older iter_*/ dirs are pruned
@@ -176,7 +176,7 @@ class GRPOConfig:
     # each epoch shuffles all action chunks from data collection
     # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
     # Same as grpo_cont.py's args.update_epochs = 10
-    update_epochs: int = 10
+    update_epochs: int = 6
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
@@ -223,10 +223,10 @@ class GRPOConfig:
     resume_from: Optional[str] = None
 
     # Directory for checkpoints (LoRA weights + optimizer state)
-    checkpoint_dir: str = "/tmp/grpo_checkpoints"
+    checkpoint_dir: str = "~/my_Isaac-GR00T/grpo_data/grpo_checkpoints"
 
     # Save checkpoint every N iterations
-    save_interval: int = 10
+    save_interval: int = 5
 
     # Random seed for reproducibility
     seed: int = 67

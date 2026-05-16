@@ -574,7 +574,7 @@ class GRPOTrainer:
         # prefix. A background Timer enforces the wall clock even if the
         # subprocess hangs on stdout with no output (otherwise the blocking
         # read could wait forever).
-        timeout_s = 1800
+        timeout_s = 2100  # 35 min
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

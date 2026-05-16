@@ -316,7 +316,7 @@ class CollectorClient:
         self,
         host: str = "127.0.0.1",
         port: int = 5556,
-        timeout_ms: int = 1_800_000,  # 30 min: longer than any plausible group
+        timeout_ms: int = 2_100_000,  # 35 min: longer than any plausible group
     ):
         self.host = host
         self.port = port

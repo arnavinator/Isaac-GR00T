@@ -54,6 +54,15 @@ from gr00t.policy.server_client import PolicyClient
 import dense_reward
 
 
+# Spacing between successive group seeds within one collect() call. Wide
+# enough to land on materially-different RoboCasa scenes. Must be strictly
+# smaller than the trainer's per-iter seed stride (100_000 in train_grpo.py)
+# divided by num_groups, or two consecutive iters' seed ranges will overlap;
+# at 1000 this is safe for num_groups <= 100 (num_groups=101 collides at
+# the iter boundary).
+GROUP_SEED_STRIDE = 1000
+
+
 # ---------------------------------------------------------------------------
 # Wrapper exposing composite scene-bundle methods over env.call()
 # ---------------------------------------------------------------------------
@@ -377,7 +386,13 @@ class EpisodeCollector:
                 print(f"  Fast-forward: enabled (pct={fast_forward_pct:.0%}) but NOT this iteration")
 
         for group_idx in range(num_groups):
-            group_seed = base_seed + group_idx
+            # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart
+            # RoboCasa scenes (closer seeds tend to produce visually similar
+            # kitchens/layouts, which dampens per-iteration diversity). The
+            # trainer's per-iter seed offset (100_000; see train_grpo.py)
+            # leaves room for num_groups < 100 without crossing into the
+            # next iter's seed range.
+            group_seed = base_seed + group_idx * GROUP_SEED_STRIDE
 
             if use_ff_for_iteration:
                 group_episodes = self._collect_one_group_with_fast_forward(

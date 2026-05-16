@@ -385,6 +385,13 @@ class GRPOTrainer:
             if stats.get("std_reward", 0) < 1e-8:
                 print(f"  Skipping update: all episodes have same reward (no gradient signal)")
                 self._log_metrics(iteration, stats, skip_reason="no_signal")
+                # Save anyway on save_interval boundaries: the model state is
+                # unchanged from the previous iter (no optimizer.step ran), but
+                # a resume point named iter_NNNN should always exist when N is
+                # a multiple of save_interval, regardless of whether the
+                # gradient update happened to fire.
+                if iteration % self.config.save_interval == 0:
+                    self._save_checkpoint(iteration)
                 continue
 
             # ═══ Phase 2b: Pre-compute reference log-probs ═══
@@ -427,6 +434,17 @@ class GRPOTrainer:
         failure handling for both modes.
         """
         self.buffer.clear()
+
+        # Prune BEFORE we create this iter's directory so the on-disk dir
+        # count never exceeds `episode_dirs_to_keep`, even mid-collection or
+        # after a crash. Pruning post-collection (the old order) left a
+        # transient `keep+1` window between mkdir and the prune call — if the
+        # trainer was killed in that window, the user saw keep+1 dirs. The
+        # current iter's dir doesn't exist yet here, so there's no risk of
+        # deleting a directory we're about to read from. Also runs on iters
+        # whose collection later fails (the failure path early-returns), so
+        # failed-iter dirs no longer linger an extra iteration.
+        self._prune_old_episode_dirs()
 
         # Output directory for this iteration's episodes.
         # Remove any leftover episode_*.npz from a previous run before the
@@ -509,11 +527,6 @@ class GRPOTrainer:
                 f"Failure counter NOT incremented."
             )
 
-        # Bound disk usage: prune old iter_*/ subdirs beyond the keep window.
-        # Done AFTER load_episodes succeeded for the current iter, so we never
-        # delete a directory we're actively reading from.
-        self._prune_old_episode_dirs()
-
     def _collect_via_subprocess(
         self,
         env_name: str,
@@ -547,7 +560,12 @@ class GRPOTrainer:
             "--server-host", self.config.server_host,
             "--server-port", str(self.config.server_port),
             "--output-dir", str(episode_dir),
-            "--seed", str(self.config.seed + self.iteration * 1000),
+            # Iter-stride 100_000 leaves room for collect_episodes.py to space
+            # its `num_groups` group seeds by 1000 (see GROUP_SEED_STRIDE in
+            # collect_episodes.py) without crossing into the next iter's seed
+            # range. Safe for num_groups <= 100; num_groups=101 collides at
+            # the iter boundary (iter N's last seed == iter N+1's first seed).
+            "--seed", str(self.config.seed + self.iteration * 100_000),
         ]
 
         # Stream collector output line-by-line so the user sees progress
@@ -611,7 +629,11 @@ class GRPOTrainer:
             result = self._collector_client.collect(
                 env_name=env_name,
                 output_dir=str(episode_dir),
-                base_seed=self.config.seed + self.iteration * 1000,
+                # Iter-stride 100_000 must match _collect_via_subprocess so
+                # both transports produce identical group seeds for a given
+                # (config.seed, iteration). See GROUP_SEED_STRIDE in
+                # collect_episodes.py for the within-iter spacing.
+                base_seed=self.config.seed + self.iteration * 100_000,
                 num_groups=self.config.num_groups,
                 success_weight=self.config.success_weight,
                 fast_forward_steps=ff_steps,
@@ -809,9 +831,12 @@ class GRPOTrainer:
     def _prune_old_episode_dirs(self):
         """Delete iter_*/ subdirs older than (current_iter - keep + 1).
 
-        The current iteration's directory is always preserved. With
-        episode_dirs_to_keep=3 and self.iteration=10, keeps iter_0008,
-        iter_0009, iter_0010 and removes iter_0001..iter_0007.
+        Called from _collect_episodes BEFORE the current iter's directory is
+        created, so we never risk deleting a dir we're about to read from.
+        With episode_dirs_to_keep=3 at the start of iteration 10, prunes
+        iter_0001..iter_0007 and leaves iter_0008, iter_0009 on disk — the
+        soon-to-be-created iter_0010 brings the on-disk count to exactly
+        `keep`.
         """
         keep = self.config.episode_dirs_to_keep
         if keep <= 0:

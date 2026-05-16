@@ -149,7 +149,7 @@ class GRPOConfig:
     ])
 
     # Directory to store collected episode .npz files
-    episode_dir: str = "~/my_Isaac-GR00T/grpo_data/grpo_episodes"
+    episode_dir: str = "grpo_data/grpo_episodes"
 
     # How many of the most recent iter_*/ subdirs to keep under episode_dir.
     # After each iteration's episodes are saved, older iter_*/ dirs are pruned
@@ -176,7 +176,7 @@ class GRPOConfig:
     # each epoch shuffles all action chunks from data collection
     # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
     # Same as grpo_cont.py's args.update_epochs = 10
-    update_epochs: int = 6
+    update_epochs: int = 5
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
@@ -185,7 +185,7 @@ class GRPOConfig:
 
     # KL divergence penalty coefficient (regularization toward reference policy)
     # Same role as grpo_cont.py's args.kl_coef = 0.002
-    kl_coef: float = 0.005
+    kl_coef: float = 0.05
 
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
@@ -223,10 +223,10 @@ class GRPOConfig:
     resume_from: Optional[str] = None
 
     # Directory for checkpoints (LoRA weights + optimizer state)
-    checkpoint_dir: str = "~/my_Isaac-GR00T/grpo_data/grpo_checkpoints"
+    checkpoint_dir: str = "grpo_data/grpo_checkpoints"
 
     # Save checkpoint every N iterations
-    save_interval: int = 5
+    save_interval: int = 2
 
     # Random seed for reproducibility
     seed: int = 67

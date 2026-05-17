@@ -90,7 +90,7 @@ class GRPOConfig:
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
     # 720 steps = 72 seconds of sim time. Some tasks need more/less time.
     # Example: [720, 720, 400, 480, 720, 720, 400] for 7 envs with varying difficulty.
-    max_episode_steps: int | list[int] = 520
+    max_episode_steps: int | list[int] = 480
 
     # How many steps from each 16-step action chunk to actually execute
     # Remaining steps discarded, fresh observation taken, new chunk predicted

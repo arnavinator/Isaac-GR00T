@@ -167,5 +167,3 @@ offline_open_loop_eval_plots/
 /data
 external_dependencies/GR00T-WholeBodyControl/
 
-# GRPO checkpoint iteration directories (large .pt weights)
-grpo_data/grpo_checkpoints/iter_*/

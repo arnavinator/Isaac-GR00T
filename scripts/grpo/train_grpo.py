@@ -73,6 +73,14 @@ class GRPOTrainer:
         self.optimizer = None
         self.iteration = 0
 
+        # Iteration number of the last gradient update that actually fired.
+        # When the skip-update path runs (collection failed or std_reward~0),
+        # we use THIS as the checkpoint dir name instead of the current loop
+        # iter — so resume from the saved checkpoint retries the skipped iter
+        # rather than burning it from the num_iterations budget. Set in
+        # setup(): 0 for a fresh run, resumed_iter for --resume-from.
+        self._last_updated_iteration = 0
+
         # Episode buffer for current iteration's data
         self.buffer = EpisodeBuffer()
 
@@ -218,6 +226,10 @@ class GRPOTrainer:
                 start_iteration = int(dir_name.split("_")[1]) + 1
                 print(f"  Continuing from iteration {start_iteration}")
         self._start_iteration = start_iteration
+        # Resumed checkpoint represents iter (start_iteration - 1)'s end-of-update
+        # state. For a fresh run, no update has fired yet → 0. The skip-save
+        # path keys off this value to name checkpoints after real progress.
+        self._last_updated_iteration = start_iteration - 1
 
         # --- Step 3: Setup optimizer (only LoRA params) ---
         print("\n[3/4] Setting up optimizer...")
@@ -385,13 +397,14 @@ class GRPOTrainer:
             if stats.get("std_reward", 0) < 1e-8:
                 print(f"  Skipping update: all episodes have same reward (no gradient signal)")
                 self._log_metrics(iteration, stats, skip_reason="no_signal")
-                # Save anyway on save_interval boundaries: the model state is
-                # unchanged from the previous iter (no optimizer.step ran), but
-                # a resume point named iter_NNNN should always exist when N is
-                # a multiple of save_interval, regardless of whether the
-                # gradient update happened to fire.
+                # Save under the LAST UPDATED iter's name (not the current loop
+                # iter), so resume from this checkpoint retries the current
+                # iter rather than burning it from the num_iterations budget.
+                # Skip the write if that dir already exists — overwriting it
+                # would lose the prior on-disk state for no benefit (model
+                # weights and optimizer moments are unchanged from then).
                 if iteration % self.config.save_interval == 0:
-                    self._save_checkpoint(iteration)
+                    self._save_checkpoint_for_skipped_iter(iteration)
                 continue
 
             # ═══ Phase 2b: Pre-compute reference log-probs ═══
@@ -401,6 +414,11 @@ class GRPOTrainer:
             phase3_start = time.time()
             update_stats = self._grpo_update()
             phase3_time = time.time() - phase3_start
+
+            # Mark this iter as the last to actually update the policy. Used
+            # by the skip-save path on a future failed iter so its checkpoint
+            # is named after real progress (and by the final save below).
+            self._last_updated_iteration = iteration
 
             # ═══ Phase 4: Logging and checkpointing ═══
             iter_time = time.time() - iter_start
@@ -421,8 +439,19 @@ class GRPOTrainer:
         print("Training complete!")
         print("=" * 60)
 
-        # Final save
-        self._save_checkpoint(self.config.num_iterations)
+        # Final save under the last successfully-updated iter's name, so the
+        # checkpoint always represents real progress. Skip if the run never
+        # produced an update, or if a save_interval boundary already wrote
+        # this dir during the loop.
+        final_iter = self._last_updated_iteration
+        if final_iter <= 0:
+            print("Final save skipped: no successful update ran during training.")
+        else:
+            final_dir = Path(self.config.checkpoint_dir) / f"iter_{final_iter:04d}"
+            if final_dir.exists():
+                print(f"Final save skipped: iter_{final_iter:04d}/ already exists.")
+            else:
+                self._save_checkpoint(final_iter)
 
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int):
         """Collect episodes for one iteration into self.buffer.
@@ -1739,6 +1768,37 @@ class GRPOTrainer:
             ckpt_dir / "optimizer.pt",
         )
         print(f"  Checkpoint saved: {ckpt_dir}")
+
+    def _save_checkpoint_for_skipped_iter(self, iteration: int):
+        """Save a resume point for an iter whose gradient update did NOT fire.
+
+        Names the dir after `_last_updated_iteration` (the iter whose state
+        we'd actually be restoring), not the current loop iter. That way:
+          - resume from this dir → start_iteration = last_updated + 1, which
+            is exactly the skipped iter — it gets a fresh attempt rather than
+            being burned from num_iterations.
+          - LR scheduling on resume matches what the skipped iter would have
+            seen (frac = 1 - (last_updated)/num_iterations), since LR is
+            recomputed per-iter from the loop counter.
+          - If the dir already exists (e.g., the previous successful iter
+            was a save_interval boundary), skip the write — the on-disk
+            state is already exactly what we'd be saving.
+        """
+        target = self._last_updated_iteration
+        if target <= 0:
+            print(
+                f"  Skip checkpoint at iter {iteration}: no successful "
+                f"update has run yet — model is still base weights."
+            )
+            return
+        ckpt_dir = Path(self.config.checkpoint_dir) / f"iter_{target:04d}"
+        if ckpt_dir.exists():
+            print(
+                f"  Skip checkpoint at iter {iteration}: iter_{target:04d}/ "
+                f"already exists (resume from there to retry iter {target + 1})."
+            )
+            return
+        self._save_checkpoint(target)
 
 
 # ---------------------------------------------------------------------------

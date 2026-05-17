@@ -223,6 +223,71 @@ uv run python scripts/grpo/test_key_roundtrip.py
 uv run python scripts/grpo/test_sim_wrapper.py
 ```
 
+## Checkpointing & Resume
+
+### What's saved
+
+Each checkpoint at `{checkpoint_dir}/iter_NNNN/` contains:
+- `lora_weights.pt` — the LoRA adapter state dict (only the `lora_*` keys; ~80MB vs ~6GB for the full model)
+- `optimizer.pt` — Adam moments + the trainable-parameter name list (validated against the current model's name order on load to detect a positional permutation from a `peft`/`torch` version bump)
+
+### Save points
+
+The trainer writes a checkpoint at any of:
+- End of a successful iter `N` where `N % save_interval == 0`
+- End of a **skipped** iter `N` where `N % save_interval == 0` (different naming — see below)
+- End of the run (always, under the last successfully-updated iter's name)
+
+### Resume
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --resume-from ~/my_Isaac-GR00T/grpo_data/grpo_checkpoints/iter_0050 \
+    --num-iterations 200
+```
+
+The trainer parses `NNNN` from the dir name and sets `start_iteration = NNNN + 1`. LoRA weights and optimizer moments are loaded from that dir; LR is recomputed each iter from the loop counter, so the schedule resumes cleanly.
+
+### What "iter NNNN" actually means
+
+**An `iter_NNNN/` directory is named after the last iter whose gradient update actually fired** — not the loop counter at the moment of the save. An iter is "skipped" (no update) when:
+- Collection failed (subprocess timeout, server RPC error, zero episodes produced) → buffer empty → `std_reward = 0` → skip path, OR
+- All episodes produced the same shaped reward (e.g., 0/25 success across the whole iter, or all 25 succeeded in identical step counts) → `std_reward < 1e-8` → skip path
+
+In both cases the model weights and optimizer moments are bit-identical to what they were after the previous successful iter. Naming the resulting checkpoint `iter_<current>` would (a) burn the failed iter from the `num_iterations` budget on resume, since `start_iteration = current + 1`, and (b) give the next iter an LR one tick lower than the one the skipped iter should have used. So `_save_checkpoint_for_skipped_iter` (`train_grpo.py:1772`) names the dir after `_last_updated_iteration` instead, and skips the write if that dir already exists:
+
+| Skip-save state | Behavior |
+|---|---|
+| No update has fired yet (e.g., fresh run, iter 1 collection failed) | Skip save: *"no successful update has run yet — model is still base weights"* |
+| Last update was iter K, `iter_K/` doesn't exist on disk | Write `iter_K/` |
+| Last update was iter K, `iter_K/` already exists | Skip save: *"resume from there to retry iter K+1"* |
+
+This is what makes resume retry the failed iter rather than burn it from `num_iterations`.
+
+### Worked example: iter 6 times out
+
+Setup: `save_interval=2`, `num_iterations=200`. Iters 1–5 succeed; iter 6's collection hits the 35-minute timeout.
+
+| Iter | Outcome | `_last_updated_iteration` | Save action |
+|---|---|---|---|
+| 1 | update succeeds | 1 | `1 % 2 ≠ 0` → no save |
+| 2 | update succeeds | 2 | save `iter_0002/` |
+| 3 | update succeeds | 3 | no save |
+| 4 | update succeeds | 4 | save `iter_0004/` |
+| 5 | update succeeds | 5 | no save |
+| 6 | collection timeout — skip path | 5 (unchanged) | skip-save → target=5, `iter_0005/` doesn't exist → write `iter_0005/` |
+
+`checkpoint_dir/` now contains `iter_0002/, iter_0004/, iter_0005/`. Resume from `iter_0005`:
+- `start_iteration = 6` → iter 6 is **retried fresh**, not skipped past
+- LR for the retry = `(1 - 5/200) × lr = 0.975 × lr` — exactly what the original (timed-out) iter 6 would have used
+- The 35 minutes the timeout cost you don't *also* burn one of your 200 training iterations
+
+If `iter_0005/` had already existed (e.g., `save_interval=1` would have written it on iter 5), the skip-save logs *"iter_0005/ already exists (resume from there to retry iter 6)"* and writes nothing — you still resume from the existing `iter_0005/` and get the same retry behavior.
+
+### Final save
+
+The post-loop final save (`train_grpo.py:442-454`) also writes under `iter_<_last_updated_iteration>/`, skipping if the dir already exists. A run that fails on its last few iters then ends with a checkpoint named after the last iter that actually trained — not the `num_iterations` value, which would otherwise be a misleadingly-named copy of older state.
+
 ## Hyperparameters
 
 ### Critical (tune these first)

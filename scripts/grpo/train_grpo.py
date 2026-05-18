@@ -26,7 +26,7 @@ import threading
 import time
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import numpy as np
 import torch
@@ -1290,20 +1290,19 @@ class GRPOTrainer:
         n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
 
         for epoch in range(self.config.update_epochs):
-            # Shuffle live chunks for this epoch. We bypass
-            # buffer.iter_minibatches because that yields from the full chunk
-            # list (live + dead) — see filter rationale above. The seed
-            # scheme matches the prior iter_minibatches contract.
+            # Stratified minibatch sampling: every minibatch contains
+            # chunks from all live groups (best-effort) — see
+            # _iter_stratified_minibatches docstring for full rationale.
+            # We bypass buffer.iter_minibatches because that yields from
+            # the full chunk list (live + dead) AND uses a flat shuffle
+            # that doesn't preserve group structure; both are wrong here.
+            # Seed scheme matches the prior iter_minibatches contract so
+            # iteration-to-iteration RNG state remains comparable.
             rng = np.random.default_rng(
                 self.config.seed + self.iteration * 100 + epoch
             )
-            indices = np.arange(n_live_chunks)
-            rng.shuffle(indices)
 
-            for start in range(0, n_live_chunks, self.config.mini_batch_size):
-                end = min(start + self.config.mini_batch_size, n_live_chunks)
-                batch = [live_chunks[indices[i]] for i in range(start, end)]
-
+            for batch in self._iter_stratified_minibatches(live_chunks, rng):
                 # --- Prepare batch tensors ---
                 result = self._prepare_batch(batch)
                 if result is None:
@@ -1478,6 +1477,126 @@ class GRPOTrainer:
             "n_updates": n_updates,
             "n_skipped_nonfinite": n_skipped_nonfinite,
         }
+
+    def _iter_stratified_minibatches(
+        self,
+        live_chunks: list[ActionChunk],
+        rng: np.random.Generator,
+    ) -> Iterator[list[ActionChunk]]:
+        """Yield minibatches with best-effort per-group stratification.
+
+        Each minibatch contains (mb_size // n_live_groups) GUARANTEED chunks
+        from every non-empty group, plus (mb_size % n_live_groups) FILLER
+        chunks drawn uniformly without replacement from chunks not yet
+        consumed this epoch. With mb_size=8 and num_groups=5 that's 1
+        chunk per group plus 3 filler.
+
+        Why stratify: chunks within an episode share an identical advantage
+        (A_ep / num_chunks from episode_buffer._build_chunks). A small
+        flat-shuffled minibatch dominated by 1-2 episodes has near-zero
+        advantage variance, and the per-minibatch z-score renorm in
+        _grpo_update_inner then squashes that batch's gradient signal
+        toward zero. Forcing every batch to span all live groups
+        guarantees the renorm has multiple distinct group-mean
+        advantages to work with.
+
+        Why uniform-over-remaining-CHUNKS for filler (vs uniform-over-
+        GROUPS): self-balances. With ~equal group sizes, fuller queues
+        contribute filler proportionally more often, so all groups drain
+        in lockstep and the "≥1 per group" guarantee holds for
+        essentially the whole epoch. Uniform-over-groups would drain
+        small groups too fast and skew the late epoch.
+
+        Walking a pre-shuffled filler_order left-to-right while skipping
+        already-used indices is equivalent to uniform-without-replacement
+        from the remaining pool: at any point, the prefix of un-visited
+        filler_order entries is itself a uniform random permutation of
+        the remaining set.
+
+        Degenerate cases:
+          - mb_size < n_live_groups: base_per_group=0, everything becomes
+            filler → degrades to flat random shuffle (no stratification).
+          - A group's queue empties before others: silently skipped in
+            subsequent guaranteed phases (best-effort); other groups
+            continue contributing.
+          - Last batch may be smaller than mb_size if chunks don't
+            divide evenly.
+
+        Each chunk is yielded exactly once per epoch.
+        """
+        n_live_chunks = len(live_chunks)
+        if n_live_chunks == 0:
+            return
+
+        # Bin chunk indices by group_id and shuffle each group's order.
+        # group_id is propagated from GRPOEpisode in
+        # episode_buffer._build_chunks.
+        group_to_queue: dict[int, list[int]] = {}
+        for i, c in enumerate(live_chunks):
+            group_to_queue.setdefault(c.group_id, []).append(i)
+        for gid in group_to_queue:
+            rng.shuffle(group_to_queue[gid])
+
+        # Global filler visitation order. Walked once left-to-right;
+        # entries already consumed by a guaranteed slot (or an earlier
+        # filler pick) are skipped without rewinding the pointer.
+        filler_order = np.arange(n_live_chunks)
+        rng.shuffle(filler_order)
+
+        group_positions: dict[int, int] = {gid: 0 for gid in group_to_queue}
+        filler_pos = 0
+        # Tracks chunks already placed in some batch this epoch. Both the
+        # guaranteed phase and the filler phase can consume any chunk, so
+        # this is the single source of truth across both paths.
+        used = np.zeros(n_live_chunks, dtype=bool)
+
+        n_live_groups = len(group_to_queue)
+        mb_size = self.config.mini_batch_size
+        base_per_group = mb_size // n_live_groups
+        n_filler = mb_size - base_per_group * n_live_groups
+
+        while True:
+            batch_idx_list: list[int] = []
+
+            # Guaranteed slots: take up to base_per_group UNUSED chunks
+            # from each non-empty group's shuffled queue. Filler-consumed
+            # entries are walked past (pointer advances, taken count does
+            # not), so each group always tries hardest to land its quota.
+            if base_per_group > 0:
+                for gid, queue in group_to_queue.items():
+                    taken = 0
+                    pos = group_positions[gid]
+                    while taken < base_per_group and pos < len(queue):
+                        idx = queue[pos]
+                        pos += 1
+                        if not used[idx]:
+                            batch_idx_list.append(idx)
+                            used[idx] = True
+                            taken += 1
+                    group_positions[gid] = pos
+
+            # Filler slots: walk filler_order, skip already-used. Same
+            # skip-on-used pattern as the guaranteed phase so a chunk
+            # that the guaranteed phase already took in this very batch
+            # isn't double-counted.
+            n_filler_taken = 0
+            while n_filler_taken < n_filler and filler_pos < n_live_chunks:
+                idx = int(filler_order[filler_pos])
+                filler_pos += 1
+                if not used[idx]:
+                    batch_idx_list.append(idx)
+                    used[idx] = True
+                    n_filler_taken += 1
+
+            if not batch_idx_list:
+                # All chunks consumed: both pointers exhausted AND no
+                # unused chunks remain. Safe termination — argued
+                # because each chunk is in both filler_order and exactly
+                # one group queue, and both pointers advance
+                # monotonically through them.
+                return
+
+            yield [live_chunks[i] for i in batch_idx_list]
 
     def _prepare_batch(self, batch: list[ActionChunk]) -> Optional[tuple[dict, list[ActionChunk]]]:
         """Convert a list of ActionChunks into GPU tensors for training.

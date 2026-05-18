@@ -67,6 +67,12 @@ class ActionChunk:
     chunk_idx: int
     episode_reward: float
     episode_success: bool
+    # Group this chunk's parent episode belongs to. Propagated from
+    # GRPOEpisode.group_id in _build_chunks. Used by the stratified
+    # minibatch iterator in train_grpo.py to bin chunks by group so each
+    # minibatch can span all live groups. Defaults to 0 to keep the
+    # dataclass constructor backward-compatible.
+    group_id: int = 0
 
     # Pre-computed reference log-prob (set after collection, before GRPO update)
     ref_log_prob: float | None = None
@@ -410,6 +416,7 @@ class EpisodeBuffer:
                     chunk_idx=chunk_idx,
                     episode_reward=episode.shaped_reward,
                     episode_success=episode.success,
+                    group_id=episode.group_id,
                 )
                 chunks.append(chunk)
 

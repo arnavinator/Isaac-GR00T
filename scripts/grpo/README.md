@@ -393,6 +393,7 @@ The trainer aborts after 3 consecutive collection failures (timeout / non-zero s
 
 ### Collection is slow
 - **First, check if you're paying per-iter startup cost** — see [Collection Modes](#collection-modes). Server mode eliminates ~10-20s/iter overhead.
+- **Then, check for swap thrashing** — see [Memory Management](#memory-management). Each worker uses ~5-6 GiB; 5 workers × 5 GiB plus trainer + system sits right at the 30 GiB RAM cliff. Once you cross it, every step pays swap I/O latency and per-group time roughly doubles.
 - Increase `group_size` (more parallel envs per group, more CPU memory)
 - Ensure server and collector are on same machine (ZMQ latency)
 - Check if MuJoCo rendering is accidentally enabled
@@ -417,6 +418,161 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python scripts/grpo/collect_episod
     --output-dir /tmp/grpo_ff_test
 # Inspect /tmp/grpo_ff_test/debug_ff/*.png — all rows should look identical
 ```
+
+## Memory Management
+
+Two memory leaks made longer training runs fall off a cliff: a slow trainer-side
+accumulator that crept upward across iterations, and a worker-side per-call
+leak that ballooned each AsyncVectorEnv subprocess during a single iter. Both
+are now patched. This section documents what was wrong, where the fixes live,
+and how to interpret the diagnostic logs they emit.
+
+### The setup that exposed both leaks
+
+Default config on a 30 GiB RAM box:
+
+| Component | Memory at steady state |
+|---|---|
+| 5 AsyncVectorEnv workers (one per `group_size`) | ~5-6 GiB each → 25-30 GiB |
+| Trainer process (model on GPU, CPU-side episode buffer) | ~1-2 GiB after cleanup |
+| Collector parent + system processes | ~2-3 GiB |
+| **Total** | **~30-35 GiB** |
+
+The system is right at the cliff. Any extra megabyte pushes a worker into
+swap, and once swap I/O contends with the model server's GPU traffic on
+`/mnt/scratch/swapfile` (which also holds the HF cache), every `env.step()`
+pays a page-fault tax. Per-group time roughly doubles, and the 35-min
+subprocess timeout fires. Without the cleanups, both leaks compound this:
+the trainer's heap grows ~3-4 GiB across iters, and each worker's
+post-group baseline grows ~700-1000 MiB per group.
+
+### Trainer-side cleanup (`train_grpo.py`)
+
+**Where:** `_release_memory_to_os()` and `_log_mem_snapshot()`, called at
+the top of every iteration in `train()` — *before* `_collect_episodes`
+spawns the collector subprocess.
+
+**What it does, in order:**
+
+1. `self.buffer.clear()` — drops the previous iter's `EpisodeBuffer`
+   (25 episodes worth of numpy arrays loaded from `.npz`, plus per-chunk
+   cached backbone features). **This step is load-bearing**: until these
+   references are dropped, `gc.collect()` and `malloc_trim()` cannot free
+   any of the underlying memory because Python still holds them as
+   reachable. The original patch ran cleanup *before* `clear()` and only
+   recovered ~130 MiB; moving `clear()` to the start recovers ~3-4 GiB.
+2. `gc.collect()` × 2 — breaks reference cycles between `ActionChunk`
+   objects and parent episodes that hold each other via shared dicts.
+   The second pass picks up any garbage produced by finalizers run during
+   the first pass.
+3. `torch.cuda.synchronize()` + `torch.cuda.empty_cache()` — drains any
+   pending GPU work and asks PyTorch's caching allocator to release
+   unused blocks back to the driver. Not the dominant CPU savings, but
+   keeps VRAM headroom predictable across iters.
+4. `ctypes.CDLL("libc.so.6").malloc_trim(0)` — asks glibc to return
+   freed heap pages to the kernel. Without this, the heap stays
+   sticky-high even after Python has dropped all refs: glibc keeps freed
+   memory in its per-thread cache for fast re-allocation, and on a memory-
+   pressured box that cache competes directly with the collector workers
+   for RSS.
+
+**Why the order matters:** every step depends on the previous one having
+run. Don't reorder unless you understand which step frees what (e.g.,
+calling `malloc_trim` before `gc.collect()` is a no-op because nothing has
+been freed yet).
+
+### Worker-side cleanup (`collect_episodes.py`)
+
+**Where:** module-level helpers `_read_proc_status_mb()`, `_log_worker_mem()`,
+and `_release_worker_memory_to_os()`, called from inside
+`GroupAlignmentWrapper.apply_scene_bundle` immediately after step 3
+(`robosuite_env.reset_from_xml_string` + `sim.reset()`).
+
+**What's leaking:** `reset_from_xml_string(xml)` builds a fresh
+`MjModel` + `MjData` and replaces `robosuite_env.sim`. The previous pair
+becomes orphaned, but several mechanisms keep it pinned:
+
+- robosuite caches references to the old `MjModel` and `MjData` in its
+  observable wrappers, sensor handlers, and contact processors
+- MuJoCo's C-side memory pools (textures, meshes, contact preallocation
+  arrays) don't always release at the glibc level even after the Python
+  wrapper objects are GC'd
+- EGL/GL framebuffer state from the renderer leaks across reloads
+
+Without cleanup, each `apply_scene_bundle` call adds ~700-1000 MiB of
+resident memory per worker; over 5 groups per iter that's ~3-4 GiB per
+worker per iter, and across 5 workers that crosses the system's RAM
+cliff into swap thrashing. The worker cleanup runs the same
+`gc.collect()` × 2 + `malloc_trim(0)` recipe as the trainer-side fix
+(no CUDA — workers don't have GPU state).
+
+**Why placement matters:** the cleanup is right after step 3 because
+that's the moment the old `MjModel` becomes unreachable from the live env
+(steps 4-6 work exclusively on the new `MjModel`). Running it earlier
+would have nothing to clean; running it later means the orphaned object
+sits in memory longer and may interfere with steps 4-6's allocations.
+
+### Diagnostic logs
+
+Both fixes emit log lines so you can verify they're working and detect
+regressions. The trainer logs at the top of every iter:
+
+```
+[mem iter 7 start (pre-release)] RSS=4923MB Swap=0MB Total=4923MB
+[mem iter 7 start (post-release)] RSS=1063MB Swap=0MB Total=1063MB
+```
+
+**What to watch:** post-release `Total` should stay roughly flat across
+iters (e.g., consistently ~1 GiB). If it climbs by hundreds of MB per
+iter, there's another accumulator we haven't found yet — most likely
+candidates are cached features on chunks, the autograd graph from
+`_grpo_update`, or wandb buffering. Pre-release climbing is *expected*
+(it's the buffer the cleanup is about to release).
+
+Each worker logs three lines per `apply_scene_bundle` call (so 5 workers
+× 5 groups × 3 = 75 worker_mem lines per iter, prefixed with `[collector]`
+by the trainer subprocess pipe):
+
+```
+[worker_mem pid=NNNN apply_scene_bundle entry] RSS=…MB Swap=…MB Total=…MB xml=…KB
+[worker_mem pid=NNNN apply_scene_bundle post-reset (pre-cleanup)] RSS=…MB Swap=…MB Total=…MB
+[worker_mem pid=NNNN apply_scene_bundle post-cleanup] RSS=…MB Swap=…MB Total=…MB
+```
+
+**What to watch:**
+
+| Comparison | Healthy | Concerning |
+|---|---|---|
+| `xml=` value across iters | Roughly constant per env | Drifting → procedural scene complexity varies by seed |
+| `post-reset` − `entry` | Negative or small (`reset_from_xml_string` does some implicit cleanup) | Large positive → new scene materially heavier than old |
+| `post-cleanup` − `entry` | ~0-100 MiB residual | 500 MiB+ residual → cleanup not catching the dominant allocation |
+| `entry` (group N+1) vs `post-cleanup` (group N) | Bounded gap (~25-100 MiB drift) | Climbing → step()-time leak between groups |
+
+### What the cleanups CAN and CANNOT do
+
+**Can:** bound the *cross-iter* and *inter-group* residual. With both
+fixes in place, the trainer stays at ~1-2 GiB indefinitely, and worker
+post-cleanup baselines drift by only ~25-100 MiB per group cycle. Without
+them, you eventually hit swap thrashing and the 35-min subprocess timeout.
+
+**Cannot:** reduce the *during-episode* peak. While each worker is
+running its 60-chunk × 8-substep episode loop, transient allocations
+(observation rendering buffers, MuJoCo contact arrays, numpy temporaries)
+push the worker's working set up by ~3-4 GiB before being released. The
+cleanup catches this *between groups*, but for the duration of an episode
+the memory is genuinely live. If 5 workers × peak (~8-9 GiB each) exceeds
+RAM, you'll still page-fault during episodes regardless of how aggressive
+the between-group cleanup is.
+
+When that happens, the fix is upstream of the cleanup:
+
+- **Bigger instance** — most reliable. ~64 GiB RAM removes the cliff entirely.
+- **Reduce per-worker peak** — smaller render resolution, fewer cameras,
+  shorter `max_episode_steps`. Cuts the transient allocation directly.
+- **Raise the subprocess timeout** (`train_grpo.py`, `timeout_s = 2100`)
+  to ~3300s. Doesn't fix the slowness, just lets each iter finish through
+  the page-fault tax.
+
 
 ## References
 

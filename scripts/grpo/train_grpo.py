@@ -357,6 +357,15 @@ class GRPOTrainer:
             self.iteration = iteration
             iter_start = time.time()
 
+            # Release memory back to OS before launching this iter's collector
+            # subprocess. The collector spawns 5 AsyncVectorEnv workers (~5 GiB
+            # RSS each); without this, glibc's heap retains ~2-4 GiB of dead
+            # numpy/.npz allocations from the previous iter and squeezes the
+            # workers into swap.
+            self._log_mem_snapshot(f"iter {iteration} start (pre-release)")
+            self._release_memory_to_os()
+            self._log_mem_snapshot(f"iter {iteration} start (post-release)")
+
             # --- Learning rate annealing (mirrors grpo_cont.py lines 244-250) ---
             frac = 1.0 - (iteration - 1) / self.config.num_iterations
             frac = max(frac, 0.1)  # Don't decay below 10% of initial LR
@@ -452,6 +461,75 @@ class GRPOTrainer:
                 print(f"Final save skipped: iter_{final_iter:04d}/ already exists.")
             else:
                 self._save_checkpoint(final_iter)
+
+    def _release_memory_to_os(self):
+        """Force memory back to the OS before starting a new iter.
+
+        EpisodeBuffer.clear() drops Python references but glibc keeps freed
+        allocations in its per-thread cache rather than returning them to
+        the kernel. With ~2 GiB of episode .npz arrays loaded each iter,
+        the heap grows monotonically and eventually squeezes the
+        AsyncVectorEnv workers (~5 GiB each) into swap, where I/O contention
+        with /mnt/scratch/swapfile makes collection 2-3x slower than its
+        non-swapping baseline.
+        """
+        import gc
+        import ctypes
+
+        # Drop the previous iter's buffered episodes + cached chunk features
+        # FIRST. Without this, gc.collect() and malloc_trim() can't release
+        # any of it because self.buffer still holds live references to the
+        # 25 episodes (~2-3 GiB of numpy arrays) and chunk-cached GPU
+        # tensors. _collect_episodes() will call clear() again at Phase 1
+        # start; that second call is a no-op on the now-empty buffer.
+        self.buffer.clear()
+
+        # gc.collect() before malloc_trim: breaks any reference cycles
+        # between ActionChunks and parent episodes that would otherwise pin
+        # numpy buffers past clear(). A single call already collects every
+        # generation; the second pass picks up any garbage created by
+        # finalizers run during the first pass (cheap insurance).
+        gc.collect()
+        gc.collect()
+
+        if torch.cuda.is_available():
+            # Synchronize first so any in-flight kernels finish and their
+            # output tensors become eligible for the caching allocator to
+            # reclaim. empty_cache() then returns those blocks to the driver.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        # Ask glibc to return freed heap pages to the kernel. Without this,
+        # the heap is sticky-high even after Python has dropped all refs.
+        # Best-effort: skipped on non-glibc libcs (musl, macOS).
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            # Best-effort: OSError if libc.so.6 absent (musl, macOS),
+            # AttributeError if the symbol is missing (unusual builds).
+            # Never let an optional cleanup crash training.
+            pass
+
+    def _log_mem_snapshot(self, label: str) -> None:
+        """Log RSS+Swap of the trainer process. Used to detect cross-iter
+        accumulation: if Total climbs across iters at the same label, the
+        cleanup in _release_memory_to_os is missing something.
+        """
+        try:
+            with open("/proc/self/status") as f:
+                fields = {}
+                for line in f:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        fields[k.strip()] = v.strip()
+            rss_mb = int(fields.get("VmRSS", "0 kB").split()[0]) / 1024
+            swap_mb = int(fields.get("VmSwap", "0 kB").split()[0]) / 1024
+            print(f"  [mem {label}] RSS={rss_mb:.0f}MB Swap={swap_mb:.0f}MB Total={rss_mb + swap_mb:.0f}MB")
+        except Exception:
+            # Non-critical logging utility: /proc/self/status unavailable
+            # (non-Linux), unexpected format, or any other parsing issue
+            # should never crash training. Skip silently.
+            pass
 
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int):
         """Collect episodes for one iteration into self.buffer.

@@ -54,6 +54,89 @@ from gr00t.policy.server_client import PolicyClient
 import dense_reward
 
 
+# ---------------------------------------------------------------------------
+# Worker-side memory diagnostics + per-call OS-release cleanup
+# ---------------------------------------------------------------------------
+#
+# These helpers run inside AsyncVectorEnv subprocess workers (via env.call()
+# RPCs from GroupAlignmentWrapper.apply_scene_bundle). Every group, that
+# method calls robosuite.reset_from_xml_string(xml), which builds a fresh
+# MjModel + MjData and replaces robosuite_env.sim. The previous pair becomes
+# orphaned, but several mechanisms keep it pinned: cached refs in robosuite
+#'s observable wrappers and sensor handlers, MuJoCo's C-side memory pools
+# (textures, meshes, contact arrays) sticky at the glibc level, and EGL/GL
+# framebuffer state from the renderer. Without explicit cleanup, each call
+# adds ~0.5-1 GiB of resident memory per worker; 5 calls/iter x 5 workers
+# crosses the system's RAM cliff into swap thrashing.
+#
+# We can't fix the underlying refs without modifying robosuite, but we can
+# (a) trigger Python's GC to collect anything no longer reachable and (b)
+# ask glibc to return freed heap pages to the kernel. The instrumentation
+# logs RSS+Swap before and after so we can quantify the per-call leak and
+# the cleanup's recovery.
+
+
+def _read_proc_status_mb() -> tuple[float, float]:
+    """Return (rss_mb, swap_mb) for the current process. Best-effort."""
+    try:
+        with open("/proc/self/status") as f:
+            fields = {}
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    fields[k.strip()] = v.strip()
+        rss_mb = int(fields.get("VmRSS", "0 kB").split()[0]) / 1024
+        swap_mb = int(fields.get("VmSwap", "0 kB").split()[0]) / 1024
+        return rss_mb, swap_mb
+    except Exception:
+        return 0.0, 0.0
+
+
+def _log_worker_mem(label: str, extra: str = "") -> None:
+    """Print this worker's memory footprint with the worker's PID prefix.
+
+    Lines are flushed immediately so they propagate through the collector's
+    stdout pipe to the trainer in real time. Best-effort: any failure is
+    silently swallowed since this is a non-critical diagnostic.
+    """
+    try:
+        import os
+        rss_mb, swap_mb = _read_proc_status_mb()
+        suffix = f" {extra}" if extra else ""
+        print(
+            f"  [worker_mem pid={os.getpid()} {label}] "
+            f"RSS={rss_mb:.0f}MB Swap={swap_mb:.0f}MB Total={rss_mb + swap_mb:.0f}MB{suffix}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
+def _release_worker_memory_to_os() -> None:
+    """Force memory back to the OS within a worker. Mirrors the trainer's
+    _release_memory_to_os pattern.
+
+    Two gc.collect() passes: first runs any finalizers (which can produce
+    new garbage), second cleans that up. malloc_trim(0) returns freed glibc
+    heap pages to the kernel; without it the Python objects are gone but
+    the worker's RSS stays sticky-high. Best-effort: any failure is
+    silently swallowed.
+    """
+    try:
+        import gc
+        gc.collect()
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        # OSError if libc.so.6 absent (musl, macOS); AttributeError if the
+        # symbol is missing. Optional cleanup must never crash the worker.
+        pass
+
+
 # Spacing between successive group seeds within one collect() call. Wide
 # enough to land on materially-different RoboCasa scenes. Must be strictly
 # smaller than the trainer's per-iter seed stride (100_000 in train_grpo.py)
@@ -107,6 +190,15 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         base_env = self.env.unwrapped
         robosuite_env = base_env.env
 
+        # ─── Instrumentation: entry baseline ───────────────────────────
+        # XML size correlates with MuJoCo MjModel size: roughly 1 KB of XML
+        # per ~50-100 KB of native MjModel memory (textures + meshes + bodies).
+        # Logging it lets us correlate per-call leak size with scene complexity
+        # and confirm/refute the hypothesis that seed 600067 produces heavier
+        # kitchens than seed 500067.
+        _xml_size_kb = len(bundle.get("model_xml", "")) // 1024
+        _log_worker_mem("apply_scene_bundle entry", extra=f"xml={_xml_size_kb}KB")
+
         # 1. Pin metadata (newer set_ep_meta / older set_attrs_from_ep_meta).
         if hasattr(robosuite_env, "set_attrs_from_ep_meta"):
             robosuite_env.set_attrs_from_ep_meta(bundle["ep_meta"])
@@ -121,6 +213,22 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         xml = robosuite_env.edit_model_xml(bundle["model_xml"])
         robosuite_env.reset_from_xml_string(xml)
         robosuite_env.sim.reset()
+
+        # ─── Fix + instrumentation: free orphaned MjModel/MjData ───────
+        # reset_from_xml_string above replaced robosuite_env.sim with a fresh
+        # MjSim; the previous MjModel/MjData are no longer referenced by the
+        # robosuite env, but Python and glibc both hold onto the memory. The
+        # cleanup here drops Python-level refs (gc) and returns freed heap
+        # pages to the kernel (malloc_trim). Two log lines bracket the call
+        # so the per-call delta is visible in the collector log:
+        #   pre-cleanup  - peak after the new MjModel allocation
+        #   post-cleanup - what the cleanup actually got back
+        # The difference between successive entries' RSS values is the
+        # residual leak (memory that even malloc_trim can't recover, eg.
+        # MuJoCo C-side allocations or fragmented heap).
+        _log_worker_mem("apply_scene_bundle post-reset (pre-cleanup)")
+        _release_worker_memory_to_os()
+        _log_worker_mem("apply_scene_bundle post-cleanup")
 
         # 4. Apply reference dynamic state (qpos/qvel/act/time).
         robosuite_env.sim.set_state_from_flattened(bundle["sim_state"])

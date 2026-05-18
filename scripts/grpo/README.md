@@ -254,7 +254,7 @@ The trainer parses `NNNN` from the dir name and sets `start_iteration = NNNN + 1
 - Collection failed (subprocess timeout, server RPC error, zero episodes produced) → buffer empty → `std_reward = 0` → skip path, OR
 - All episodes produced the same shaped reward (e.g., 0/25 success across the whole iter, or all 25 succeeded in identical step counts) → `std_reward < 1e-8` → skip path
 
-In both cases the model weights and optimizer moments are bit-identical to what they were after the previous successful iter. Naming the resulting checkpoint `iter_<current>` would (a) burn the failed iter from the `num_iterations` budget on resume, since `start_iteration = current + 1`, and (b) give the next iter an LR one tick lower than the one the skipped iter should have used. So `_save_checkpoint_for_skipped_iter` (`train_grpo.py:1772`) names the dir after `_last_updated_iteration` instead, and skips the write if that dir already exists:
+In both cases the model weights and optimizer moments are bit-identical to what they were after the previous successful iter. Naming the resulting checkpoint `iter_<current>` would (a) burn the failed iter from the `num_iterations` budget on resume, since `start_iteration = current + 1`, and (b) give the next iter an LR one tick lower than the one the skipped iter should have used. So `train_grpo.py:_save_checkpoint_for_skipped_iter` names the dir after `_last_updated_iteration` instead, and skips the write if that dir already exists:
 
 | Skip-save state | Behavior |
 |---|---|
@@ -286,7 +286,7 @@ If `iter_0005/` had already existed (e.g., `save_interval=1` would have written 
 
 ### Final save
 
-The post-loop final save (`train_grpo.py:442-454`) also writes under `iter_<_last_updated_iteration>/`, skipping if the dir already exists. A run that fails on its last few iters then ends with a checkpoint named after the last iter that actually trained — not the `num_iterations` value, which would otherwise be a misleadingly-named copy of older state.
+The post-loop final save (the block immediately after the main `train()` loop in `train_grpo.py`) also writes under `iter_<_last_updated_iteration>/`, skipping if the dir already exists. A run that fails on its last few iters then ends with a checkpoint named after the last iter that actually trained — not the `num_iterations` value, which would otherwise be a misleadingly-named copy of older state.
 
 ## Hyperparameters
 
@@ -295,9 +295,11 @@ The post-loop final save (`train_grpo.py:442-454`) also writes under `iter_<_las
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | `group_size` | 5 | G = rollouts per group (parallel envs with same seed). More = tighter advantage estimates |
-| `num_groups` | 5 | Groups per iteration (different initial states). More = diverse gradients |
+| `num_groups` | 5 | Minimum groups per iteration (different initial states). More = diverse gradients. With dynamic mode, the collector may add more — see `min_successful_groups` |
+| `min_successful_groups` | 4 | Dynamic group collection: keep adding groups past `num_groups` until this many have >=1 successful rollout (capped at `max_groups`). Set to 0 to disable (always exactly `num_groups`). See [Checkpointing & Resume](#checkpointing--resume) for the rationale |
+| `max_groups` | 10 | Hard cap on dynamic group collection. Must be `>= num_groups` and `<= 100`. Subprocess and RPC timeouts auto-scale at 7 min/group when dynamic mode is active |
 | `learning_rate` | 1e-5 | Lower = more stable, higher = faster but risks collapse |
-| `kl_coef` | 0.005 | Higher = stays closer to pretrained, lower = more exploration |
+| `kl_coef` | 0.05 | Higher = stays closer to pretrained, lower = more exploration |
 | `clip_eps` | 0.2 | Clipping range for surrogate objective (0.1-0.3 typical) |
 | `lora_rank` | 16 | Higher = more expressive (~20M params at r=16) |
 
@@ -305,13 +307,14 @@ The post-loop final save (`train_grpo.py:442-454`) also writes under `iter_<_las
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `update_epochs` | 10 | More epochs = more updates per data, risk overfitting |
+| `update_epochs` | 5 | More epochs = more updates per data, risk overfitting |
 | `tau_centers` | [0, .25, .35, .5, .6, .75] | τ eval points for FM log-prob (K = len(list)) |
 | `success_weight` | 1.0 | Balance binary reward vs dense progress signal (1.0 = binary only) |
 | `max_grad_norm` | 0.5 | Gradient clipping threshold |
-| `fast_forward_steps` | 10 | Outer steps to skip before branching (0=disabled, per-env list OK) |
-| `fast_forward_pct` | 0.5 | Fraction of groups using fast-forward (rest start normally) |
-| `episode_dirs_to_keep` | 3 | Number of recent `iter_*/` subdirs to retain under `episode_dir`; older dirs are pruned after each successful collection. Set to 0 to disable pruning. Bounds disk usage on `/tmp` over long runs. |
+| `save_interval` | 2 | Save checkpoint every N iterations. Skipped iters (no gradient update) save under the prior successful iter's name; see [Checkpointing & Resume](#checkpointing--resume) |
+| `fast_forward_steps` | 16 | Outer steps to skip before branching (0=disabled, per-env list OK) |
+| `fast_forward_pct` | 0.8 | Fraction of groups using fast-forward (rest start normally) |
+| `episode_dirs_to_keep` | 3 | Number of recent `iter_*/` subdirs to retain under `episode_dir`; older dirs are pruned at the start of each iteration. Set to 0 to disable pruning. Bounds disk usage on `/tmp` over long runs. |
 | `collector_server_host` | `""` | Empty = subprocess mode (default). Set to a host (e.g., `"127.0.0.1"`) to use a long-running `collector_server.py` and skip the per-iter startup cost. See [Collection Modes](#collection-modes). |
 | `collector_server_port` | 5556 | Port of the long-running collector server. Only used when `collector_server_host` is non-empty. Distinct from the model server's port 5555. |
 
@@ -371,7 +374,7 @@ where:
 - Lower `lora_rank` (16 → 8)
 
 ### KL divergence explodes
-- Increase `kl_coef` (0.005 → 0.02)
+- Increase `kl_coef` (0.05 → 0.1 or 0.2)
 - Decrease `learning_rate`
 - Check for NaN in loss (gradient clipping issue)
 
@@ -405,7 +408,7 @@ Your `lora_target_modules` (or `lora_rank`) differs between the saved checkpoint
 PEFT or PyTorch version changed between save and resume, altering the trainable-parameter traversal order. AdamW state would silently re-attach to the wrong tensors. Pin `peft` and `torch` versions across save and load, or restart training from scratch.
 
 ### `episode/kl_loss` is small but always non-negative
-Expected. The KL penalty uses Schulman's k3 unbiased estimator (`E[exp(ref-current) - (ref-current) - 1]`), which is non-negative pointwise (zero exactly when current ≡ ref). If kl_loss climbs above ~0.5–1.0, the policy is drifting from ref faster than `kl_coef` can brake — either bump `kl_coef` (0.005 → 0.01) or lower `learning_rate`.
+Expected. The KL penalty uses Schulman's k3 unbiased estimator (`E[exp(ref-current) - (ref-current) - 1]`), which is non-negative pointwise (zero exactly when current ≡ ref). If kl_loss climbs above ~0.5–1.0, the policy is drifting from ref faster than `kl_coef` can brake — either bump `kl_coef` (0.05 → 0.1) or lower `learning_rate`.
 
 ### Verifying fast-forward branching
 ```bash

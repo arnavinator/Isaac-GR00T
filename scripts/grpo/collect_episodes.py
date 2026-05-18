@@ -374,6 +374,17 @@ def parse_args():
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for environment initialization.",
     )
+    parser.add_argument(
+        "--min-successful-groups", type=int, default=0,
+        help="Min groups with >=1 success before stopping. 0 = disabled "
+             "(always collect exactly num_groups). When >0, collector continues "
+             "past num_groups (capped at max_groups) until criterion is met.",
+    )
+    parser.add_argument(
+        "--max-groups", type=int, default=None,
+        help="Hard cap on dynamic group collection. Defaults to num_groups "
+             "(no dynamic collection). Must be <= 100 (GROUP_SEED_STRIDE limit).",
+    )
     return parser.parse_args()
 
 
@@ -458,8 +469,10 @@ class EpisodeCollector:
         success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
+        min_successful_groups: int = 0,
+        max_groups: int | None = None,
     ) -> list[dict]:
-        """Collect num_groups groups of self.group_size rollouts each.
+        """Collect groups of self.group_size rollouts each.
 
         Each group consists of group_size rollouts from the SAME initial state
         (same env reset seed). Different groups have different seeds. Within a
@@ -475,10 +488,48 @@ class EpisodeCollector:
         scaled rewards). Long-run FF fraction across iterations still
         approaches `fast_forward_pct` because each call gets a different
         `base_seed` from the trainer.
+
+        Dynamic group collection: when min_successful_groups > 0, after
+        collecting `num_groups` groups the collector keeps adding one more
+        group at a time until either (a) at least `min_successful_groups`
+        groups have produced at least one successful rollout, or (b)
+        `max_groups` groups have been collected (warning logged).
         """
+        # Default max_groups = num_groups (disables dynamic mode regardless
+        # of min_successful_groups, since we can't go beyond num_groups).
+        if max_groups is None:
+            max_groups = num_groups
+
+        dynamic_mode = min_successful_groups > 0 and max_groups > num_groups
+
+        # Validation. These constraints are also enforced statically in the
+        # trainer config, but a misconfigured manual CLI invocation would
+        # bypass that and silently produce wrong-shaped data.
+        if num_groups < 1:
+            raise ValueError(
+                f"num_groups must be >= 1, got {num_groups}"
+            )
+        if max_groups < num_groups:
+            raise ValueError(
+                f"max_groups ({max_groups}) must be >= num_groups ({num_groups})"
+            )
+        if min_successful_groups > max_groups:
+            raise ValueError(
+                f"min_successful_groups ({min_successful_groups}) cannot "
+                f"exceed max_groups ({max_groups}) — criterion would be unsatisfiable."
+            )
+        # GROUP_SEED_STRIDE × max_groups must stay below the trainer's per-iter
+        # seed stride (100_000; see train_grpo.py) or two consecutive iters'
+        # seed ranges overlap.
+        if max_groups * GROUP_SEED_STRIDE > 100_000:
+            raise ValueError(
+                f"max_groups={max_groups} with GROUP_SEED_STRIDE={GROUP_SEED_STRIDE} "
+                f"would overflow the trainer's per-iter seed stride (100_000), "
+                f"causing seed collisions across iterations."
+            )
+
         all_episodes: list[dict] = []
         start_time = time.time()
-        total_episodes = self.group_size * num_groups
         rng = np.random.default_rng(base_seed)
 
         ff_enabled = fast_forward_steps > 0 and fast_forward_pct > 0
@@ -486,20 +537,35 @@ class EpisodeCollector:
         # rng so the FF/non-FF outcome is reproducible.
         use_ff_for_iteration = ff_enabled and rng.random() < fast_forward_pct
 
-        print(f"\nCollecting {num_groups} groups × {self.group_size} rollouts = {total_episodes} episodes...")
+        # Header
+        if dynamic_mode:
+            print(
+                f"\nCollecting {num_groups}+ groups (cap {max_groups}) "
+                f"× {self.group_size} rollouts each..."
+            )
+            print(
+                f"  Dynamic: continue past {num_groups} groups until "
+                f">={min_successful_groups} groups have >=1 success "
+                f"(or hit cap)."
+            )
+        else:
+            total_episodes = self.group_size * num_groups
+            print(
+                f"\nCollecting {num_groups} groups × {self.group_size} rollouts "
+                f"= {total_episodes} episodes..."
+            )
         if ff_enabled:
             if use_ff_for_iteration:
-                print(f"  Fast-forward: ALL {num_groups} groups branch at step {fast_forward_steps}")
+                print(f"  Fast-forward: ALL groups branch at step {fast_forward_steps}")
             else:
                 print(f"  Fast-forward: enabled (pct={fast_forward_pct:.0%}) but NOT this iteration")
 
-        for group_idx in range(num_groups):
+        successful_groups = 0
+        group_idx = 0
+        while True:
             # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart
             # RoboCasa scenes (closer seeds tend to produce visually similar
-            # kitchens/layouts, which dampens per-iteration diversity). The
-            # trainer's per-iter seed offset (100_000; see train_grpo.py)
-            # leaves room for num_groups < 100 without crossing into the
-            # next iter's seed range.
+            # kitchens/layouts, which dampens per-iteration diversity).
             group_seed = base_seed + group_idx * GROUP_SEED_STRIDE
 
             if use_ff_for_iteration:
@@ -520,23 +586,86 @@ class EpisodeCollector:
 
             all_episodes.extend(group_episodes)
 
+            group_successes = sum(e["success"] for e in group_episodes)
+            # "Successful group" = at least one rollout succeeded. This is
+            # an approximation for "group will produce a non-zero gradient
+            # signal" — the strict condition is per-group reward std > 1e-4
+            # (see episode_buffer.py:compute_advantages). Edge cases where
+            # the approximation differs:
+            #   - All G rollouts succeed at IDENTICAL num_steps: rewards
+            #     all equal → std=0 → group dead, but counted here.
+            #   - All G rollouts fail with IDENTICAL max_progress (only
+            #     matters when success_weight<1.0): same situation.
+            # Both require zero policy-noise-induced variance on
+            # success/failure timing, which is vanishingly rare on
+            # non-trivial RoboCasa tasks (typical num_steps spreads over
+            # 10s of substeps within a successful group). If you observe
+            # dynamic mode terminating with 4 "successful" groups but
+            # _grpo_update_inner reports `Filtering N/N chunks ... dead
+            # groups`, switch this criterion to a per-group reward std check
+            # (would require the collector to compute time-scaled rewards,
+            # which it doesn't currently do).
+            if group_successes > 0:
+                successful_groups += 1
+
+            group_idx += 1
+
             n_done = len(all_episodes)
             elapsed = time.time() - start_time
             rate = n_done / elapsed * 60 if elapsed > 0 else 0
-            group_successes = sum(e["success"] for e in group_episodes)
+            if dynamic_mode:
+                progress_str = (
+                    f"successful groups: {successful_groups}/{min_successful_groups}, "
+                    f"eps: {n_done}"
+                )
+                count_str = f"{group_idx}/{num_groups}+"
+            else:
+                progress_str = f"total: {n_done}/{self.group_size * num_groups}"
+                count_str = f"{group_idx}/{num_groups}"
             print(
-                f"  Group {group_idx+1}/{num_groups} (seed={group_seed}) {ff_label}: "
+                f"  Group {count_str} (seed={group_seed}) {ff_label}: "
                 f"{group_successes}/{self.group_size} success | "
-                f"total: {n_done}/{total_episodes} ({rate:.0f} eps/min)"
+                f"{progress_str} ({rate:.0f} eps/min)"
             )
+
+            # Stop conditions. have_signal is True when the dynamic criterion
+            # is met OR when dynamic mode is disabled (in which case we just
+            # need have_min_groups).
+            have_min_groups = group_idx >= num_groups
+            have_signal = (
+                not dynamic_mode
+                or successful_groups >= min_successful_groups
+            )
+            at_max_cap = group_idx >= max_groups
+
+            if have_min_groups and have_signal:
+                break
+            if at_max_cap:
+                if not have_signal:
+                    print(
+                        f"  WARNING: hit max_groups={max_groups} cap with only "
+                        f"{successful_groups}/{min_successful_groups} successful "
+                        f"groups — proceeding with what was collected."
+                    )
+                break
 
         elapsed = time.time() - start_time
         successes = sum(e["success"] for e in all_episodes)
+        total_eps = len(all_episodes)
+        rate = total_eps / elapsed * 60 if elapsed > 0 else 0
         print(
-            f"\nCollection complete: {total_episodes} episodes in {elapsed:.1f}s "
-            f"({total_episodes/elapsed*60:.0f} eps/min)"
+            f"\nCollection complete: {total_eps} episodes from {group_idx} "
+            f"groups in {elapsed:.1f}s ({rate:.0f} eps/min)"
         )
-        print(f"Success rate: {successes}/{total_episodes} ({100*successes/total_episodes:.0f}%)")
+        # Defensive: total_eps is normally >= group_size after at least one
+        # group, but a worker death producing an empty group_episodes list
+        # would make this 0. Guard the division.
+        success_pct = 100 * successes / total_eps if total_eps > 0 else 0.0
+        print(
+            f"Success rate: {successes}/{total_eps} "
+            f"({success_pct:.0f}% episodes), "
+            f"successful groups: {successful_groups}/{group_idx}"
+        )
         # Only report dense progress when it actually contributed to the shaped
         # reward — with success_weight=1.0 (the default) the progress term is
         # multiplied by (1 - success_weight) = 0, so max_progress stays at the
@@ -1146,6 +1275,8 @@ def main():
             success_weight=args.success_weight,
             fast_forward_steps=args.fast_forward_steps,
             fast_forward_pct=args.fast_forward_pct,
+            min_successful_groups=args.min_successful_groups,
+            max_groups=args.max_groups,
         )
         save_episodes(episodes, args.output_dir)
     finally:

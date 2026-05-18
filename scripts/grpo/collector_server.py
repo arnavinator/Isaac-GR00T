@@ -265,13 +265,20 @@ class CollectorServer:
         collector.output_dir = output_dir
 
         t0 = time.time()
-        episodes = collector.collect(
+        # max_groups is optional in the payload — older trainers won't send
+        # it. If absent, EpisodeCollector.collect() defaults to num_groups
+        # (which disables dynamic mode).
+        collect_kwargs = dict(
             num_groups=int(data["num_groups"]),
             base_seed=int(data["base_seed"]),
             success_weight=float(data.get("success_weight", 1.0)),
             fast_forward_steps=int(data.get("fast_forward_steps", 0)),
             fast_forward_pct=float(data.get("fast_forward_pct", 0.5)),
+            min_successful_groups=int(data.get("min_successful_groups", 0)),
         )
+        if "max_groups" in data and data["max_groups"] is not None:
+            collect_kwargs["max_groups"] = int(data["max_groups"])
+        episodes = collector.collect(**collect_kwargs)
         save_episodes(episodes, str(output_dir))
         elapsed = time.time() - t0
 
@@ -317,10 +324,12 @@ class CollectorClient:
         host: str = "127.0.0.1",
         port: int = 5556,
         timeout_ms: int = 2_100_000,  # 35 min: longer than any plausible group
+        ping_timeout_ms: int = 30_000,  # 30 sec — fail fast on connect/server-down, but tolerate slow server warmup (AsyncVectorEnv worker spawn can take ~10-30s on first ping)
     ):
         self.host = host
         self.port = port
         self.timeout_ms = timeout_ms
+        self.ping_timeout_ms = ping_timeout_ms
         self.context = zmq.Context()
         self.socket: zmq.Socket | None = None
         self._init_socket()
@@ -340,7 +349,16 @@ class CollectorClient:
         self.socket.connect(f"tcp://{self.host}:{self.port}")
 
     def ping(self) -> dict:
-        return self._call("ping", requires_input=False)
+        # Use a short timeout for ping. The trainer pings at __init__, so a
+        # dead/unreachable server should fail fast (10 sec) rather than
+        # hanging for `timeout_ms` (which scales with max_groups and can be
+        # >70 min for default config). Override the socket's RCVTIMEO for
+        # this single call, then restore the long timeout after.
+        return self._call(
+            "ping",
+            requires_input=False,
+            timeout_ms_override=self.ping_timeout_ms,
+        )
 
     def collect(
         self,
@@ -351,8 +369,10 @@ class CollectorClient:
         success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
+        min_successful_groups: int = 0,
+        max_groups: int | None = None,
     ) -> dict:
-        return self._call("collect", {
+        payload = {
             "env_name": env_name,
             "output_dir": str(output_dir),
             "base_seed": int(base_seed),
@@ -360,31 +380,60 @@ class CollectorClient:
             "success_weight": float(success_weight),
             "fast_forward_steps": int(fast_forward_steps),
             "fast_forward_pct": float(fast_forward_pct),
-        })
+            "min_successful_groups": int(min_successful_groups),
+        }
+        # Only include max_groups when set so older servers (which don't know
+        # this key) keep the EpisodeCollector default behaviour.
+        if max_groups is not None:
+            payload["max_groups"] = int(max_groups)
+        return self._call("collect", payload)
 
     def kill(self) -> dict:
         return self._call("kill", requires_input=False)
 
     def _call(
-        self, endpoint: str, data: dict | None = None, requires_input: bool = True
+        self, endpoint: str, data: dict | None = None, requires_input: bool = True,
+        timeout_ms_override: int | None = None,
     ) -> Any:
         request: dict = {"endpoint": endpoint}
         if requires_input:
             request["data"] = data or {}
+        # Optionally override RCVTIMEO for this single call (e.g., short
+        # timeout for ping). Restored in `finally` so subsequent calls keep
+        # the long timeout. If the socket gets rebuilt by _init_socket on a
+        # timeout/error path, the rebuilt socket already has self.timeout_ms.
+        if timeout_ms_override is not None:
+            self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms_override)
         try:
-            self.socket.send(msgpack.packb(request))
-            reply = self.socket.recv()
-        except zmq.error.Again:
-            # Timeout: REQ/REP socket state is unrecoverable — must rebuild
-            # before the next call, otherwise next send() raises EFSM.
-            self._init_socket()
-            raise TimeoutError(
-                f"Collector server did not reply within {self.timeout_ms / 1000:.0f}s "
-                f"(endpoint={endpoint!r})"
-            )
-        except zmq.error.ZMQError:
-            self._init_socket()
-            raise
+            try:
+                self.socket.send(msgpack.packb(request))
+                reply = self.socket.recv()
+            except zmq.error.Again:
+                # Timeout: REQ/REP socket state is unrecoverable — must rebuild
+                # before the next call, otherwise next send() raises EFSM.
+                self._init_socket()
+                effective_timeout = (
+                    timeout_ms_override
+                    if timeout_ms_override is not None
+                    else self.timeout_ms
+                )
+                raise TimeoutError(
+                    f"Collector server did not reply within "
+                    f"{effective_timeout / 1000:.0f}s "
+                    f"(endpoint={endpoint!r})"
+                )
+            except zmq.error.ZMQError:
+                self._init_socket()
+                raise
+        finally:
+            # Restore the long timeout if we overrode it and the socket is
+            # still alive. If _init_socket ran above, this is a harmless
+            # no-op (the new socket already has self.timeout_ms set).
+            if timeout_ms_override is not None and self.socket is not None:
+                try:
+                    self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+                except zmq.error.ZMQError:
+                    pass
 
         response = msgpack.unpackb(reply, raw=False)
         if isinstance(response, dict) and "error" in response:

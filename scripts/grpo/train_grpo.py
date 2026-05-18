@@ -121,9 +121,21 @@ class GRPOTrainer:
         if self.config.collector_server_host:
             sys.path.insert(0, str(Path(__file__).parent))
             from collector_server import CollectorClient
+            # Scale RPC timeout from the EFFECTIVE upper bound on groups
+            # this iter. With dynamic mode active (min_successful_groups>0
+            # and max_groups>num_groups in EpisodeCollector.collect), the
+            # collector may run up to max_groups groups; otherwise it stops
+            # at exactly num_groups. ~7 min/group on the user's setup.
+            effective_max_groups = (
+                self.config.max_groups
+                if self.config.min_successful_groups > 0
+                and self.config.max_groups > self.config.num_groups
+                else self.config.num_groups
+            )
             self._collector_client = CollectorClient(
                 host=self.config.collector_server_host,
                 port=self.config.collector_server_port,
+                timeout_ms=420_000 * effective_max_groups,
             )
             try:
                 info = self._collector_client.ping()
@@ -348,7 +360,23 @@ class GRPOTrainer:
         """
         print(f"\nStarting training: {self.config.num_iterations} iterations")
         total_eps = self.config.group_size * self.config.num_groups
-        print(f"  Episodes per iteration: {total_eps} ({self.config.num_groups} groups × {self.config.group_size})")
+        is_dynamic = (
+            self.config.min_successful_groups > 0
+            and self.config.max_groups > self.config.num_groups
+        )
+        if is_dynamic:
+            max_eps = self.config.group_size * self.config.max_groups
+            print(
+                f"  Episodes per iteration: {total_eps}-{max_eps} "
+                f"({self.config.num_groups}-{self.config.max_groups} groups × "
+                f"{self.config.group_size}; dynamic, target "
+                f">={self.config.min_successful_groups} successful groups)"
+            )
+        else:
+            print(
+                f"  Episodes per iteration: {total_eps} "
+                f"({self.config.num_groups} groups × {self.config.group_size})"
+            )
         print(f"  Update epochs: {self.config.update_epochs}")
         print(f"  Mini-batch size: {self.config.mini_batch_size}")
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
@@ -424,10 +452,29 @@ class GRPOTrainer:
             update_stats = self._grpo_update()
             phase3_time = time.time() - phase3_start
 
-            # Mark this iter as the last to actually update the policy. Used
-            # by the skip-save path on a future failed iter so its checkpoint
-            # is named after real progress (and by the final save below).
-            self._last_updated_iteration = iteration
+            # Treat an iter as "updated" only if at least one optimizer.step()
+            # actually fired. Two paths lead to n_updates=0 here that the
+            # outer std_reward<1e-8 skip-check (line 427) does NOT catch:
+            #   1. Every minibatch had non-finite loss (bf16 ratio overflow).
+            #   2. Every group's per-group std<1e-4 (so the dead-chunk filter
+            #      in _grpo_update_inner left zero live chunks), but the
+            #      GLOBAL std_reward exceeded 1e-8 — e.g., a mix of all-fail
+            #      groups (rewards=0) and all-succeed-with-identical-num_steps
+            #      groups (rewards=constant).
+            # In both cases the model + optimizer are bit-identical to the
+            # prior successful iter. Don't bump _last_updated_iteration, and
+            # write the save (if scheduled) under the prior iter's name via
+            # _save_checkpoint_for_skipped_iter — so resume retries this
+            # iter rather than burning it from the num_iterations budget.
+            did_update = update_stats.get("n_updates", 0) > 0
+            if did_update:
+                self._last_updated_iteration = iteration
+            else:
+                print(
+                    f"  No gradient steps fired this iter (n_updates=0). "
+                    f"Treating iter {iteration} as skipped — model state "
+                    f"unchanged from iter {self._last_updated_iteration}."
+                )
 
             # ═══ Phase 4: Logging and checkpointing ═══
             iter_time = time.time() - iter_start
@@ -440,9 +487,13 @@ class GRPOTrainer:
                 f"total={iter_time:.0f}s"
             )
 
-            # Save checkpoint
+            # Save checkpoint. When did_update is False, route through the
+            # skipped-iter save path so the dir name reflects real progress.
             if iteration % self.config.save_interval == 0:
-                self._save_checkpoint(iteration)
+                if did_update:
+                    self._save_checkpoint(iteration)
+                else:
+                    self._save_checkpoint_for_skipped_iter(iteration)
 
         print("\n" + "=" * 60)
         print("Training complete!")
@@ -573,7 +624,22 @@ class GRPOTrainer:
             ff_steps = self.config.fast_forward_steps
 
         total_episodes = self.config.group_size * self.config.num_groups
-        print(f"  Collecting {self.config.num_groups} groups × {self.config.group_size} = {total_episodes} episodes...")
+        is_dynamic = (
+            self.config.min_successful_groups > 0
+            and self.config.max_groups > self.config.num_groups
+        )
+        if is_dynamic:
+            max_total = self.config.group_size * self.config.max_groups
+            print(
+                f"  Collecting {self.config.num_groups}+ groups (cap "
+                f"{self.config.max_groups}) × {self.config.group_size} "
+                f"rollouts = {total_episodes}-{max_total} episodes..."
+            )
+        else:
+            print(
+                f"  Collecting {self.config.num_groups} groups × "
+                f"{self.config.group_size} = {total_episodes} episodes..."
+            )
 
         # Run collection: RPC to long-running server if configured, else
         # spawn a fresh subprocess.
@@ -625,12 +691,27 @@ class GRPOTrainer:
         # drop in episode count usually points to MuJoCo worker crashes,
         # IPC stalls, or env-side termination bugs — worth seeing in the
         # log so the operator can investigate.
-        expected_total = self.config.group_size * self.config.num_groups
+        # In dynamic mode the collector may produce more groups than
+        # `num_groups`, so the static `group_size * num_groups` lower bound
+        # would suppress this warning when actual collection > num_groups
+        # but lost episodes within those groups. Use the max of (configured
+        # minimum, actually-loaded distinct group_ids) as the expected
+        # group count: catches partial-loss within loaded groups AND
+        # static-mode under-collection. Doesn't catch entirely-missing
+        # groups in dynamic mode (no signal in the buffer for that).
+        loaded_group_ids = (
+            len(set(ep.group_id for ep in self.buffer.episodes))
+            if self.buffer.episodes
+            else 0
+        )
+        expected_groups = max(self.config.num_groups, loaded_group_ids)
+        expected_total = self.config.group_size * expected_groups
         if n_loaded < expected_total:
             pct = 100 * n_loaded / expected_total if expected_total > 0 else 0
             print(
                 f"  WARNING: Only {n_loaded}/{expected_total} episodes "
-                f"({pct:.0f}%) loaded — some workers may have failed silently. "
+                f"({pct:.0f}%) loaded across {loaded_group_ids} group(s) — "
+                f"some workers may have failed silently. "
                 f"Failure counter NOT incremented."
             )
 
@@ -673,6 +754,11 @@ class GRPOTrainer:
             # range. Safe for num_groups <= 100; num_groups=101 collides at
             # the iter boundary (iter N's last seed == iter N+1's first seed).
             "--seed", str(self.config.seed + self.iteration * 100_000),
+            # Dynamic group collection (config-driven). When
+            # min_successful_groups=0 in config, collector behaves identically
+            # to the old fixed-num_groups path.
+            "--min-successful-groups", str(self.config.min_successful_groups),
+            "--max-groups", str(self.config.max_groups),
         ]
 
         # Stream collector output line-by-line so the user sees progress
@@ -681,7 +767,18 @@ class GRPOTrainer:
         # prefix. A background Timer enforces the wall clock even if the
         # subprocess hangs on stdout with no output (otherwise the blocking
         # read could wait forever).
-        timeout_s = 2100  # 35 min
+        # Scale subprocess timeout from the EFFECTIVE upper bound on groups
+        # this iter (matches the RPC client's scaling at __init__). When
+        # dynamic mode is disabled (min_successful_groups=0 or max_groups
+        # equals num_groups), the collector stops at num_groups so there's
+        # no need to grant the dynamic-mode worst-case 70-min budget.
+        effective_max_groups = (
+            self.config.max_groups
+            if self.config.min_successful_groups > 0
+            and self.config.max_groups > self.config.num_groups
+            else self.config.num_groups
+        )
+        timeout_s = 420 * effective_max_groups  # 7 min/group
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -745,6 +842,8 @@ class GRPOTrainer:
                 success_weight=self.config.success_weight,
                 fast_forward_steps=ff_steps,
                 fast_forward_pct=self.config.fast_forward_pct,
+                min_successful_groups=self.config.min_successful_groups,
+                max_groups=self.config.max_groups,
             )
         except FatalCollectorError as e:
             raise RuntimeError(
@@ -983,6 +1082,29 @@ class GRPOTrainer:
         if not chunks:
             return
 
+        # Drop chunks from dead groups (per-group std < 1e-4 → advantage = 0).
+        # They get filtered again in _grpo_update before any forward pass, so
+        # computing their ref log-probs here would be pure waste — and they
+        # also wouldn't get encoded-feature cache entries that nothing
+        # downstream would use. The advantage is set to literal `0.0` upstream
+        # (episode_buffer.py:367), so `== 0.0` would also work; `abs(x) > 1e-12`
+        # is defense-in-depth against any future change that introduces float
+        # noise in the per-group normalization path.
+        n_total = len(chunks)
+        chunks = [c for c in chunks if abs(c.advantage) > 1e-12]
+        n_live = len(chunks)
+        if n_live < n_total:
+            print(
+                f"  Skipping ref log-prob pass for {n_total - n_live}/"
+                f"{n_total} dead-group chunks (advantage == 0)."
+            )
+        if not chunks:
+            # Should have been caught by std_reward < 1e-8 in train(), but
+            # guard against the edge case of a non-zero global std but every
+            # group still dead (mathematically possible with a single
+            # success-vs-failure split across groups).
+            return
+
         batch_size = self.config.mini_batch_size * 2  # Larger batches OK (no grad)
         K = len(self.config.tau_centers)
         noise_s = getattr(self.model.action_head.config, "noise_s", 0.999)
@@ -1133,6 +1255,31 @@ class GRPOTrainer:
         # through LoRA params because requires_grad is set at the parameter level.
         self.model.action_head.model.eval()
 
+        # Build live-only chunks for the GRPO update. Dead-group chunks
+        # (advantage == 0 from per-group normalization in episode_buffer.py)
+        # would otherwise pollute training in two ways:
+        #   1. Per-minibatch renormalization: `(0 - mean) / std` for a dead
+        #      chunk picks up arbitrary magnitude from the live chunks'
+        #      subsample mean — competes with real signal.
+        #   2. Variable minibatch composition after a per-batch filter: a
+        #      minibatch that randomly lands on N_live=1 falls through the
+        #      `numel() > 1` renorm guard and contributes an un-normalized
+        #      tiny gradient at a different scale than other minibatches.
+        # Filtering at the buffer level (here) keeps every minibatch
+        # uniformly-sized live-only.
+        all_chunks = self.buffer._build_chunks()
+        live_chunks = [c for c in all_chunks if abs(c.advantage) > 1e-12]
+        n_total_chunks = len(all_chunks)
+        n_live_chunks = len(live_chunks)
+        if n_live_chunks < n_total_chunks:
+            print(
+                f"  Filtering {n_total_chunks - n_live_chunks}/"
+                f"{n_total_chunks} chunks with zero advantage (dead groups). "
+                f"Remaining live chunks: {n_live_chunks}."
+            )
+        if n_live_chunks == 0:
+            return {}
+
         total_loss = 0.0
         total_clip_loss = 0.0
         total_kl = 0.0
@@ -1143,12 +1290,20 @@ class GRPOTrainer:
         n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
 
         for epoch in range(self.config.update_epochs):
-            # Iterate over mini-batches (shuffled each epoch)
-            for batch in self.buffer.iter_minibatches(
-                batch_size=self.config.mini_batch_size,
-                shuffle=True,
-                seed=self.config.seed + self.iteration * 100 + epoch,
-            ):
+            # Shuffle live chunks for this epoch. We bypass
+            # buffer.iter_minibatches because that yields from the full chunk
+            # list (live + dead) — see filter rationale above. The seed
+            # scheme matches the prior iter_minibatches contract.
+            rng = np.random.default_rng(
+                self.config.seed + self.iteration * 100 + epoch
+            )
+            indices = np.arange(n_live_chunks)
+            rng.shuffle(indices)
+
+            for start in range(0, n_live_chunks, self.config.mini_batch_size):
+                end = min(start + self.config.mini_batch_size, n_live_chunks)
+                batch = [live_chunks[indices[i]] for i in range(start, end)]
+
                 # --- Prepare batch tensors ---
                 result = self._prepare_batch(batch)
                 if result is None:

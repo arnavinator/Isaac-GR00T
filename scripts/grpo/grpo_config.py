@@ -83,8 +83,25 @@ class GRPOConfig:
     # Each group gets a unique seed → unique initial kitchen/object configuration.
     # More groups = more diverse gradient signal per update.
     # Same as grpo_cont.py's args.num_groups = 5
-    # Total episodes per iteration = group_size × num_groups
+    # With dynamic group collection (see min_successful_groups), this is the
+    # MINIMUM number of groups; the collector may collect more (up to max_groups)
+    # if the success criterion isn't met after the first num_groups.
     num_groups: int = 5
+
+    # Dynamic group collection: after collecting `num_groups` groups, if fewer
+    # than `min_successful_groups` had at least one rollout succeed, the
+    # collector keeps adding one group at a time until the criterion is met
+    # or `max_groups` is reached. Set to 0 to disable (always exactly num_groups).
+    # Useful when many groups time out or fail entirely (dead groups contribute
+    # zero gradient signal — see the dead-group filter in train_grpo.py).
+    min_successful_groups: int = 4
+
+    # Hard cap on dynamic group collection. Bounds worst-case wall time when
+    # the task is too hard for the current policy. Must be >= num_groups and
+    # <= 100 (the GROUP_SEED_STRIDE limit in collect_episodes.py). The
+    # subprocess and RPC timeouts auto-scale from this value at 7 min/group,
+    # matching the original 35 min budget for 5 groups.
+    max_groups: int = 10
 
     # Maximum steps per episode before truncation (at 10Hz action rate).
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
@@ -241,3 +258,51 @@ class GRPOConfig:
 
     # Wandb run name (auto-generated if None)
     wandb_run_name: Optional[str] = None
+
+    def __post_init__(self):
+        """Validate config invariants at construction time.
+
+        Catches misconfigurations BEFORE the trainer spends ~1 minute on
+        model load + server bind, so the operator gets immediate feedback
+        instead of the "subprocess exited 1" or RPC FatalCollectorError
+        path that would otherwise surface the same error several minutes in.
+
+        Mirror constraints with EpisodeCollector.collect()'s runtime
+        validation (collect_episodes.py:508-525), but check here too so a
+        misconfigured trainer never reaches collection.
+        """
+        if self.num_groups < 1:
+            raise ValueError(f"num_groups must be >= 1, got {self.num_groups}")
+        if self.group_size < 1:
+            raise ValueError(f"group_size must be >= 1, got {self.group_size}")
+        if self.save_interval < 1:
+            raise ValueError(
+                f"save_interval must be >= 1, got {self.save_interval}"
+            )
+        if self.max_groups < self.num_groups:
+            raise ValueError(
+                f"max_groups ({self.max_groups}) must be >= num_groups "
+                f"({self.num_groups})"
+            )
+        # GROUP_SEED_STRIDE=1000 in collect_episodes.py × max_groups must
+        # stay below the trainer's per-iter seed stride (100_000) or two
+        # consecutive iters' seed ranges overlap. max_groups=100 is the
+        # boundary (last seed = base + 99_000, next iter at base + 100_000).
+        if self.max_groups > 100:
+            raise ValueError(
+                f"max_groups ({self.max_groups}) must be <= 100 to avoid "
+                f"seed-range collisions with the next iter (per-iter stride "
+                f"is 100_000 in train_grpo.py, group stride is 1000 in "
+                f"collect_episodes.py)."
+            )
+        if self.min_successful_groups < 0:
+            raise ValueError(
+                f"min_successful_groups must be >= 0, got "
+                f"{self.min_successful_groups}"
+            )
+        if self.min_successful_groups > self.max_groups:
+            raise ValueError(
+                f"min_successful_groups ({self.min_successful_groups}) cannot "
+                f"exceed max_groups ({self.max_groups}) — criterion would be "
+                f"unsatisfiable."
+            )

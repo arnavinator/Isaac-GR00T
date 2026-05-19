@@ -77,7 +77,7 @@ class GRPOConfig:
     # Advantages are computed by comparing outcomes WITHIN a group.
     # Same as grpo_cont.py's args.num_envs = 5
     # Also determines the number of parallel environments (one env per rollout).
-    group_size: int = 5
+    group_size: int = 4
 
     # Number of groups per iteration ("questions per iteration")
     # Each group gets a unique seed → unique initial kitchen/object configuration.
@@ -128,7 +128,7 @@ class GRPOConfig:
     # Number of outer steps (action chunks) to fast-forward before branching.
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
     # 0 = disabled. 10 outer steps = 80 sub-steps at n_action_steps=8.
-    fast_forward_steps: int | list[int] = 16
+    fast_forward_steps: int | list[int] = 12
 
     # Fraction of groups that use fast-forward (rest start from seed normally).
     # Mixing ensures the full trajectory stays in the training distribution,
@@ -202,7 +202,7 @@ class GRPOConfig:
 
     # KL divergence penalty coefficient (regularization toward reference policy)
     # Same role as grpo_cont.py's args.kl_coef = 0.002
-    kl_coef: float = 0.05
+    kl_coef: float = 0.1
 
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).

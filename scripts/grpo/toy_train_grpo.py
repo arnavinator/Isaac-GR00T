@@ -48,13 +48,15 @@ from train_grpo import GRPOTrainer
 # threshold (1e-4 in episode_buffer.compute_advantages), so every seed
 # contributes a real gradient signal instead of getting filtered out.
 FIXED_SEEDS: list[int] = [
-    104067,  # iter 1, group 5: 2/4
-    203067,  # iter 2, group 4: 1/4
-    400067,  # iter 4, group 1: 2/4
-    401067,  # iter 4, group 2: 2/4
-    406067,  # iter 4, group 7: 1/4
-    501067,  # iter 5, group 2: 1/4
-    506067,  # iter 5, group 7: 1/4
+    101067,     # 0/4
+    203067,     # 1/4
+    303067,     # 0/4
+    305067,     # 0/4
+    402067,     # 0/4
+    406067,     # 1/4
+    501067,     # 1/4
+    502067,     # 0/4
+    507067,     # 0/4
 ]
 
 

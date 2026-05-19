@@ -150,6 +150,10 @@ class EpisodeBuffer:
         self.episodes: list[GRPOEpisode] = []
         self.advantages: np.ndarray | None = None  # [num_episodes]
         self._chunks: list[ActionChunk] | None = None
+        # Populated by compute_advantages; consumed by stats() so TB logging
+        # can see how much signal each iteration actually carried.
+        self._n_groups: int = 0
+        self._n_dead_groups: int = 0
 
     def clear(self):
         """Clear buffer for next iteration.
@@ -171,6 +175,8 @@ class EpisodeBuffer:
         self.episodes = []
         self.advantages = None
         self._chunks = None
+        self._n_groups = 0
+        self._n_dead_groups = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -324,6 +330,8 @@ class EpisodeBuffer:
         """
         if not self.episodes:
             self.advantages = np.array([])
+            self._n_groups = 0
+            self._n_dead_groups = 0
             return self.advantages
 
         # Step 1: Compute shaped rewards per episode
@@ -351,6 +359,7 @@ class EpisodeBuffer:
         group_ids = np.array([ep.group_id for ep in self.episodes])
         unique_groups = np.unique(group_ids)
 
+        n_dead = 0
         for gid in unique_groups:
             mask = group_ids == gid
             group_rewards = rewards[mask]
@@ -358,6 +367,7 @@ class EpisodeBuffer:
             if len(group_rewards) <= 1:
                 # Single episode in group — no comparison possible
                 self.advantages[mask] = 0.0
+                n_dead += 1
             else:
                 mean_r = group_rewards.mean()
                 std_r = group_rewards.std(ddof=1)
@@ -371,8 +381,12 @@ class EpisodeBuffer:
                 if std_r < 1e-4:
                     # No meaningful signal within group
                     self.advantages[mask] = 0.0
+                    n_dead += 1
                 else:
                     self.advantages[mask] = (group_rewards - mean_r) / std_r
+
+        self._n_groups = int(len(unique_groups))
+        self._n_dead_groups = int(n_dead)
 
         return self.advantages
 
@@ -490,16 +504,49 @@ class EpisodeBuffer:
             return {}
 
         rewards = [ep.shaped_reward for ep in self.episodes]
+        num_steps_list = [ep.num_steps for ep in self.episodes]
+
+        # Per-group success rate distribution. Each group's rate is
+        # (n_successes_in_group / n_episodes_in_group); aggregated to
+        # min / median / max so TB shows the spread without histograms.
+        group_to_total: dict[int, int] = {}
+        group_to_succ: dict[int, int] = {}
+        for ep in self.episodes:
+            group_to_total[ep.group_id] = group_to_total.get(ep.group_id, 0) + 1
+            if ep.success:
+                group_to_succ[ep.group_id] = group_to_succ.get(ep.group_id, 0) + 1
+        per_group_success = [
+            group_to_succ.get(gid, 0) / group_to_total[gid]
+            for gid in group_to_total
+        ]
+
         return {
             "num_episodes": self.num_episodes,
             "num_chunks": self.num_chunks,
             "success_rate": self.success_rate,
             "mean_progress": self.mean_progress,
-            "mean_reward": np.mean(rewards),
-            "std_reward": np.std(rewards),
+            "mean_reward": float(np.mean(rewards)),
+            "std_reward": float(np.std(rewards)),
             "mean_advantage": float(self.advantages.mean()) if self.advantages is not None else 0,
             "std_advantage": float(self.advantages.std()) if self.advantages is not None else 0,
             "pct_positive_advantage": float((self.advantages > 0).mean()) if self.advantages is not None else 0,
+            # Group quality (populated by compute_advantages); diagnoses how
+            # much of the iter's signal got filtered out by the dead-group
+            # threshold downstream.
+            "n_groups": self._n_groups,
+            "n_dead_groups": self._n_dead_groups,
+            "n_live_groups": max(0, self._n_groups - self._n_dead_groups),
+            # Per-group success rate spread (min/median/max across groups).
+            # Reveals when the iter average masks a bimodal "some seeds at
+            # 100%, others at 0%" pattern.
+            "group_success_min": float(min(per_group_success)) if per_group_success else 0.0,
+            "group_success_median": float(np.median(per_group_success)) if per_group_success else 0.0,
+            "group_success_max": float(max(per_group_success)) if per_group_success else 0.0,
+            # Trajectory length stats. Catches the "model is rushing" failure
+            # mode (mean_num_steps drops below baseline) before success_rate
+            # collapse becomes visible.
+            "mean_num_steps": float(np.mean(num_steps_list)),
+            "std_num_steps": float(np.std(num_steps_list)),
         }
 
 

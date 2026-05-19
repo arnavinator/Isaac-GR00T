@@ -21,6 +21,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 """
 
 import sys
+import math
 import shutil
 import threading
 import time
@@ -243,6 +244,19 @@ class GRPOTrainer:
         # path keys off this value to name checkpoints after real progress.
         self._last_updated_iteration = start_iteration - 1
 
+        # Snapshot the trainable LoRA params for cumulative-drift logging
+        # (lora/weight_delta_norm in _log_metrics). Resumed runs snapshot at
+        # the resume point; fresh runs snapshot at PEFT init. The metric
+        # tracks how far the policy has moved SINCE THIS RUN STARTED.
+        # Cost: ~80 MB for ~20M fp32 LoRA params, dwarfed by the 6 GB frozen
+        # base. Must run AFTER fp32 upcast AND after resume-load so the
+        # baseline tensor dtypes/values match what the optimizer sees.
+        self._lora_init_params = {
+            name: p.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+
         # --- Step 3: Setup optimizer (only LoRA params) ---
         print("\n[3/4] Setting up optimizer...")
         # Capture (name, param) pairs in the SAME order that
@@ -433,7 +447,11 @@ class GRPOTrainer:
             # Skip update if no gradient signal (all same outcome)
             if stats.get("std_reward", 0) < 1e-8:
                 print(f"  Skipping update: all episodes have same reward (no gradient signal)")
-                self._log_metrics(iteration, stats, skip_reason="no_signal")
+                self._log_metrics(
+                    iteration, stats, skip_reason="no_signal",
+                    phase_times={"collect": phase1_time, "advantage": phase2_time},
+                    lora_delta_norm=self._compute_lora_delta_norm(),
+                )
                 # Save under the LAST UPDATED iter's name (not the current loop
                 # iter), so resume from this checkpoint retries the current
                 # iter rather than burning it from the num_iterations budget.
@@ -478,7 +496,15 @@ class GRPOTrainer:
 
             # ═══ Phase 4: Logging and checkpointing ═══
             iter_time = time.time() - iter_start
-            self._log_metrics(iteration, stats, update_stats, lr, iter_time)
+            self._log_metrics(
+                iteration, stats, update_stats, lr, iter_time,
+                phase_times={
+                    "collect": phase1_time,
+                    "advantage": phase2_time,
+                    "update": phase3_time,
+                },
+                lora_delta_norm=self._compute_lora_delta_norm(),
+            )
 
             print(
                 f"  Time: collect={phase1_time:.0f}s, "
@@ -1286,6 +1312,13 @@ class GRPOTrainer:
         total_ratio = 0.0
         total_log_ratio_abs = 0.0
         clipfracs = []
+        # Per-minibatch diagnostics — surface gradient magnitude and ratio
+        # distribution tails. grad_norm answers "is there any signal hitting
+        # the LoRA params?"; ratio_max/min reveal when a near-1 mean_ratio
+        # hides outlier minibatches doing all the clipping work.
+        grad_norms: list[float] = []
+        ratio_maxes: list[float] = []
+        ratio_mins: list[float] = []
         n_updates = 0
         n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
 
@@ -1435,11 +1468,24 @@ class GRPOTrainer:
                 self.optimizer.zero_grad()
                 loss.backward()
 
-                # Gradient clipping
-                nn.utils.clip_grad_norm_(
+                # Gradient clipping. clip_grad_norm_ returns the TOTAL norm
+                # of the gradient vector BEFORE clipping — capture it for
+                # the train/grad_norm_* diagnostics (independent of whether
+                # clipping actually fired this minibatch).
+                pre_clip_grad_norm = nn.utils.clip_grad_norm_(
                     [p for p in self.model.parameters() if p.requires_grad],
                     self.config.max_grad_norm,
                 )
+                # `clip_grad_norm_` with default error_if_nonfinite=False can
+                # return inf/nan if backward introduced a non-finite gradient
+                # that didn't show up in the forward `loss` (which we already
+                # guard above). A single inf in `grad_norms` then poisons
+                # np.mean/np.max into inf and breaks TB chart autoscale for
+                # the rest of the run. Drop non-finite values silently —
+                # n_skipped_nonfinite already tracks the upstream loss case.
+                gnorm = float(pre_clip_grad_norm)
+                if math.isfinite(gnorm):
+                    grad_norms.append(gnorm)
                 self.optimizer.step()
 
                 # --- Track statistics ---
@@ -1455,6 +1501,18 @@ class GRPOTrainer:
                     # log-prob is noisy enough that most updates will clip, which
                     # caps the effective gradient signal.
                     total_log_ratio_abs += log_ratio.abs().mean().item()
+                    # Ratio distribution tails — when mean_ratio≈1 but
+                    # clipfrac jumps, the tail values are doing the clipping.
+                    # bf16 `ratio = log_ratio.exp()` can overflow to +inf
+                    # even when the clipped loss stays finite (clamp bounds
+                    # the loss but not the raw ratio). Filter the same way
+                    # as grad_norms to keep TB charts clean.
+                    rmax = ratio.max().item()
+                    rmin = ratio.min().item()
+                    if math.isfinite(rmax):
+                        ratio_maxes.append(rmax)
+                    if math.isfinite(rmin):
+                        ratio_mins.append(rmin)
                     n_updates += 1
 
         # Model remains in eval mode (it never left)
@@ -1476,6 +1534,10 @@ class GRPOTrainer:
             "mean_log_ratio_abs": total_log_ratio_abs / n_updates,
             "n_updates": n_updates,
             "n_skipped_nonfinite": n_skipped_nonfinite,
+            "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
+            "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
+            "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
+            "ratio_min": float(np.min(ratio_mins)) if ratio_mins else 1.0,
         }
 
     def _iter_stratified_minibatches(
@@ -2046,24 +2108,91 @@ class GRPOTrainer:
             except Exception:
                 pass
 
-    def _log_metrics(self, iteration, stats, update_stats=None, lr=None, iter_time=None, skip_reason=None):
+    def _log_metrics(
+        self,
+        iteration,
+        stats,
+        update_stats=None,
+        lr=None,
+        iter_time=None,
+        skip_reason=None,
+        phase_times=None,
+        lora_delta_norm=None,
+    ):
         """Log training metrics to TensorBoard and wandb."""
         if self.writer is None:
             return
 
-        # Episode stats
-        self.writer.add_scalar("episode/success_rate", stats.get("success_rate", 0), iteration)
-        # mean_progress is only meaningful when dense progress actually fed into
-        # the shaped reward. With success_weight=1.0 (default) the collector
-        # skips compute_dense_progress entirely, so max_progress is a constant 0
-        # and logging it here would just produce a flat zero curve.
-        if self.config.success_weight < 1.0:
-            self.writer.add_scalar("episode/mean_progress", stats.get("mean_progress", 0), iteration)
-        self.writer.add_scalar("episode/mean_reward", stats.get("mean_reward", 0), iteration)
-        self.writer.add_scalar("episode/std_reward", stats.get("std_reward", 0), iteration)
+        # Episode stats are only meaningful when the collector returned
+        # data this iter. An empty `stats` dict means buffer.stats() saw
+        # zero episodes (collection failed entirely); logging `.get(..., 0)`
+        # defaults on that path would falsely show "0% success",
+        # "0 groups", "0 num_steps", etc. — indistinguishable from a real
+        # all-fail iter. Skip the whole episode/* block in that case.
+        if stats:
+            self.writer.add_scalar("episode/success_rate", stats.get("success_rate", 0), iteration)
+            # mean_progress is only meaningful when dense progress actually fed into
+            # the shaped reward. With success_weight=1.0 (default) the collector
+            # skips compute_dense_progress entirely, so max_progress is a constant 0
+            # and logging it here would just produce a flat zero curve.
+            if self.config.success_weight < 1.0:
+                self.writer.add_scalar("episode/mean_progress", stats.get("mean_progress", 0), iteration)
+            self.writer.add_scalar("episode/mean_reward", stats.get("mean_reward", 0), iteration)
+            self.writer.add_scalar("episode/std_reward", stats.get("std_reward", 0), iteration)
 
-        # Update stats
-        if update_stats:
+            # Episode trajectory length — catches "model is rushing" failure mode
+            # (mean_num_steps drops below baseline) before success_rate collapses.
+            self.writer.add_scalar("episode/mean_num_steps", stats.get("mean_num_steps", 0), iteration)
+            self.writer.add_scalar("episode/std_num_steps", stats.get("std_num_steps", 0), iteration)
+
+            # Group quality. n_dead_groups → how many groups got std<1e-4 in
+            # compute_advantages (or were singletons) and contributed zero
+            # gradient. group_success_* → distribution shape across groups
+            # (an iter-mean of 50% could be "all groups at 50%" or "half at
+            # 100%, half at 0%" — very different).
+            self.writer.add_scalar("episode/n_groups", stats.get("n_groups", 0), iteration)
+            self.writer.add_scalar("episode/n_dead_groups", stats.get("n_dead_groups", 0), iteration)
+            self.writer.add_scalar("episode/n_live_groups", stats.get("n_live_groups", 0), iteration)
+            self.writer.add_scalar("episode/group_success_min", stats.get("group_success_min", 0), iteration)
+            self.writer.add_scalar("episode/group_success_median", stats.get("group_success_median", 0), iteration)
+            self.writer.add_scalar("episode/group_success_max", stats.get("group_success_max", 0), iteration)
+
+            # Advantage signal availability (already in buffer.stats() but
+            # previously not surfaced to TB). pct_positive_advantage near 0.5 is
+            # healthy; far off means the group-relative normalization is failing.
+            self.writer.add_scalar("episode/mean_advantage", stats.get("mean_advantage", 0), iteration)
+            self.writer.add_scalar("episode/std_advantage", stats.get("std_advantage", 0), iteration)
+            self.writer.add_scalar(
+                "episode/pct_positive_advantage",
+                stats.get("pct_positive_advantage", 0),
+                iteration,
+            )
+
+        # Update-counter scalars: log even when n_updates=0, because seeing
+        # n_updates=0 IS the diagnostic signal — it pinpoints which iters
+        # never fired a step (dead-group filter / non-finite loss). Without
+        # logging these, a skipped iter would just show as a gap in TB
+        # train/loss instead of a clear n_updates=0 bar.
+        if update_stats is not None:
+            self.writer.add_scalar(
+                "train/n_updates",
+                update_stats.get("n_updates", 0),
+                iteration,
+            )
+            self.writer.add_scalar(
+                "train/n_skipped_nonfinite",
+                update_stats.get("n_skipped_nonfinite", 0),
+                iteration,
+            )
+
+        # Loss / ratio / grad scalars are only meaningful when at least one
+        # optimizer.step() actually fired. `_grpo_update_inner` returns
+        # `{"n_skipped_nonfinite": N}` when every minibatch got skipped for
+        # non-finite loss — a truthy dict missing every loss/ratio key. The
+        # old `if update_stats:` gate then emitted `train/loss=0`,
+        # `train/grad_norm_mean=0`, `train/mean_ratio=1` etc. as `.get(...)`
+        # defaults — fake values that pollute the TB curves.
+        if update_stats and update_stats.get("n_updates", 0) > 0:
             self.writer.add_scalar("train/loss", update_stats.get("loss", 0), iteration)
             self.writer.add_scalar("train/clip_loss", update_stats.get("clip_loss", 0), iteration)
             self.writer.add_scalar("train/kl_loss", update_stats.get("kl_loss", 0), iteration)
@@ -2074,14 +2203,25 @@ class GRPOTrainer:
                 update_stats.get("mean_log_ratio_abs", 0),
                 iteration,
             )
-            # Track NaN/Inf-skipped minibatches; sustained nonzero values
-            # indicate ratio overflow or numerical instability worth tuning
-            # (lower lr or alpha, or cast MSE to fp32).
+            # Gradient norm BEFORE clipping (mean/max across minibatches).
+            # The primary "is anything actually training?" signal — if this
+            # stays near 0 across many iters, the FM log-prob gradient
+            # vanishes regardless of clip_loss appearance.
             self.writer.add_scalar(
-                "train/n_skipped_nonfinite",
-                update_stats.get("n_skipped_nonfinite", 0),
+                "train/grad_norm_mean",
+                update_stats.get("grad_norm_mean", 0),
                 iteration,
             )
+            self.writer.add_scalar(
+                "train/grad_norm_max",
+                update_stats.get("grad_norm_max", 0),
+                iteration,
+            )
+            # Ratio distribution tails. With mean_ratio≈1 and modest
+            # clipfrac, large ratio_max/small ratio_min reveal outlier
+            # minibatches doing all the clipping work.
+            self.writer.add_scalar("train/ratio_max", update_stats.get("ratio_max", 1), iteration)
+            self.writer.add_scalar("train/ratio_min", update_stats.get("ratio_min", 1), iteration)
 
         if lr is not None:
             self.writer.add_scalar("train/learning_rate", lr, iteration)
@@ -2089,18 +2229,82 @@ class GRPOTrainer:
         if iter_time is not None:
             self.writer.add_scalar("time/iteration_seconds", iter_time, iteration)
 
-        # Wandb logging
+        # Phase-time breakdown (collect / advantage / update). The trainer
+        # already times each phase for its console summary; surface them
+        # here so TB can answer "which phase regressed?" without parsing logs.
+        if phase_times is not None:
+            for phase_name, secs in phase_times.items():
+                self.writer.add_scalar(f"time/{phase_name}_seconds", secs, iteration)
+
+        # Cumulative L2 distance of LoRA params from their setup-time snapshot.
+        # The "has the policy actually moved?" diagnostic: if this stays near
+        # zero across iters, no amount of clip_loss / mean_log_ratio_abs
+        # commentary matters — the model is unchanged.
+        if lora_delta_norm is not None:
+            self.writer.add_scalar("lora/weight_delta_norm", lora_delta_norm, iteration)
+
+        # Wandb logging. Mirror the TB gates so the wandb dashboard doesn't
+        # show fake zeros either.
         if self.config.use_wandb:
             try:
                 import wandb
-                log_dict = {"iteration": iteration, **stats}
-                if update_stats:
-                    log_dict.update({f"train/{k}": v for k, v in update_stats.items()})
-                if lr:
+                log_dict = {"iteration": iteration}
+                if stats:
+                    log_dict.update(stats)
+                if update_stats is not None:
+                    # Counters always; loss/ratio/grad only when n_updates>0
+                    # (matching the TB-side gating).
+                    log_dict["train/n_updates"] = update_stats.get("n_updates", 0)
+                    log_dict["train/n_skipped_nonfinite"] = (
+                        update_stats.get("n_skipped_nonfinite", 0)
+                    )
+                    if update_stats.get("n_updates", 0) > 0:
+                        log_dict.update({
+                            f"train/{k}": v
+                            for k, v in update_stats.items()
+                            if k not in ("n_updates", "n_skipped_nonfinite")
+                        })
+                if lr is not None:
                     log_dict["train/lr"] = lr
+                if phase_times is not None:
+                    log_dict.update({f"time/{k}_seconds": v for k, v in phase_times.items()})
+                if lora_delta_norm is not None:
+                    log_dict["lora/weight_delta_norm"] = lora_delta_norm
                 wandb.log(log_dict)
             except Exception:
                 pass
+
+    def _compute_lora_delta_norm(self) -> float:
+        """L2 norm of (current trainable params − snapshot taken at setup time).
+
+        Tracks cumulative drift of LoRA weights SINCE THIS RUN STARTED.
+        Resumed runs reset the baseline at setup (snapshot post-load), so
+        the metric measures within-run drift, not drift from PEFT init.
+
+        Diagnostic intent: when training appears to fire (n_updates > 0,
+        non-zero loss) but episode metrics don't budge, this number tells
+        you whether the weights themselves are actually moving. A flat
+        curve here means the optimizer steps are too small to change the
+        policy regardless of what the loss says.
+
+        Accumulates the squared-delta sum on-device with a single sync at
+        the end. The naive per-param `.item()` pattern triggers one
+        GPU→CPU sync per LoRA tensor (~hundreds), measurably stalling the
+        log call on real hardware.
+        """
+        if not getattr(self, "_lora_init_params", None):
+            return 0.0
+        total_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                if name in self._lora_init_params:
+                    # All trainable params are fp32 post-upcast (see setup()),
+                    # so this cast is a no-op in the common path but keeps
+                    # the subtraction safe if a future refactor leaves any
+                    # trainable param in bf16.
+                    delta = p.detach().float() - self._lora_init_params[name].float()
+                    total_sq = total_sq + delta.pow(2).sum()
+        return float(total_sq.sqrt().item())
 
     def _save_checkpoint(self, iteration: int):
         """Save LoRA weights and optimizer state."""

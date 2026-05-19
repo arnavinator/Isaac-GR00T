@@ -21,7 +21,6 @@ runs/
 out/
 recordings/
 plots/
-*.npz
 
 # C extensions
 *.so

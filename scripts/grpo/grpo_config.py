@@ -269,7 +269,7 @@ class GRPOConfig:
     # too. Note: the long-running collector_server (when collector_server_host
     # is set) is launched separately — to silence its output, start it with
     # GRPO_CLEAN_OUTPUT=1 in the env yourself.
-    clean_output: bool = False
+    clean_output: bool = True
 
     def __post_init__(self):
         """Validate config invariants at construction time.

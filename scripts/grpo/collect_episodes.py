@@ -38,15 +38,102 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from collections import defaultdict, deque
 from functools import partial
 from pathlib import Path
 
+# ─── Import-time noise suppression ───────────────────────────────────────
+# Driven by the GRPO_CLEAN_OUTPUT=1 env var (set by train_grpo.py when
+# config.clean_output is True). MUST run BEFORE the gymnasium / robocasa
+# imports below, since several of these noises fire at import time:
+#   - robosuite's logger emits [WARNING]/[INFO] from macros.py + __init__.py
+#   - robocasa/__init__.py:294 has a bare `print(...)` for the mimicgen miss
+#   - gymnasium.utils.passive_env_checker UserWarning fires per reset/step
+# AsyncVectorEnv subprocess workers re-import this module on spawn and
+# inherit GRPO_CLEAN_OUTPUT, so suppression applies to them too.
+_CLEAN_OUTPUT = os.environ.get("GRPO_CLEAN_OUTPUT") == "1"
+if _CLEAN_OUTPUT:
+    import logging
+    import warnings
+
+    # Robosuite [WARNING]/[INFO] suppression. Two non-obvious facts about
+    # robosuite's logger force the filter approach below:
+    #   1. The actual logger name is "robosuite_logs", NOT "robosuite". See
+    #      robosuite/utils/log_utils.py:63 (DefaultLogger logger_name kwarg
+    #      default) and the module-level
+    #      `ROBOSUITE_DEFAULT_LOGGER = DefaultLogger(...).get_logger()`.
+    #   2. log_utils.py:89 calls `logger.setLevel(INFO)` when robosuite is
+    #      imported (via DefaultLogger.__init__). A pre-import setLevel(ERROR)
+    #      on the logger is therefore CLOBBERED to INFO before the first
+    #      [robosuite WARNING] is even emitted. The level dial is unusable
+    #      from outside without monkey-patching.
+    # An attached Filter survives setLevel changes (Logger.handle checks
+    # filter() and isEnabledFor() independently), so we pre-create the
+    # logger by name and attach a filter that drops anything below ERROR.
+    # When robosuite later calls getLogger("robosuite_logs") at log_utils
+    # line 71/97, it gets THIS same logger instance and the filter persists.
+    # The filter runs in Logger.handle() BEFORE callHandlers dispatches to
+    # the StreamHandler, so the handler's stream destination (default stderr,
+    # which redirect_stdout doesn't reach) is irrelevant — records are
+    # dropped before they ever get written.
+    # Catches: import-time WARNINGs (robosuite/macros.py "No private macro
+    # file" trio, robosuite/__init__.py "Could not import robosuite_models"
+    # and "Could not load mink-based whole-body IK", robocasa/macros.py's
+    # mirror of the macro warnings via the same shared ROBOSUITE_DEFAULT_LOGGER)
+    # AND runtime [robosuite INFO] (per-rollout "Loading controller
+    # configuration from..." at composite_controller_factory.py:121).
+    class _DropRobosuiteBelowError(logging.Filter):
+        def filter(self, record):  # noqa: A003 — must match Filter API
+            return record.levelno >= logging.ERROR
+    logging.getLogger("robosuite_logs").addFilter(_DropRobosuiteBelowError())
+
+    # gymnasium.utils.passive_env_checker UserWarning: "obs not within the
+    # observation space" — fires per reset()/step() at runtime via
+    # warnings.warn(). filterwarnings adds to the global filter list; the
+    # warnings module checks it at warn() call time, so timing here is fine.
+    warnings.filterwarnings(
+        "ignore",
+        category=UserWarning,
+        module=r"gymnasium\.utils\.passive_env_checker",
+    )
+
 import gymnasium as gym
 import numpy as np
 
-from gr00t.eval.rollout_policy import get_gym_env
+# The mimicgen warning is a bare print() in robocasa/__init__.py — neither
+# logging level nor warnings.filterwarnings reaches it. Redirect stdout for
+# the import that triggers the robocasa side. Stderr is untouched, so real
+# ImportErrors still surface.
+#
+# Important: rollout_policy lazy-imports robocasa inside its env_fn (see
+# gr00t/eval/rollout_policy.py:79-90 — `import robocasa` lives in the inner
+# `env_fn` body, fired only when env_fn() is called by gym.make). Just
+# wrapping `from gr00t.eval.rollout_policy import ...` doesn't catch the
+# print, because robocasa hasn't been touched yet at that point. We force-
+# import robocasa inside the redirect block so its module-level mimicgen
+# `print(...)` lands inside the swallow. Subsequent lazy imports (in env_fn
+# AND in AsyncVectorEnv worker spawns, which inherit the cache via fresh
+# import via env-var-driven re-run of this block) hit sys.modules and stay
+# silent. Anything else printed at import time is expected to be silent in
+# this codebase; if a future robocasa version adds a useful import-time
+# print, set --no-clean-output to see it again.
+if _CLEAN_OUTPUT:
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        from gr00t.eval.rollout_policy import get_gym_env
+        try:
+            import robocasa  # noqa: F401  -- eager to capture mimicgen print
+        except ImportError:
+            # collect_episodes.py runs in the robocasa venv where robocasa
+            # is installed; if it isn't, suppression is best-effort and the
+            # downstream env construction will surface the real ImportError
+            # via the normal traceback path on stderr.
+            pass
+else:
+    from gr00t.eval.rollout_policy import get_gym_env
 from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
 from gr00t.policy.server_client import PolicyClient
 
@@ -98,7 +185,12 @@ def _log_worker_mem(label: str, extra: str = "") -> None:
     Lines are flushed immediately so they propagate through the collector's
     stdout pipe to the trainer in real time. Best-effort: any failure is
     silently swallowed since this is a non-critical diagnostic.
+
+    No-op when GRPO_CLEAN_OUTPUT=1 (config.clean_output=True) — the user
+    opted out of memory diagnostics.
     """
+    if _CLEAN_OUTPUT:
+        return
     try:
         import os
         rss_mb, swap_mb = _read_proc_status_mb()

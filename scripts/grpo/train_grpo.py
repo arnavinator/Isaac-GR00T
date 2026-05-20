@@ -22,6 +22,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 
 import sys
 import math
+import os
 import shutil
 import threading
 import time
@@ -591,7 +592,12 @@ class GRPOTrainer:
         """Log RSS+Swap of the trainer process. Used to detect cross-iter
         accumulation: if Total climbs across iters at the same label, the
         cleanup in _release_memory_to_os is missing something.
+
+        No-op when config.clean_output=True — paired with the worker-side
+        [worker_mem pid=...] suppression in collect_episodes.py.
         """
+        if self.config.clean_output:
+            return
         try:
             with open("/proc/self/status") as f:
                 fields = {}
@@ -805,12 +811,24 @@ class GRPOTrainer:
             else self.config.num_groups
         )
         timeout_s = 420 * effective_max_groups  # 7 min/group
+        # When clean_output is on, propagate via env var because the
+        # collector's import-time suppression must run BEFORE argparse
+        # (otherwise robocasa import noise has already fired). Copy the
+        # current env so the subprocess keeps PATH / PYTHONPATH /
+        # MUJOCO_GL / etc.; subprocess.Popen(env=...) replaces, not merges.
+        # AsyncVectorEnv workers spawned inside the collector inherit the
+        # env var too, so [worker_mem pid=...] is also suppressed.
+        sub_env = None
+        if self.config.clean_output:
+            sub_env = os.environ.copy()
+            sub_env["GRPO_CLEAN_OUTPUT"] = "1"
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=sub_env,
         )
         import threading as _threading
         timed_out = {"v": False}

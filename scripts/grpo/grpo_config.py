@@ -259,6 +259,18 @@ class GRPOConfig:
     # Wandb run name (auto-generated if None)
     wandb_run_name: Optional[str] = None
 
+    # Suppress collector-side import noise (robosuite [WARNING]/[INFO], mimicgen
+    # `print`, gymnasium passive_env_checker UserWarning) and the per-iter
+    # process-memory diagnostics ([worker_mem pid=...] from collect_episodes.py
+    # and [mem iter ...] from train_grpo.py). Real operational warnings —
+    # collector failures, non-finite-loss skips, partial collections — are NOT
+    # affected. The trainer propagates this to the collector subprocess via the
+    # GRPO_CLEAN_OUTPUT=1 env var, so AsyncVectorEnv workers (spawn) pick it up
+    # too. Note: the long-running collector_server (when collector_server_host
+    # is set) is launched separately — to silence its output, start it with
+    # GRPO_CLEAN_OUTPUT=1 in the env yourself.
+    clean_output: bool = False
+
     def __post_init__(self):
         """Validate config invariants at construction time.
 

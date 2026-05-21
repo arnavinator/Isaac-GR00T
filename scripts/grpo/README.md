@@ -124,6 +124,106 @@ requires.
 
 ---
 
+## Loading a Trained LoRA Checkpoint for Inference
+
+Each `iter_NNNN/` checkpoint dir contains:
+
+```
+iter_NNNN/
+  lora_weights.pt   # filtered LoRA-only state dict (~80 MB at rank=16)
+  optimizer.pt      # only needed for resuming training; ignored for inference
+```
+
+There are two supported inference paths: a **server-client benchmark** (drop
+into the existing denoising-lab eval pipeline) and an **in-process notebook**
+(direct `DenoisingLab` API for trajectory experimentation).
+
+### Reproducible benchmark via `robocasa_eval_benchmark.py`
+
+`scripts/denoising_lab/eval/robocasa_eval_benchmark.py` is strategy-agnostic —
+it just connects to whatever ZMQ server is running on `--port`. So the only
+thing that changes for a LoRA strategy is the **server**: instead of
+`gr00t/eval/run_gr00t_server.py` (baseline), use `grpo_server.py`, which
+already supports loading a LoRA checkpoint via `--lora-checkpoint`.
+
+**Terminal 1 — model venv, GRPO server with LoRA:**
+
+```bash
+uv run python scripts/grpo/grpo_server.py \
+    --model-path nvidia/GR00T-N1.6-3B \
+    --embodiment-tag ROBOCASA_PANDA_OMRON \
+    --lora-checkpoint grpo_data/grpo_checkpoints/iter_0100 \
+    --use-sim-policy-wrapper \
+    --port 5555 \
+    --verbose
+```
+
+**Terminal 2 — sim venv, identical to baseline_euler eval:**
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/denoising_lab/eval/robocasa_eval_benchmark.py \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --n-episodes 15 --seed 42 --n-envs 2 --port 5555 \
+    --max-episode-steps 480 \
+    --output-dir ~/benchmark_results/grpo_iter_0100 \
+    --strategy-name grpo_iter_0100
+```
+
+Use whatever env(s) the LoRA was trained on (see `GRPOConfig.env_names`) —
+benchmarking on tasks the policy never saw will mostly measure the base
+model. Override `--lora-rank` / `--lora-alpha` / `--lora-target-modules` on
+the server command **only** if you trained with non-default values; mismatch
+hard-fails inside `load_lora_checkpoint` (`lora_dit.py:165-185`) rather than
+silently degrading.
+
+`grpo_server.py` does not track gradients during inference. The `Gr00tPolicy`
+forward pass runs inside `torch.inference_mode()`
+(`gr00t/policy/gr00t_policy.py:347`), so the `requires_grad=True` flag that
+PEFT sets on the LoRA params is a no-op — no autograd graph is built and the
+extra cost beyond the baseline server is just the LoRA matmuls themselves.
+
+### Interactive notebook via `DenoisingLab`
+
+For the trajectory-fan / seed-sweep experiments in
+`scripts/denoising_lab/notebooks/`, inject the LoRA into the existing
+`DenoisingLab` after it loads the base model. See
+`scripts/denoising_lab/notebooks/interactive_denoising_panda_lora_v1.ipynb`
+for a working copy of `interactive_denoising_panda_v2.ipynb` with the
+injection cell pre-wired. The full pattern:
+
+```python
+# After: lab = DenoisingLab(MODEL_PATH, EMBODIMENT_TAG, device=DEVICE)
+import sys, os
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts", "grpo"))
+from lora_dit import apply_lora_to_dit, load_lora_checkpoint
+
+apply_lora_to_dit(lab.model, rank=16, alpha=32, dropout=0.0)
+load_lora_checkpoint(lab.model, "grpo_data/grpo_checkpoints/iter_0100")
+# Pin freshly-injected LoRA Linears to the DiT's device/dtype:
+lab.model.action_head.model.to(device=lab.device, dtype=lab.dtype)
+```
+
+Caveats:
+
+- **`.to(device=lab.device, dtype=lab.dtype)` is required.** PEFT's
+  `inject_adapter_in_model` creates the new Linear submodules at default
+  device/dtype; without the cast, the first `lab.denoise(...)` call hits a
+  cross-device or cross-dtype error.
+- **The `lab.action_head` reference set in `DenoisingLab.__init__` is
+  unchanged** — LoRA injection mutates the same `model.action_head.model`
+  object in place, so subsequent `lab.encode_features_from_sim_obs(...)` /
+  `lab.denoise(...)` calls automatically route through the trained adapters.
+- **LoRA only touches the DiT, not the Eagle backbone.** A `BackboneFeatures`
+  cached from a base-model run remains valid input to a LoRA `denoise`, and
+  vice versa — useful for A/B comparing the same observation through both
+  policies.
+- **For A/B comparisons**, build a second `DenoisingLab` instance for the
+  base model rather than trying to "uninject" LoRA — `merge_lora_weights`
+  (`lora_dit.py:205`) is irreversible and there is no `unmerge` helper.
+
+---
+
 ## Episode Collection
 
 ### Groups, seeds, and within-group variance

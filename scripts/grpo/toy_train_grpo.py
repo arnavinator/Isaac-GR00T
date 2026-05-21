@@ -73,7 +73,7 @@ class ToyGRPOConfig(GRPOConfig):
     # same 28-episode batch overfits to the minibatch much faster than it
     # improves the policy. 2 epochs is enough to see whether the gradient is
     # moving the right way.
-    update_epochs: int = 2
+    update_epochs: int = 4
 
     # Cosmetic alignment: parent's startup print uses num_groups to describe
     # episodes-per-iter. Match the real (fixed-seed) count.
@@ -83,10 +83,11 @@ class ToyGRPOConfig(GRPOConfig):
     # set; if a seed produces an all-fail group, the dead-group filter
     # already handles it downstream.
     min_successful_groups: int = 0
+    fast_forward_steps: int | list[int] = 3
 
     # Force ALL groups to fast-forward every iter (production used 0.8, which
     # mixes FF and non-FF iters and adds avoidable noise to the success curve).
-    fast_forward_pct: float = 0.6
+    fast_forward_pct: float = 0
 
     save_interval: int = 1
 

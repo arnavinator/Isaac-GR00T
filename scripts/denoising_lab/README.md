@@ -88,6 +88,20 @@ Observation saved to: /tmp/saved_observations/ep000_step000.npz
 > s
 ```
 
+**Non-interactive sweep with `--auto-save-step`** — to capture observations across an entire episode without stepping by hand, add `--auto-save-step`. The script runs save+step (saves the observation `.npz` + camera `.png`, then steps the env) every iteration, terminating naturally on task success or `--max-episode-steps` truncation:
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+  scripts/denoising_lab/eval/interactive_rollout.py \
+  --env-name robocasa_panda_omron/OpenDrawer_PandaOmron_Env \
+  --host 127.0.0.1 --port 5555 \
+  --n-action-steps 8 --max-episode-steps 480 \
+  --save-dir /tmp/saved_observations \
+  --auto-save-step
+```
+
+Useful for capturing a full trajectory of `.npz` observations from a single run for downstream analysis. Combine with `--seed N` for reproducibility. If `--seed` is omitted, the script picks a seed itself, prints it after the `Text prompt: ...` line at episode start, and records it inside each saved `.npz` (`__step_info__.seed`).
+
 **Step 3 — Open the PandaOmron notebook** (main `.venv`, GPU):
 
 ```bash

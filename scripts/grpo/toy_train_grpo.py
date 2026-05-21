@@ -48,15 +48,17 @@ from train_grpo import GRPOTrainer
 # threshold (1e-4 in episode_buffer.compute_advantages), so every seed
 # contributes a real gradient signal instead of getting filtered out.
 FIXED_SEEDS: list[int] = [
-    101067,     # 0/4
-    203067,     # 1/4
-    303067,     # 0/4
+    # 101067,     # 0/4
+    # 203067,     # 1/4
+    # 303067,     # 0/4
     305067,     # 0/4
-    402067,     # 0/4
-    406067,     # 1/4
-    501067,     # 1/4
-    502067,     # 0/4
-    507067,     # 0/4
+    305067,     # 0/4
+    305067,     # 0/4
+    # 402067,     # 0/4
+    # 406067,     # 1/4
+    # # 501067,     # 1/4
+    # 502067,     # 0/4
+    # 507067,     # 0/4
 ]
 
 
@@ -65,7 +67,7 @@ class ToyGRPOConfig(GRPOConfig):
     """GRPOConfig with toy-mode defaults. Every field is still CLI-overridable."""
 
     # Shorter run: this is a diagnostic, not a real training session.
-    num_iterations: int = 30
+    num_iterations: int = 15
 
     # Fewer epochs per iter: with noisy RL gradients, 5 epochs of re-fit on the
     # same 28-episode batch overfits to the minibatch much faster than it
@@ -84,9 +86,9 @@ class ToyGRPOConfig(GRPOConfig):
 
     # Force ALL groups to fast-forward every iter (production used 0.8, which
     # mixes FF and non-FF iters and adds avoidable noise to the success curve).
-    fast_forward_pct: float = 1.0
+    fast_forward_pct: float = 0.6
 
-    save_interval: int = 5
+    save_interval: int = 1
 
 
 class ToyGRPOTrainer(GRPOTrainer):

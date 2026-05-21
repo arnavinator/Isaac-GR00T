@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,7 @@ class InteractiveRollout:
         save_dir: str = "/tmp/saved_observations",
         video_dir: str | None = None,
         seed: int | None = None,
+        auto_save_step: bool = False,
     ):
         self.env_name = env_name
         self.save_dir = Path(save_dir)
@@ -85,6 +87,7 @@ class InteractiveRollout:
         self.n_action_steps = n_action_steps
         self.video_dir = video_dir
         self.seed = seed
+        self.auto_save_step = auto_save_step
 
         # Create PolicyClient (ZMQ)
         self.client = PolicyClient(host=host, port=port, strict=False)
@@ -281,9 +284,10 @@ class InteractiveRollout:
             Episode info dict with success, length, etc.
         """
         self.step_count = 0
-        self._episode_seed = None
         if self.seed is not None:
             self._episode_seed = self.seed + self.episode_count
+        else:
+            self._episode_seed = random.randrange(2**31)
         obs, info = self.env.reset(seed=self._episode_seed)
 
         # Wrap obs in batch dimension for PolicyClient
@@ -300,8 +304,6 @@ class InteractiveRollout:
 
         print(f"\n{'='*60}")
         print(f"Episode {self.episode_count} started. Env: {self.env_name}")
-        if self._episode_seed is not None:
-            print(f"Seed: {self._episode_seed}")
         print(f"{'='*60}")
 
         # Detect language key and initialize prompt tracking
@@ -315,6 +317,7 @@ class InteractiveRollout:
         prompt_history: list[tuple[int, str]] = [(0, original_prompt)]
         if language_key:
             print(f"Text prompt: '{original_prompt}'")
+        print(f"Seed: {self._episode_seed}")
 
         done = False
         total_reward = 0.0
@@ -327,10 +330,15 @@ class InteractiveRollout:
             print(f"\nStep {self.step_count} | Reward so far: {total_reward:.2f}")
             if prompt_override is not None:
                 print(f"  Prompt (modified): '{prompt_override}'")
-            print("Menu: [s]tep  [so]save+step  [d]etails  [o]save-obs  [m]odify-text  [r]e-query  [q]uit")
+            if not self.auto_save_step:
+                print("Menu: [s]tep  [so]save+step  [d]etails  [o]save-obs  [m]odify-text  [r]e-query  [q]uit")
 
             while True:
-                choice = input("> ").strip().lower()
+                if self.auto_save_step:
+                    choice = "so"
+                    print("> so (auto)")
+                else:
+                    choice = input("> ").strip().lower()
 
                 if choice in ("s", "step", "", "so", "save-step"):
                     # Save observation first if requested
@@ -723,6 +731,13 @@ def main():
         "None = random.",
     )
 
+    parser.add_argument(
+        "--auto-save-step",
+        action="store_true",
+        help="Non-interactive: automatically save+step every iteration until "
+        "the episode terminates (success or failure).",
+    )
+
     # Replay mode arguments
     parser.add_argument(
         "--replay",
@@ -776,6 +791,7 @@ def main():
         save_dir=args.save_dir,
         video_dir=args.video_dir,
         seed=args.seed,
+        auto_save_step=args.auto_save_step,
     )
 
     episode = 0

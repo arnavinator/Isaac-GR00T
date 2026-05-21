@@ -622,12 +622,26 @@ class EpisodeCollector:
 
         all_episodes: list[dict] = []
         start_time = time.time()
-        rng = np.random.default_rng(base_seed)
 
         ff_enabled = fast_forward_steps > 0 and fast_forward_pct > 0
-        # One Bernoulli for the whole iteration. Drawn from a base_seed-derived
-        # rng so the FF/non-FF outcome is reproducible.
-        use_ff_for_iteration = ff_enabled and rng.random() < fast_forward_pct
+        # One Bernoulli for the whole iteration. Drawn from OS entropy
+        # (`default_rng()` with no argument) — NOT from `base_seed`. The
+        # FF decision is a training-data sampling concern; `base_seed`
+        # exists to control env initialization. Coupling them means
+        # repeated `base_seed` values (e.g., toy_train_grpo.py reusing the
+        # same fixed seed across iters/calls) lock the FF Bernoulli to a
+        # deterministic outcome — `ff_pct=0.6` becomes either 100% or 0%
+        # depending on which side of the threshold the seeded draw lands.
+        # Fresh OS entropy decouples the two concerns: env init stays
+        # reproducible from `base_seed`, and the FF draw actually achieves
+        # the configured rate.
+        # We accept losing bit-exact reproducibility of the FF curriculum
+        # across re-runs at the same `--seed`. That property was already
+        # partial — torch.randn during denoising isn't seeded, so two
+        # re-runs already diverge on policy noise — and no analysis path
+        # depends on FF being bit-reproducible.
+        ff_rng = np.random.default_rng()
+        use_ff_for_iteration = ff_enabled and ff_rng.random() < fast_forward_pct
 
         # Header
         if dynamic_mode:

@@ -341,9 +341,17 @@ class EpisodeBuffer:
         ])
 
         # Step 1b: Time-scale rewards (faster solutions get higher reward)
-        for i, ep in enumerate(self.episodes):
-            if ep.num_steps > 0:
-                rewards[i] = rewards[i] / ep.num_steps * max_episode_steps
+        # TEMPORARILY DISABLED for the binary-reward ablation experiment.
+        # With time-scaling on, all-success groups have variance from num_steps
+        # → live → speed-pressure gradient pushes the policy toward fragile fast
+        # solutions → collapse pattern observed in toy_lr3.0e-5_v2 / 4.0e-5_v2.
+        # With this block disabled, rewards are pure binary {0, 1} and
+        # all-success / all-fail groups become std=0 → automatically filtered
+        # by the dead-group threshold below. Re-enable for production-style
+        # multi-seed runs where speed pressure is diluted by seed diversity.
+        # for i, ep in enumerate(self.episodes):
+        #     if ep.num_steps > 0:
+        #         rewards[i] = rewards[i] / ep.num_steps * max_episode_steps
 
         # Store shaped rewards in episodes
         for ep, r in zip(self.episodes, rewards):

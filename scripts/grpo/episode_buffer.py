@@ -341,14 +341,28 @@ class EpisodeBuffer:
         ])
 
         # Step 1b: Time-scale rewards (faster solutions get higher reward)
-        # TEMPORARILY DISABLED for the binary-reward ablation experiment.
-        # With time-scaling on, all-success groups have variance from num_steps
-        # → live → speed-pressure gradient pushes the policy toward fragile fast
-        # solutions → collapse pattern observed in toy_lr3.0e-5_v2 / 4.0e-5_v2.
-        # With this block disabled, rewards are pure binary {0, 1} and
-        # all-success / all-fail groups become std=0 → automatically filtered
-        # by the dead-group threshold below. Re-enable for production-style
-        # multi-seed runs where speed pressure is diluted by seed diversity.
+        # DISABLED. The single-scene ablation experiments (toy_lr3.0e-5_v2/v3
+        # on seed 305067) confirmed time-scaling was the dominant cause of the
+        # success-rate collapse pattern observed across multiple LRs:
+        #   - With time-scaling: all-success groups stay alive (variance from
+        #     num_steps differences) → gradient becomes pure "be faster"
+        #     pressure → policy moves toward fragile fast solutions →
+        #     failures rise → pct_positive_advantage flips → avoidance
+        #     gradient walks policy AWAY from working trajectories →
+        #     ratio_min collapses, clipfrac >0.2, success collapses.
+        #   - Without time-scaling: all-success/all-fail groups go std=0 →
+        #     auto-filtered by the dead-group threshold below → only mixed
+        #     groups contribute gradient. Convergence stops itself once a
+        #     group hits all-success. Verified end-to-end in v3: success
+        #     climbed 0.50 → 0.83 and HELD; clipfrac stayed near 0;
+        #     mean_ratio stayed near 1.
+        # `mean_num_steps` still dropped naturally in v3 without an explicit
+        # speed bonus (failures hit truncation; successes terminate early),
+        # so disabling this block does NOT cost us trajectory efficiency.
+        # If you ever want a speed component back, prefer a CAPPED multiplier
+        # (e.g., min(1.5, max_steps/num_steps)) so a fast success gets at
+        # most 1.5× a slow one — not the original ~9× that drove the
+        # asymmetric gradient collapse.
         # for i, ep in enumerate(self.episodes):
         #     if ep.num_steps > 0:
         #         rewards[i] = rewards[i] / ep.num_steps * max_episode_steps

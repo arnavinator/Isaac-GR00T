@@ -204,6 +204,21 @@ class GRPOConfig:
     # Same role as grpo_cont.py's args.kl_coef = 0.002
     kl_coef: float = 0.1
 
+    # Jitter-GRPO Jacobian regularizer strength (paired scheduling).
+    # When > 0, every action chunk produces TWO entries per epoch: a "fixed"
+    # version (DiT input noise = original ε) and a "jitter" version (DiT input
+    # noise = ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled per τ
+    # per minibatch from the global torch RNG). The velocity target a − ε
+    # stays at the ORIGINAL ε in both branches; the cached chunk.ref_log_prob
+    # (computed at original ε) is reused — the bias is O(λ²) and θ-independent,
+    # so the gradient direction is unaffected. In expectation this adds a
+    # Frobenius-norm Jacobian penalty (1-t)²·λ²·‖∇_x v_θ‖_F², encouraging the
+    # velocity field to be locally smooth around each rolled-out trajectory.
+    # Doubles optimizer steps per epoch — halve update_epochs MANUALLY for
+    # jitter runs to match the per-iter optimizer-step budget of vanilla GRPO.
+    # 0.0 disables (bit-identical to vanilla GRPO). Suggested value 0.05.
+    jitter_lambda: float = 0.0
+
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
     # K = len(tau_centers) determines how many points along the noise→action interpolation
@@ -317,4 +332,9 @@ class GRPOConfig:
                 f"min_successful_groups ({self.min_successful_groups}) cannot "
                 f"exceed max_groups ({self.max_groups}) — criterion would be "
                 f"unsatisfiable."
+            )
+        if not (0.0 <= self.jitter_lambda < 1.0):
+            raise ValueError(
+                f"jitter_lambda must be in [0.0, 1.0), got {self.jitter_lambda}. "
+                f"Variance preservation requires λ < 1; use 0.0 to disable."
             )

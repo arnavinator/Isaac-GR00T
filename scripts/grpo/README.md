@@ -566,6 +566,377 @@ The cache is invalidated each iteration by `buffer.clear()` (called by
 
 ---
 
+## Jitter-GRPO (Jacobian regularizer)
+
+An optional, feature-flagged extension layered on top of the standard GRPO
+loop. Default `jitter_lambda = 0.0` is bit-identical to vanilla GRPO; setting
+`--jitter-lambda 0.05` activates the full mechanism.
+
+### Motivation
+
+Standard GRPO trains the DiT velocity field along the rolled-out denoising
+trajectory: each update tightens `v_θ(x_t, t | obs)` toward `(a − ε)` at the
+single point `x_t = (1−t)·ε + t·a`. Trajectories from noise samples *near* `ε`
+rely entirely on architectural smoothness of the velocity field to land near
+`a`. When that smoothness is poor, a successful action chunk's basin can be
+narrow — the model is fragile to tiny perturbations of the inference noise.
+
+However, the promise of Flow Matching is to be *noise-resillient* and have the
+denoising velocity field push noise into good action basins, whereas today, the 
+velocity field is quite sensitive to perturbations in noise, leading to fragility 
+when picking between high-advantage and low-advantage actions.
+In order to encourage the the velocity field to be more robust, we would like
+to encourage neighboring noise to `ε` to also lead to `a`.
+
+Jitter-GRPO adds a Frobenius-norm Jacobian penalty
+`(1−t)²·λ²·‖∇_x v_θ‖_F²` *in expectation* to the existing loss, encouraging
+the velocity field to be locally smooth along each rolled-out path. The
+implementation is a one-line trick: feed the DiT a variance-preserving
+jittered noise input `ε' = √(1−λ²)·ε + λ·ξ` (ξ ~ N(0, I)) but keep the
+velocity target at the **original** `a − ε`. Taking expectation over ξ gives
+the standard FM loss + the Jacobian penalty, with no double-backward and no
+architecture changes. The cached `chunk.ref_log_prob` (computed at the
+original ε) is reused for both branches — the cached-vs-recomputed-ref bias
+is `O(λ²)` and θ-independent, so the gradient direction is unaffected.
+
+### Knob: `GRPOConfig.jitter_lambda`
+
+- Default `0.0` → bit-identical to vanilla GRPO (no jittered passes, no
+  per-branch metrics, no extra CUDA syncs).
+- Suggested value `0.05` (variance-preservation multiplier `(1−t)²·λ²` ≤
+  2.5e-3, comfortably below the bf16 mantissa noise floor).
+- Range-checked in `GRPOConfig.__post_init__`: must satisfy `0.0 ≤ λ < 1.0`
+  (variance preservation requires `λ < 1`).
+- The trainer prints a one-line `[Jitter-GRPO] lambda=...` banner at startup
+  when active, including the doubled-step warning.
+
+### Paired scheduling (entries doubling)
+
+Each live chunk produces TWO entries per epoch when jitter is active:
+
+```python
+entries = (
+    [(c, "fixed") for c in live_chunks]      # always
+    + [(c, "jitter") for c in live_chunks]   # only when jitter_lambda > 0
+)
+```
+
+Both entries reference the **same** `ActionChunk` object (so they share
+`tau_samples`, `ref_log_prob`, `initial_noise`, and the cached backbone
+features). The only difference is the DiT input noise during the forward
+pass: "fixed" rows use the original `ε`, "jitter" rows use
+`ε' = √(1−λ²)·ε + λ·ξ`.
+
+Doubling the entries list doubles the number of optimizer steps per epoch.
+**Halve `update_epochs` MANUALLY** when running with jitter (e.g., 4 → 2)
+to match the per-iter optimizer-step budget of vanilla GRPO. The trainer
+does not auto-halve — the relationship is left explicit so the user can
+audit it from the CLI.
+
+### `compute_fm_log_prob`: per-τ jittered input noise
+
+`fm_log_prob.compute_fm_log_prob` gains an optional `noise_for_input` kwarg:
+
+```python
+def compute_fm_log_prob(..., noise, noise_for_input=None):
+    eps = noise                       # original ε; drives velocity_target
+    velocity_target = actions - eps   # ALWAYS at the ORIGINAL ε
+
+    if noise_for_input is not None:   # required shape: [K, B, H, D]
+        eps_input_all = noise_for_input
+    else:
+        eps_input_all = None          # back-compat fallback
+
+    for k in range(n_samples):        # K-loop over tau_centers
+        eps_input = eps if eps_input_all is None else eps_input_all[k]
+        noisy_trajectory = (1 - t)*eps_input + t*actions
+        # ... DiT forward, MSE per row, accumulate
+```
+
+Two design choices:
+
+1. **`velocity_target` stays at the ORIGINAL ε.** It's `actions - noise`,
+   NOT `actions - noise_for_input`. The asymmetry between input and target
+   is what produces the Jacobian regularizer in expectation. Swapping the
+   target to ε' would gain an `O(λ²)` model-independent floor that doesn't
+   shrink as the model improves.
+
+2. **Per-τ independent ξ_k.** The trainer already probes the FM log-prob
+   at `K = len(tau_centers)` different τ values per chunk per minibatch
+   (see the `tau_centers` subsection above — defaults to a length-6
+   late-biased schedule). Jitter-GRPO draws ONE fresh ξ_k for each of
+   those K τ-evaluations, so a paired chunk's jittered forward pass uses
+   K different ε'_k = √(1−λ²)·ε + λ·ξ_k along its K τ samples. The
+   caller therefore passes a 4-D `[K, B, H, D]` tensor where each
+   `noise_for_input[k]` carries the ξ-jitter for one τ-evaluation. This
+   gives K independent samples of the Jacobian expectation per minibatch,
+   matching the variance-reduction structure of `tau_centers`. Only the
+   4-D shape is supported (validated with a shape check); 3-D broadcast
+   would diverge from the per-τ-fresh-ξ design.
+
+Backward compat: when `noise_for_input=None` (the default), the function
+falls back to `eps_input = eps` and the K-loop is bit-identical to the
+pre-Jitter-GRPO code.
+
+### `_iter_stratified_minibatches`: now yields entries
+
+Refactored to operate on `list[(ActionChunk, str)]` instead of
+`list[ActionChunk]`. Group binning still uses `chunk.group_id` (read off
+the tuple's first element); both copies of a paired chunk share `group_id`
+so they land in the same group's queue but typically end up in different
+minibatches across the epoch. Yielded type: `list[(ActionChunk, str)]`.
+
+Same deterministic shuffle behavior — at `jitter_lambda=0`,
+`entries = [(c, "fixed") for c in live_chunks]` has identical length and
+ordering to the old `live_chunks`, and the same RNG seed produces the
+same minibatch composition.
+
+### `_prepare_batch`: carries mode through
+
+Takes `batch: list[(ActionChunk, str)]`. The order-preserving filter
+`valid_pairs = [(c, m) for (c, m) in batch if c.raw_action is not None]`
+keeps modes aligned 1:1 with `valid_batch`. Returns the same `batch_data`
+dict with one new key:
+
+```python
+batch_data["modes"]: list[str]   # length B, parallel to valid_batch
+```
+
+### `_compute_ref_log_probs`: always tags as "fixed"
+
+The reference log-prob pass uses the original ε for both branches (per the
+cached-ref invariant), so its single call site simply wraps the chunk list
+as `[(c, "fixed") for c in batch]` before passing into `_prepare_batch`.
+No `noise_for_input` is constructed; the ref pass is bit-identical
+regardless of `jitter_lambda`.
+
+### ξ sampling and `noise_for_input` construction
+
+Inside `_grpo_update_inner`, after `_prepare_batch` returns and the
+`ready_*` slicing is done:
+
+```python
+ready_modes = [batch_data["modes"][i] for i in ready_indices]
+lam = self.config.jitter_lambda
+
+if lam > 0.0 and any(m == "jitter" for m in ready_modes):
+    K = len(self.config.tau_centers)
+    B_r, H, D = ready_noise.shape
+
+    # Unseeded; uses global torch RNG, matching _sample_jittered_timesteps.
+    xi = torch.randn(K, B_r, H, D,
+                     device=self.device, dtype=ready_noise.dtype)
+
+    jitter_mask = torch.tensor(
+        [m == "jitter" for m in ready_modes],
+        device=self.device, dtype=torch.bool,
+    )
+
+    # expand returns a stride-0 view; clone() materializes a writable
+    # [K, B_r, H, D] tensor so __setitem__ writes per-K rows independently.
+    noise_for_input = (
+        ready_noise.unsqueeze(0).expand(K, -1, -1, -1).clone()
+    )
+    sqrt_one_minus = (1.0 - lam * lam) ** 0.5
+    noise_for_input[:, jitter_mask] = (
+        sqrt_one_minus * ready_noise[jitter_mask].unsqueeze(0)
+        + lam * xi[:, jitter_mask]
+    )
+else:
+    noise_for_input = None
+```
+
+Three notable details:
+
+- **ξ is unseeded.** Uses the global torch RNG, matching how
+  `_sample_jittered_timesteps` jitters the τ centers. On-policy collection
+  noise also isn't seeded per-call, so making ξ a special case would be
+  inconsistent with the rest of the training-time stochasticity. Resume
+  across iters proceeds without errors but ξ values are not bit-reproducible
+  across the resume boundary at `jitter_lambda > 0`.
+- **`expand+clone` is required.** `unsqueeze(0).expand(K, -1, -1, -1)`
+  returns a stride-0 view across the K dim; `__setitem__` on the view would
+  alias all K rows. The explicit `.clone()` materializes a writable per-K
+  tensor before the assignment.
+- **Fixed rows pass through unchanged.** Only
+  `noise_for_input[:, jitter_mask]` is overwritten. Rows where
+  `mode == "fixed"` retain `ready_noise` from the broadcast clone — ε for
+  both target and input, identical to vanilla GRPO behavior.
+
+The constructed `noise_for_input` then flows into:
+
+```python
+current_log_probs = compute_fm_log_prob(
+    ..., noise=ready_noise, noise_for_input=noise_for_input,
+    n_samples=len(self.config.tau_centers),
+)
+```
+
+When the gate is False (λ=0 or no jitter rows in this mb),
+`noise_for_input=None` and the K-loop takes the original-ε path.
+
+VRAM cost: `xi + noise_for_input ≈ 2 × 614 KB` per minibatch at
+`K=6, B=8, H=50, D=128` in bf16. Negligible vs the DiT activations.
+
+### Per-branch metrics (`*_fixed` / `*_jitter` TB scalars)
+
+The KL is refactored to expose `kl_per_row_full` as a named intermediate so
+it can be indexed by branch. The final `kl_loss = kl_coef *
+kl_per_row_full.mean()` is numerically identical to the previous inlined
+form.
+
+Inside the no-grad accumulator block, **gated on `lam > 0.0`**, we split
+the per-row tensors by mode and accumulate row-level sums:
+
+```python
+if lam > 0.0:
+    fixed_mask = torch.tensor([m == "fixed" for m in ready_modes], ...)
+    jit_mask = ~fixed_mask
+
+    n_f = int(fixed_mask.sum().item())
+    n_j = int(jit_mask.sum().item())
+    if n_f > 0:
+        ratio_sum_fixed         += ratio[fixed_mask].sum().item()
+        log_ratio_abs_sum_fixed += log_ratio_abs[fixed_mask].sum().item()
+        clipfrac_sum_fixed      += int(over_clip[fixed_mask].sum().item())
+        kl_per_row_sum_fixed    += kl_per_row_full[fixed_mask].sum().item()
+        n_rows_fixed            += n_f
+    # ... analogous for jitter
+```
+
+End-of-iter, per-branch metrics are added to `update_stats` only when at
+least one row of that branch fired:
+
+```python
+if n_rows_fixed > 0:
+    result["clipfrac_fixed"]           = clipfrac_sum_fixed / n_rows_fixed
+    result["mean_ratio_fixed"]         = ratio_sum_fixed / n_rows_fixed
+    result["mean_log_ratio_abs_fixed"] = log_ratio_abs_sum_fixed / n_rows_fixed
+    result["kl_loss_fixed"]            = kl_coef * (kl_per_row_sum_fixed / n_rows_fixed)
+# ... analogous for jitter
+```
+
+The gating on `lam > 0.0` matters: at `jitter_lambda=0`, the per-mb
+accumulator block is skipped entirely, the per-branch counters stay at
+their zero defaults, the result-dict gating `if n_rows_fixed > 0:` is
+False, and no `_fixed`/`_jitter` keys are emitted. Vanilla GRPO runs see
+exactly the same TB curves they always did.
+
+**Aggregation note.** Legacy aggregated metrics (`clipfrac`, `mean_ratio`,
+`mean_log_ratio_abs`, `kl_loss`) are means-of-per-mb-means — each minibatch
+contributes one entry regardless of size. The new `*_fixed` / `*_jitter`
+metrics are **row-weighted** (sum / n_rows). The two will differ slightly
+when minibatch sizes vary across the iter (e.g., the last mb is smaller
+than `mb_size`).
+
+### TB / wandb writing (`_log_metrics`)
+
+A small loop in `_log_metrics` iterates `for branch in ("fixed", "jitter")`
+× `for metric in ("clipfrac", "mean_ratio", "mean_log_ratio_abs",
+"kl_loss")` and writes `train/<metric>_<branch>` only if the key is
+present in `update_stats`:
+
+```python
+for branch in ("fixed", "jitter"):
+    for metric in ("clipfrac", "mean_ratio",
+                   "mean_log_ratio_abs", "kl_loss"):
+        key = f"{metric}_{branch}"
+        if key in update_stats:
+            self.writer.add_scalar(f"train/{key}", update_stats[key], iteration)
+```
+
+The wandb path already iterates `update_stats.items()` so it picks up the
+new keys automatically.
+
+### What this surfaces (the diagnostic signal)
+
+The empirical Jacobian-norm signal is the **gap** between the fixed and
+jitter branches' `mean_log_ratio_abs` (and analogous `clipfrac`):
+
+- A jitter row's `current_log_prob = -MSE(v_θ(x_t', t), v_target)` evaluates
+  the velocity field at a perturbed input; the expected gap to the
+  fixed-row evaluation is `(1−t)²·λ²·‖∇_x v_θ‖_F²`.
+- If the gap **shrinks** across iters, the regularizer is doing its job —
+  the velocity field is becoming smoother along the rolled-out trajectory.
+- If the gap is **flat**, λ may be too small to provide signal.
+- If `clipfrac_jitter ≫ clipfrac_fixed`, the jitter branch's ratio variance
+  has grown beyond the clip threshold — λ is likely too aggressive for the
+  current model state, or the model is genuinely sensitive in a way the
+  regularizer is fighting.
+
+### Bit-identical guarantee at `jitter_lambda = 0`
+
+| Path | Behavior at λ=0 |
+|------|-----------------|
+| `entries` construction | `[(c, "fixed") for c in live_chunks]` — same length and order as old `live_chunks`. |
+| `_iter_stratified_minibatches` | Same RNG seed, same shuffle, same minibatch composition; yields the same chunks just wrapped in 1-tuples of `(c, "fixed")`. |
+| `_prepare_batch` | Same `valid_batch` ordering; new `modes` list emitted but unused downstream. |
+| `compute_fm_log_prob` | `noise_for_input=None` → `eps_input = eps` → K-loop math unchanged. |
+| ξ-sampling block | Gated on `lam > 0.0`; not entered. |
+| Per-branch metric block | Gated on `lam > 0.0`; not entered. No extra CUDA syncs from `.item()`. |
+| Legacy aggregated metrics | Identical formulation; per-mb-mean accumulators preserved. |
+| TB scalars | No `_fixed`/`_jitter` keys emitted; legacy TB curves byte-identical. |
+
+Resume across iters at `jitter_lambda=0` is bit-reproducible end-to-end.
+At `jitter_lambda > 0`, ξ samples are not bit-reproducible across the
+resume boundary (intentional — ξ uses global torch RNG, matching τ-jitter
+and on-policy collection noise).
+
+### Toy / production CLI
+
+Toy-mode (fixed-seed diagnostic, fast turnaround):
+
+```bash
+uv run python scripts/grpo/toy_train_grpo.py \
+    --jitter-lambda 0.05 --update-epochs 2
+```
+
+Production (single-task or multi-task):
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --jitter-lambda 0.05 --update-epochs 2 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --num-iterations 200
+```
+
+To compare against vanilla GRPO at the **same per-iter step budget**, run
+a baseline at `--jitter-lambda 0 --update-epochs 4`. Same total
+optimizer-step count; the difference is solely the Jacobian regularizer
+pressure on positive-advantage chunks (basin sharpening) and
+negative-advantage chunks (neighborhood-carve).
+
+The toy script's startup banner prints `Jitter lambda: <value>` so you can
+confirm the flag flowed through. `grpo_data/` collisions between jitter and
+non-jitter runs at the same LR are the user's responsibility to manage
+(rename or override `--checkpoint-dir` / `--episode-dir` to keep TB curves
+separate).
+
+### Files touched by this feature
+
+| File | Change |
+|------|--------|
+| `grpo_config.py` | Adds `jitter_lambda: float = 0.0` field + range check in `__post_init__`. |
+| `fm_log_prob.py` | `compute_fm_log_prob` accepts optional `noise_for_input: Tensor[K,B,H,D] \| None`. K-loop uses `eps_input_all[k]` per τ when provided; `velocity_target = actions - eps` unchanged. |
+| `train_grpo.py` | `_iter_stratified_minibatches` and `_prepare_batch` operate on `(chunk, mode)` entries. `_compute_ref_log_probs` wraps as `("fixed", chunk)` tuples. `_grpo_update_inner` builds doubled entries, samples ξ via global RNG, constructs `noise_for_input` via expand+clone, threads it into `compute_fm_log_prob`, and adds gated per-branch metric accumulators. `_log_metrics` writes the per-branch TB scalars. Startup banner prints jitter lambda when active. |
+| `toy_train_grpo.py` | Prints `Jitter lambda` in the startup banner; inherits the field from `GRPOConfig` automatically. |
+
+### Scope
+
+Implemented: paired scheduling on top of the existing single-chunk-per-row
+training loop, per-τ independent ξ_k jitter on the DiT input (one fresh ξ
+per τ in `tau_centers`), cached-ref reuse for both branches, gated
+per-branch TB metrics.
+
+Not implemented: adaptive λ schedules, an offline noise-sensitivity
+validation eval (the per-branch `mean_log_ratio_abs` gap is the live
+signal), and the alternative formulation that recomputes the reference at
+the jittered input (the cached-ref bias is `O(λ²)` and `θ`-independent —
+recomputation costs an extra DiT pass per minibatch for no observable
+training-direction change).
+
+---
+
 ## Checkpointing & Resuming
 
 ### What gets saved

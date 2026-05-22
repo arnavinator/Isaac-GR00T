@@ -46,6 +46,7 @@ def compute_fm_log_prob(
     noise_beta_alpha: float = 1.5,
     noise_beta_beta: float = 1.0,
     noise_s: float = 1.0,
+    noise_for_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute FM log-probability surrogate for a batch of action chunks.
 
@@ -70,11 +71,20 @@ def compute_fm_log_prob(
         timesteps: [K, B] pre-specified diffusion timesteps (continuous in [0, noise_s]).
             If None, samples K fresh timesteps from Beta distribution.
         noise: [B, action_horizon, action_dim] SINGLE noise vector for all K samples.
-            If None, samples one fresh noise tensor.
+            If None, samples one fresh noise tensor. ALSO defines the velocity_target
+            via velocity_target = actions - noise (this is the ORIGINAL ε in the
+            Jitter-GRPO formulation).
         n_samples: Number of timestep samples for variance reduction (K).
         noise_beta_alpha: Alpha param for Beta distribution (default 1.5).
         noise_beta_beta: Beta param for Beta distribution (default 1.0).
         noise_s: Scaling factor for timestep (default from model config: 0.999).
+        noise_for_input: Optional [K, B, action_horizon, action_dim] tensor of
+            per-K DiT INPUT noise (Jitter-GRPO ε'_k). When provided, the
+            noisy_trajectory at timestep k is built from noise_for_input[k]
+            instead of `noise`, while velocity_target stays at (actions - noise).
+            None = use `noise` for both target and input (current behavior,
+            bit-identical when jitter is disabled). The 4-D shape with leading
+            K is required so each τ can use an independent ξ-jitter.
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
@@ -95,8 +105,30 @@ def compute_fm_log_prob(
         eps = torch.randn_like(actions)
 
     # The velocity target is constant across all tau (it's a property of the
-    # (action, noise) pair, not the interpolation point)
+    # (action, noise) pair, not the interpolation point). In Jitter-GRPO this
+    # stays at the ORIGINAL eps even when the DiT input is the jittered
+    # eps' = sqrt(1-λ²)·eps + λ·ξ — that asymmetry is what makes the loss in
+    # expectation an FM-loss + Jacobian-norm regularizer.
     velocity_target = actions - eps
+
+    # Resolve the per-K input-noise tensor. Only the [K, B, H, D] shape is
+    # supported because the only call path that exercises this argument
+    # (Jitter-GRPO in _grpo_update_inner) constructs it as such; carrying
+    # broadcast logic for shapes nothing exercises is dead surface area.
+    if noise_for_input is None:
+        eps_input_all = None
+    else:
+        if not (
+            noise_for_input.dim() == 4
+            and noise_for_input.shape[0] == n_samples
+            and noise_for_input.shape[1:] == eps.shape
+        ):
+            raise ValueError(
+                f"noise_for_input must be None or shape "
+                f"[{n_samples}, {eps.shape[0]}, {eps.shape[1]}, {eps.shape[2]}]; "
+                f"got {tuple(noise_for_input.shape)}"
+            )
+        eps_input_all = noise_for_input
 
     # Validate the action mask once — it's invariant across the k-loop.
     # An all-zero mask for any sample means compute_action_mask / the caller
@@ -125,9 +157,15 @@ def compute_fm_log_prob(
             t = (1 - t) * noise_s
 
         # --- Construct noisy trajectory at this timestep ---
-        # x_t = (1 - t) * epsilon + t * action
+        # x_t = (1 - t) * epsilon + t * action.
+        # In Jitter-GRPO (eps_input_all is not None), the DiT INPUT noise is
+        # the jittered eps'_k = sqrt(1-λ²)·eps + λ·ξ_k (constructed by the
+        # caller), but velocity_target above stays at (action - original_eps).
+        # That asymmetry is what gives the loss its Jacobian-regularizer
+        # interpretation in expectation.
+        eps_input = eps if eps_input_all is None else eps_input_all[k]
         t_expanded = t[:, None, None]  # [B, 1, 1]
-        noisy_trajectory = (1 - t_expanded) * eps + t_expanded * actions
+        noisy_trajectory = (1 - t_expanded) * eps_input + t_expanded * actions
 
         # --- Forward pass through DiT ---
         num_timestep_buckets = action_head.num_timestep_buckets

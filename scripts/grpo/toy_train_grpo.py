@@ -73,7 +73,10 @@ class ToyGRPOConfig(GRPOConfig):
     # same 28-episode batch overfits to the minibatch much faster than it
     # improves the policy. 2 epochs is enough to see whether the gradient is
     # moving the right way.
-    update_epochs: int = 4
+    # update_epochs: int = 4
+
+    update_epochs: int = 2
+    jitter_lambda: float = 0.05
 
     # Cosmetic alignment: parent's startup print uses num_groups to describe
     # episodes-per-iter. Match the real (fixed-seed) count.

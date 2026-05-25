@@ -2,13 +2,14 @@
 # to be used with PNG generated from interactive_rollout.py
 import argparse
 import glob
+import os
 import re
 import numpy as np
 import imageio.v3 as iio
 from PIL import Image, ImageDraw, ImageFont
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input-dir", required=True, help="Directory containing ep*_step*.png files")
+parser.add_argument("--input-dir", required=True, help="Directory containing *_step*.png files")
 parser.add_argument("--output", default=None, help="Output video path (default: <input-dir>/rollout.mp4)")
 parser.add_argument("--fps", type=int, default=10)
 args = parser.parse_args()
@@ -17,13 +18,13 @@ INPUT_DIR = args.input_dir
 OUTPUT_PATH = args.output or f"{INPUT_DIR}/rollout.mp4"
 FPS = args.fps
 
-pngs = sorted(glob.glob(f"{INPUT_DIR}/ep*_step*.png"))
-pattern = re.compile(r"ep(\d+)_step(\d+)\.png")
+pngs = sorted(glob.glob(f"{INPUT_DIR}/*_step*.png"))
+pattern = re.compile(r"(.+)_step(\d+)\.png$")
 frames = []
 for p in pngs:
-    m = pattern.search(p)
+    m = pattern.search(os.path.basename(p))
     if m:
-        frames.append((int(m.group(1)), int(m.group(2)), p))
+        frames.append((m.group(1), int(m.group(2)), p))
 frames.sort(key=lambda x: (x[0], x[1]))
 
 if not frames:
@@ -38,7 +39,7 @@ except OSError:
     font = ImageFont.load_default()
 
 rendered = []
-for ep, step, path in frames:
+for prefix, step, path in frames:
     img = Image.open(path).convert("RGB")
     draw = ImageDraw.Draw(img)
     label = str(step)

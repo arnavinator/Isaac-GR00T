@@ -175,6 +175,8 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 
 **Step budget**: The branching rollout accounts for elapsed time. If you branch from step 12 with `--n-action-steps 8` and `--max-episode-steps 720`, the first 96 sub-steps (12 × 8) are counted as consumed, plus however many custom action sub-steps are executed. The autonomous phase uses the remaining budget.
 
+Note that `--max-episode-steps` counts **sub-steps**, not outer steps. The autonomous phase will run at most `(max_episode_steps − branch_step × n_action_steps − custom_substeps) / n_action_steps` outer steps before truncation. To cap the autonomous phase explicitly, lower `--max-episode-steps`. For example, branching from step 18 with no custom action: the default `--max-episode-steps 720` allows `(720 − 144) / 8 = 72` autonomous outer steps, while `--max-episode-steps 480` allows `(480 − 144) / 8 = 42`.
+
 **CLI flags**:
 
 | Flag | Default | Description |

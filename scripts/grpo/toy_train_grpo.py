@@ -82,9 +82,14 @@ class ToyGRPOConfig(GRPOConfig):
     # episodes-per-iter. Match the real (fixed-seed) count.
     num_groups: int = len(FIXED_SEEDS)
 
-    # Disable dynamic group collection. Each iter uses exactly the fixed seed
-    # set; if a seed produces an all-fail group, the dead-group filter
-    # already handles it downstream.
+    # Default 0 keeps single-pass behavior: iterate FIXED_SEEDS once and
+    # let the downstream dead-group filter drop any all-fail / all-success
+    # groups. Set > 0 to enable round-robin retries of failed slots —
+    # ToyGRPOTrainer._collect_episodes will keep re-running still-failed
+    # slots from FIXED_SEEDS until this many slots succeed (>= 1
+    # task-successful rollout) or max_groups total attempts have been
+    # made. Same semantics as production's dynamic-collection path,
+    # scoped to the fixed seed list instead of fresh seeds.
     min_successful_groups: int = 0
     fast_forward_steps: int | list[int] = 3
 
@@ -105,10 +110,18 @@ class ToyGRPOTrainer(GRPOTrainer):
     before returning, so the rest of the trainer (LR sched, advantage
     compute, GRPO update, checkpointing) sees the unmodified config.
 
-    Re-tags loaded episodes with a unique per-seed group_id because the
-    subprocess always writes group_id=0 when num_groups=1; without re-tagging,
-    all 7 calls' episodes would merge into one giant pseudo-group and
-    compute_advantages would normalize across them instead of within each seed.
+    Re-tags loaded episodes with a globally-unique per-attempt group_id
+    (the subprocess always writes group_id=0 when num_groups=1; without
+    re-tagging, every attempt's episodes would collapse into a single
+    pseudo-group spanning the iter) and the slot's env_seed (which
+    _log_metrics buckets by). When config.min_successful_groups > 0,
+    also runs an outer round-robin retry of any slot whose group had
+    no task-successful rollouts, until config.min_successful_groups
+    slots have succeeded or config.max_groups total subprocess attempts
+    have been made — mirroring the production dynamic-collection
+    semantics from collect_episodes.EpisodeCollector.collect, scoped
+    to the FIXED_SEEDS list instead of fresh seeds. See
+    _collect_episodes for the full retry algorithm.
     """
 
     def __init__(self, config: ToyGRPOConfig, fixed_seeds: list[int] | None = None):
@@ -128,19 +141,72 @@ class ToyGRPOTrainer(GRPOTrainer):
                 "the subprocess path, then re-launch."
             )
 
+        # The toy's Phase-1 initial pass unconditionally attempts every fixed
+        # seed once before any retries — that's the diagnostic invariant.
+        # max_groups < len(FIXED_SEEDS) would cap that pass mid-way, which
+        # is almost certainly not what the user intended. The parent
+        # validator only enforces max_groups >= num_groups, and num_groups
+        # is CLI-overridable independently of fixed_seeds, so a pathological
+        # combo (e.g., --num-groups 1 --max-groups 1 with len(FIXED_SEEDS)=3)
+        # would slip past the parent check without this guard.
+        if self.config.max_groups < len(self.fixed_seeds):
+            raise ValueError(
+                f"max_groups ({self.config.max_groups}) must be >= "
+                f"len(FIXED_SEEDS) ({len(self.fixed_seeds)}). The toy's "
+                f"initial pass always attempts every fixed seed once before "
+                f"any retries; max_groups < len(FIXED_SEEDS) would cap that "
+                f"pass and is almost certainly a misconfiguration."
+            )
+
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int) -> None:
-        """One subprocess call per fixed seed, accumulating into self.buffer."""
+        """One subprocess call per fixed seed, retrying failed seeds until
+        min_successful_groups slots succeed or max_groups attempts are made.
+
+        Retry semantics match the production dynamic-collection path
+        (collect_episodes.EpisodeCollector.collect): a "successful" group has
+        at least one rollout that completed the task (group_successes > 0;
+        see collect_episodes.py:714). After the initial pass through
+        FIXED_SEEDS, if fewer than config.min_successful_groups slots have
+        produced a successful group, round-robin retry the still-failed
+        slots one at a time until any of:
+          - >= min_successful_groups slots have succeeded
+          - total attempts reaches config.max_groups
+          - all slots have already succeeded (criterion exceeds
+            len(FIXED_SEEDS), which is unsatisfiable by adding more
+            attempts since each slot contributes at most 1).
+
+        Each subprocess call gets a globally-unique group_id within the
+        iter (incremented per attempt), so retries accumulate in the
+        buffer alongside the initial pass and downstream advantage
+        computation treats them as distinct groups — matching production,
+        where dynamically-added groups never replace existing ones. The
+        dead-group filter (per-group std < 1e-4 in compute_advantages)
+        then handles all-fail and all-success groups uniformly. Episodes
+        are also re-tagged with env_seed so _log_metrics can pool
+        per-seed TB curves across the initial attempt and any retries of
+        the same scene.
+
+        Model-side denoising RNG is unseeded (see collect_episodes.py:
+        640-642), so retries with the same env seed produce different
+        rollouts on the same kitchen layout — same property the existing
+        duplicate-FIXED_SEEDS pattern (e.g., [305067, 305067, 305067])
+        already relies on.
+
+        Note: ToyGRPOConfig defaults min_successful_groups=0, so by
+        default no retries happen and behavior reduces to the original
+        single-pass iteration over FIXED_SEEDS.
+        """
         # Parent-equivalent setup
         self.buffer.clear()
         self._prune_old_episode_dirs()
 
         episode_dir = Path(self.config.episode_dir) / f"iter_{self.iteration:04d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
-        # Wipe any stale per-seed subdirs from an aborted previous toy run
-        # (same checkpoint_dir → same iter_NNNN/seed_* layout). Also drop
+        # Wipe any stale per-slot subdirs from an aborted previous toy run
+        # (same checkpoint_dir → same iter_NNNN/slot_*/ layout). Also drop
         # any orphan top-level episode_*.npz that a re-run might glob.
         for stale_d in list(episode_dir.iterdir()):
-            if stale_d.is_dir() and stale_d.name.startswith("seed_"):
+            if stale_d.is_dir() and stale_d.name.startswith("slot_"):
                 shutil.rmtree(stale_d, ignore_errors=True)
         for stale_f in episode_dir.glob("episode_*.npz"):
             stale_f.unlink()
@@ -151,87 +217,226 @@ class ToyGRPOTrainer(GRPOTrainer):
         else:
             ff_steps = self.config.fast_forward_steps
 
-        print(
-            f"  [TOY] Collecting {len(self.fixed_seeds)} fixed seeds × "
-            f"{self.config.group_size} rollouts each "
-            f"(one subprocess per seed)..."
-        )
+        n_slots = len(self.fixed_seeds)
+        min_succ = self.config.min_successful_groups
+        # max_attempts caps total subprocess calls per iter (initial pass
+        # plus any retries). __init__ enforces max_groups >= n_slots so the
+        # initial pass always fits the budget, leaving room for >= 0 retries.
+        max_attempts = self.config.max_groups
+        # Per-attempt log display: when min_succ=0 Phase 2 is skipped, so
+        # the actual cap on attempts is n_slots — not max_attempts. Pick
+        # the right one so "Attempt N/M" reads honestly.
+        attempt_cap_display = max_attempts if min_succ > 0 else n_slots
+        if min_succ > 0:
+            print(
+                f"  [TOY] Collecting {n_slots} fixed seeds × "
+                f"{self.config.group_size} rollouts each, then retrying "
+                f"failed seeds round-robin until {min_succ} slots succeed "
+                f"or {max_attempts} total attempts "
+                f"(one subprocess per attempt)..."
+            )
+        else:
+            print(
+                f"  [TOY] Collecting {n_slots} fixed seeds × "
+                f"{self.config.group_size} rollouts each "
+                f"(no retry: min_successful_groups=0)..."
+            )
 
-        # Snapshot every field we mutate inside the per-seed loop, so the
-        # restoration in `finally` is exact even on exceptions.
+        # Snapshot every field we mutate inside the per-attempt helper,
+        # so the restoration in `finally` is exact even on exceptions.
         orig_num_groups = self.config.num_groups
         orig_min_succ = self.config.min_successful_groups
         orig_max_groups = self.config.max_groups
         orig_seed = self.config.seed
         orig_iter = self.iteration
 
-        n_failed_seeds = 0
+        # Per-slot tracking. A "slot" is an index into FIXED_SEEDS; a slot
+        # has "succeeded" once any of its attempts produced a group with
+        # >= 1 task-successful rollout (matches the production
+        # group_successes>0 criterion in collect_episodes.py:714).
+        slot_attempts = [0] * n_slots
+        slot_succeeded = [False] * n_slots
+        n_attempts = 0           # total subprocess calls this iter
+        n_successful_slots = 0   # distinct slots with >= 1 successful attempt
+        next_group_id = 0        # globally-unique within this iter
+
+        def _run_one_attempt(slot_idx: int, group_id: int) -> bool:
+            """One subprocess call for FIXED_SEEDS[slot_idx], tagging
+            loaded episodes with `group_id` and the slot's env_seed.
+            Returns True iff the loaded group had >= 1 task-successful
+            rollout. Side effects: appends loaded episodes to
+            self.buffer.episodes; increments n_attempts and
+            slot_attempts[slot_idx].
+            """
+            nonlocal n_attempts
+            fixed_seed = self.fixed_seeds[slot_idx]
+            # Unique subdir per (slot, attempt). Including slot_idx is
+            # what makes duplicate entries in FIXED_SEEDS (e.g.,
+            # [305067, 305067, 305067]) safe: without it, all three
+            # Phase-1 slots would compute the same `seed_X` path and
+            # each subprocess would overwrite the previous slot's
+            # episode_*.npz files on disk. (The in-memory buffer
+            # happens to survive because load_episodes runs between
+            # subprocess calls, but the on-disk dir would only show
+            # the LAST occupant — confusing for post-mortem inspection
+            # and one numpy mmap default away from silent data
+            # corruption.) load_episodes globs episode_*.npz within
+            # one dir, so reusing one across retries of the SAME slot
+            # would also re-load earlier attempts alongside the new one.
+            attempt_idx = slot_attempts[slot_idx]
+            if attempt_idx == 0:
+                sub_dir = (
+                    episode_dir
+                    / f"slot_{slot_idx:02d}_seed_{fixed_seed:08d}"
+                )
+            else:
+                sub_dir = (
+                    episode_dir
+                    / f"slot_{slot_idx:02d}_seed_{fixed_seed:08d}"
+                      f"_retry_{attempt_idx:02d}"
+                )
+            sub_dir.mkdir(parents=True, exist_ok=True)
+
+            # _collect_via_subprocess passes:
+            #     --seed = self.config.seed + self.iteration * 100_000
+            # Make this resolve to exactly fixed_seed regardless of attempt.
+            self.config.seed = fixed_seed
+            self.iteration = 0
+
+            slot_attempts[slot_idx] = attempt_idx + 1
+            n_attempts += 1
+
+            tag = (
+                f"slot {slot_idx + 1}/{n_slots}"
+                if attempt_idx == 0
+                else f"RETRY {attempt_idx} of slot {slot_idx + 1}"
+            )
+            print(
+                f"  [TOY] Attempt {n_attempts}/{attempt_cap_display}: "
+                f"env_seed={fixed_seed} ({tag}), group_id={group_id}"
+            )
+
+            # Wrap in try/except: _collect_via_subprocess RETURNS a
+            # failure_reason for its known failure modes (timeout,
+            # non-zero exit), but a raise can still come from
+            # subprocess.Popen (OSError on a bad venv path) or from
+            # stdout pipe iteration (IOError on a broken pipe).
+            # Without this guard, such an exception would propagate
+            # mid-loop with a partial buffer from earlier successful
+            # attempts, and the parent's train() — which doesn't catch
+            # — would tear down the run with that partial state still
+            # in self.buffer. Treating as a failed attempt keeps
+            # accounting consistent with the returned-failure_reason path.
+            try:
+                failure_reason = self._collect_via_subprocess(
+                    env_name=env_name,
+                    episode_dir=sub_dir,
+                    max_steps=max_steps,
+                    ff_steps=ff_steps,
+                )
+            except Exception as e:
+                failure_reason = (
+                    f"unexpected exception: {type(e).__name__}: {e}"
+                )
+
+            if failure_reason is not None:
+                print(f"  [TOY]   FAILED: {failure_reason}")
+                return False
+
+            n_before = len(self.buffer.episodes)
+            self.buffer.load_episodes(sub_dir)
+            n_loaded = len(self.buffer.episodes) - n_before
+            if n_loaded == 0:
+                print(f"  [TOY]   produced 0 episodes")
+                return False
+
+            # Re-tag with our globally-unique group_id and the slot's
+            # env_seed value. Collector always writes group_id=0 since
+            # num_groups=1; without re-tagging, every attempt's
+            # episodes would collapse into a single pseudo-group
+            # spanning the iter.
+            n_success_in_group = 0
+            for ep in self.buffer.episodes[n_before:]:
+                ep.group_id = group_id
+                ep.env_seed = fixed_seed
+                if ep.success:
+                    n_success_in_group += 1
+            had_success = n_success_in_group > 0
+            print(
+                f"  [TOY]   loaded {n_loaded} episodes, "
+                f"{n_success_in_group}/{n_loaded} succeeded "
+                f"(group {'ALIVE' if had_success else 'failed'})"
+            )
+            return had_success
+
         try:
             # Force the subprocess to emit exactly one group per call.
-            # `min_successful_groups=0` disables dynamic mode; `max_groups=1`
-            # satisfies the validator's max_groups>=num_groups invariant.
+            # `min_successful_groups=0` disables the subprocess's own
+            # dynamic mode; `max_groups=1` satisfies the validator's
+            # max_groups>=num_groups invariant. The toy's outer Python
+            # loop replaces subprocess-side dynamic collection.
             self.config.num_groups = 1
             self.config.min_successful_groups = 0
             self.config.max_groups = 1
 
-            for seed_idx, fixed_seed in enumerate(self.fixed_seeds):
-                sub_dir = episode_dir / f"seed_{fixed_seed:08d}"
-                sub_dir.mkdir(parents=True, exist_ok=True)
+            # Phase 1: full initial pass through every fixed seed.
+            # Independent of min_successful_groups — every seed always
+            # gets at least one attempt, matching the toy's
+            # "fixed seed" diagnostic intent.
+            for slot_idx in range(n_slots):
+                had_success = _run_one_attempt(slot_idx, next_group_id)
+                next_group_id += 1
+                if had_success and not slot_succeeded[slot_idx]:
+                    slot_succeeded[slot_idx] = True
+                    n_successful_slots += 1
 
-                # _collect_via_subprocess passes:
-                #     --seed = self.config.seed + self.iteration * 100_000
-                # Make this resolve to exactly fixed_seed.
-                self.config.seed = fixed_seed
-                self.iteration = 0
-
-                print(
-                    f"  [TOY] Seed {seed_idx + 1}/{len(self.fixed_seeds)}: "
-                    f"env_seed={fixed_seed}"
-                )
-                # Wrap in try/except: _collect_via_subprocess RETURNS a
-                # failure_reason for its known failure modes (timeout,
-                # non-zero exit), but a raise can still come from
-                # subprocess.Popen (OSError if the robocasa venv path is
-                # wrong) or from the stdout pipe iteration (IOError on a
-                # broken pipe). Without this guard, such an exception
-                # would propagate mid-loop with a partial buffer from
-                # earlier successful seeds, and the parent's train() — which
-                # doesn't catch — would tear down the run with that partial
-                # state still in self.buffer. Treating it as a failed seed
-                # keeps the failure accounting consistent with the
-                # returned-failure_reason path.
-                try:
-                    failure_reason = self._collect_via_subprocess(
-                        env_name=env_name,
-                        episode_dir=sub_dir,
-                        max_steps=max_steps,
-                        ff_steps=ff_steps,
+            # Phase 2: round-robin retry of still-failed slots. Skipped
+            # entirely when min_successful_groups==0 (default) — in that
+            # case behavior is identical to the original single-pass toy.
+            # Each successful retry takes its slot out of the rotation;
+            # the toy's interest is per-slot success, not extra
+            # successful attempts on already-good slots.
+            retry_cursor = 0
+            while (
+                min_succ > 0
+                and n_successful_slots < min_succ
+                and n_attempts < max_attempts
+            ):
+                # True fixed-order round-robin: walk slot indices forward
+                # from retry_cursor (wrapping), skipping already-succeeded
+                # slots. Naive `still_failed[cursor % len(still_failed)]`
+                # was incorrect: removing a slot when it succeeds shifts
+                # later slots' positions in the list, so the cursor
+                # silently skipped a still-failed slot in the next pick.
+                slot_idx: int | None = None
+                for offset in range(n_slots):
+                    cand = (retry_cursor + offset) % n_slots
+                    if not slot_succeeded[cand]:
+                        slot_idx = cand
+                        retry_cursor = (cand + 1) % n_slots
+                        break
+                if slot_idx is None:
+                    # All slots have succeeded but criterion is still
+                    # unmet — only possible when min_successful_groups
+                    # > len(FIXED_SEEDS), since each slot can
+                    # contribute at most 1 to n_successful_slots.
+                    # Adding more attempts to already-succeeded slots
+                    # wouldn't help; stop.
+                    print(
+                        f"  [TOY] All {n_slots} slots have succeeded "
+                        f"but min_successful_groups={min_succ} > "
+                        f"len(FIXED_SEEDS)={n_slots} — criterion is "
+                        f"unsatisfiable. Stopping retries."
                     )
-                except Exception as e:
-                    failure_reason = (
-                        f"unexpected exception: {type(e).__name__}: {e}"
-                    )
-
-                if failure_reason is not None:
-                    print(f"  [TOY] Seed {fixed_seed} FAILED: {failure_reason}")
-                    n_failed_seeds += 1
-                    continue
-
-                # Append this seed's 4 episodes onto the buffer, then re-tag
-                # with a unique per-seed group_id (collector wrote 0 since
-                # num_groups=1; without this re-tag, compute_advantages would
-                # pool all 28 episodes into a single group and the
-                # group-relative normalization would lose its meaning).
-                n_before = len(self.buffer.episodes)
-                self.buffer.load_episodes(sub_dir)
-                n_loaded_this_seed = len(self.buffer.episodes) - n_before
-                for ep in self.buffer.episodes[n_before:]:
-                    ep.group_id = seed_idx
-                    ep.env_seed = fixed_seed
-
-                if n_loaded_this_seed == 0:
-                    print(f"  [TOY] Seed {fixed_seed} produced 0 episodes")
-                    n_failed_seeds += 1
+                    break
+                had_success = _run_one_attempt(slot_idx, next_group_id)
+                next_group_id += 1
+                if had_success:
+                    # First success for this slot — bump the count.
+                    # (We only pick still-failed slots above, so
+                    # slot_succeeded[slot_idx] is guaranteed False here.)
+                    slot_succeeded[slot_idx] = True
+                    n_successful_slots += 1
         finally:
             self.config.num_groups = orig_num_groups
             self.config.min_successful_groups = orig_min_succ
@@ -244,7 +449,8 @@ class ToyGRPOTrainer(GRPOTrainer):
         if not self.buffer.episodes:
             self._consecutive_collect_failures += 1
             print(
-                f"  [TOY] WARNING: 0 episodes loaded "
+                f"  [TOY] WARNING: 0 episodes loaded across all "
+                f"{n_attempts} attempts "
                 f"({self._consecutive_collect_failures}/"
                 f"{self._max_consecutive_collect_failures} consecutive failures)"
             )
@@ -260,12 +466,35 @@ class ToyGRPOTrainer(GRPOTrainer):
             return
 
         self._consecutive_collect_failures = 0
-        n_succ_seeds = len(self.fixed_seeds) - n_failed_seeds
-        print(
+        # Actual loaded group count (not n_attempts): an attempt that
+        # crashed or loaded 0 episodes contributes no group_id to the
+        # buffer, so next_group_id (which increments per attempt) would
+        # overstate. Pull the real count from buffer.episodes.
+        n_groups_loaded = len({ep.group_id for ep in self.buffer.episodes})
+        summary = (
             f"  [TOY] Loaded {len(self.buffer.episodes)} episodes from "
-            f"{n_succ_seeds}/{len(self.fixed_seeds)} seeds "
-            f"({self.buffer.num_chunks} chunks total)"
+            f"{n_groups_loaded} groups across {n_attempts} subprocess attempts; "
+            f"{n_successful_slots}/{n_slots} slots had >= 1 successful rollout"
         )
+        if min_succ > 0:
+            summary += f" (target: {min_succ})"
+        summary += f" ({self.buffer.num_chunks} chunks total)"
+        print(summary)
+        # Final warning only when the attempt cap was the actual reason
+        # for stopping short. The unsatisfiable-criterion branch
+        # (min_succ > len(FIXED_SEEDS)) already printed its own message
+        # above and exits with n_attempts < max_attempts, so don't
+        # mislabel it as "hit attempt cap".
+        if (
+            min_succ > 0
+            and n_successful_slots < min_succ
+            and n_attempts >= max_attempts
+        ):
+            print(
+                f"  [TOY] WARNING: hit attempt cap "
+                f"({n_attempts}/{max_attempts}) with only "
+                f"{n_successful_slots}/{min_succ} successful slots."
+            )
 
     def _log_metrics(
         self,
@@ -286,10 +515,16 @@ class ToyGRPOTrainer(GRPOTrainer):
         obscures bimodal "some seeds climbing, others flat" patterns;
         per-seed lines surface them.
 
-        Indexing: _collect_episodes re-tags every episode with
-        `group_id = enumerate(self.fixed_seeds)`, so group_id i ↔
-        fixed_seeds[i]. We re-bucket by group_id here and emit one
-        scalar per fixed seed.
+        Bucketing: by ep.env_seed (the seed of the fixed initial state).
+        With the retry path in _collect_episodes, a single fixed seed
+        can produce multiple groups per iter — the initial attempt plus
+        zero or more retries — each tagged with its own globally-unique
+        group_id but the SAME env_seed. Pooling by env_seed combines
+        those attempts into one curve per seed, which is what the
+        diagnostic actually wants: "for THIS scene, what was the
+        success rate this iter across however many rollouts I
+        collected?" Duplicate entries in FIXED_SEEDS (e.g., the
+        [305067]*3 default) likewise pool under their single seed value.
         """
         super()._log_metrics(
             iteration, stats, update_stats, lr, iter_time, skip_reason,
@@ -298,20 +533,22 @@ class ToyGRPOTrainer(GRPOTrainer):
         if self.writer is None:
             return
 
-        group_to_total: dict[int, int] = {}
-        group_to_succ: dict[int, int] = {}
+        seed_to_total: dict[int, int] = {}
+        seed_to_succ: dict[int, int] = {}
         for ep in self.buffer.episodes:
-            group_to_total[ep.group_id] = group_to_total.get(ep.group_id, 0) + 1
+            seed_to_total[ep.env_seed] = seed_to_total.get(ep.env_seed, 0) + 1
             if ep.success:
-                group_to_succ[ep.group_id] = group_to_succ.get(ep.group_id, 0) + 1
+                seed_to_succ[ep.env_seed] = seed_to_succ.get(ep.env_seed, 0) + 1
 
-        for seed_idx, seed in enumerate(self.fixed_seeds):
-            total = group_to_total.get(seed_idx, 0)
+        # dict.fromkeys preserves first-occurrence order and dedupes.
+        for seed in dict.fromkeys(self.fixed_seeds):
+            total = seed_to_total.get(seed, 0)
             if total == 0:
-                # This seed's subprocess failed this iter — leave the curve
-                # ungapped by skipping (TB plots will interpolate visually).
+                # This seed's subprocess failed every attempt this iter —
+                # leave the curve ungapped by skipping (TB plots will
+                # interpolate visually).
                 continue
-            rate = group_to_succ.get(seed_idx, 0) / total
+            rate = seed_to_succ.get(seed, 0) / total
             self.writer.add_scalar(
                 f"toy_seeds/seed_{seed}_success_rate", rate, iteration
             )

@@ -82,20 +82,14 @@ class ToyGRPOConfig(GRPOConfig):
     # episodes-per-iter. Match the real (fixed-seed) count.
     num_groups: int = len(FIXED_SEEDS)
 
-    # Default 0 keeps single-pass behavior: iterate FIXED_SEEDS once and
-    # let the downstream dead-group filter drop any all-fail / all-success
-    # groups. Set > 0 to enable round-robin retries of failed slots —
-    # ToyGRPOTrainer._collect_episodes will keep re-running still-failed
-    # slots from FIXED_SEEDS until this many slots succeed (>= 1
-    # task-successful rollout) or max_groups total attempts have been
-    # made. Same semantics as production's dynamic-collection path,
-    # scoped to the fixed seed list instead of fresh seeds.
     min_successful_groups: int = 0
-    fast_forward_steps: int | list[int] = 3
+
+    max_groups: int = 8
 
     # Force ALL groups to fast-forward every iter (production used 0.8, which
     # mixes FF and non-FF iters and adds avoidable noise to the success curve).
     fast_forward_pct: float = 0
+    fast_forward_steps: int | list[int] = 3
 
     save_interval: int = 1
 

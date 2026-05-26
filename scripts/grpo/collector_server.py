@@ -278,6 +278,10 @@ class CollectorServer:
         )
         if "max_groups" in data and data["max_groups"] is not None:
             collect_kwargs["max_groups"] = int(data["max_groups"])
+        # init_state_npz_path is optional and forwarded only when present so a
+        # mismatched-version trainer that doesn't send it still works.
+        if "init_state_npz_path" in data and data["init_state_npz_path"] is not None:
+            collect_kwargs["init_state_npz_path"] = str(data["init_state_npz_path"])
         episodes = collector.collect(**collect_kwargs)
         save_episodes(episodes, str(output_dir))
         elapsed = time.time() - t0
@@ -371,6 +375,7 @@ class CollectorClient:
         fast_forward_pct: float = 0.5,
         min_successful_groups: int = 0,
         max_groups: int | None = None,
+        init_state_npz_path: str | None = None,
     ) -> dict:
         payload = {
             "env_name": env_name,
@@ -386,6 +391,11 @@ class CollectorClient:
         # this key) keep the EpisodeCollector default behaviour.
         if max_groups is not None:
             payload["max_groups"] = int(max_groups)
+        # Same pattern for init_state_npz_path — optional, only sent when used.
+        # Older servers without this key will silently ignore it (the field is
+        # in msgpack payload but never looked up).
+        if init_state_npz_path is not None:
+            payload["init_state_npz_path"] = str(init_state_npz_path)
         return self._call("collect", payload)
 
     def kill(self) -> dict:

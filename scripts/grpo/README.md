@@ -315,6 +315,60 @@ Edge cases handled:
   `<output_dir>/debug_ff/group<G>_seed<S>_ff<F>.png` so you can eyeball
   that every env in a group really is bit-identical at the branch point.
 
+### Init from saved sim state
+
+A second, more explicit branching mode: instead of having env 0 run the
+*current model* forward N steps to produce a branch state (Fast-Forward),
+load a **pre-saved** scene + sim state from a `.npz` and start every env in
+every group from there. Intended for overfitting / curriculum experiments —
+e.g., training GRPO on a single known-hard intermediate state (step 10 of a
+specific failing trajectory) to study how the policy refines its behavior at
+that state without burning compute on the upstream approach.
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --init-state-npz-path /path/to/ep000_step010.npz \
+    --success-weight 0.3 \
+    --fast-forward-pct 0.0 \
+    --min-successful-groups 0 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --num-iterations 50
+```
+
+The npz must be produced by `scripts/denoising_lab/eval/interactive_rollout.py`
+(or any saver that follows the same contract: `__sim_state__`,
+`__model_xml__`, `__ep_meta__` keys; see `branching_rollout.py:182-210`).
+
+Mechanics:
+
+1. `_load_init_bundle` (`collect_episodes.py`) parses the npz once per
+   collector process and caches the resulting `{ep_meta, model_xml,
+   sim_state}` dict, keyed by path.
+2. `_align_envs_to_group_scene` short-circuits the usual "env 0's bundle →
+   all envs" handshake and broadcasts the loaded bundle to every env via
+   the same `apply_scene_bundle` RPC (`collect_episodes.py:313-405`).
+3. Within-group and across-group divergence comes entirely from per-env
+   denoising noise; the env starts bit-identical everywhere.
+
+Interactions with other knobs:
+
+- **Forces Fast-Forward off internally.** `fast_forward_steps` /
+  `fast_forward_pct` are ignored when `init_state_npz_path` is set
+  (logged at iter start). Set `fast_forward_pct=0.0` on the CLI too if
+  you want the intent visible in logs without trusting the override.
+- **Set `min_successful_groups = 0`.** The dynamic-collection criterion
+  ("≥ N groups had ≥ 1 success") is meaningless when every group starts
+  from the same hard state — the success rate is a single number, not a
+  per-group property.
+- **Set `success_weight < 1.0`.** Pure-binary reward + hard start state
+  is a dead-gradient trap: every rollout fails identically, group std=0,
+  advantages get zeroed by the dead-group filter
+  (`episode_buffer.py:403-406`), no learning happens. `success_weight=0.3`
+  makes `max_progress` (which varies with denoising noise) contribute to
+  the shaped reward so advantages have signal even before any rollout
+  succeeds. `GRPOConfig.__post_init__` emits a warning if you set
+  `init_state_npz_path` with `success_weight=1.0`.
+
 ### Dynamic group collection
 
 Many RoboCasa tasks have a wide success-rate distribution early in
@@ -1046,6 +1100,9 @@ uv run python scripts/grpo/train_grpo.py \
   Default 8.
 - `fast_forward_steps: int | list[int]`, `fast_forward_pct` — see
   "Fast-Forward Branching". Default 12 / 0.8.
+- `init_state_npz_path` — see "Init from saved sim state". Default None
+  (disabled). When set, overrides the seed-based scene init for every
+  group; intended for overfitting / curriculum experiments.
 - `env_names: list[str]` — round-robin task selection.
 - `episode_dir`, `episode_dirs_to_keep`.
 
@@ -1057,7 +1114,11 @@ uv run python scripts/grpo/train_grpo.py \
 
 **Reward shaping**
 - `success_weight` (0-1) — binary weight in shaped reward. Default 1.0
-  (pure binary, no dense progress collected).
+  (pure binary, no dense progress collected). Set < 1.0 when training
+  from a hard initial state (e.g., `init_state_npz_path`) to avoid the
+  dead-gradient stall — `max_progress` then contributes a continuous
+  signal that varies with denoising noise even before any rollout
+  succeeds. See "Init from saved sim state".
 
 **GRPO algorithm**
 - `clip_eps` (default 0.2)

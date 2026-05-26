@@ -136,6 +136,29 @@ class GRPOConfig:
     # 0.0 = never fast-forward, 1.0 = always fast-forward.
     fast_forward_pct: float = 0.8
 
+    # ─── Init from saved sim state (overfitting / curriculum) ────────────────
+    # When set, every group's branch point is loaded from this saved-state npz
+    # instead of being produced by env.reset(seed=...) (and instead of running
+    # the current model forward via fast-forward). Used for overfitting GRPO on
+    # a specific intermediate state — e.g., step 10 of a known failing episode —
+    # for analysis or curriculum.
+    #
+    # The npz must contain __sim_state__, __model_xml__, __ep_meta__ as produced
+    # by scripts/denoising_lab/eval/interactive_rollout.py (or any other saver
+    # that follows the branching_rollout.py:182-210 contract).
+    #
+    # Interactions with other knobs:
+    #   - Internally short-circuits the fast-forward path; fast_forward_steps /
+    #     fast_forward_pct are ignored. Set fast_forward_pct=0.0 explicitly to
+    #     make the intent visible in logs.
+    #   - min_successful_groups should be 0 — every group starts from the same
+    #     hard state, so "N groups had >=1 success" is not the criterion you want.
+    #   - success_weight < 1.0 is strongly recommended; from a hard saved state
+    #     binary-only reward typically produces dead groups (every rollout fails
+    #     identically → std=0 → zero advantage → no learning). With shaped reward
+    #     enabled, max_progress varies with denoising noise and provides signal.
+    init_state_npz_path: Optional[str] = None
+
     # ZMQ server host and port for model inference during collection
     server_host: str = "127.0.0.1"
     server_port: int = 5555
@@ -338,3 +361,109 @@ class GRPOConfig:
                 f"jitter_lambda must be in [0.0, 1.0), got {self.jitter_lambda}. "
                 f"Variance preservation requires λ < 1; use 0.0 to disable."
             )
+        # success_weight is a probability-like blend weight in the shaped
+        # reward (success_weight * success + (1-success_weight) * max_progress);
+        # values outside [0, 1] silently invert the progress term (e.g.,
+        # success_weight=2.5 → reward = 2.5*success - 1.5*max_progress) and
+        # corrupt the training signal without crashing. Cheap to range-check.
+        if not (0.0 <= self.success_weight <= 1.0):
+            raise ValueError(
+                f"success_weight must be in [0.0, 1.0], got {self.success_weight}. "
+                f"It blends binary success and dense max_progress in the shaped "
+                f"reward; values outside [0, 1] flip the sign of the progress term."
+            )
+
+        # ── init_state_npz_path validations ─────────────────────────────────
+        # These run at config-construction time so failures surface BEFORE the
+        # trainer spends minutes on model load + server bind. The npz path
+        # also needs to be resolved to an absolute path here so it remains
+        # valid across processes: the long-running collector_server (and the
+        # robocasa-venv subprocess) may have a different CWD than the trainer.
+        if self.init_state_npz_path is not None:
+            # Empty / whitespace path is almost certainly a CLI typo; reject
+            # rather than waste a subprocess on np.load("").
+            if not self.init_state_npz_path.strip():
+                raise ValueError(
+                    "init_state_npz_path is empty/whitespace; pass a real "
+                    "path (or unset the flag to disable the override)."
+                )
+            # Embedded NUL bytes survive str checks but raise a cryptic
+            # OS-level "embedded null character" deep inside pathlib's
+            # stat() — wrap with a clearer message and the offending input.
+            if "\x00" in self.init_state_npz_path:
+                raise ValueError(
+                    f"init_state_npz_path contains an embedded NUL byte "
+                    f"({self.init_state_npz_path!r}). Most likely a quoting "
+                    f"or env-var-injection bug at the call site."
+                )
+            from pathlib import Path
+            _init_path = Path(self.init_state_npz_path).expanduser().resolve()
+            if not _init_path.exists():
+                raise FileNotFoundError(
+                    f"init_state_npz_path does not exist: {_init_path} "
+                    f"(passed as {self.init_state_npz_path!r}). Resolve relative "
+                    f"to the trainer's CWD; double-check the path."
+                )
+            if not _init_path.is_file():
+                raise ValueError(
+                    f"init_state_npz_path is not a regular file: {_init_path} "
+                    f"(maybe a directory?). Pass the .npz file path itself."
+                )
+            # Overwrite with the resolved absolute path so subprocess /
+            # collector_server consumers don't depend on CWD.
+            self.init_state_npz_path = str(_init_path)
+
+            # Single-state overfitting + sparse reward is a dead-gradient
+            # trap: every rollout fails identically, group std=0, advantages
+            # get zeroed by the dead-group filter (episode_buffer.py:403-406),
+            # no learning. Warn rather than raise — there are edge cases
+            # (e.g., a hand-picked init state where the model already
+            # succeeds intermittently) where success_weight=1.0 is fine.
+            if self.success_weight >= 1.0:
+                import warnings
+                # stacklevel=3: warn() at depth 0 → __post_init__ at 1 →
+                # dataclass-generated __init__ at 2 → user's GRPOConfig(...)
+                # call at 3 (or tyro.cli internals, still a reasonable
+                # pointer back to the trainer's startup path).
+                warnings.warn(
+                    f"init_state_npz_path is set with success_weight={self.success_weight}. "
+                    f"Single-state overfitting from a hard state typically requires "
+                    f"success_weight < 1.0 so max_progress provides advantage variance "
+                    f"even before any rollout succeeds. Consider success_weight=0.3.",
+                    stacklevel=3,
+                )
+
+            # min_successful_groups > 0 (dynamic collection) is meaningless
+            # when every group starts from the same saved state: either every
+            # group's success rate is the same (modulo denoising noise) or
+            # the policy is stuck and no number of extra groups helps. The
+            # dynamic loop would just run to max_groups every iter, blowing
+            # the wall-clock budget without adding signal.
+            if self.min_successful_groups > 0:
+                import warnings
+                warnings.warn(
+                    f"init_state_npz_path is set with min_successful_groups="
+                    f"{self.min_successful_groups}. Dynamic group collection's "
+                    f"'N groups had >=1 success' criterion is not meaningful "
+                    f"when every group starts from the same saved state — "
+                    f"either all groups succeed similarly or all fail, and "
+                    f"extra groups don't add signal. Set min_successful_groups=0.",
+                    stacklevel=3,
+                )
+
+            # Multiple env_names + a single saved npz is almost certainly a
+            # config bug: the npz's sim_state has dims tied to one env's
+            # MjModel (nq+nv), and round-robin would apply it to envs with
+            # different dims on subsequent iters → MuJoCo errors. Even when
+            # dims happen to match, the saved scene/objects belong to one
+            # task and don't make sense for another.
+            if len(self.env_names) > 1:
+                import warnings
+                warnings.warn(
+                    f"init_state_npz_path is set with multiple env_names="
+                    f"{self.env_names}. The saved sim state is tied to a "
+                    f"specific env's MjModel; round-robin training will apply "
+                    f"it to mismatched envs and crash (or silently corrupt "
+                    f"state). Use a single env_name with init_state.",
+                    stacklevel=3,
+                )

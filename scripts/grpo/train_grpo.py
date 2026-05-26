@@ -802,6 +802,13 @@ class GRPOTrainer:
             "--max-groups", str(self.config.max_groups),
         ]
 
+        # Optional saved-state override. Only append when set so the existing
+        # CLI behavior (no flag → no override) is unchanged for baseline runs.
+        if self.config.init_state_npz_path is not None:
+            cmd.extend(
+                ["--init-state-npz-path", self.config.init_state_npz_path]
+            )
+
         # Stream collector output line-by-line so the user sees progress
         # instead of waiting for the whole subprocess to finish. Mirror the
         # collector's stdout/stderr to the trainer log with a "[collector]"
@@ -897,6 +904,7 @@ class GRPOTrainer:
                 fast_forward_pct=self.config.fast_forward_pct,
                 min_successful_groups=self.config.min_successful_groups,
                 max_groups=self.config.max_groups,
+                init_state_npz_path=self.config.init_state_npz_path,
             )
         except FatalCollectorError as e:
             raise RuntimeError(

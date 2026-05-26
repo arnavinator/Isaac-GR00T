@@ -38,6 +38,8 @@ Usage:
 """
 
 import argparse
+import copy
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -241,6 +243,67 @@ GROUP_SEED_STRIDE = 1000
 # ---------------------------------------------------------------------------
 # Wrapper exposing composite scene-bundle methods over env.call()
 # ---------------------------------------------------------------------------
+
+
+def _load_init_bundle(npz_path: str) -> dict:
+    """Load a saved sim-state npz into the dict shape apply_scene_bundle expects.
+
+    The npz contract (set by scripts/denoising_lab/eval/interactive_rollout.py
+    and consumed by scripts/denoising_lab/eval/branching_rollout.py:182-210)
+    uses double-underscore keys:
+        __sim_state__   : np.ndarray, MuJoCo MjSimState flat
+        __model_xml__   : str, the scene XML
+        __ep_meta__     : str, JSON-serialized robosuite ep_meta dict
+
+    apply_scene_bundle (this file, GroupAlignmentWrapper) expects:
+        sim_state, model_xml, ep_meta (as native dict, not JSON string)
+
+    This helper does the key rename + json.loads + type validation in one
+    place so the override path in _align_envs_to_group_scene stays a single
+    line. All failure modes raise ValueError with the offending path quoted,
+    so the user can grep their training log for the path that broke.
+    """
+    if not npz_path:
+        # Defensive — GRPOConfig.__post_init__ rejects empty strings, but
+        # collect_episodes.py is also runnable standalone via CLI.
+        raise ValueError("init_state_npz_path is empty; expected a path string")
+    data = dict(np.load(npz_path, allow_pickle=True))
+    if "__sim_state__" not in data:
+        raise ValueError(
+            f"{npz_path}: missing __sim_state__. "
+            "Re-save using scripts/denoising_lab/eval/interactive_rollout.py "
+            "(it writes __sim_state__, __model_xml__, __ep_meta__)."
+        )
+    if "__model_xml__" not in data or "__ep_meta__" not in data:
+        raise ValueError(
+            f"{npz_path}: missing __model_xml__ and/or __ep_meta__ — "
+            "apply_scene_bundle needs the full triple to restore the scene "
+            "deterministically (XML rebuild + ep_meta layout pinning)."
+        )
+    # json.loads may raise JSONDecodeError if the npz was hand-edited or
+    # serialized by a saver that doesn't follow the contract. Wrap with the
+    # path so the user knows which file is broken.
+    try:
+        ep_meta = json.loads(str(data["__ep_meta__"]))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{npz_path}: __ep_meta__ is not valid JSON ({e}). "
+            "Expected a JSON-serialized robosuite ep_meta dict; "
+            "see interactive_rollout.py for the canonical save format."
+        ) from e
+    # apply_scene_bundle passes ep_meta to robosuite_env.set_ep_meta which
+    # expects a dict (it indexes by key). A JSON scalar or list would either
+    # crash deep in robosuite or silently store wrong state.
+    if not isinstance(ep_meta, dict):
+        raise ValueError(
+            f"{npz_path}: __ep_meta__ JSON-decoded to {type(ep_meta).__name__}, "
+            "expected dict (e.g., {'layout_id': ..., 'style_id': ..., ...})."
+        )
+    return {
+        "ep_meta": ep_meta,
+        "model_xml": str(data["__model_xml__"]),
+        "sim_state": np.asarray(data["__sim_state__"]),
+    }
 
 
 class GroupAlignmentWrapper(MultiStepWrapper):
@@ -477,6 +540,14 @@ def parse_args():
         help="Hard cap on dynamic group collection. Defaults to num_groups "
              "(no dynamic collection). Must be <= 100 (GROUP_SEED_STRIDE limit).",
     )
+    parser.add_argument(
+        "--init-state-npz-path", type=str, default=None,
+        help="Override every group's branch point with a saved sim state from "
+             "this .npz (must contain __sim_state__, __model_xml__, __ep_meta__ "
+             "as produced by scripts/denoising_lab/eval/interactive_rollout.py). "
+             "Forces fast-forward off internally. Pair with --success-weight <1.0 "
+             "to avoid dead-gradient stalls when starting from a hard state.",
+    )
     return parser.parse_args()
 
 
@@ -546,6 +617,16 @@ class EpisodeCollector:
 
         self.policy_client = PolicyClient(host=server_host, port=server_port)
 
+        # Lazy-loaded saved init-state bundle (set per-collect() call). Keyed
+        # by path so re-load happens only when the path changes — typical
+        # overfitting runs reuse the same path across all iters.
+        self._init_bundle: dict | None = None
+        self._init_bundle_path: str | None = None
+        # Per-call slot. _align_envs_to_group_scene reads this; collect()
+        # writes it at the top of each invocation. Keeps the signature of
+        # _align_envs_to_group_scene unchanged (1 caller, 1 caller's caller).
+        self._active_init_bundle_path: str | None = None
+
         print(f"Collector initialized:")
         print(f"  Env: {env_name} (task_type: {self.task_type})")
         print(f"  Group size (parallel envs): {group_size}")
@@ -563,6 +644,7 @@ class EpisodeCollector:
         fast_forward_pct: float = 0.5,
         min_successful_groups: int = 0,
         max_groups: int | None = None,
+        init_state_npz_path: str | None = None,
     ) -> list[dict]:
         """Collect groups of self.group_size rollouts each.
 
@@ -623,7 +705,19 @@ class EpisodeCollector:
         all_episodes: list[dict] = []
         start_time = time.time()
 
+        # Saved init-state bundle (set per-call) — _align_envs_to_group_scene
+        # reads from self._active_init_bundle_path; the lazy load itself runs
+        # inside that method via _get_init_bundle so the trainer subprocess
+        # only pays the I/O cost the first time the path is seen.
+        self._active_init_bundle_path = init_state_npz_path
+
         ff_enabled = fast_forward_steps > 0 and fast_forward_pct > 0
+        # Init-state override pre-empts the FF curriculum: with all groups
+        # branching from the same saved scene, an extra model-rollout prefix
+        # would just append more divergent post-restore behavior to a state
+        # the user already chose. Skip the Bernoulli draw outright.
+        if init_state_npz_path is not None:
+            ff_enabled = False
         # One Bernoulli for the whole iteration. Drawn from OS entropy
         # (`default_rng()` with no argument) — NOT from `base_seed`. The
         # FF decision is a training-data sampling concern; `base_seed`
@@ -665,6 +759,12 @@ class EpisodeCollector:
                 print(f"  Fast-forward: ALL groups branch at step {fast_forward_steps}")
             else:
                 print(f"  Fast-forward: enabled (pct={fast_forward_pct:.0%}) but NOT this iteration")
+        if init_state_npz_path is not None:
+            # NOT guarded by _CLEAN_OUTPUT — init-state is a substantive
+            # behavior change (all groups share a fixed scene), so the user
+            # needs visible confirmation that the flag took effect. Matches
+            # the FF prints above which are also unguarded for the same reason.
+            print(f"  Init-state override: every group restores from {init_state_npz_path}")
 
         successful_groups = 0
         group_idx = 0
@@ -858,12 +958,26 @@ class EpisodeCollector:
              to env 0; env 0 re-applies its own (a no-op effect, but it runs
              in parallel with the other workers so no wall-time cost).
 
+        When self._active_init_bundle_path is set (overfitting / curriculum
+        mode), step 2 is skipped and step 3 broadcasts the lazy-loaded saved
+        bundle instead. Every env in every group then starts from the same
+        fixed scene + sim state regardless of group_seed; only the policy's
+        denoising noise drives within-group divergence.
+
         Returns wrapper-stacked observations, one per env. Bit-identical
         across the group when this returns (verifiable via
         --debug-fast-forward).
         """
         seeds = [group_seed] * self.group_size
         vector_obs, _ = self.envs.reset(seed=seeds)
+
+        if self._active_init_bundle_path is not None:
+            # Saved-state override: ignore env 0's scene entirely and broadcast
+            # the loaded bundle to all envs (including the G==1 case — the
+            # user explicitly asked to start from this saved state).
+            bundle = self._get_init_bundle(self._active_init_bundle_path)
+            obs_tuple = self.envs.call("apply_scene_bundle", bundle)
+            return list(obs_tuple)
 
         if self.group_size == 1:
             # Nothing to align to — just return the lone env's obs.
@@ -872,6 +986,50 @@ class EpisodeCollector:
         bundles = self.envs.call("get_scene_bundle")
         obs_tuple = self.envs.call("apply_scene_bundle", bundles[0])
         return list(obs_tuple)
+
+    def _get_init_bundle(self, npz_path: str) -> dict:
+        """Return a fresh bundle for one apply_scene_bundle broadcast.
+
+        The npz is parsed once and cached (keyed by path string) — typical
+        overfitting runs reuse the same path across all iters, so the npz is
+        opened exactly once per collector process.
+
+        Each call returns a NEW dict with FRESH copies of ep_meta (deepcopy)
+        and sim_state (np.copy). This defensive copying matters because:
+
+          - `robosuite_env.set_ep_meta(bundle["ep_meta"])` stores the dict by
+            reference as `self._ep_meta`; later `robosuite_env.get_ep_meta()`
+            calls during reset MUTATE that dict in-place (adding `layout_id`,
+            `style_id`, `object_cfgs`, `lang`, `fixture_refs`, etc. — see e.g.
+            external_dependencies/robocasa/.../kitchen.py:355 and the
+            symmetric writers around line 1100+ in tabletop.py). Without a
+            deepcopy here, the cached bundle would accumulate state from
+            every iteration's reset and break determinism across groups.
+            ep_meta can be nested (object_cfgs is a list of dicts), so a
+            shallow copy is not enough.
+
+          - sim_state is mutable; MuJoCo's set_state_from_flattened doesn't
+            document copy-vs-reference semantics, so np.copy is cheap insurance.
+
+          - In SyncVectorEnv (group_size=1) the bundle reaches the wrapper
+            by reference (no pickle boundary); in AsyncVectorEnv (group_size>1)
+            pickling already gives each worker a deep copy. The defensive
+            copies here cover both cases uniformly. model_xml is left as the
+            cached str (Python strings are immutable).
+
+        Cost is negligible (ep_meta is a few KB of nested dicts; sim_state is
+        ~60 floats); apply_scene_bundle itself is the expensive operation.
+        """
+        if self._init_bundle is None or self._init_bundle_path != npz_path:
+            if not _CLEAN_OUTPUT:
+                print(f"  [init-bundle] loading {npz_path}")
+            self._init_bundle = _load_init_bundle(npz_path)
+            self._init_bundle_path = npz_path
+        return {
+            "ep_meta": copy.deepcopy(self._init_bundle["ep_meta"]),
+            "model_xml": self._init_bundle["model_xml"],
+            "sim_state": np.copy(self._init_bundle["sim_state"]),
+        }
 
     def _lockstep_step(
         self, observations_per_env: list[dict]
@@ -1383,6 +1541,7 @@ def main():
             fast_forward_pct=args.fast_forward_pct,
             min_successful_groups=args.min_successful_groups,
             max_groups=args.max_groups,
+            init_state_npz_path=args.init_state_npz_path,
         )
         save_episodes(episodes, args.output_dir)
     finally:

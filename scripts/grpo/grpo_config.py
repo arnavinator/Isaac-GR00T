@@ -258,7 +258,7 @@ class GRPOConfig:
 
     # Learning rate — 10x lower than supervised finetuning (1e-4)
     # RL gradients are noisier, so we need smaller steps
-    learning_rate: float = 1e-5
+    learning_rate: float = 3e-5
 
     # AdamW weight decay (L2 regularization on LoRA weights)
     weight_decay: float = 1e-5

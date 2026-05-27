@@ -777,6 +777,7 @@ class GRPOTrainer:
 
         cmd = [
             robocasa_python,
+            "-u",  # unbuffered: per-group lines appear in real-time
             collector_script,
             "--env-name", env_name,
             "--group-size", str(self.config.group_size),

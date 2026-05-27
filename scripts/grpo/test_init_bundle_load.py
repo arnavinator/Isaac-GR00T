@@ -52,20 +52,62 @@ except Exception:
                 f"{npz_path}: __ep_meta__ JSON-decoded to {type(ep_meta).__name__}, "
                 "expected dict."
             )
+        consumed_substeps = 0
+        branch_step = None
+        saved_n_action_steps = None
+        if "__step_info__" in data:
+            try:
+                step_info = json.loads(str(data["__step_info__"]))
+                if isinstance(step_info, dict):
+                    branch_step = step_info.get("step")
+                    saved_n_action_steps = step_info.get("n_action_steps")
+            except json.JSONDecodeError:
+                pass
+        if branch_step is None:
+            import re
+            m = re.search(r"step(\d+)", Path(npz_path).stem)
+            if m:
+                branch_step = int(m.group(1))
+        if branch_step is not None and saved_n_action_steps is not None:
+            consumed_substeps = int(branch_step) * int(saved_n_action_steps)
+            if consumed_substeps < 0:
+                raise ValueError(
+                    f"{npz_path}: consumed_substeps={consumed_substeps} (negative)."
+                )
+        elif branch_step is not None:
+            import warnings as _w
+            _w.warn(
+                f"{npz_path}: missing n_action_steps; cannot compute "
+                f"consumed_substeps. Defaulting to 0.",
+                stacklevel=3,
+            )
+        else:
+            import warnings as _w
+            _w.warn(
+                f"{npz_path}: no __step_info__ and filename has no step; "
+                f"cannot compute consumed_substeps. Defaulting to 0.",
+                stacklevel=3,
+            )
         return {
             "ep_meta": ep_meta,
             "model_xml": str(data["__model_xml__"]),
             "sim_state": np.asarray(data["__sim_state__"]),
+            "consumed_substeps": consumed_substeps,
         }
 
 
 def _write_minimal_npz(path: Path, *, include_sim_state: bool = True,
                        include_model_xml: bool = True,
-                       include_ep_meta: bool = True) -> None:
+                       include_ep_meta: bool = True,
+                       step_info: dict | None = None) -> None:
     """Write an npz with as many of the three required keys as requested.
 
     The keys/values mirror what interactive_rollout.py would save, but the
     contents are dummies so no robocasa or MuJoCo runtime is required.
+
+    If `step_info` is a dict (e.g., {"step": 10, "n_action_steps": 8}), the
+    __step_info__ key is included so consumed_substeps gets billed against
+    the wrapper's max_episode_steps budget.
     """
     save_dict: dict = {}
     if include_sim_state:
@@ -77,20 +119,22 @@ def _write_minimal_npz(path: Path, *, include_sim_state: bool = True,
             json.dumps({"layout_id": 7, "style_id": 2}),
             dtype=object,
         )
+    if step_info is not None:
+        save_dict["__step_info__"] = np.array(json.dumps(step_info), dtype=object)
     np.savez_compressed(str(path), **save_dict)
 
 
 def test_happy_path_keys_and_types():
-    """A well-formed npz produces a dict with the three expected keys and types."""
+    """A well-formed npz produces a dict with the four expected keys and types."""
     with tempfile.TemporaryDirectory() as tmpdir:
         npz_path = Path(tmpdir) / "ep000_step010.npz"
-        _write_minimal_npz(npz_path)
+        _write_minimal_npz(npz_path, step_info={"step": 10, "n_action_steps": 8})
 
         bundle = _load_init_bundle_real(str(npz_path))
 
-        assert set(bundle.keys()) == {"ep_meta", "model_xml", "sim_state"}, (
-            f"Unexpected keys: {sorted(bundle.keys())}"
-        )
+        assert set(bundle.keys()) == {
+            "ep_meta", "model_xml", "sim_state", "consumed_substeps",
+        }, f"Unexpected keys: {sorted(bundle.keys())}"
         # ep_meta must be a NATIVE dict (json.loads), not a JSON string. The
         # robosuite set_ep_meta path indexes into it like a dict downstream.
         assert isinstance(bundle["ep_meta"], dict), (
@@ -172,23 +216,123 @@ def test_apply_scene_bundle_contract():
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         npz_path = Path(tmpdir) / "ep000_step010.npz"
-        _write_minimal_npz(npz_path)
+        _write_minimal_npz(npz_path, step_info={"step": 10, "n_action_steps": 8})
 
         bundle = _load_init_bundle_real(str(npz_path))
 
-        # apply_scene_bundle (collect_episodes.py:313-405) reads bundle["ep_meta"],
-        # bundle["model_xml"], bundle["sim_state"]. The bundle MUST NOT carry
-        # the npz-side double-underscore spellings.
-        for npz_spelling in ("__ep_meta__", "__model_xml__", "__sim_state__"):
+        # apply_scene_bundle (collect_episodes.py:412-522) reads bundle["ep_meta"],
+        # bundle["model_xml"], bundle["sim_state"], bundle["consumed_substeps"].
+        # The bundle MUST NOT carry the npz-side double-underscore spellings.
+        for npz_spelling in (
+            "__ep_meta__", "__model_xml__", "__sim_state__", "__step_info__",
+        ):
             assert npz_spelling not in bundle, (
                 f"Bundle leaked npz-side key {npz_spelling}; apply_scene_bundle "
                 f"will silently ignore it and fall back to wrong defaults."
             )
-        for bundle_spelling in ("ep_meta", "model_xml", "sim_state"):
+        for bundle_spelling in (
+            "ep_meta", "model_xml", "sim_state", "consumed_substeps",
+        ):
             assert bundle_spelling in bundle, (
                 f"Bundle missing apply_scene_bundle-expected key {bundle_spelling}."
             )
-        print("  [PASS] bundle uses apply_scene_bundle key spellings")
+        # The contract is not just "key present" — it must carry the right
+        # VALUE. step=10, n_action_steps=8 → consumed_substeps = 80.
+        assert bundle["consumed_substeps"] == 80, (
+            f"contract violation: expected consumed_substeps=80 (10*8), "
+            f"got {bundle['consumed_substeps']}"
+        )
+        print("  [PASS] bundle uses apply_scene_bundle key spellings + correct values")
+
+
+def test_consumed_substeps_extraction():
+    """consumed_substeps must be billed correctly so the post-restore rollout
+    truncates at max_episode_steps - consumed_substeps remaining sub-steps,
+    matching branching_rollout.py:488-505. Covers four scenarios:
+
+      1. __step_info__ has both `step` and `n_action_steps` → consumed = step * n_action_steps
+      2. __step_info__ has only `step` → fall back to filename parse for `step`,
+         but without n_action_steps we can't compute → default 0 (with warning)
+      3. No __step_info__ but filename matches `ep*_step*.npz` → still need
+         n_action_steps; default 0 (with warning)
+      4. No __step_info__ and no parseable filename → default 0 (with warning)
+    """
+    import warnings as _warnings
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Canonical case: full step_info → consumed = 10 * 8 = 80
+        npz1 = Path(tmpdir) / "ep000_step010.npz"
+        _write_minimal_npz(npz1, step_info={"step": 10, "n_action_steps": 8})
+        bundle1 = _load_init_bundle_real(str(npz1))
+        assert bundle1["consumed_substeps"] == 80, (
+            f"expected 80 (10 outer × 8 substeps), got {bundle1['consumed_substeps']}"
+        )
+
+        # 2. step_info with only `step` — n_action_steps missing → default 0 + warn
+        npz2 = Path(tmpdir) / "ep000_step005.npz"
+        _write_minimal_npz(npz2, step_info={"step": 5})
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            bundle2 = _load_init_bundle_real(str(npz2))
+            assert bundle2["consumed_substeps"] == 0
+            assert any("n_action_steps" in str(x.message) for x in w), (
+                f"expected warning about missing n_action_steps, got: {[str(x.message) for x in w]}"
+            )
+
+        # 3. No step_info, filename has step → can extract step but not n_action_steps
+        npz3 = Path(tmpdir) / "ep007_step012.npz"
+        _write_minimal_npz(npz3, step_info=None)
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            bundle3 = _load_init_bundle_real(str(npz3))
+            # branch_step=12 from filename, but no n_action_steps → default 0
+            assert bundle3["consumed_substeps"] == 0
+            assert any("n_action_steps" in str(x.message) for x in w)
+
+        # 4. Neither — default 0, warn that budget accounting is missing
+        npz4 = Path(tmpdir) / "random_name.npz"
+        _write_minimal_npz(npz4, step_info=None)
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            bundle4 = _load_init_bundle_real(str(npz4))
+            assert bundle4["consumed_substeps"] == 0
+            assert any("step" in str(x.message).lower() for x in w)
+
+        # 5. consumed_substeps respects different n_action_steps
+        npz5 = Path(tmpdir) / "ep000_step020.npz"
+        _write_minimal_npz(npz5, step_info={"step": 20, "n_action_steps": 4})
+        bundle5 = _load_init_bundle_real(str(npz5))
+        assert bundle5["consumed_substeps"] == 80, (
+            f"expected 80 (20 outer × 4 substeps), got {bundle5['consumed_substeps']}"
+        )
+
+        # 6. branch_step=0 — the legitimate "just-reset, no time elapsed" case.
+        # Should produce consumed_substeps=0 (full fresh budget) without warning.
+        npz6 = Path(tmpdir) / "ep000_step000.npz"
+        _write_minimal_npz(npz6, step_info={"step": 0, "n_action_steps": 8})
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            bundle6 = _load_init_bundle_real(str(npz6))
+            assert bundle6["consumed_substeps"] == 0
+            assert not any(
+                "consumed_substeps" in str(x.message) for x in w
+            ), f"step=0 should not warn, got: {[str(x.message) for x in w]}"
+
+        # 7. Negative step from a hand-edited __step_info__ should be REJECTED,
+        # not silently produce an empty pre-fill via Python's `[x] * -n == []`.
+        npz7 = Path(tmpdir) / "ep000_bad.npz"
+        _write_minimal_npz(npz7, step_info={"step": -5, "n_action_steps": 8})
+        try:
+            _load_init_bundle_real(str(npz7))
+        except ValueError as e:
+            assert "negative" in str(e).lower() or "consumed" in str(e).lower(), (
+                f"error should mention negative/consumed, got: {e}"
+            )
+        else:
+            raise AssertionError(
+                "expected ValueError for negative consumed_substeps"
+            )
+
+        print("  [PASS] consumed_substeps extracted/defaulted correctly across 7 scenarios")
 
 
 def test_ep_meta_must_be_dict():
@@ -280,6 +424,7 @@ def test_defensive_copy_consecutive_calls():
                 "ep_meta": copy.deepcopy(self._init_bundle["ep_meta"]),
                 "model_xml": self._init_bundle["model_xml"],
                 "sim_state": np.copy(self._init_bundle["sim_state"]),
+                "consumed_substeps": self._init_bundle["consumed_substeps"],
             }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -296,6 +441,9 @@ def test_defensive_copy_consecutive_calls():
                     "object_cfgs": [{"name": "mug", "pos": [0.1, 0.2, 0.3]}],
                 }),
                 dtype=object,
+            ),
+            __step_info__=np.array(
+                json.dumps({"step": 10, "n_action_steps": 8}), dtype=object,
             ),
         )
         col = _MiniCollector()
@@ -321,6 +469,13 @@ def test_defensive_copy_consecutive_calls():
         # But VALUES must match — the copy must be faithful.
         assert b1["ep_meta"] == b2["ep_meta"]
         assert np.array_equal(b1["sim_state"], b2["sim_state"])
+        # consumed_substeps is an int (immutable) so it's value-shared safely.
+        # Asserting equality protects against a future refactor that wraps it
+        # in a mutable container without updating the copy logic.
+        assert b1["consumed_substeps"] == b2["consumed_substeps"] == 80, (
+            f"consumed_substeps must round-trip; got b1={b1['consumed_substeps']} "
+            f"b2={b2['consumed_substeps']}"
+        )
 
         # Simulate robosuite mutating the dict it received from b1 — this
         # is what get_ep_meta does after set_ep_meta stores the reference.
@@ -337,6 +492,9 @@ def test_defensive_copy_consecutive_calls():
         assert (b3["sim_state"] != 0).any(), (
             "cached sim_state was corrupted by mutation through a prior bundle"
         )
+        assert b3["consumed_substeps"] == 80, (
+            "consumed_substeps must survive mutations to other bundle fields"
+        )
         print("  [PASS] consecutive calls return fresh copies; cache is mutation-safe")
 
 
@@ -346,6 +504,7 @@ if __name__ == "__main__":
     test_missing_sim_state_raises()
     test_missing_model_xml_or_ep_meta_raises()
     test_apply_scene_bundle_contract()
+    test_consumed_substeps_extraction()
     test_ep_meta_must_be_dict()
     test_malformed_ep_meta_json_rejected()
     test_defensive_copy_consecutive_calls()

@@ -245,6 +245,18 @@ GROUP_SEED_STRIDE = 1000
 # ---------------------------------------------------------------------------
 
 
+def _parse_step_from_filename(npz_path: str) -> int | None:
+    """Extract the outer-step index from `ep*_step*.npz`-style filenames.
+
+    Mirrors scripts/denoising_lab/eval/branching_rollout.py:_parse_step_from_filename
+    so an npz that lacks __step_info__ can still surface its branch step via
+    the filename convention used by interactive_rollout.py.
+    """
+    import re
+    m = re.search(r"step(\d+)", Path(npz_path).stem)
+    return int(m.group(1)) if m else None
+
+
 def _load_init_bundle(npz_path: str) -> dict:
     """Load a saved sim-state npz into the dict shape apply_scene_bundle expects.
 
@@ -254,9 +266,19 @@ def _load_init_bundle(npz_path: str) -> dict:
         __sim_state__   : np.ndarray, MuJoCo MjSimState flat
         __model_xml__   : str, the scene XML
         __ep_meta__     : str, JSON-serialized robosuite ep_meta dict
+        __step_info__   : str (optional), JSON dict with keys `step` and
+                          `n_action_steps` for the outer step the npz was
+                          saved at — used to bill consumed_substeps against
+                          MultiStepWrapper.max_episode_steps so the post-
+                          restore rollout has only the REMAINING budget, not
+                          a fresh full budget. Mirrors branching_rollout.py
+                          Phase 3 wrapper-sync (lines 488-505).
 
     apply_scene_bundle (this file, GroupAlignmentWrapper) expects:
-        sim_state, model_xml, ep_meta (as native dict, not JSON string)
+        sim_state, model_xml, ep_meta (as native dict, not JSON string),
+        consumed_substeps (int, optional — defaults to 0 if not provided,
+        which means "restored env starts with a fresh full budget"; this
+        default preserves the existing fast-forward branch behavior).
 
     This helper does the key rename + json.loads + type validation in one
     place so the override path in _align_envs_to_group_scene stays a single
@@ -299,10 +321,72 @@ def _load_init_bundle(npz_path: str) -> dict:
             f"{npz_path}: __ep_meta__ JSON-decoded to {type(ep_meta).__name__}, "
             "expected dict (e.g., {'layout_id': ..., 'style_id': ..., ...})."
         )
+
+    # Extract consumed_substeps from __step_info__ (canonical) or filename
+    # (fallback). consumed_substeps = branch_step * n_action_steps tells
+    # apply_scene_bundle how many sub-steps have ALREADY been spent against
+    # the wrapper's max_episode_steps budget, so the post-restore rollout
+    # truncates at the correct remaining horizon. If neither source resolves
+    # both pieces of info, default to 0 (a fresh full budget — old behavior)
+    # and warn so the user can fix the npz.
+    consumed_substeps = 0
+    branch_step: int | None = None
+    saved_n_action_steps: int | None = None
+    if "__step_info__" in data:
+        try:
+            step_info = json.loads(str(data["__step_info__"]))
+            if isinstance(step_info, dict):
+                branch_step = step_info.get("step")
+                saved_n_action_steps = step_info.get("n_action_steps")
+        except json.JSONDecodeError:
+            # Bad __step_info__ JSON is non-fatal — fall through to filename
+            # parsing. The user already gets a clear error if __ep_meta__ is
+            # the broken JSON (above).
+            pass
+    if branch_step is None:
+        branch_step = _parse_step_from_filename(npz_path)
+    if branch_step is not None and saved_n_action_steps is not None:
+        consumed_substeps = int(branch_step) * int(saved_n_action_steps)
+        # Negative consumed_substeps would silently no-op the pre-fill
+        # (`[0.0] * -40` is `[]` in Python). Catch it loudly here — typically
+        # caused by a hand-edited __step_info__ with a negative `step` or
+        # `n_action_steps`.
+        if consumed_substeps < 0:
+            raise ValueError(
+                f"{npz_path}: __step_info__ produced consumed_substeps="
+                f"{consumed_substeps} (negative). branch_step={branch_step}, "
+                f"n_action_steps={saved_n_action_steps}; both must be >= 0."
+            )
+    elif branch_step is not None:
+        # We know step but not n_action_steps. Warn rather than assume — a
+        # wrong assumption silently breaks budget accounting in either
+        # direction.
+        import warnings
+        warnings.warn(
+            f"{npz_path}: __step_info__ provides branch_step={branch_step} but "
+            f"not n_action_steps — cannot compute consumed_substeps. "
+            f"Restored env will start with a fresh max_episode_steps budget "
+            f"instead of the remaining budget after step {branch_step}.",
+            stacklevel=3,
+        )
+    else:
+        # Neither source resolved. This is normal for hand-built npzs but
+        # surprising for interactive_rollout.py output. Warn once per load.
+        import warnings
+        warnings.warn(
+            f"{npz_path}: no __step_info__ key and filename doesn't match "
+            f"ep*_step*.npz — cannot bill any consumed sub-steps against "
+            f"max_episode_steps. Restored env will start with a fresh full "
+            f"budget. If this npz represents an intermediate trajectory step, "
+            f"re-save with interactive_rollout.py to get correct budget accounting.",
+            stacklevel=3,
+        )
+
     return {
         "ep_meta": ep_meta,
         "model_xml": str(data["__model_xml__"]),
         "sim_state": np.asarray(data["__sim_state__"]),
+        "consumed_substeps": consumed_substeps,
     }
 
 
@@ -418,12 +502,69 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         groot_obs = base_env.get_groot_observation(basic_obs)
 
         # 6. Refresh wrapper state (mirrors MultiStepWrapper.reset()).
+        # Pre-fill reward/done with `consumed_substeps` placeholders so the
+        # wrapper's truncation check (len(self.reward) >= max_episode_steps;
+        # see multistep_wrapper.py:271-275) bills sub-steps that have already
+        # elapsed in the saved trajectory against the budget. The post-restore
+        # rollout then truncates after `max_episode_steps - consumed_substeps`
+        # more sub-steps, matching Phase 3 of branching_rollout.py:488-505.
+        #
+        # consumed_substeps defaults to 0 when absent from the bundle. This
+        # preserves the existing fast-forward branch behavior, where the FF
+        # prefix runs INSIDE the wrapper and naturally grows self.reward —
+        # no pre-fill needed there.
+        #
+        # Pre-filling with 0.0 / False is safe under MultiStepWrapper's
+        # default reward_agg_method="max" (line 129) and done aggregator
+        # "max" (line 281): zeros don't change max for non-negative rewards,
+        # and False doesn't suppress True. info uses dict_take_last_n
+        # (line 282), so it's windowed and unaffected.
+        consumed_substeps = int(bundle.get("consumed_substeps", 0))
+        # Sanity-check the pre-fill against the wrapper's budget — if the
+        # saved trajectory's elapsed sub-steps already exhausted (or exceeded)
+        # max_episode_steps, the very first sub-step after restore will fire
+        # the truncation check (len(self.reward) >= max_episode_steps) and
+        # the episode terminates with ~zero data, producing useless training
+        # signal. Surface this loudly so the user can pick a less-advanced
+        # branch point or raise max_episode_steps.
+        if (
+            consumed_substeps > 0
+            and self.max_episode_steps is not None
+            and consumed_substeps >= self.max_episode_steps
+        ):
+            import warnings
+            warnings.warn(
+                f"consumed_substeps={consumed_substeps} >= max_episode_steps="
+                f"{self.max_episode_steps}; post-restore rollout will truncate "
+                f"after a single sub-step. Either pick an npz from earlier in "
+                f"the trajectory or raise --max-episode-steps.",
+                stacklevel=2,
+            )
+        # The pre-fill is safe under reward_agg_method="max" because zeros
+        # don't change the max of non-negative rewards. Under "sum" it's also
+        # safe (zeros add nothing). Under "mean" it WOULD dilute (80 zeros
+        # plus 8 real rewards of 0.5 → mean ~0.045 instead of 0.5). Warn so
+        # any future change to the default aggregation method surfaces here.
+        if consumed_substeps > 0 and getattr(
+            self, "reward_agg_method", "max"
+        ) not in ("max", "sum"):
+            import warnings
+            warnings.warn(
+                f"apply_scene_bundle pre-fills self.reward with zeros, which "
+                f"is safe under reward_agg_method in ('max', 'sum') but "
+                f"dilutes results under reward_agg_method="
+                f"{self.reward_agg_method!r}. The pre-fill matches "
+                f"branching_rollout.py's pattern; if you genuinely need a "
+                f"non-max aggregation, you'll need to skip the pre-fill "
+                f"or compute the aggregate over only the post-restore tail.",
+                stacklevel=2,
+            )
         self.obs = deque(
             [groot_obs] * (self.max_steps_needed + 1),
             maxlen=self.max_steps_needed + 1,
         )
-        self.reward = list()
-        self.done = list()
+        self.reward = [0.0] * consumed_substeps
+        self.done = [False] * consumed_substeps
         self.info = defaultdict(lambda: deque(maxlen=self.n_action_steps + 1))
 
         return self._get_obs(self.video_delta_indices, self.state_delta_indices)
@@ -1029,6 +1170,8 @@ class EpisodeCollector:
             "ep_meta": copy.deepcopy(self._init_bundle["ep_meta"]),
             "model_xml": self._init_bundle["model_xml"],
             "sim_state": np.copy(self._init_bundle["sim_state"]),
+            # consumed_substeps is a plain int → safe to share by value.
+            "consumed_substeps": self._init_bundle["consumed_substeps"],
         }
 
     def _lockstep_step(

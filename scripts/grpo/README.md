@@ -343,10 +343,13 @@ Mechanics:
 
 1. `_load_init_bundle` (`collect_episodes.py`) parses the npz once per
    collector process and caches the resulting `{ep_meta, model_xml,
-   sim_state}` dict, keyed by path.
+   sim_state, consumed_substeps}` dict, keyed by path. The
+   `consumed_substeps` field is what makes the post-restore rollout
+   truncate at the **remaining** budget rather than a fresh full one —
+   see "Budget accounting" below.
 2. `_align_envs_to_group_scene` short-circuits the usual "env 0's bundle →
    all envs" handshake and broadcasts the loaded bundle to every env via
-   the same `apply_scene_bundle` RPC (`collect_episodes.py:313-405`).
+   the same `apply_scene_bundle` RPC (`collect_episodes.py:412-522`).
 3. Within-group and across-group divergence comes entirely from per-env
    denoising noise; the env starts bit-identical everywhere.
 
@@ -368,6 +371,78 @@ Interactions with other knobs:
   the shaped reward so advantages have signal even before any rollout
   succeeds. `GRPOConfig.__post_init__` emits a warning if you set
   `init_state_npz_path` with `success_weight=1.0`.
+
+#### Budget accounting (`consumed_substeps`)
+
+The saved npz represents an env state captured **partway through** an
+original trajectory — `ep000_step010.npz` is 10 outer chunks into episode
+0. Naively restoring the sim state without telling the wrapper about
+that elapsed time would grant the post-restore rollout a **fresh full**
+`max_episode_steps` budget — i.e., a step-10 restore would get the same
+horizon as a step-0 restore, contradicting "this is what happens after
+10 steps have already elapsed in the original trajectory." The
+`consumed_substeps` field fixes this by billing the elapsed sub-steps
+against the wrapper's truncation check, so the rollout has only the
+**remaining** budget. Mirrors `branching_rollout.py:488-505` exactly.
+
+**Formula.** `consumed_substeps = branch_step × n_action_steps`. Worked
+example for the user's typical setup:
+
+| Knob | Value |
+|------|-------|
+| `__step_info__["step"]` (from npz) | 10 |
+| `__step_info__["n_action_steps"]` (from npz) | 8 |
+| `consumed_substeps` (derived) | 80 |
+| `--max-episode-steps` (CLI / config) | 480 |
+| **Remaining post-restore budget** | **400 sub-steps = 50 outer chunks** |
+
+**Mechanism.** `apply_scene_bundle` pre-fills `self.reward` and
+`self.done` with `consumed_substeps` placeholders so
+`MultiStepWrapper`'s truncation check
+(`len(self.reward) >= max_episode_steps` at `multistep_wrapper.py:271-275`)
+already accounts for the elapsed time. The first post-restore sub-step
+truncates at `max_episode_steps - consumed_substeps` more sub-steps,
+not at `max_episode_steps`.
+
+**NPZ contract.** `__step_info__` is a JSON object with the keys `step`
+(outer chunk index when the npz was saved) and `n_action_steps`
+(sub-steps per outer chunk used by the original rollout). Both are
+written by `scripts/denoising_lab/eval/interactive_rollout.py` and read
+by `branching_rollout.py:182-210`. Note that the SAVED `n_action_steps`
+is used — not the current run's `--n-action-steps` — so consumed sub-
+steps reflect actual wall-clock time elapsed in the original trajectory
+regardless of any chunk-size changes between save and replay.
+
+**Fallbacks and warnings.** Three fallback paths, in order:
+
+1. `__step_info__` present with both `step` and `n_action_steps` →
+   compute `consumed_substeps` precisely. No warning.
+2. `__step_info__` present but `n_action_steps` missing → warn, default
+   to `consumed_substeps=0` (fresh full budget). The user should re-save
+   with `interactive_rollout.py` to get correct accounting.
+3. No `__step_info__` AND filename doesn't match `ep*_step*.npz` → warn,
+   default to `consumed_substeps=0`. Same remediation.
+
+**Sanity checks.** Two more guards fire at runtime in
+`apply_scene_bundle`:
+
+- If `consumed_substeps >= max_episode_steps`, a warning suggests either
+  picking an earlier branch point or raising `--max-episode-steps`; the
+  rollout would otherwise truncate after a single sub-step with
+  near-zero training signal.
+- If `reward_agg_method` is not `"max"` or `"sum"` (defaults to `"max"`
+  in `MultiStepWrapper`), a warning fires because the pre-filled zeros
+  would dilute a `"mean"` aggregation.
+
+A negative `consumed_substeps` (from a hand-edited `__step_info__` with
+a negative `step` or `n_action_steps`) raises `ValueError` at load time
+rather than silently no-op'ing via Python's `[0.0] * -n == []`.
+
+**What `consumed_substeps` does NOT change:** the recorded episode
+`num_steps` still counts from 0 post-restore (matching the FF
+convention), so time-scaled advantages compare post-restore effort
+fairly within a group. Only the wrapper's truncation horizon is
+affected.
 
 ### Dynamic group collection
 

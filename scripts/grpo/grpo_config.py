@@ -413,43 +413,19 @@ class GRPOConfig:
             # collector_server consumers don't depend on CWD.
             self.init_state_npz_path = str(_init_path)
 
-            # Single-state overfitting + sparse reward is a dead-gradient
-            # trap: every rollout fails identically, group std=0, advantages
-            # get zeroed by the dead-group filter (episode_buffer.py:403-406),
-            # no learning. Warn rather than raise — there are edge cases
-            # (e.g., a hand-picked init state where the model already
-            # succeeds intermittently) where success_weight=1.0 is fine.
-            if self.success_weight >= 1.0:
-                import warnings
-                # stacklevel=3: warn() at depth 0 → __post_init__ at 1 →
-                # dataclass-generated __init__ at 2 → user's GRPOConfig(...)
-                # call at 3 (or tyro.cli internals, still a reasonable
-                # pointer back to the trainer's startup path).
-                warnings.warn(
-                    f"init_state_npz_path is set with success_weight={self.success_weight}. "
-                    f"Single-state overfitting from a hard state typically requires "
-                    f"success_weight < 1.0 so max_progress provides advantage variance "
-                    f"even before any rollout succeeds. Consider success_weight=0.3.",
-                    stacklevel=3,
-                )
-
-            # min_successful_groups > 0 (dynamic collection) is meaningless
-            # when every group starts from the same saved state: either every
-            # group's success rate is the same (modulo denoising noise) or
-            # the policy is stuck and no number of extra groups helps. The
-            # dynamic loop would just run to max_groups every iter, blowing
-            # the wall-clock budget without adding signal.
-            if self.min_successful_groups > 0:
-                import warnings
-                warnings.warn(
-                    f"init_state_npz_path is set with min_successful_groups="
-                    f"{self.min_successful_groups}. Dynamic group collection's "
-                    f"'N groups had >=1 success' criterion is not meaningful "
-                    f"when every group starts from the same saved state — "
-                    f"either all groups succeed similarly or all fail, and "
-                    f"extra groups don't add signal. Set min_successful_groups=0.",
-                    stacklevel=3,
-                )
+            # NOTE: deliberately do NOT warn on success_weight=1.0 +
+            # init_state or on min_successful_groups>0 + init_state. Both
+            # are valid choices:
+            #   - success_weight=1.0: pure sparse binary reward is a
+            #     legitimate setup; the operator may know the policy
+            #     succeeds intermittently from this state, or may want to
+            #     deliberately avoid mixing in dense-progress shaping.
+            #   - min_successful_groups>0: with all groups starting from
+            #     the same saved state, requiring ≥N "successful" groups
+            #     is a stability mechanism — each group draws independent
+            #     denoising noise, so ≥N alive groups gives a less noisy
+            #     gradient direction and reduces policy-collapse risk
+            #     from few-group updates.
 
             # Multiple env_names + a single saved npz is almost certainly a
             # config bug: the npz's sim_state has dims tied to one env's

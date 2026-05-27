@@ -359,18 +359,20 @@ Interactions with other knobs:
   `fast_forward_pct` are ignored when `init_state_npz_path` is set
   (logged at iter start). Set `fast_forward_pct=0.0` on the CLI too if
   you want the intent visible in logs without trusting the override.
-- **Set `min_successful_groups = 0`.** The dynamic-collection criterion
-  ("≥ N groups had ≥ 1 success") is meaningless when every group starts
-  from the same hard state — the success rate is a single number, not a
-  per-group property.
-- **Set `success_weight < 1.0`.** Pure-binary reward + hard start state
-  is a dead-gradient trap: every rollout fails identically, group std=0,
-  advantages get zeroed by the dead-group filter
-  (`episode_buffer.py:403-406`), no learning happens. `success_weight=0.3`
-  makes `max_progress` (which varies with denoising noise) contribute to
-  the shaped reward so advantages have signal even before any rollout
-  succeeds. `GRPOConfig.__post_init__` emits a warning if you set
-  `init_state_npz_path` with `success_weight=1.0`.
+- **`min_successful_groups` is a gradient-stability knob.** With every
+  group starting from the same saved state, each group is an independent
+  sample of the per-group success-rate distribution (different denoising
+  noise → different outcomes). Requiring ≥N alive groups via
+  `min_successful_groups=N` reduces gradient noise and the risk of
+  policy collapse from low-alive-group updates — at the cost of more
+  wall time when the success rate is low (the dynamic loop extends
+  toward `max_groups`).
+- **`success_weight` choice.** Default `1.0` (pure binary reward) is
+  fully supported and a common choice. Setting `success_weight < 1.0`
+  blends in `max_progress`, which provides advantage variance even
+  before any rollout succeeds — useful if early-iter all-failure dead
+  groups would stall training. Pick whichever fits the analysis; the
+  trainer does not warn for either choice.
 
 #### Budget accounting (`consumed_substeps`)
 
@@ -1189,11 +1191,10 @@ uv run python scripts/grpo/train_grpo.py \
 
 **Reward shaping**
 - `success_weight` (0-1) — binary weight in shaped reward. Default 1.0
-  (pure binary, no dense progress collected). Set < 1.0 when training
-  from a hard initial state (e.g., `init_state_npz_path`) to avoid the
-  dead-gradient stall — `max_progress` then contributes a continuous
-  signal that varies with denoising noise even before any rollout
-  succeeds. See "Init from saved sim state".
+  (pure binary, no dense progress collected). Set < 1.0 to blend in
+  `max_progress`, which provides continuous advantage variance from
+  denoising noise; useful when binary-only would produce all-failure
+  groups early on.
 
 **GRPO algorithm**
 - `clip_eps` (default 0.2)

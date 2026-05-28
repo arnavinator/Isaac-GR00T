@@ -218,6 +218,33 @@ class GRPOConfig:
     # Same as grpo_cont.py's args.update_epochs = 10
     update_epochs: int = 5
 
+    # ─── Balanced Training ───────────────────────────────────────────────────
+    # Addresses the common failure mode where most collected episodes are
+    # failures (negative-advantage chunks vastly outnumber positives).
+    # Two complementary mechanisms activate together when enabled:
+    #
+    #   1. Balanced mini-batch sampling: each mini-batch is drawn with
+    #      `balanced_training_positive_adv_ratio` fraction from positive-advantage
+    #      chunks and `1 - ratio` from negative-advantage chunks, OVERSAMPLING
+    #      the rare positive class when its natural frequency is below the
+    #      target ratio. When positives already meet or exceed the target,
+    #      sampling falls back to the normal stratified scheme (no change).
+    #
+    #   2. Dynamic epoch count: actual epochs for this iteration are
+    #      max(1, ceil(successful_eps / total_eps × update_epochs)).
+    #      Proportionally fewer updates when little positive data exists,
+    #      preventing the model from over-fitting to a skewed negative dataset.
+    #
+    # When False (default), both mechanisms are disabled and training is
+    # identical to the unmodified stratified-minibatch path.
+    balanced_training: bool = True
+
+    # Target fraction of positive-advantage chunks in each mini-batch.
+    # Must be strictly in (0.0, 1.0). Only active when balanced_training=True.
+    # Default 0.5: equal split between positive and negative advantages.
+    # Set higher (e.g. 0.7) to bias the gradient more toward success examples.
+    balanced_training_positive_adv_ratio: float = 0.5
+
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
     # Smaller = more updates per epoch but noisier gradients
@@ -371,6 +398,16 @@ class GRPOConfig:
                 f"success_weight must be in [0.0, 1.0], got {self.success_weight}. "
                 f"It blends binary success and dense max_progress in the shaped "
                 f"reward; values outside [0, 1] flip the sign of the progress term."
+            )
+
+        if self.balanced_training and not (
+            0.0 < self.balanced_training_positive_adv_ratio < 1.0
+        ):
+            raise ValueError(
+                f"balanced_training_positive_adv_ratio must be strictly in "
+                f"(0.0, 1.0) when balanced_training=True, got "
+                f"{self.balanced_training_positive_adv_ratio}. "
+                f"Use a value like 0.5 (equal split) or 0.7 (bias toward positives)."
             )
 
         # ── init_state_npz_path validations ─────────────────────────────────

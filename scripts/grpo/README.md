@@ -648,9 +648,118 @@ self-balances. Fuller groups contribute filler proportionally more often,
 so all groups drain in lockstep and the "≥1 per group" guarantee holds
 for essentially the whole epoch.
 
-### Clipped surrogate + KL
+### Balanced Training
 
-Per minibatch:
+An optional pair of mechanisms that address the common failure mode in
+early-stage GRPO where most rollouts fail: negative-advantage chunks
+vastly outnumber positives, individual mini-batches carry a weak or
+one-sided gradient signal, and a small number of sparse successes are
+over- or under-weighted relative to the training budget they warrant.
+
+Both mechanisms are off by default (`balanced_training = False`) and
+activate together. When off, training is bit-identical to the unmodified
+stratified-minibatch path.
+
+#### Mechanism 1: balanced mini-batch sampling
+
+**What it does.** When the natural fraction of positive-advantage chunks
+in the live dataset is below `balanced_training_positive_adv_ratio` (X),
+each mini-batch is constructed with exactly X fraction from
+positive-advantage entries and `1 − X` from negative-advantage entries,
+oversampling the rare positive class to guarantee directional balance in
+every gradient step.
+
+**When it activates.** Only when `natural_pos_frac < X`. When positives
+already meet or exceed X (or when one sign class is entirely absent), the
+method falls back to `_iter_stratified_minibatches` unchanged.
+
+**Sampling strategy.** Positive-advantage entries are drawn in shuffled
+order without replacement within each cycle; the pool reshuffles when
+exhausted. This guarantees best-effort equal exposure across positive
+chunks — no single chunk dominates due to random luck. Negative-advantage
+entries are drawn without replacement from a per-epoch shuffled pool and
+stop when exhausted; some negatives go unseen each epoch, which is the
+expected cost of oversampling the minority class. Across multiple epochs
+the negative pool reshuffles, so all negatives are eventually covered.
+
+**Epoch length.** Anchored to `ceil(n_live_chunks / mb_size)`, matching
+the vanilla stratified path so `update_epochs` remains directly comparable
+between balanced and vanilla runs. When the negative pool drains early
+(a rounding-edge-case scenario), the epoch stops rather than yielding
+positive-only tail batches that would defeat the balance guarantee.
+
+**Relationship to Jitter-GRPO.** With `jitter_lambda > 0`, `entries` is
+doubled (`fixed + jitter` copies of each chunk). Both copies of a positive
+chunk are independent entries in the positive pool. The balanced sampler
+draws from them in shuffled order; the Jacobian regularizer accumulates at
+epoch granularity (not within a single mini-batch), so the pairing
+requirement is satisfied regardless of whether fixed and jitter copies land
+in the same batch. The combination of both features is sound.
+
+#### Mechanism 2: dynamic epoch count
+
+**What it does.** Scales `update_epochs` down proportionally to the
+fraction of live-group episodes that have positive advantage:
+
+```
+actual_num_epochs = max(1, ceil(successful_eps / total_eps × update_epochs))
+```
+
+This prevents over-training on a skewed iteration where most rollouts
+failed: with 10 % positive-advantage episodes, running 5 full epochs would
+grind through the same small set of successful trajectories repeatedly. The
+formula gives 1 epoch instead, matching the training investment to the
+available positive signal.
+
+**What counts as `successful_eps / total_eps`.**
+
+- `total_eps` is the number of episodes in **live groups** only — groups
+  whose per-group reward std is ≥ 1e-4 and thus produce non-zero gradient
+  signal. Dead all-success or all-fail groups are excluded from both
+  numerator and denominator to prevent their inflating `success_frac` and
+  keeping `actual_num_epochs` near `update_epochs` when real signal is
+  sparse.
+- `successful_eps` counts live-group episodes with **positive advantage**
+  (`self.buffer.advantages[i] > 0`), not `ep.success`. This is intentional:
+  with shaped rewards (`success_weight < 1.0`) a failing episode with high
+  `max_progress` can contribute positive advantage, and `ep.success` would
+  undercount it. Using advantage sign keeps the epoch formula consistent
+  with mechanism 1, which oversamples chunks with `c.advantage > 0`.
+
+**Example.** 5 groups of 4 rollouts each. After dead-group filtering, 2
+live groups remain. Live-group episodes: 4 + 4 = 8. Positive-advantage
+episodes: 3. `success_frac = 3/8 = 0.375`. With `update_epochs = 5`:
+`actual_num_epochs = max(1, ceil(0.375 × 5)) = 2`. The other 3 epochs
+are skipped — the training budget reflects the actual signal available.
+
+#### CLI usage
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --balanced-training True \
+    --balanced-training-positive-adv-ratio 0.5 \
+    --update-epochs 5 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env
+```
+
+The startup banner prints `Balanced training: ON (positive_adv_ratio=…,
+dynamic epochs=max(1, ceil(success_frac × …)))`. A per-iteration line
+`Balanced training: X/Y positive-advantage live-group episodes → Z/N
+epochs` is printed whenever the epoch count is reduced below
+`update_epochs`. TensorBoard logs `balanced/actual_epochs` and
+`balanced/success_fraction` whenever at least one optimizer step fired
+in that iteration.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `grpo_config.py` | Adds `balanced_training: bool = False` and `balanced_training_positive_adv_ratio: float = 0.5` with `__post_init__` validation (ratio strictly in `(0, 1)` when feature is on). |
+| `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` from live-group episode advantages before the epoch loop; dispatches to `_iter_balanced_minibatches` when enabled. New method `_iter_balanced_minibatches`. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `n_updates > 0`). Wandb bulk update excludes these keys from the `train/` namespace to avoid double-logging. |
+
+---
+
+### Clipped surrogate + KL
 
 ```
 ratio = (current_log_prob - ref_log_prob).exp()
@@ -1202,6 +1311,12 @@ uv run python scripts/grpo/train_grpo.py \
 - `mini_batch_size` (default 8 chunks)
 - `kl_coef` (default 0.1)
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
+- `balanced_training` (default `False`) — see "Balanced Training". When
+  `True`, activates balanced mini-batch sampling and dynamic epoch count.
+- `balanced_training_positive_adv_ratio` (default `0.5`) — target fraction
+  of positive-advantage chunks per mini-batch. Must be strictly in `(0, 1)`.
+  Only active when `balanced_training=True`. Raise above 0.5 (e.g. 0.7) to
+  bias more gradient steps toward success examples.
 
 **Optimizer**
 - `learning_rate` (default 1e-5; ~10× lower than supervised FT because RL
@@ -1226,7 +1341,9 @@ mismatch internally.
 
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
 `train/{loss,clip_loss,kl_loss,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
-`train/learning_rate`, and `time/iteration_seconds`. `mean_log_ratio_abs`
+`train/learning_rate`, `time/iteration_seconds`, and (when
+`balanced_training=True` and at least one gradient step fired)
+`balanced/{actual_epochs,success_fraction}`. `mean_log_ratio_abs`
 is the primary diagnostic for DPPO-style surrogates: large values mean
 the FM-MSE log-prob is noisy enough that most updates clip.
 

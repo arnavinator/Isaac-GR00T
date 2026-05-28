@@ -394,6 +394,12 @@ class GRPOTrainer:
             )
         print(f"  Update epochs: {self.config.update_epochs}")
         print(f"  Mini-batch size: {self.config.mini_batch_size}")
+        if self.config.balanced_training:
+            print(
+                f"  Balanced training: ON "
+                f"(positive_adv_ratio={self.config.balanced_training_positive_adv_ratio}, "
+                f"dynamic epochs=max(1, ceil(success_frac × {self.config.update_epochs})))"
+            )
         if self.config.jitter_lambda > 0.0:
             # Surface the doubled-step cost up-front so the user can confirm
             # update_epochs has been halved if they want to match vanilla
@@ -1395,7 +1401,47 @@ class GRPOTrainer:
         n_rows_fixed = 0
         n_rows_jitter = 0
 
-        for epoch in range(self.config.update_epochs):
+        # ── Balanced training: dynamic epoch count ───────────────────────────
+        # When balanced_training=True, scale down update_epochs proportionally
+        # to the fraction of positive-advantage episodes among live-group episodes.
+        # actual_epochs = max(1, ceil(successful_eps / total_eps × update_epochs))
+        #
+        # We count only episodes from LIVE groups (those with at least one
+        # non-zero-advantage chunk in live_chunks). Dead groups — all-success
+        # or all-fail with std<1e-4 — produce no gradient signal, so including
+        # their episodes would inflate success_frac and keep actual_num_epochs
+        # near update_epochs even when real training signal is sparse.
+        #
+        # We use episode-level advantage sign (self.buffer.advantages[i] > 0)
+        # rather than ep.success, for consistency with _iter_balanced_minibatches
+        # which oversamples chunks with c.advantage > 0. With shaped rewards
+        # (success_weight < 1.0), a failing episode with high max_progress can
+        # have positive advantage — ep.success would undercount these.
+        if self.config.balanced_training:
+            live_group_ids = {c.group_id for c in live_chunks}
+            live_ep_indices = [
+                i for i, ep in enumerate(self.buffer.episodes)
+                if ep.group_id in live_group_ids
+            ]
+            successful_eps = sum(
+                1 for i in live_ep_indices
+                if self.buffer.advantages is not None and self.buffer.advantages[i] > 0
+            )
+            total_eps_collected = max(len(live_ep_indices), 1)
+            success_frac = successful_eps / total_eps_collected
+            actual_num_epochs = max(
+                1, math.ceil(success_frac * self.config.update_epochs)
+            )
+            if actual_num_epochs != self.config.update_epochs:
+                print(
+                    f"  Balanced training: {successful_eps}/{total_eps_collected} "
+                    f"positive-advantage live-group episodes → {actual_num_epochs}/{self.config.update_epochs} epochs"
+                )
+        else:
+            actual_num_epochs = self.config.update_epochs
+            success_frac = None  # Not computed; omit from stats
+
+        for epoch in range(actual_num_epochs):
             # Stratified minibatch sampling: every minibatch contains
             # chunks from all live groups (best-effort) — see
             # _iter_stratified_minibatches docstring for full rationale.
@@ -1408,7 +1454,12 @@ class GRPOTrainer:
                 self.config.seed + self.iteration * 100 + epoch
             )
 
-            for batch in self._iter_stratified_minibatches(entries, rng):
+            if self.config.balanced_training:
+                batch_iter = self._iter_balanced_minibatches(entries, rng)
+            else:
+                batch_iter = self._iter_stratified_minibatches(entries, rng)
+
+            for batch in batch_iter:
                 # --- Prepare batch tensors ---
                 result = self._prepare_batch(batch)
                 if result is None:
@@ -1705,7 +1756,12 @@ class GRPOTrainer:
 
         # Model remains in eval mode (it never left)
         if n_updates == 0:
-            return {"n_skipped_nonfinite": n_skipped_nonfinite} if n_skipped_nonfinite else {}
+            early: dict = {"n_skipped_nonfinite": n_skipped_nonfinite} if n_skipped_nonfinite else {}
+            if self.config.balanced_training:
+                early["actual_epochs"] = actual_num_epochs
+                if success_frac is not None:
+                    early["success_fraction"] = success_frac
+            return early
 
         if n_skipped_nonfinite > 0:
             print(
@@ -1726,7 +1782,10 @@ class GRPOTrainer:
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
             "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
             "ratio_min": float(np.min(ratio_mins)) if ratio_mins else 1.0,
+            "actual_epochs": actual_num_epochs,
         }
+        if success_frac is not None:
+            result["success_fraction"] = success_frac
         # Per-branch metrics (Jitter-GRPO). Only emitted when jitter_lambda > 0
         # — at jitter_lambda == 0 the per-branch accumulators stay at their
         # zero defaults (the per-mb update block is gated on `lam > 0`), so
@@ -1881,6 +1940,114 @@ class GRPOTrainer:
                 return
 
             yield [entries[i] for i in batch_idx_list]
+
+    def _iter_balanced_minibatches(
+        self,
+        entries: list[tuple[ActionChunk, str]],
+        rng: np.random.Generator,
+    ) -> Iterator[list[tuple[ActionChunk, str]]]:
+        """Yield mini-batches with balanced positive/negative advantage sampling.
+
+        Each mini-batch is composed of:
+          - `balanced_training_positive_adv_ratio` fraction from positive-advantage
+            entries (chunk.advantage > 0), oversampled WITH replacement when the
+            natural positive fraction is below the target ratio.
+          - `1 - ratio` fraction from negative-advantage entries, sampled WITHOUT
+            replacement (each negative is seen at most once per epoch).
+
+        Oversampling is triggered only when the natural positive fraction in
+        `entries` is strictly less than `balanced_training_positive_adv_ratio`.
+        When the natural fraction already meets or exceeds the target, or when
+        one sign class is entirely absent, the method delegates to the standard
+        `_iter_stratified_minibatches` (no change in behavior).
+
+        Epoch length (number of mini-batches) is anchored to `ceil(n / mb_size)`
+        matching the vanilla stratified path — the total gradient update budget
+        per epoch stays comparable. Positives cycle with replacement if needed;
+        negatives are drawn from a per-epoch shuffled queue and stop when
+        exhausted (so the last batch may be smaller).
+
+        Args:
+            entries: List of (ActionChunk, mode) tuples from _grpo_update_inner.
+            rng:     Per-epoch numpy Generator (caller provides reproducible seed).
+
+        Yields:
+            Lists of (ActionChunk, mode) tuples, length <= mini_batch_size.
+        """
+        if not entries:
+            return
+
+        pos_ratio = self.config.balanced_training_positive_adv_ratio
+
+        # Split entries by advantage sign. The per-chunk advantage inherits its
+        # sign directly from the episode-level group-relative normalization;
+        # live_chunks already filtered out zero-advantage (dead group) entries.
+        pos_indices = [i for i, (c, _) in enumerate(entries) if c.advantage > 0]
+        neg_indices = [i for i, (c, _) in enumerate(entries) if c.advantage <= 0]
+
+        natural_pos_frac = len(pos_indices) / len(entries)
+
+        # Fall back to stratified sampling when:
+        #   - Positives already meet the target (no oversampling needed)
+        #   - One of the pools is empty (can't construct a balanced batch)
+        if natural_pos_frac >= pos_ratio or not pos_indices or not neg_indices:
+            yield from self._iter_stratified_minibatches(entries, rng)
+            return
+
+        mb_size = self.config.mini_batch_size
+        n_pos_per_batch = max(1, round(pos_ratio * mb_size))
+        n_neg_per_batch = mb_size - n_pos_per_batch
+
+        # Guard: if rounding left no room for negatives (e.g. pos_ratio=0.9375
+        # with mb_size=8 causes round(7.5)=8 → n_neg=0), fall back to the
+        # standard stratified path rather than silently training on only
+        # positive data.
+        if n_neg_per_batch <= 0:
+            yield from self._iter_stratified_minibatches(entries, rng)
+            return
+
+        # Shuffle both pools independently for this epoch.
+        pos_pool = list(rng.permutation(len(pos_indices)).astype(int))
+        neg_pool = list(rng.permutation(len(neg_indices)).astype(int))
+
+        # Epoch length is anchored to ceil(n_entries / mb_size) to keep the
+        # per-epoch optimizer-step budget comparable to the vanilla stratified
+        # path. Positives are cycled with replacement when exhausted; negatives
+        # advance a running pointer and stop when the pool drains. As a result,
+        # roughly (1-pos_ratio)/(1-natural_pos_frac) of the negative pool is
+        # consumed each epoch — some negatives may go unseen, which is the
+        # expected cost of oversampling the minority class.
+        n_batches = math.ceil(len(entries) / mb_size)
+        pos_ptr = 0
+        neg_ptr = 0
+
+        for _ in range(n_batches):
+            batch: list[tuple[ActionChunk, str]] = []
+
+            # --- Positive slots (oversample with replacement) ---
+            for _ in range(n_pos_per_batch):
+                if pos_ptr >= len(pos_pool):
+                    # Re-shuffle and restart when pool is exhausted
+                    pos_pool = list(rng.permutation(len(pos_indices)).astype(int))
+                    pos_ptr = 0
+                batch.append(entries[pos_indices[pos_pool[pos_ptr]]])
+                pos_ptr += 1
+
+            # --- Negative slots (without replacement, stop when exhausted) ---
+            taken = 0
+            while taken < n_neg_per_batch and neg_ptr < len(neg_pool):
+                batch.append(entries[neg_indices[neg_pool[neg_ptr]]])
+                neg_ptr += 1
+                taken += 1
+
+            yield batch
+
+            # Negative pool exhausted — remaining batches would contain only
+            # positive-advantage entries, defeating balanced sampling. Stop now
+            # rather than yielding oversampled-positive-only batches that produce
+            # misleading (same-sign-only) per-minibatch z-score renorm.
+            if neg_ptr >= len(neg_pool):
+                return
 
     def _prepare_batch(
         self, batch: list[tuple[ActionChunk, str]]
@@ -2407,6 +2574,26 @@ class GRPOTrainer:
                 iteration,
             )
 
+        # Balanced training diagnostics. Only emitted when balanced_training=True
+        # AND at least one optimizer step actually fired. Gating on n_updates>0
+        # prevents logging "planned" epoch counts on iters where all minibatches
+        # were skipped (non-finite loss) — the name "actual_epochs" should reflect
+        # what was executed, not what was planned.
+        if (self.config.balanced_training and update_stats is not None
+                and update_stats.get("n_updates", 0) > 0):
+            if "actual_epochs" in update_stats:
+                self.writer.add_scalar(
+                    "balanced/actual_epochs",
+                    update_stats["actual_epochs"],
+                    iteration,
+                )
+            if "success_fraction" in update_stats:
+                self.writer.add_scalar(
+                    "balanced/success_fraction",
+                    update_stats["success_fraction"],
+                    iteration,
+                )
+
         # Update-counter scalars: log even when n_updates=0, because seeing
         # n_updates=0 IS the diagnostic signal — it pinpoints which iters
         # never fired a step (dead-group filter / non-finite loss). Without
@@ -2518,7 +2705,14 @@ class GRPOTrainer:
                         log_dict.update({
                             f"train/{k}": v
                             for k, v in update_stats.items()
-                            if k not in ("n_updates", "n_skipped_nonfinite")
+                            if k not in (
+                                "n_updates", "n_skipped_nonfinite",
+                                # Handled by the gated balanced_training block
+                                # below; exclude here to avoid both a spurious
+                                # train/actual_epochs curve on vanilla runs and
+                                # a double-log (train/ + balanced/) on balanced runs.
+                                "actual_epochs", "success_fraction",
+                            )
                         })
                 if lr is not None:
                     log_dict["train/lr"] = lr
@@ -2526,6 +2720,12 @@ class GRPOTrainer:
                     log_dict.update({f"time/{k}_seconds": v for k, v in phase_times.items()})
                 if lora_delta_norm is not None:
                     log_dict["lora/weight_delta_norm"] = lora_delta_norm
+                if (self.config.balanced_training and update_stats is not None
+                        and update_stats.get("n_updates", 0) > 0):
+                    if "actual_epochs" in update_stats:
+                        log_dict["balanced/actual_epochs"] = update_stats["actual_epochs"]
+                    if "success_fraction" in update_stats:
+                        log_dict["balanced/success_fraction"] = update_stats["success_fraction"]
                 wandb.log(log_dict)
             except Exception:
                 pass

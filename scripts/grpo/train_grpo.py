@@ -398,7 +398,7 @@ class GRPOTrainer:
             print(
                 f"  Balanced training: ON "
                 f"(positive_adv_ratio={self.config.balanced_training_positive_adv_ratio}, "
-                f"dynamic epochs=max(1, ceil(success_frac × {self.config.update_epochs})))"
+                f"dynamic epochs=max(1, floor(2·min(sf,1-sf)·{self.config.update_epochs}+0.5)))"
             )
         if self.config.jitter_lambda > 0.0:
             # Surface the doubled-step cost up-front so the user can confirm
@@ -1402,9 +1402,30 @@ class GRPOTrainer:
         n_rows_jitter = 0
 
         # ── Balanced training: dynamic epoch count ───────────────────────────
-        # When balanced_training=True, scale down update_epochs proportionally
-        # to the fraction of positive-advantage episodes among live-group episodes.
-        # actual_epochs = max(1, ceil(successful_eps / total_eps × update_epochs))
+        # When balanced_training=True, scale update_epochs using a tent function
+        # of the positive-advantage fraction among live-group episodes:
+        #
+        #   m    = min(successful_eps, total_eps − successful_eps)
+        #   actual_epochs = max(1, (4·m·update_epochs + total_eps) // (2·total_eps))
+        #
+        # This is the exact integer form of floor(2·min(sf,1-sf)·E + 0.5), where
+        # sf = successful_eps / total_eps and E = update_epochs. Integer arithmetic
+        # avoids ULP cancellation in `1.0 − sf` which can make the float version
+        # give the wrong result when (4·m·E + n) / (2·n) lands just below a
+        # half-integer (e.g. n=24, m=7, E=6 → exact 3.5, float gives 3.4999…
+        # → floor(3.9999…) = 3 instead of the correct 4).
+        #
+        # The tent peaks at success_frac=0.5 (→ full update_epochs) and decays
+        # symmetrically toward both extremes:
+        #   - Near 0% or 100% success: asymmetric advantages, least informative
+        #     signal → 1 epoch
+        #   - Near 50% success: balanced +/- signal, most informative → full
+        #     update_epochs
+        #
+        # This replaces the old monotonic formula ceil(success_frac × update_epochs),
+        # which pathologically gave MORE epochs at high success (70% → 3 epochs),
+        # exactly when the gradient signal is most asymmetric and most likely to
+        # cause policy overshoot. The tent reduces epochs at both extremes.
         #
         # We count only episodes from LIVE groups (those with at least one
         # non-zero-advantage chunk in live_chunks). Dead groups — all-success
@@ -1428,14 +1449,21 @@ class GRPOTrainer:
                 if self.buffer.advantages is not None and self.buffer.advantages[i] > 0
             )
             total_eps_collected = max(len(live_ep_indices), 1)
-            success_frac = successful_eps / total_eps_collected
-            actual_num_epochs = max(
-                1, math.ceil(success_frac * self.config.update_epochs)
-            )
+            success_frac = successful_eps / total_eps_collected  # float, for logging only
+            # Exact integer tent: (4·m·E + n) // (2·n) where m = min(k, n-k).
+            # Avoids the ULP cancellation that can corrupt math.floor(float + 0.5)
+            # at specific integer counts when update_epochs >= 6.
+            m = min(successful_eps, total_eps_collected - successful_eps)
+            E = self.config.update_epochs
+            n = total_eps_collected
+            actual_num_epochs = max(1, (4 * m * E + n) // (2 * n))
+            update_scale = 2.0 * m / n  # float tent scale, for the print only
             if actual_num_epochs != self.config.update_epochs:
                 print(
                     f"  Balanced training: {successful_eps}/{total_eps_collected} "
-                    f"positive-advantage live-group episodes → {actual_num_epochs}/{self.config.update_epochs} epochs"
+                    f"positive-advantage live-group episodes "
+                    f"(tent scale={update_scale:.2f}) "
+                    f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
                 )
         else:
             actual_num_epochs = self.config.update_epochs
@@ -1948,24 +1976,29 @@ class GRPOTrainer:
     ) -> Iterator[list[tuple[ActionChunk, str]]]:
         """Yield mini-batches with balanced positive/negative advantage sampling.
 
-        Each mini-batch is composed of:
-          - `balanced_training_positive_adv_ratio` fraction from positive-advantage
-            entries (chunk.advantage > 0), oversampled WITH replacement when the
-            natural positive fraction is below the target ratio.
-          - `1 - ratio` fraction from negative-advantage entries, sampled WITHOUT
-            replacement (each negative is seen at most once per epoch).
+        Applies the target pos/neg ratio in BOTH directions:
+          - When natural_pos_frac < pos_ratio (too few positives): positives
+            are the minority class, oversampled WITH replacement. Negatives
+            are sampled WITHOUT replacement and control when the epoch ends.
+          - When natural_pos_frac > pos_ratio (too few negatives): negatives
+            are the minority class, oversampled WITH replacement. Positives
+            are sampled WITHOUT replacement and control when the epoch ends.
 
-        Oversampling is triggered only when the natural positive fraction in
-        `entries` is strictly less than `balanced_training_positive_adv_ratio`.
-        When the natural fraction already meets or exceeds the target, or when
-        one sign class is entirely absent, the method delegates to the standard
-        `_iter_stratified_minibatches` (no change in behavior).
+        Falls back to _iter_stratified_minibatches only when one sign class
+        is entirely absent (can't form a balanced batch).
+
+        This bidirectional design prevents two distinct failure modes:
+          - Low success (few positives): gradient dominated by negative
+            advantages → oversample positives to provide learning signal.
+          - High success (few negatives): minibatch z-score renorm amplifies
+            the rare large-negative-advantage failures, causing the policy to
+            over-correct toward avoiding those specific failure modes. Cycling
+            negatives with replacement caps this amplification.
 
         Epoch length (number of mini-batches) is anchored to `ceil(n / mb_size)`
-        matching the vanilla stratified path — the total gradient update budget
-        per epoch stays comparable. Positives cycle with replacement if needed;
-        negatives are drawn from a per-epoch shuffled queue and stop when
-        exhausted (so the last batch may be smaller).
+        matching the vanilla stratified path. The minority pool cycles with
+        replacement; the majority pool is drawn without replacement and may not
+        be fully consumed before the epoch anchor is reached.
 
         Args:
             entries: List of (ActionChunk, mode) tuples from _grpo_update_inner.
@@ -1985,68 +2018,83 @@ class GRPOTrainer:
         pos_indices = [i for i, (c, _) in enumerate(entries) if c.advantage > 0]
         neg_indices = [i for i, (c, _) in enumerate(entries) if c.advantage <= 0]
 
-        natural_pos_frac = len(pos_indices) / len(entries)
-
-        # Fall back to stratified sampling when:
-        #   - Positives already meet the target (no oversampling needed)
-        #   - One of the pools is empty (can't construct a balanced batch)
-        if natural_pos_frac >= pos_ratio or not pos_indices or not neg_indices:
+        # Fall back to stratified when one sign class is absent — we can't
+        # form a balanced batch without both positive and negative entries.
+        if not pos_indices or not neg_indices:
             yield from self._iter_stratified_minibatches(entries, rng)
             return
+
+        natural_pos_frac = len(pos_indices) / len(entries)
 
         mb_size = self.config.mini_batch_size
         n_pos_per_batch = max(1, round(pos_ratio * mb_size))
         n_neg_per_batch = mb_size - n_pos_per_batch
 
-        # Guard: if rounding left no room for negatives (e.g. pos_ratio=0.9375
-        # with mb_size=8 causes round(7.5)=8 → n_neg=0), fall back to the
-        # standard stratified path rather than silently training on only
-        # positive data.
+        # Guard: if rounding left no room for one sign class (e.g. pos_ratio=0.9375
+        # with mb_size=8 causes round(7.5)=8 → n_neg=0), fall back.
         if n_neg_per_batch <= 0:
             yield from self._iter_stratified_minibatches(entries, rng)
             return
 
+        # Determine minority vs majority pool based on which sign class is
+        # underrepresented relative to the target ratio:
+        #   - natural_pos_frac < pos_ratio: positives are minority → cycle positives
+        #   - natural_pos_frac > pos_ratio: negatives are minority → cycle negatives
+        # The minority pool is oversampled with replacement (cycles when exhausted);
+        # the majority pool is sampled without replacement and controls epoch end.
+        if natural_pos_frac < pos_ratio:
+            minority_indices = pos_indices
+            majority_indices = neg_indices
+            n_minority_per_batch = n_pos_per_batch
+            n_majority_per_batch = n_neg_per_batch
+        else:
+            # natural_pos_frac >= pos_ratio: negatives are minority (or exactly at
+            # target, in which case either direction is fine — negatives is the
+            # conservative choice since it prevents positive dominance in batches).
+            minority_indices = neg_indices
+            majority_indices = pos_indices
+            n_minority_per_batch = n_neg_per_batch
+            n_majority_per_batch = n_pos_per_batch
+
         # Shuffle both pools independently for this epoch.
-        pos_pool = list(rng.permutation(len(pos_indices)).astype(int))
-        neg_pool = list(rng.permutation(len(neg_indices)).astype(int))
+        minority_pool = list(rng.permutation(len(minority_indices)).astype(int))
+        majority_pool = list(rng.permutation(len(majority_indices)).astype(int))
 
         # Epoch length is anchored to ceil(n_entries / mb_size) to keep the
         # per-epoch optimizer-step budget comparable to the vanilla stratified
-        # path. Positives are cycled with replacement when exhausted; negatives
-        # advance a running pointer and stop when the pool drains. As a result,
-        # roughly (1-pos_ratio)/(1-natural_pos_frac) of the negative pool is
-        # consumed each epoch — some negatives may go unseen, which is the
-        # expected cost of oversampling the minority class.
+        # path. The minority pool cycles with replacement when exhausted; the
+        # majority pool advances a running pointer. When the majority pool
+        # drains before n_batches is reached, the epoch terminates early to
+        # avoid yielding minority-only batches (same-sign z-score renorm would
+        # produce meaningless gradients).
         n_batches = math.ceil(len(entries) / mb_size)
-        pos_ptr = 0
-        neg_ptr = 0
+        minority_ptr = 0
+        majority_ptr = 0
 
         for _ in range(n_batches):
             batch: list[tuple[ActionChunk, str]] = []
 
-            # --- Positive slots (oversample with replacement) ---
-            for _ in range(n_pos_per_batch):
-                if pos_ptr >= len(pos_pool):
+            # --- Minority slots (oversample with replacement) ---
+            for _ in range(n_minority_per_batch):
+                if minority_ptr >= len(minority_pool):
                     # Re-shuffle and restart when pool is exhausted
-                    pos_pool = list(rng.permutation(len(pos_indices)).astype(int))
-                    pos_ptr = 0
-                batch.append(entries[pos_indices[pos_pool[pos_ptr]]])
-                pos_ptr += 1
+                    minority_pool = list(rng.permutation(len(minority_indices)).astype(int))
+                    minority_ptr = 0
+                batch.append(entries[minority_indices[minority_pool[minority_ptr]]])
+                minority_ptr += 1
 
-            # --- Negative slots (without replacement, stop when exhausted) ---
+            # --- Majority slots (without replacement, stop when exhausted) ---
             taken = 0
-            while taken < n_neg_per_batch and neg_ptr < len(neg_pool):
-                batch.append(entries[neg_indices[neg_pool[neg_ptr]]])
-                neg_ptr += 1
+            while taken < n_majority_per_batch and majority_ptr < len(majority_pool):
+                batch.append(entries[majority_indices[majority_pool[majority_ptr]]])
+                majority_ptr += 1
                 taken += 1
 
             yield batch
 
-            # Negative pool exhausted — remaining batches would contain only
-            # positive-advantage entries, defeating balanced sampling. Stop now
-            # rather than yielding oversampled-positive-only batches that produce
-            # misleading (same-sign-only) per-minibatch z-score renorm.
-            if neg_ptr >= len(neg_pool):
+            # Majority pool exhausted — stop rather than yielding minority-only
+            # batches (same-sign z-score renorm would be meaningless).
+            if majority_ptr >= len(majority_pool):
                 return
 
     def _prepare_batch(

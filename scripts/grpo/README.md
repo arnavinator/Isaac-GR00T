@@ -656,37 +656,43 @@ vastly outnumber positives, individual mini-batches carry a weak or
 one-sided gradient signal, and a small number of sparse successes are
 over- or under-weighted relative to the training budget they warrant.
 
-Both mechanisms are off by default (`balanced_training = False`) and
+Both mechanisms are on by default (`balanced_training = True`) and
 activate together. When off, training is bit-identical to the unmodified
 stratified-minibatch path.
 
 #### Mechanism 1: balanced mini-batch sampling
 
-**What it does.** When the natural fraction of positive-advantage chunks
-in the live dataset is below `balanced_training_positive_adv_ratio` (X),
-each mini-batch is constructed with exactly X fraction from
-positive-advantage entries and `1 − X` from negative-advantage entries,
-oversampling the rare positive class to guarantee directional balance in
-every gradient step.
+**What it does.** Each mini-batch enforces `balanced_training_positive_adv_ratio`
+(X) in **both directions**. The sign class that is underrepresented relative to
+X is the "minority" and is oversampled with replacement; the overrepresented
+class is the "majority" and is drawn without replacement, controlling when the
+epoch ends.
 
-**When it activates.** Only when `natural_pos_frac < X`. When positives
-already meet or exceed X (or when one sign class is entirely absent), the
-method falls back to `_iter_stratified_minibatches` unchanged.
+**When it activates.** Always when both sign classes are present:
+- `natural_pos_frac < X`: too few positives → cycle positives, drain negatives
+- `natural_pos_frac ≥ X`: too few negatives → cycle negatives, drain positives
 
-**Sampling strategy.** Positive-advantage entries are drawn in shuffled
-order without replacement within each cycle; the pool reshuffles when
-exhausted. This guarantees best-effort equal exposure across positive
-chunks — no single chunk dominates due to random luck. Negative-advantage
-entries are drawn without replacement from a per-epoch shuffled pool and
-stop when exhausted; some negatives go unseen each epoch, which is the
-expected cost of oversampling the minority class. Across multiple epochs
-the negative pool reshuffles, so all negatives are eventually covered.
+Falls back to `_iter_stratified_minibatches` only when one sign class is
+entirely absent (all episodes fail or all succeed within live groups).
 
-**Epoch length.** Anchored to `ceil(n_live_chunks / mb_size)`, matching
-the vanilla stratified path so `update_epochs` remains directly comparable
-between balanced and vanilla runs. When the negative pool drains early
-(a rounding-edge-case scenario), the epoch stops rather than yielding
-positive-only tail batches that would defeat the balance guarantee.
+**Why bidirectional matters.** At high success rates (e.g. 70% positive), the
+few negative-advantage chunks (failures) receive a very large magnitude from
+per-minibatch z-score renorm, producing an outsized "avoid failure" gradient
+that can collapse the policy in the next iteration. Cycling negatives caps this
+by ensuring each batch has the targeted proportion regardless of the natural
+distribution.
+
+**Sampling strategy.** The minority pool reshuffles when exhausted to give
+best-effort equal exposure across minority chunks. The majority pool advances
+monotonically and may not be fully consumed before the epoch-length anchor is
+reached — some majority chunks go unseen each epoch, which is the documented
+cost of the rebalancing.
+
+**Epoch length.** Anchored to `ceil(n_live_chunks / mb_size)`, matching the
+vanilla stratified path so `update_epochs` remains directly comparable between
+balanced and vanilla runs. When the majority pool drains early, the epoch stops
+rather than yielding minority-only tail batches that would defeat the balance
+guarantee.
 
 **Relationship to Jitter-GRPO.** With `jitter_lambda > 0`, `entries` is
 doubled (`fixed + jitter` copies of each chunk). Both copies of a positive
@@ -698,18 +704,28 @@ in the same batch. The combination of both features is sound.
 
 #### Mechanism 2: dynamic epoch count
 
-**What it does.** Scales `update_epochs` down proportionally to the
-fraction of live-group episodes that have positive advantage:
+**What it does.** Scales `update_epochs` using a **tent function** of the
+positive-advantage fraction, implemented via exact integer arithmetic:
 
 ```
-actual_num_epochs = max(1, ceil(successful_eps / total_eps × update_epochs))
+m = min(successful_eps, total_eps − successful_eps)
+actual_num_epochs = max(1, (4·m·update_epochs + total_eps) // (2·total_eps))
 ```
 
-This prevents over-training on a skewed iteration where most rollouts
-failed: with 10 % positive-advantage episodes, running 5 full epochs would
-grind through the same small set of successful trajectories repeatedly. The
-formula gives 1 epoch instead, matching the training investment to the
-available positive signal.
+This is the integer form of `floor(2·min(sf, 1−sf)·update_epochs + 0.5)`.
+The formula peaks at `success_frac = 0.5` (→ full `update_epochs`) and
+decays symmetrically toward both extremes:
+
+- **Near 0% success:** all-failure, purely negative advantages, sparse useful
+  signal → 1 epoch
+- **Near 50% success:** balanced +/− advantages, most informative → full
+  `update_epochs`
+- **Near 100% success:** all-success, highly asymmetric advantages (the few
+  failures get very large negative advantage from group-relative normalisation,
+  dominating gradient direction) → reduced epochs
+
+The integer formula avoids ULP cancellation that can corrupt `float`-based
+implementations at specific episode counts when `update_epochs ≥ 6`.
 
 **What counts as `successful_eps / total_eps`.**
 
@@ -726,11 +742,11 @@ available positive signal.
   undercount it. Using advantage sign keeps the epoch formula consistent
   with mechanism 1, which oversamples chunks with `c.advantage > 0`.
 
-**Example.** 5 groups of 4 rollouts each. After dead-group filtering, 2
-live groups remain. Live-group episodes: 4 + 4 = 8. Positive-advantage
-episodes: 3. `success_frac = 3/8 = 0.375`. With `update_epochs = 5`:
-`actual_num_epochs = max(1, ceil(0.375 × 5)) = 2`. The other 3 epochs
-are skipped — the training budget reflects the actual signal available.
+**Examples.** 5 groups × 4 rollouts, `update_epochs = 4`:
+- `success_frac = 0.25` (2/8 positive): `m=2`, `(32+8)//16 = 2` epochs
+- `success_frac = 0.50` (4/8): `m=4`, `(64+8)//16 = 4` epochs (peak)
+- `success_frac = 0.70` (14/20): `m=6`, `(96+20)//40 = 2` epochs — fewer
+  than the old monotonic formula's 3, preventing overshoot at high success
 
 #### CLI usage
 
@@ -743,10 +759,10 @@ uv run python scripts/grpo/train_grpo.py \
 ```
 
 The startup banner prints `Balanced training: ON (positive_adv_ratio=…,
-dynamic epochs=max(1, ceil(success_frac × …)))`. A per-iteration line
-`Balanced training: X/Y positive-advantage live-group episodes → Z/N
-epochs` is printed whenever the epoch count is reduced below
-`update_epochs`. TensorBoard logs `balanced/actual_epochs` and
+dynamic epochs=max(1, floor(2·min(sf,1-sf)·N+0.5)))`. A per-iteration line
+`Balanced training: X/Y positive-advantage live-group episodes (tent scale=Z)
+→ A/N epochs` is printed whenever the epoch count differs from `update_epochs`.
+TensorBoard logs `balanced/actual_epochs` and
 `balanced/success_fraction` whenever at least one optimizer step fired
 in that iteration.
 
@@ -754,8 +770,9 @@ in that iteration.
 
 | File | Change |
 |------|--------|
-| `grpo_config.py` | Adds `balanced_training: bool = False` and `balanced_training_positive_adv_ratio: float = 0.5` with `__post_init__` validation (ratio strictly in `(0, 1)` when feature is on). |
-| `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` from live-group episode advantages before the epoch loop; dispatches to `_iter_balanced_minibatches` when enabled. New method `_iter_balanced_minibatches`. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `n_updates > 0`). Wandb bulk update excludes these keys from the `train/` namespace to avoid double-logging. |
+| `grpo_config.py` | Adds `balanced_training: bool = True` and `balanced_training_positive_adv_ratio: float = 0.5` with `__post_init__` validation (ratio strictly in `(0, 1)` when feature is on). |
+| `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` via integer tent formula from live-group episode counts. Dispatches to `_iter_balanced_minibatches` when enabled. `_iter_balanced_minibatches` applies the target ratio bidirectionally — cycles the minority sign class with replacement, drains the majority without replacement. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `n_updates > 0`). |
+| `test_balanced_fixes.py` | Unit tests for both mechanisms: per-batch ratio in both directions (too-few-positives and too-many-positives), epoch-length anchor, minority cycling, all fallback paths, tent formula correctness including integer ULP cases. |
 
 ---
 
@@ -1311,7 +1328,7 @@ uv run python scripts/grpo/train_grpo.py \
 - `mini_batch_size` (default 8 chunks)
 - `kl_coef` (default 0.1)
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
-- `balanced_training` (default `False`) — see "Balanced Training". When
+- `balanced_training` (default `True`) — see "Balanced Training". When
   `True`, activates balanced mini-batch sampling and dynamic epoch count.
 - `balanced_training_positive_adv_ratio` (default `0.5`) — target fraction
   of positive-advantage chunks per mini-batch. Must be strictly in `(0, 1)`.

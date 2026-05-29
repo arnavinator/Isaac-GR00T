@@ -219,24 +219,29 @@ class GRPOConfig:
     update_epochs: int = 5
 
     # ─── Balanced Training ───────────────────────────────────────────────────
-    # Addresses the common failure mode where most collected episodes are
-    # failures (negative-advantage chunks vastly outnumber positives).
-    # Two complementary mechanisms activate together when enabled:
+    # Addresses gradient instability from skewed episode outcomes. Two
+    # complementary mechanisms activate together when enabled:
     #
-    #   1. Balanced mini-batch sampling: each mini-batch is drawn with
-    #      `balanced_training_positive_adv_ratio` fraction from positive-advantage
-    #      chunks and `1 - ratio` from negative-advantage chunks, OVERSAMPLING
-    #      the rare positive class when its natural frequency is below the
-    #      target ratio. When positives already meet or exceed the target,
-    #      sampling falls back to the normal stratified scheme (no change).
+    #   1. Balanced mini-batch sampling: each mini-batch enforces the target
+    #      pos/neg ratio in BOTH directions. The underrepresented sign class is
+    #      the "minority" and is oversampled with replacement; the
+    #      overrepresented class is the "majority" and is drawn without
+    #      replacement, controlling when the epoch ends.
+    #        - natural_pos_frac < pos_ratio: too few positives → cycle positives
+    #        - natural_pos_frac > pos_ratio: too few negatives → cycle negatives
+    #      Falls back to stratified sampling only when one sign class is
+    #      entirely absent (no positives or no negatives).
     #
-    #   2. Dynamic epoch count: actual epochs for this iteration are
-    #      max(1, ceil(successful_eps / total_eps × update_epochs)).
-    #      Proportionally fewer updates when little positive data exists,
-    #      preventing the model from over-fitting to a skewed negative dataset.
+    #   2. Dynamic epoch count via a tent function of success_frac:
+    #        m = min(successful_eps, total_eps − successful_eps)
+    #        actual_epochs = max(1, (4·m·update_epochs + total_eps) // (2·total_eps))
+    #      Peaks at success_frac=0.5 (→ full update_epochs); decays to 1 at
+    #      both 0% and 100% success. Reduces training at asymmetric extremes
+    #      in either direction, preventing both under-training (sparse signal)
+    #      and over-training (highly asymmetric advantages at high success).
     #
-    # When False (default), both mechanisms are disabled and training is
-    # identical to the unmodified stratified-minibatch path.
+    # When False, both mechanisms are disabled and training is identical to
+    # the unmodified stratified-minibatch path.
     balanced_training: bool = True
 
     # Target fraction of positive-advantage chunks in each mini-batch.

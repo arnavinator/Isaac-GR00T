@@ -1458,13 +1458,14 @@ class GRPOTrainer:
             n = total_eps_collected
             actual_num_epochs = max(1, (4 * m * E + n) // (2 * n))
             update_scale = 2.0 * m / n  # float tent scale, for the print only
-            if actual_num_epochs != self.config.update_epochs:
-                print(
-                    f"  Balanced training: {successful_eps}/{total_eps_collected} "
-                    f"positive-advantage live-group episodes "
-                    f"(tent scale={update_scale:.2f}) "
-                    f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
-                )
+            # Always print: silence looks like balanced training is off when it's
+            # actually running at full capacity (epochs == update_epochs near peak).
+            print(
+                f"  Balanced training: {successful_eps}/{total_eps_collected} "
+                f"positive-advantage live-group episodes "
+                f"(tent scale={update_scale:.2f}) "
+                f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
+            )
         else:
             actual_num_epochs = self.config.update_epochs
             success_frac = None  # Not computed; omit from stats

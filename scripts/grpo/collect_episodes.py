@@ -773,34 +773,40 @@ class EpisodeCollector:
         # SyncVectorEnv when num_envs == 1 (no IPC overhead). Pattern matches
         # scripts/denoising_lab/eval/robocasa_eval_benchmark.py:336-343.
         #
-        # autoreset_mode=DISABLED is LOAD-BEARING for multi-turn collection (and
-        # for re-using the same vector env across groups). Gymnasium's default
-        # NEXT_STEP autoreset flags a terminated env and silently resets it
-        # (discarding the action) on its NEXT step. Since we re-use the vector
-        # env across turns/groups and re-establish each branch point via the
-        # apply_scene_bundle RPC (which does NOT clear that flag — and for
-        # AsyncVectorEnv(shared_memory=False) a vector reset() does NOT clear the
-        # worker flag either), a leftover autoreset would make the FIRST step of
-        # the next turn/group reset to a fresh random scene instead of the branch
-        # point, corrupting the within-group GRPO invariant. DISABLED removes the
-        # autoreset state machine entirely; the per-env loop keeps stepping
-        # already-done envs with zero actions but ignores their results (via
-        # active_indices), and MultiStepWrapper.step either no-ops (once an env's
-        # self.done[-1] is set, i.e. truncated) or harmlessly over-runs the inner
-        # env — so nothing the collector consumes depends on background autoreset.
-        # _align/_restart still call envs.reset() before apply_scene_bundle, which
-        # clears SyncVectorEnv's per-env terminated guard (it asserts you don't
-        # step a just-terminated env).
+        # Autoreset handling is gymnasium-VERSION DEPENDENT:
+        #   * gymnasium >= 1.0 defaults to AutoresetMode.NEXT_STEP: a terminated
+        #     env is flagged and its NEXT step() silently resets it (discarding
+        #     the action). Because we re-use one persistent vector env across
+        #     turns/groups and re-establish each branch point via the
+        #     apply_scene_bundle RPC (which does NOT clear that flag — and for
+        #     AsyncVectorEnv(shared_memory=False) a vector reset() does NOT clear
+        #     the worker flag either), a leftover NEXT_STEP autoreset would make
+        #     the FIRST step after a turn/group boundary reset to a fresh random
+        #     scene instead of the branch point, corrupting the within-group GRPO
+        #     invariant. We pass autoreset_mode=DISABLED to remove that flag.
+        #   * Older gymnasium (e.g. the robocasa venv, ~0.26–0.29) has NO
+        #     AutoresetMode and auto-resets on the SAME step as termination (with
+        #     terminal info in info["final_info"], which is why _info_for_env
+        #     reads final_info first). Same-step autoreset does NOT leak across a
+        #     turn/group boundary, so no autoreset_mode is needed — and the enum
+        #     doesn't exist, so passing it would raise AttributeError.
+        # Detect support and pass the kwarg only when present (correct + safe on
+        # both). Either way, _align/_restart call envs.reset() before
+        # apply_scene_bundle, which on gymnasium>=1.0 also clears SyncVectorEnv's
+        # per-env terminated guard (it asserts you don't step a just-terminated env).
+        _autoreset_enum = getattr(gym.vector, "AutoresetMode", None)
+        _autoreset_kw = (
+            {"autoreset_mode": _autoreset_enum.DISABLED}
+            if _autoreset_enum is not None
+            else {}
+        )
         if self.num_envs > 1:
             self.envs = gym.vector.AsyncVectorEnv(
-                env_fns, shared_memory=False, context="spawn",
-                autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+                env_fns, shared_memory=False, context="spawn", **_autoreset_kw,
             )
             self._uses_async = True
         else:
-            self.envs = gym.vector.SyncVectorEnv(
-                env_fns, autoreset_mode=gym.vector.AutoresetMode.DISABLED,
-            )
+            self.envs = gym.vector.SyncVectorEnv(env_fns, **_autoreset_kw)
             self._uses_async = False
 
         self.policy_client = PolicyClient(host=server_host, port=server_port)

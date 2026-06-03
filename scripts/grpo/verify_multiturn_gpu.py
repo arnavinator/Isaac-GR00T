@@ -151,10 +151,20 @@ def phase_a(env_name: str, n_action_steps: int):
         num_async_vector_env=num_envs,
     )
     try:
-        # 1. Construction: the load-bearing fix.
-        check("vector env constructed with autoreset_mode=DISABLED",
-              str(getattr(_autoreset_mode(collector.envs), "name", _autoreset_mode(collector.envs))) == "DISABLED",
-              f"got {_autoreset_mode(collector.envs)!r}")
+        # 1. Construction. Autoreset handling is gymnasium-version dependent
+        # (see EpisodeCollector.__init__): gymnasium>=1.0 → DISABLED is requested
+        # (the load-bearing fix for NEXT_STEP autoreset); older gymnasium (e.g.
+        # the robocasa venv) has no AutoresetMode and uses same-step autoreset,
+        # which doesn't leak — so no autoreset_mode is set. Either is fine here;
+        # the decisive cross-turn check in step 6 validates the actual behavior.
+        import gymnasium as _gym
+        mode = _autoreset_mode(collector.envs)
+        if getattr(_gym.vector, "AutoresetMode", None) is not None:
+            check("vector env requests autoreset_mode=DISABLED (gymnasium>=1.0)",
+                  str(getattr(mode, "name", mode)) == "DISABLED", f"got {mode!r}")
+        else:
+            info(f"gymnasium<1.0 (no AutoresetMode): same-step autoreset (mode={mode!r}) "
+                 f"— no cross-turn leak, no autoreset_mode needed; step 6 still validates it")
         check("num_envs == 2 and turns_per_group == 2",
               collector.num_envs == 2 and collector.turns_per_group == 2,
               f"num_envs={collector.num_envs}, turns={collector.turns_per_group}")

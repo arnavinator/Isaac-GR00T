@@ -628,7 +628,15 @@ def parse_args():
     )
     parser.add_argument(
         "--group-size", type=int, default=5,
-        help="Rollouts per group (G). All share the same env seed; also the number of parallel envs.",
+        help="Rollouts per group (G). All share the same env seed. Defaults to "
+             "the number of parallel envs unless --num-async-vector-env is set.",
+    )
+    parser.add_argument(
+        "--num-async-vector-env", type=int, default=None,
+        help="Physical AsyncVectorEnv worker count per group. Default None → "
+             "group_size. Must be <= group_size and divide it evenly. When "
+             "smaller than group_size, each group is collected over "
+             "group_size // num_async_vector_env sequential turns.",
     )
     parser.add_argument(
         "--num-groups", type=int, default=12,
@@ -721,9 +729,26 @@ class EpisodeCollector:
         server_port: int,
         debug_fast_forward: bool = False,
         output_dir: str = "/tmp/grpo_episodes",
+        num_async_vector_env: int | None = None,
     ):
         self.env_name = env_name
-        self.group_size = group_size
+        self.group_size = group_size            # LOGICAL rollouts per group
+        # PHYSICAL AsyncVectorEnv worker count. None → group_size (one worker
+        # per rollout = original behavior). Each group is then collected over
+        # turns_per_group sequential turns of num_envs rollouts each. Mirror
+        # the config-level validation so a standalone CLI run can't bypass it.
+        self.num_envs = (
+            group_size if num_async_vector_env is None else num_async_vector_env
+        )
+        if (
+            not (1 <= self.num_envs <= self.group_size)
+            or self.group_size % self.num_envs != 0
+        ):
+            raise ValueError(
+                f"num_async_vector_env ({self.num_envs}) must satisfy "
+                f"1 <= n <= group_size ({self.group_size}) and divide it evenly."
+            )
+        self.turns_per_group = self.group_size // self.num_envs
         self.n_action_steps = n_action_steps
         # max_episode_steps is exposed so callers (e.g., CollectorServer) can
         # report it back to the trainer for cross-process config validation.
@@ -737,23 +762,45 @@ class EpisodeCollector:
                 _make_collector_env,
                 env_name=env_name,
                 env_idx=i,
-                total_n_envs=group_size,
+                total_n_envs=self.num_envs,
                 n_action_steps=n_action_steps,
                 max_episode_steps=max_episode_steps,
             )
-            for i in range(group_size)
+            for i in range(self.num_envs)
         ]
 
-        # AsyncVectorEnv (subprocess workers, parallel MuJoCo) when G > 1;
-        # SyncVectorEnv when G == 1 (no IPC overhead). Pattern matches
+        # AsyncVectorEnv (subprocess workers, parallel MuJoCo) when num_envs > 1;
+        # SyncVectorEnv when num_envs == 1 (no IPC overhead). Pattern matches
         # scripts/denoising_lab/eval/robocasa_eval_benchmark.py:336-343.
-        if group_size > 1:
+        #
+        # autoreset_mode=DISABLED is LOAD-BEARING for multi-turn collection (and
+        # for re-using the same vector env across groups). Gymnasium's default
+        # NEXT_STEP autoreset flags a terminated env and silently resets it
+        # (discarding the action) on its NEXT step. Since we re-use the vector
+        # env across turns/groups and re-establish each branch point via the
+        # apply_scene_bundle RPC (which does NOT clear that flag — and for
+        # AsyncVectorEnv(shared_memory=False) a vector reset() does NOT clear the
+        # worker flag either), a leftover autoreset would make the FIRST step of
+        # the next turn/group reset to a fresh random scene instead of the branch
+        # point, corrupting the within-group GRPO invariant. DISABLED removes the
+        # autoreset state machine entirely; the per-env loop keeps stepping
+        # already-done envs with zero actions but ignores their results (via
+        # active_indices), and MultiStepWrapper.step either no-ops (once an env's
+        # self.done[-1] is set, i.e. truncated) or harmlessly over-runs the inner
+        # env — so nothing the collector consumes depends on background autoreset.
+        # _align/_restart still call envs.reset() before apply_scene_bundle, which
+        # clears SyncVectorEnv's per-env terminated guard (it asserts you don't
+        # step a just-terminated env).
+        if self.num_envs > 1:
             self.envs = gym.vector.AsyncVectorEnv(
                 env_fns, shared_memory=False, context="spawn",
+                autoreset_mode=gym.vector.AutoresetMode.DISABLED,
             )
             self._uses_async = True
         else:
-            self.envs = gym.vector.SyncVectorEnv(env_fns)
+            self.envs = gym.vector.SyncVectorEnv(
+                env_fns, autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+            )
             self._uses_async = False
 
         self.policy_client = PolicyClient(host=server_host, port=server_port)
@@ -770,7 +817,11 @@ class EpisodeCollector:
 
         print(f"Collector initialized:")
         print(f"  Env: {env_name} (task_type: {self.task_type})")
-        print(f"  Group size (parallel envs): {group_size}")
+        print(f"  Group size (logical rollouts/group): {self.group_size}")
+        print(
+            f"  Async vector envs (physical workers): {self.num_envs} "
+            f"({self.turns_per_group} turn(s)/group)"
+        )
         print(f"  Vector env: {'AsyncVectorEnv' if self._uses_async else 'SyncVectorEnv'}")
         print(f"  Server: {server_host}:{server_port}")
 
@@ -1030,10 +1081,11 @@ class EpisodeCollector:
         group_id: int,
         success_weight: float,
     ) -> list[dict]:
-        """Collect one group with all envs at the seed-aligned starting state."""
-        observations = self._align_envs_to_group_scene(group_seed)
-        return self._run_per_env_loop(
-            observations, group_id, group_seed, success_weight
+        """Collect one group (group_size rollouts) from the seed-aligned scene,
+        across turns_per_group turns of num_envs rollouts each."""
+        observations, branch_bundle = self._align_envs_to_group_scene(group_seed)
+        return self._run_group_over_turns(
+            group_seed, group_id, success_weight, branch_bundle, observations
         )
 
     def _collect_one_group_with_fast_forward(
@@ -1060,7 +1112,7 @@ class EpisodeCollector:
         groups numerically — a known artifact of FF; group-relative advantages
         are unaffected since they normalize WITHIN each group.
         """
-        observations = self._align_envs_to_group_scene(group_seed)
+        observations, _seed_bundle = self._align_envs_to_group_scene(group_seed)
 
         for step in range(fast_forward_steps):
             new_obs = self._lockstep_step(observations)
@@ -1069,6 +1121,7 @@ class EpisodeCollector:
                     f"    Env terminated at step {step} during fast-forward, "
                     "falling back to normal collection"
                 )
+                # Fallback collects the FULL multi-turn group from seed.
                 return self._collect_one_group(
                     group_seed, group_id, success_weight
                 )
@@ -1079,14 +1132,122 @@ class EpisodeCollector:
                 group_id, group_seed, fast_forward_steps, observations
             )
 
-        return self._run_per_env_loop(
-            observations, group_id, group_seed, success_weight
+        # Capture the POST-FF branch point so turns 2..k restart from the exact
+        # state turn 1's lockstep reached. Re-running the FF prefix would diverge
+        # (the server's denoising noise is unseeded). All num_envs envs are
+        # bit-identical here (lockstep guarantee, asserted by _verify_branch_point
+        # when debugging), so env 0's bundle IS the shared branch point. Skip the
+        # capture for the true singleton (turns_per_group == 1). Note FF mode is
+        # never combined with init_state (collect() disables FF when init_state is
+        # set), so _run_group_over_turns always re-applies this captured bundle.
+        post_ff_bundle = None
+        if self.turns_per_group > 1:
+            # Deep-copy the captured bundle so it stays pristine across turns:
+            # apply_scene_bundle mutates ep_meta in place (see _get_init_bundle),
+            # and in SyncVectorEnv env.call passes the arg with no pickle boundary.
+            post_ff_bundle = copy.deepcopy(self.envs.call("get_scene_bundle")[0])
+            # The FF prefix ran INSIDE the wrapper, so every env's truncation
+            # counter (MultiStepWrapper.reward) grew by exactly
+            # fast_forward_steps * n_action_steps substeps — reaching this capture
+            # point requires that NO env terminated during the prefix (else
+            # _lockstep_step returns None and we fall back), so each outer step
+            # ran the full n_action_steps. Turn 1 continues from that live wrapper,
+            # so its remaining horizon is max_episode_steps minus those substeps.
+            # get_scene_bundle does NOT carry the wrapper budget, so without this
+            # stamp turns 2..k would restore a FULL budget via apply_scene_bundle
+            # (consumed_substeps defaults to 0) and run longer than turn 1 — a
+            # within-group horizon asymmetry that biases group-relative advantages.
+            post_ff_bundle["consumed_substeps"] = (
+                fast_forward_steps * self.n_action_steps
+            )
+
+        return self._run_group_over_turns(
+            group_seed, group_id, success_weight, post_ff_bundle, observations
         )
+
+    # ─── Multi-turn group driver ──────────────────────────────────────────
+
+    def _restart_at_branch_point(
+        self, branch_bundle: dict, group_seed: int
+    ) -> list[dict]:
+        """Re-apply a group's branch point to all physical envs for a new turn.
+
+        Turn 1 of a group is set up by _align_envs_to_group_scene (reset then
+        apply_scene_bundle). Turns 2..k mirror that reset-then-apply. The vector
+        env is constructed with autoreset_mode=DISABLED, so there is no NEXT_STEP
+        autoreset to leak across the turn boundary — but the preceding
+        self.envs.reset() is still required: SyncVectorEnv tracks a per-env
+        "just terminated" guard and asserts you don't step a terminated env, and
+        the previous turn left every env terminated; reset() clears that guard so
+        the next turn's first step is legal. (For AsyncVectorEnv under DISABLED
+        the reset is a harmless no-op w.r.t. autoreset.) The reset's own scene is
+        immediately overwritten by apply_scene_bundle, so only its guard-clearing
+        effect matters.
+
+        For init-state mode we re-fetch a FRESH deep-copied bundle each turn via
+        _get_init_bundle (preserving the existing "fresh copy per apply"
+        invariant — see _get_init_bundle). For normal / fast-forward modes we
+        re-apply a FRESH deep copy of the bundle captured on turn 1 (env 0's
+        seed-aligned or post-FF scene). The deep copy is load-bearing:
+        apply_scene_bundle mutates ep_meta in place, and in SyncVectorEnv
+        (num_envs==1) env.call crosses no pickle boundary, so applying the stored
+        branch_bundle directly would accumulate robosuite reset state across turns
+        and make turns 2..k diverge from turn 1. apply_scene_bundle restores the
+        full scene + dynamic sim state bit-identically and refreshes the wrapper's
+        obs/reward/done deques, so each turn starts from an identical clean slate.
+        """
+        # Clear SyncVectorEnv's per-env terminated guard left by the previous
+        # turn's terminating steps before re-applying the branch point.
+        self.envs.reset(seed=[group_seed] * self.num_envs)
+        if self._active_init_bundle_path is not None:
+            bundle = self._get_init_bundle(self._active_init_bundle_path)
+        else:
+            bundle = copy.deepcopy(branch_bundle)
+        obs_tuple = self.envs.call("apply_scene_bundle", bundle)
+        return list(obs_tuple)
+
+    def _run_group_over_turns(
+        self,
+        group_seed: int,
+        group_id: int,
+        success_weight: float,
+        branch_bundle: dict | None,
+        first_turn_obs: list[dict],
+    ) -> list[dict]:
+        """Collect group_size rollouts for one logical group across
+        turns_per_group sequential turns of num_envs rollouts each.
+
+        Turn 1 runs on first_turn_obs (already at the branch point, established
+        by the caller). Turns 2..k re-apply the branch point to all physical
+        envs for a bit-identical restart, then run another num_envs rollouts.
+        Every rollout is tagged with the SAME group_id, so GRPO advantage
+        normalization (which groups by group_id) treats all turns as one group.
+        Within-group diversity comes from the policy's per-query denoising noise
+        (unseeded) — fresh on every turn — NOT from env randomness.
+        """
+        group_episodes = self._run_per_env_loop(
+            first_turn_obs, group_id, group_seed, success_weight
+        )
+        for _turn in range(1, self.turns_per_group):
+            # branch_bundle is None only for the true singleton (group_size==1,
+            # turns_per_group==1) where this loop never runs; in init-state mode
+            # _restart_at_branch_point re-fetches regardless. Guard defensively.
+            if branch_bundle is None and self._active_init_bundle_path is None:
+                break
+            turn_obs = self._restart_at_branch_point(branch_bundle, group_seed)
+            group_episodes.extend(
+                self._run_per_env_loop(
+                    turn_obs, group_id, group_seed, success_weight
+                )
+            )
+        return group_episodes
 
     # ─── Vector env primitives ────────────────────────────────────────────
 
-    def _align_envs_to_group_scene(self, group_seed: int) -> list[dict]:
-        """Reset all G envs to env 0's scene + dynamic state.
+    def _align_envs_to_group_scene(
+        self, group_seed: int
+    ) -> tuple[list[dict], dict | None]:
+        """Reset all physical envs to env 0's scene + dynamic state.
 
         Each subprocess env runs in its own MuJoCo instance with its own
         construction-time random scene. We can't change those choices from
@@ -1095,7 +1256,7 @@ class EpisodeCollector:
           1. Reset all envs with seed=group_seed (each ends up with its own
              scene because the RNG choices were baked at construction).
           2. get_scene_bundle on all envs (capture env 0's bundle).
-          3. apply_scene_bundle(env0_bundle) on all envs — envs 1..G-1 align
+          3. apply_scene_bundle(env0_bundle) on all envs — envs 1..N-1 align
              to env 0; env 0 re-applies its own (a no-op effect, but it runs
              in parallel with the other workers so no wall-time cost).
 
@@ -1105,28 +1266,42 @@ class EpisodeCollector:
         fixed scene + sim state regardless of group_seed; only the policy's
         denoising noise drives within-group divergence.
 
-        Returns wrapper-stacked observations, one per env. Bit-identical
-        across the group when this returns (verifiable via
-        --debug-fast-forward).
+        Returns (observations, branch_bundle): per-env wrapper-stacked obs
+        (bit-identical across the num_envs physical envs when this returns —
+        verifiable via --debug-fast-forward), plus env 0's captured scene
+        bundle for the turn driver to RE-APPLY on later turns of this group.
+        branch_bundle is None only for the true single-rollout group_size==1
+        case (one env, one turn — nothing to restart). For init-state mode the
+        returned bundle is the loaded fixed bundle; the driver re-fetches a
+        fresh copy each turn (see _restart_at_branch_point).
         """
-        seeds = [group_seed] * self.group_size
+        seeds = [group_seed] * self.num_envs
         vector_obs, _ = self.envs.reset(seed=seeds)
 
         if self._active_init_bundle_path is not None:
             # Saved-state override: ignore env 0's scene entirely and broadcast
-            # the loaded bundle to all envs (including the G==1 case — the
+            # the loaded bundle to all envs (including the num_envs==1 case — the
             # user explicitly asked to start from this saved state).
             bundle = self._get_init_bundle(self._active_init_bundle_path)
             obs_tuple = self.envs.call("apply_scene_bundle", bundle)
-            return list(obs_tuple)
+            return list(obs_tuple), bundle
 
         if self.group_size == 1:
-            # Nothing to align to — just return the lone env's obs.
-            return self._unbatch_vector_obs(vector_obs)
+            # True singleton: one rollout, one env, one turn — nothing to align
+            # to and no later turns to restart, so no branch bundle is needed.
+            return self._unbatch_vector_obs(vector_obs), None
 
+        # group_size > 1: capture env 0's bundle and broadcast it to all physical
+        # envs — even when num_envs == 1 (SyncVectorEnv multi-turn), so that turn
+        # 1 and every later turn restart from the SAME captured state. Snapshot a
+        # pristine deep copy as the branch point BEFORE applying it: the turn-1
+        # apply below mutates ep_meta in place (and in SyncVectorEnv the arg
+        # crosses no pickle boundary), so reusing the same object as the stored
+        # branch point would carry turn-1 reset state into turns 2..k.
         bundles = self.envs.call("get_scene_bundle")
+        branch_bundle = copy.deepcopy(bundles[0])
         obs_tuple = self.envs.call("apply_scene_bundle", bundles[0])
-        return list(obs_tuple)
+        return list(obs_tuple), branch_bundle
 
     def _get_init_bundle(self, npz_path: str) -> dict:
         """Return a fresh bundle for one apply_scene_bundle broadcast.
@@ -1152,8 +1327,8 @@ class EpisodeCollector:
           - sim_state is mutable; MuJoCo's set_state_from_flattened doesn't
             document copy-vs-reference semantics, so np.copy is cheap insurance.
 
-          - In SyncVectorEnv (group_size=1) the bundle reaches the wrapper
-            by reference (no pickle boundary); in AsyncVectorEnv (group_size>1)
+          - In SyncVectorEnv (num_envs==1) the bundle reaches the wrapper
+            by reference (no pickle boundary); in AsyncVectorEnv (num_envs>1)
             pickling already gives each worker a deep copy. The defensive
             copies here cover both cases uniformly. model_xml is left as the
             cached str (Python strings are immutable).
@@ -1186,7 +1361,7 @@ class EpisodeCollector:
         # is enough for the server query.
         batched = self._batch_per_env_obs([observations_per_env[0]])
         actions, _, _, _ = self._get_actions_from_server(batched)
-        actions_full = self._broadcast_actions(actions, self.group_size)
+        actions_full = self._broadcast_actions(actions, self.num_envs)
 
         next_obs, _, terms, truncs, _ = self.envs.step(actions_full)
         if any(terms) or any(truncs):
@@ -1205,21 +1380,22 @@ class EpisodeCollector:
         Each outer step:
           - Batches active envs' obs and queries the policy server.
           - Builds a [G, T, dim] action tensor: real chunks for active envs,
-            zeros for already-done envs (gymnasium auto-resets done envs in
-            the background; we ignore the auto-reset obs by filtering on
-            active_indices).
+            zeros for already-done envs (under autoreset_mode=DISABLED a done
+            env's MultiStepWrapper.step either no-ops, if truncated, or harmlessly
+            over-runs the inner env with the zero action — either way we ignore
+            done envs by filtering on active_indices).
           - Calls vector env.step (parallel MuJoCo across subprocess workers).
-          - Reads terminal info via final_info handling so autoreset doesn't
-            clobber the terminating chunk's substep dones / success flag
-            (pattern from robocasa_eval_benchmark.py:393-402).
+          - Reads terminal info on the terminating step (final_info handling is
+            kept as a defensive fallback; pattern from
+            robocasa_eval_benchmark.py:393-402).
 
         Episode num_steps starts at 0 in both normal and post-FF modes.
         """
         episodes = [
             self._new_episode(group_id, group_seed)
-            for _ in range(self.group_size)
+            for _ in range(self.num_envs)
         ]
-        done_flags = [False] * self.group_size
+        done_flags = [False] * self.num_envs
 
         while not all(done_flags):
             active_indices = [i for i, d in enumerate(done_flags) if not d]
@@ -1282,8 +1458,8 @@ class EpisodeCollector:
                     )
 
             # Update obs only for envs we'll step again next iteration. Done
-            # envs auto-reset in the background; we never consume their fresh
-            # obs since they're filtered out via active_indices.
+            # envs are never re-read (filtered out via active_indices), so we
+            # don't consume their post-step obs.
             for env_idx in active_indices:
                 if not done_flags[env_idx]:
                     observations_per_env[env_idx] = self._extract_per_env(
@@ -1337,7 +1513,7 @@ class EpisodeCollector:
 
         # 2. Compare wrapper observations (what the policy actually sees).
         ref_obs = observations_per_env[0]
-        for i in range(1, self.group_size):
+        for i in range(1, self.num_envs):
             for key in ref_obs:
                 if isinstance(ref_obs[key], np.ndarray):
                     diff = np.abs(
@@ -1350,7 +1526,7 @@ class EpisodeCollector:
         # 3. Render camera views from all envs and save as a montage.
         try:
             all_frames = []
-            for i in range(self.group_size):
+            for i in range(self.num_envs):
                 obs = observations_per_env[i]
                 env_frames = []
                 for key in sorted(obs.keys()):
@@ -1370,7 +1546,7 @@ class EpisodeCollector:
                     import cv2
                     cv2.imwrite(str(out_path), cv2.cvtColor(montage, cv2.COLOR_RGB2BGR))
                     print(f"    [DEBUG] Montage saved: {out_path}")
-                    print(f"    [DEBUG] Layout: {self.group_size} rows (envs) × {len(env_frames)} cols (cameras)")
+                    print(f"    [DEBUG] Layout: {self.num_envs} rows (envs) × {len(env_frames)} cols (cameras)")
                     print(f"    [DEBUG] All rows should look identical if lockstep is correct")
                 except ImportError:
                     npy_path = out_path.with_suffix(".npy")
@@ -1469,7 +1645,7 @@ class EpisodeCollector:
 
     def _unbatch_vector_obs(self, vector_obs: dict) -> list[dict]:
         """Convert vector env's batched dict to a per-env list of obs dicts."""
-        return [self._extract_per_env(vector_obs, i) for i in range(self.group_size)]
+        return [self._extract_per_env(vector_obs, i) for i in range(self.num_envs)]
 
     def _broadcast_actions(self, actions_one: dict, dst_size: int) -> dict:
         """Broadcast a [1, T, dim] action dict to [dst_size, T, dim].
@@ -1487,27 +1663,31 @@ class EpisodeCollector:
     ) -> dict:
         """Build [G, T, dim] from [num_active, T, dim], padding done envs with zeros.
 
-        Done envs receive a zero action; gymnasium auto-resets them in the
-        background and the dummy step's data is ignored by the caller (filtered
-        out via active_indices). The per-env wasted compute is bounded by the
-        slowest env's remaining episode length, which is typically the
+        Done envs receive a zero action; under autoreset_mode=DISABLED their
+        MultiStepWrapper.step either no-ops (if truncated) or over-runs the inner
+        env with the zero action, and the result is ignored by the caller
+        (filtered out via active_indices). The per-env wasted compute is bounded
+        by the slowest env's remaining episode length, which is typically the
         bottleneck anyway.
         """
         out = {}
         for k, v in actions_active.items():
-            full = np.zeros((self.group_size,) + v.shape[1:], dtype=v.dtype)
+            full = np.zeros((self.num_envs,) + v.shape[1:], dtype=v.dtype)
             for j, env_idx in enumerate(active_indices):
                 full[env_idx] = v[j]
             out[k] = full
         return out
 
     def _info_for_env(self, infos: dict, key: str, env_idx: int):
-        """Read info[key][env_idx], preferring final_info on a terminating step.
+        """Read info[key][env_idx], preferring final_info when present.
 
-        Under gymnasium's autoreset, infos[key] for a terminated env reflects
-        the auto-reset episode's state, NOT the terminal episode's. The
-        terminal info is preserved in infos["final_info"][env_idx]. Pattern
-        from scripts/denoising_lab/eval/robocasa_eval_benchmark.py:393-402.
+        Under autoreset_mode=DISABLED (what we use) there is no autoreset, so the
+        terminating step's regular infos[key] already holds the terminal value
+        and the final_info branch is simply an unused, defensive fallback. (It is
+        retained for robustness: under SAME_STEP-style autoreset the terminating
+        step's regular info would reflect the reset episode and the terminal info
+        would live in infos["final_info"][env_idx]. Pattern from
+        scripts/denoising_lab/eval/robocasa_eval_benchmark.py:393-402.)
         """
         if "final_info" in infos and infos["final_info"][env_idx] is not None:
             return infos["final_info"][env_idx].get(key)
@@ -1673,6 +1853,7 @@ def main():
         server_port=args.server_port,
         debug_fast_forward=args.debug_fast_forward,
         output_dir=args.output_dir,
+        num_async_vector_env=args.num_async_vector_env,
     )
 
     try:

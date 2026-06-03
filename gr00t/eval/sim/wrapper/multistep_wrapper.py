@@ -253,6 +253,17 @@ class MultiStepWrapper(gym.Wrapper):
         states = []
         rewards = []
         dones = []
+        # Defaults so that if the loop breaks on its FIRST iteration — which
+        # happens when step() is called on an already-done env (e.g. a vector
+        # env under autoreset_mode=DISABLED steps a done env while sibling envs
+        # are still active) — `env_state` and `truncated` remain bound for the
+        # post-loop assembly/return below. Without these, that path raises
+        # UnboundLocalError (env_state at info["model"]=..., then truncated at
+        # the return). In the normal path both are overwritten inside the loop,
+        # so this is behavior-preserving; it just makes step() a clean no-op
+        # (returns the cached obs with done=True) instead of crashing.
+        env_state = {"states": [], "model": []}
+        truncated = False
         for step in range(self.n_action_steps):
             act = {}
             for key, value in action.items():

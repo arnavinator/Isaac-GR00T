@@ -15,7 +15,8 @@ to the right collector by env_name.
 Architecture:
 - Trainer (main .venv) → CollectorClient → ZMQ → CollectorServer (robocasa venv)
 - CollectorServer holds a dict {env_name: EpisodeCollector}, dispatches per request.
-- Each EpisodeCollector owns its own AsyncVectorEnv (group_size workers).
+- Each EpisodeCollector owns its own AsyncVectorEnv (num_async_vector_env workers,
+  default group_size).
 
 Usage:
     # Terminal 1 (sim venv) — start the long-running collector server.
@@ -43,9 +44,9 @@ Usage:
     # noise/raw_action capture hooks the collector relies on).
 
 Operational notes:
-- Each EpisodeCollector spawns group_size MuJoCo subprocesses; total worker
-  count is len(env_names) × group_size. Sized to fit on one machine — 8
-  tasks × 5 workers = 40 sims is comfortable on 64+ GB RAM.
+- Each EpisodeCollector spawns num_async_vector_env MuJoCo subprocesses (default
+  group_size); total worker count is len(env_names) × num_async_vector_env. Sized
+  to fit on one machine — 8 tasks × 5 workers = 40 sims is comfortable on 64+ GB RAM.
 - Memory creep over many iterations is real (small leaks in MuJoCo/robosuite
   caches). Restart the server every ~50-100 iterations as a hygiene measure;
   the trainer's --collector-server-host flag handles connect-fail by simply
@@ -99,11 +100,12 @@ class CollectorServer:
 
     Endpoints:
       - ping  → {"status": "ok", "envs": [...], "group_size": int,
-                 "n_action_steps": int, "env_max_steps": {env: int}}
+                 "num_async_vector_env": int|None, "n_action_steps": int,
+                 "env_max_steps": {env: int}}
         The trainer pings at __init__ to validate that its config matches
-        the server's bake-time args (n_action_steps / group_size / per-env
-        max_episode_steps). Any mismatch fails fast with the exact restart
-        command needed.
+        the server's bake-time args (n_action_steps / group_size /
+        num_async_vector_env / per-env max_episode_steps). Any mismatch fails
+        fast with the exact restart command needed.
       - collect (data: env_name, output_dir, base_seed, num_groups,
         success_weight, fast_forward_steps, fast_forward_pct)
         → {"n_episodes", "n_successes", "elapsed_s", "env_name"}
@@ -120,6 +122,7 @@ class CollectorServer:
         policy_server_port: int,
         listen_port: int,
         debug_fast_forward: bool = False,
+        num_async_vector_env: int | None = None,
     ):
         if len(env_names) != len(max_episode_steps):
             raise ValueError(
@@ -129,14 +132,18 @@ class CollectorServer:
 
         # Stored for ping()-based validation by the trainer.
         self.group_size = group_size
+        # Physical worker count per group (None → group_size). Bake-time, like
+        # group_size/n_action_steps — reported via ping() for the trainer to
+        # cross-check against its own config.
+        self.num_async_vector_env = num_async_vector_env
         self.n_action_steps = n_action_steps
         self.env_max_steps: dict[str, int] = dict(zip(env_names, max_episode_steps))
         self.debug_fast_forward = debug_fast_forward
         self.listen_port = listen_port
 
         # Pre-initialize one collector per env. Each one spawns its own
-        # AsyncVectorEnv (group_size workers) — the entire startup cost is
-        # paid once here, not per iteration.
+        # AsyncVectorEnv (num_async_vector_env workers, default group_size) — the
+        # entire startup cost is paid once here, not per iteration.
         self.collectors: dict[str, EpisodeCollector] = {}
         for env_name, max_steps in zip(env_names, max_episode_steps):
             print(f"\n[collector_server] Initializing collector for {env_name} (max_steps={max_steps})...")
@@ -149,6 +156,7 @@ class CollectorServer:
                 server_port=policy_server_port,
                 debug_fast_forward=debug_fast_forward,
                 output_dir="/tmp",  # overridden per-request
+                num_async_vector_env=num_async_vector_env,
             )
 
         # ZMQ REP socket. RCVTIMEO lets the run loop wake periodically so
@@ -193,6 +201,7 @@ class CollectorServer:
                         "status": "ok",
                         "envs": list(self.collectors),
                         "group_size": self.group_size,
+                        "num_async_vector_env": self.num_async_vector_env,
                         "n_action_steps": self.n_action_steps,
                         "env_max_steps": self.env_max_steps,
                         "debug_fast_forward": self.debug_fast_forward,
@@ -490,6 +499,12 @@ def parse_args() -> argparse.Namespace:
         help="Rollouts per group (G). Same for all envs. MUST match trainer config.",
     )
     parser.add_argument(
+        "--num-async-vector-env", type=int, default=None,
+        help="Physical AsyncVectorEnv worker count per group. Default None → "
+             "group_size. Must be <= group_size and divide it evenly. MUST "
+             "match trainer config (validated at ping time).",
+    )
+    parser.add_argument(
         "--n-action-steps", type=int, default=8,
         help="Substeps per action chunk. MUST match trainer config.",
     )
@@ -524,6 +539,7 @@ def main():
         policy_server_port=args.policy_server_port,
         listen_port=args.listen_port,
         debug_fast_forward=args.debug_fast_forward,
+        num_async_vector_env=args.num_async_vector_env,
     )
 
     # SIGTERM handler: just flip the running flag; the run loop polls every

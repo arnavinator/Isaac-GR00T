@@ -127,7 +127,10 @@ class GRPOTrainer:
             # this iter. With dynamic mode active (min_successful_groups>0
             # and max_groups>num_groups in EpisodeCollector.collect), the
             # collector may run up to max_groups groups; otherwise it stops
-            # at exactly num_groups. ~7 min/group on the user's setup.
+            # at exactly num_groups. ~7 min/group on the user's setup. With
+            # num_async_vector_env < group_size each group is collected over
+            # turns_per_group sequential turns, so scale by that factor too
+            # (turns_per_group == 1 in the default one-env-per-rollout case).
             effective_max_groups = (
                 self.config.max_groups
                 if self.config.min_successful_groups > 0
@@ -137,7 +140,15 @@ class GRPOTrainer:
             self._collector_client = CollectorClient(
                 host=self.config.collector_server_host,
                 port=self.config.collector_server_port,
-                timeout_ms=420_000 * effective_max_groups,
+                # Cap below ZMQ's int32 RCVTIMEO limit (~2.147e9 ms). The scaled
+                # value can exceed it at extreme configs (e.g. group_size>=52,
+                # num_envs=1, max_groups=100 → turns_per_group=52), which would
+                # otherwise raise OverflowError at socket setup. ~2e9 ms (~23
+                # days) is effectively unbounded for collection anyway.
+                timeout_ms=min(
+                    420_000 * effective_max_groups * self._turns_per_group(),
+                    2_000_000_000,
+                ),
             )
             try:
                 info = self._collector_client.ping()
@@ -158,6 +169,7 @@ class GRPOTrainer:
                 f"{self.config.collector_server_port} "
                 f"(envs: {sorted(info.get('envs', []))}, "
                 f"group_size={info.get('group_size')}, "
+                f"num_async_vector_env={info.get('num_async_vector_env')}, "
                 f"n_action_steps={info.get('n_action_steps')})"
             )
 
@@ -392,13 +404,23 @@ class GRPOTrainer:
                 f"  Episodes per iteration: {total_eps} "
                 f"({self.config.num_groups} groups × {self.config.group_size})"
             )
+        if self._resolved_num_async_vector_env() != self.config.group_size:
+            print(
+                f"  Async vector envs: {self._resolved_num_async_vector_env()} "
+                f"workers → {self._turns_per_group()} turns/group "
+                f"(group_size={self.config.group_size})"
+            )
         print(f"  Update epochs: {self.config.update_epochs}")
         print(f"  Mini-batch size: {self.config.mini_batch_size}")
-        if self.config.balanced_training:
+        if self.config.balanced_minibatch_training:
             print(
-                f"  Balanced training: ON "
-                f"(positive_adv_ratio={self.config.balanced_training_positive_adv_ratio}, "
-                f"dynamic epochs=max(1, floor(2·min(sf,1-sf)·{self.config.update_epochs}+0.5)))"
+                f"  Balanced mini-batch sampling: ON "
+                f"(positive_adv_ratio={self.config.balanced_minibatch_positive_adv_ratio})"
+            )
+        if self.config.dynamic_epoch_training:
+            print(
+                f"  Dynamic epoch count: ON "
+                f"(tent epochs=max(1, floor(2·min(sf,1-sf)·{self.config.update_epochs}+0.5)))"
             )
         if self.config.jitter_lambda > 0.0:
             # Surface the doubled-step cost up-front so the user can confirm
@@ -762,6 +784,22 @@ class GRPOTrainer:
                 f"Failure counter NOT incremented."
             )
 
+    def _resolved_num_async_vector_env(self) -> int:
+        """Physical AsyncVectorEnv worker count per group (config value, or
+        group_size when unset). __post_init__ guarantees it divides group_size
+        and is <= group_size."""
+        return (
+            self.config.group_size
+            if self.config.num_async_vector_env is None
+            else self.config.num_async_vector_env
+        )
+
+    def _turns_per_group(self) -> int:
+        """Sequential collection turns needed to fill one group of group_size
+        rollouts with num_async_vector_env physical envs (1 in the default
+        one-env-per-rollout case)."""
+        return self.config.group_size // self._resolved_num_async_vector_env()
+
     def _collect_via_subprocess(
         self,
         env_name: str,
@@ -787,6 +825,7 @@ class GRPOTrainer:
             collector_script,
             "--env-name", env_name,
             "--group-size", str(self.config.group_size),
+            "--num-async-vector-env", str(self._resolved_num_async_vector_env()),
             "--num-groups", str(self.config.num_groups),
             "--max-episode-steps", str(max_steps),
             "--n-action-steps", str(self.config.n_action_steps),
@@ -833,7 +872,7 @@ class GRPOTrainer:
             and self.config.max_groups > self.config.num_groups
             else self.config.num_groups
         )
-        timeout_s = 420 * effective_max_groups  # 7 min/group
+        timeout_s = 420 * effective_max_groups * self._turns_per_group()  # 7 min/group/turn
         # When clean_output is on, propagate via env var because the
         # collector's import-time suppression must run BEFORE argparse
         # (otherwise robocasa import noise has already fired). Copy the
@@ -918,9 +957,11 @@ class GRPOTrainer:
                 f"Collector server reports fatal config error: {e}. This "
                 f"won't fix itself on retry — restart the collector server "
                 f"with --env-names / --max-episode-steps / --group-size / "
-                f"--n-action-steps matching this trainer's config "
+                f"--num-async-vector-env / --n-action-steps matching this "
+                f"trainer's config "
                 f"(env_names={self.config.env_names}, "
                 f"group_size={self.config.group_size}, "
+                f"num_async_vector_env={self._resolved_num_async_vector_env()}, "
                 f"n_action_steps={self.config.n_action_steps})."
             ) from e
         except TimeoutError as e:
@@ -960,6 +1001,25 @@ class GRPOTrainer:
                 f"group_size mismatch: trainer config = {self.config.group_size}, "
                 f"server (boot-time) = {server_group_size}. Restart the "
                 f"collector server with --group-size {self.config.group_size}."
+            )
+
+        # num_async_vector_env: resolve both sides to the effective worker count
+        # before comparing, so a trainer with None (→ group_size) matches a
+        # server booted with --num-async-vector-env group_size and vice-versa.
+        # An OLD server (pre-this-feature) returns None for the key → resolves
+        # to its group_size; this passes silently when the trainer also uses the
+        # default and correctly fails (with a restart hint) when the trainer
+        # lowers num_async_vector_env below group_size.
+        trainer_nave = self._resolved_num_async_vector_env()
+        server_nave_raw = info.get("num_async_vector_env")
+        server_nave = (
+            server_group_size if server_nave_raw is None else server_nave_raw
+        )
+        if server_nave != trainer_nave:
+            raise RuntimeError(
+                f"num_async_vector_env mismatch: trainer config = {trainer_nave}, "
+                f"server (boot-time) = {server_nave}. Restart the collector "
+                f"server with --num-async-vector-env {trainer_nave}."
             )
 
         server_n_action_steps = info.get("n_action_steps")
@@ -1402,7 +1462,7 @@ class GRPOTrainer:
         n_rows_jitter = 0
 
         # ── Balanced training: dynamic epoch count ───────────────────────────
-        # When balanced_training=True, scale update_epochs using a tent function
+        # When dynamic_epoch_training=True, scale update_epochs using a tent function
         # of the positive-advantage fraction among live-group episodes:
         #
         #   m    = min(successful_eps, total_eps − successful_eps)
@@ -1438,7 +1498,7 @@ class GRPOTrainer:
         # which oversamples chunks with c.advantage > 0. With shaped rewards
         # (success_weight < 1.0), a failing episode with high max_progress can
         # have positive advantage — ep.success would undercount these.
-        if self.config.balanced_training:
+        if self.config.dynamic_epoch_training:
             live_group_ids = {c.group_id for c in live_chunks}
             live_ep_indices = [
                 i for i, ep in enumerate(self.buffer.episodes)
@@ -1458,10 +1518,10 @@ class GRPOTrainer:
             n = total_eps_collected
             actual_num_epochs = max(1, (4 * m * E + n) // (2 * n))
             update_scale = 2.0 * m / n  # float tent scale, for the print only
-            # Always print: silence looks like balanced training is off when it's
-            # actually running at full capacity (epochs == update_epochs near peak).
+            # Always print: silence looks like dynamic epoch scaling is off when
+            # it's actually running at full capacity (epochs == update_epochs near peak).
             print(
-                f"  Balanced training: {successful_eps}/{total_eps_collected} "
+                f"  Dynamic epochs: {successful_eps}/{total_eps_collected} "
                 f"positive-advantage live-group episodes "
                 f"(tent scale={update_scale:.2f}) "
                 f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
@@ -1483,7 +1543,7 @@ class GRPOTrainer:
                 self.config.seed + self.iteration * 100 + epoch
             )
 
-            if self.config.balanced_training:
+            if self.config.balanced_minibatch_training:
                 batch_iter = self._iter_balanced_minibatches(entries, rng)
             else:
                 batch_iter = self._iter_stratified_minibatches(entries, rng)
@@ -1786,7 +1846,7 @@ class GRPOTrainer:
         # Model remains in eval mode (it never left)
         if n_updates == 0:
             early: dict = {"n_skipped_nonfinite": n_skipped_nonfinite} if n_skipped_nonfinite else {}
-            if self.config.balanced_training:
+            if self.config.dynamic_epoch_training:
                 early["actual_epochs"] = actual_num_epochs
                 if success_frac is not None:
                     early["success_fraction"] = success_frac
@@ -2011,7 +2071,7 @@ class GRPOTrainer:
         if not entries:
             return
 
-        pos_ratio = self.config.balanced_training_positive_adv_ratio
+        pos_ratio = self.config.balanced_minibatch_positive_adv_ratio
 
         # Split entries by advantage sign. The per-chunk advantage inherits its
         # sign directly from the episode-level group-relative normalization;
@@ -2623,12 +2683,12 @@ class GRPOTrainer:
                 iteration,
             )
 
-        # Balanced training diagnostics. Only emitted when balanced_training=True
+        # Dynamic-epoch diagnostics. Only emitted when dynamic_epoch_training=True
         # AND at least one optimizer step actually fired. Gating on n_updates>0
         # prevents logging "planned" epoch counts on iters where all minibatches
         # were skipped (non-finite loss) — the name "actual_epochs" should reflect
         # what was executed, not what was planned.
-        if (self.config.balanced_training and update_stats is not None
+        if (self.config.dynamic_epoch_training and update_stats is not None
                 and update_stats.get("n_updates", 0) > 0):
             if "actual_epochs" in update_stats:
                 self.writer.add_scalar(
@@ -2756,10 +2816,11 @@ class GRPOTrainer:
                             for k, v in update_stats.items()
                             if k not in (
                                 "n_updates", "n_skipped_nonfinite",
-                                # Handled by the gated balanced_training block
-                                # below; exclude here to avoid both a spurious
-                                # train/actual_epochs curve on vanilla runs and
-                                # a double-log (train/ + balanced/) on balanced runs.
+                                # Handled by the gated dynamic_epoch_training
+                                # block below; exclude here to avoid both a
+                                # spurious train/actual_epochs curve on vanilla
+                                # runs and a double-log (train/ + balanced/) on
+                                # dynamic-epoch runs.
                                 "actual_epochs", "success_fraction",
                             )
                         })
@@ -2769,7 +2830,7 @@ class GRPOTrainer:
                     log_dict.update({f"time/{k}_seconds": v for k, v in phase_times.items()})
                 if lora_delta_norm is not None:
                     log_dict["lora/weight_delta_norm"] = lora_delta_norm
-                if (self.config.balanced_training and update_stats is not None
+                if (self.config.dynamic_epoch_training and update_stats is not None
                         and update_stats.get("n_updates", 0) > 0):
                     if "actual_epochs" in update_stats:
                         log_dict["balanced/actual_epochs"] = update_stats["actual_epochs"]

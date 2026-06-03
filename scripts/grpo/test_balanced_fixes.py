@@ -31,8 +31,9 @@ class _FakeChunk:
 
 @dataclass
 class _FakeConfig:
-    balanced_training: bool = True
-    balanced_training_positive_adv_ratio: float = 0.5
+    balanced_minibatch_training: bool = True
+    dynamic_epoch_training: bool = True
+    balanced_minibatch_positive_adv_ratio: float = 0.5
     mini_batch_size: int = 8
     update_epochs: int = 4
     seed: int = 42
@@ -43,7 +44,7 @@ class _FakeTrainer:
 
     def __init__(self, pos_ratio: float = 0.5, mb_size: int = 8, update_epochs: int = 4):
         self.config = _FakeConfig(
-            balanced_training_positive_adv_ratio=pos_ratio,
+            balanced_minibatch_positive_adv_ratio=pos_ratio,
             mini_batch_size=mb_size,
             update_epochs=update_epochs,
         )
@@ -68,7 +69,7 @@ class _FakeTrainer:
         if not entries:
             return
 
-        pos_ratio = self.config.balanced_training_positive_adv_ratio
+        pos_ratio = self.config.balanced_minibatch_positive_adv_ratio
 
         pos_indices = [i for i, (c, _) in enumerate(entries) if c.advantage > 0]
         neg_indices = [i for i, (c, _) in enumerate(entries) if c.advantage <= 0]
@@ -153,17 +154,17 @@ def _make_tent_epochs_exact(k: int, n: int, update_epochs: int) -> int:
     return max(1, (4 * m * update_epochs + n) // (2 * n))
 
 
-def compute_actual_epochs(balanced_training: bool, success_frac: float, update_epochs: int) -> int:
+def compute_actual_epochs(dynamic_epoch_training: bool, success_frac: float, update_epochs: int) -> int:
     """Stub for the epoch-count branching in _grpo_update_inner.
 
     Mirrors the if/else at train_grpo.py:
-        if self.config.balanced_training:
+        if self.config.dynamic_epoch_training:
             m = min(successful_eps, total_eps - successful_eps)
             actual_num_epochs = max(1, (4*m*E + n) // (2*n))  # integer tent
         else:
             actual_num_epochs = self.config.update_epochs  # tent NOT applied
     """
-    if balanced_training:
+    if dynamic_epoch_training:
         return _make_tent_epochs(success_frac, update_epochs)
     else:
         return update_epochs  # no tent — exactly what the else branch does
@@ -245,7 +246,7 @@ def test_tent_epoch_scaling():
         got = _make_tent_epochs(f, update_epochs=4)
         check(f"tent always >=1 at frac={f}", got >= 1, f"got {got}")
 
-    # balanced_training=False path is unaffected — returns update_epochs unchanged
+    # dynamic_epoch_training=False path is unaffected — returns update_epochs unchanged
     # (this is tested at the trainer level in test_false_path_unchanged)
 
 
@@ -418,22 +419,22 @@ def test_balanced_sampler_epoch_length_anchor():
 
 
 def test_false_path_unchanged():
-    """balanced_training=False: actual_num_epochs must always equal config.update_epochs.
+    """dynamic_epoch_training=False: actual_num_epochs must always equal config.update_epochs.
 
     Uses compute_actual_epochs() — a stub that mirrors the if/else in
     _grpo_update_inner — so we actually exercise both branches rather than
     checking local variable assignments (which would be a tautology).
     """
-    print("\n[Fix 2] balanced_training=False path is unchanged")
+    print("\n[Fix 2] dynamic_epoch_training=False path is unchanged")
 
     update_epochs = 4
 
     # False path: no tent applied regardless of what success_frac would be.
     # Verify compute_actual_epochs returns update_epochs exactly for all fractions.
     for frac in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]:
-        got = compute_actual_epochs(balanced_training=False, success_frac=frac, update_epochs=update_epochs)
+        got = compute_actual_epochs(dynamic_epoch_training=False, success_frac=frac, update_epochs=update_epochs)
         check(
-            f"balanced=False, frac={frac}: actual_epochs=={update_epochs} (tent NOT applied)",
+            f"dynamic_epoch=False, frac={frac}: actual_epochs=={update_epochs} (tent NOT applied)",
             got == update_epochs,
             f"got {got}",
         )
@@ -449,17 +450,17 @@ def test_false_path_unchanged():
     )
 
     # True path: tent IS applied and gives update_epochs only at exactly sf=0.5.
-    got_at_half = compute_actual_epochs(balanced_training=True, success_frac=0.5, update_epochs=update_epochs)
+    got_at_half = compute_actual_epochs(dynamic_epoch_training=True, success_frac=0.5, update_epochs=update_epochs)
     check(
-        f"balanced=True, frac=0.5: actual_epochs=={update_epochs} (tent peak)",
+        f"dynamic_epoch=True, frac=0.5: actual_epochs=={update_epochs} (tent peak)",
         got_at_half == update_epochs,
         f"got {got_at_half}",
     )
     # At 0% and 100% success (all-one-sign), tent gives 1 — not update_epochs.
     for extreme_frac in [0.0, 1.0]:
-        got = compute_actual_epochs(balanced_training=True, success_frac=extreme_frac, update_epochs=update_epochs)
+        got = compute_actual_epochs(dynamic_epoch_training=True, success_frac=extreme_frac, update_epochs=update_epochs)
         check(
-            f"balanced=True, frac={extreme_frac}: actual_epochs==1 (tent floor)",
+            f"dynamic_epoch=True, frac={extreme_frac}: actual_epochs==1 (tent floor)",
             got == 1,
             f"got {got}",
         )
@@ -608,6 +609,73 @@ def test_tent_exact_integer_formula():
         check(f"integer tent always >=1: k={k},n={n},E={E}", got >= 1, f"got {got}")
 
 
+# ── Split: the two flags are independent ─────────────────────────────────────
+
+def test_independent_flag_combinations():
+    """balanced_minibatch_training and dynamic_epoch_training are independent.
+
+    Drives all four on/off combinations on the iter-4-like input (14 pos, 6 neg,
+    success_frac=0.7, update_epochs=4) and asserts:
+      - the minibatch flag ALONE controls sampling: ON → epoch pos-fraction
+        ≈ 0.5 (balanced), OFF → ≈ 0.7 (stratified / natural).
+      - the dynamic-epoch flag ALONE controls epochs: ON → tent gives 2, OFF → 4.
+    NOTE on scope: like the rest of this file, the dispatch (`_dispatch` below)
+    and epoch (`compute_actual_epochs`) helpers MIRROR the real gating in
+    train_grpo._grpo_update_inner rather than invoking it (the real path needs
+    the GPU model + buffer). So this guards the *logic* of independence, not the
+    exact flag names at the real dispatch sites — those are verified by
+    inspection (train_grpo.py: epochs gate on dynamic_epoch_training, sampler
+    gate on balanced_minibatch_training).
+    """
+    print("\n[Split] Independent balanced_minibatch_training × dynamic_epoch_training")
+
+    n_pos, n_neg = 14, 6
+    success_frac = n_pos / (n_pos + n_neg)  # 0.7
+    update_epochs = 4
+
+    def _dispatch(trainer, entries, rng):
+        # Mirror train_grpo._grpo_update_inner's minibatch dispatch gating.
+        if trainer.config.balanced_minibatch_training:
+            return list(trainer._iter_balanced_minibatches(entries, rng))
+        return list(trainer._iter_stratified_minibatches(entries, rng))
+
+    for mb_flag in (True, False):
+        for dyn_flag in (True, False):
+            trainer = _FakeTrainer(pos_ratio=0.5, mb_size=8, update_epochs=update_epochs)
+            trainer.config.balanced_minibatch_training = mb_flag
+            trainer.config.dynamic_epoch_training = dyn_flag
+
+            rng = np.random.default_rng(17)
+            entries = _make_entries(n_pos, n_neg)
+            batches = _dispatch(trainer, entries, rng)
+            all_pos = sum(sum(1 for c, _ in b if c.advantage > 0) for b in batches)
+            all_total = sum(len(b) for b in batches)
+            obs_pos_frac = all_pos / all_total if all_total else 0.0
+
+            # Sampler behavior depends ONLY on the minibatch flag.
+            if mb_flag:
+                check(
+                    f"mb={mb_flag}, dyn={dyn_flag}: balanced sampler → pos_frac≈0.5",
+                    abs(obs_pos_frac - 0.5) < 0.15,
+                    f"obs={obs_pos_frac:.2f}",
+                )
+            else:
+                check(
+                    f"mb={mb_flag}, dyn={dyn_flag}: stratified → pos_frac≈natural 0.7",
+                    obs_pos_frac > 0.6,
+                    f"obs={obs_pos_frac:.2f}",
+                )
+
+            # Epoch count depends ONLY on the dynamic-epoch flag.
+            epochs = compute_actual_epochs(dyn_flag, success_frac, update_epochs)
+            expected_epochs = 2 if dyn_flag else update_epochs
+            check(
+                f"mb={mb_flag}, dyn={dyn_flag}: actual_epochs=={expected_epochs}",
+                epochs == expected_epochs,
+                f"got {epochs}",
+            )
+
+
 if __name__ == "__main__":
     test_tent_epoch_scaling()
     test_balanced_sampler_too_few_positives()
@@ -621,6 +689,7 @@ if __name__ == "__main__":
     test_balanced_sampler_minority_cycles()
     test_iter4_scenario()
     test_tent_exact_integer_formula()
+    test_independent_flag_combinations()
 
     print()
     if _failures:

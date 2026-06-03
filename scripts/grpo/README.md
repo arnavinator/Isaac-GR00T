@@ -260,14 +260,45 @@ trainer's `env_names` and raises on mismatch.
 
 ### AsyncVectorEnv + scene-bundle alignment
 
-`group_size > 1` uses `gym.vector.AsyncVectorEnv` (subprocess workers,
-parallel MuJoCo). RoboCasa picks layout/textures at env construction via a
-per-instance RNG, so identically-seeded parallel workers still render
-**different** scenes. `GroupAlignmentWrapper` (`collect_episodes.py`)
-exposes composite RPCs (`get_scene_bundle`, `apply_scene_bundle`) that the
-parent invokes via `env.call()` to copy env-0's scene XML + flat MuJoCo
-state to all other workers. After alignment, every env in the group is
-bit-identical (verifiable via `--debug-fast-forward`).
+`num_async_vector_env > 1` uses `gym.vector.AsyncVectorEnv` (subprocess
+workers, parallel MuJoCo); `== 1` uses `SyncVectorEnv` (no IPC). RoboCasa
+picks layout/textures at env construction via a per-instance RNG, so
+identically-seeded parallel workers still render **different** scenes.
+`GroupAlignmentWrapper` (`collect_episodes.py`) exposes composite RPCs
+(`get_scene_bundle`, `apply_scene_bundle`) that the parent invokes via
+`env.call()` to copy env-0's scene XML + flat MuJoCo state to all other
+workers. After alignment, every env in the group is bit-identical
+(verifiable via `--debug-fast-forward`).
+
+### Decoupling group size from worker count (`num_async_vector_env`)
+
+`group_size` is the **logical** number of rollouts per group;
+`num_async_vector_env` is the **physical** number of parallel sim workers.
+By default (`None`) they're equal — one worker per rollout, unchanged from
+before this knob existed. Set `num_async_vector_env < group_size` to cap
+peak worker RAM (each MuJoCo worker is ~5 GiB) on RAM-limited hosts: a group
+is then collected over `k = group_size // num_async_vector_env` sequential
+**turns** of `num_async_vector_env` rollouts each.
+
+- **Constraint:** `1 <= num_async_vector_env <= group_size` and
+  `group_size % num_async_vector_env == 0` (validated in
+  `GRPOConfig.__post_init__`; non-divisor or `> group_size` raises). Going
+  *above* `group_size` (packing multiple groups into one batch) is out of
+  scope.
+- Turn 1 establishes and **captures** the branch-point bundle; turns 2..k
+  re-apply it (`apply_scene_bundle`) so every turn restarts from the
+  bit-identical state. All `group_size` rollouts share one `group_id`, so
+  group-relative advantage normalization is unaffected — it sees one group
+  of `group_size`, not `k` smaller groups.
+- Diversity across turns is genuine: the server's denoising noise
+  (`torch.randn`) is unseeded, so each turn's fresh query yields distinct
+  rollouts even from the identical initial state.
+- **Cost:** ~`k`× collection wall time per group (turns are sequential). The
+  trainer scales its subprocess / RPC collector timeouts by `k`
+  automatically.
+- Bake-time, like `group_size`: pass `--num-async-vector-env` to
+  `collector_server.py` so it matches the trainer; the ping check fails fast
+  with a restart hint on mismatch.
 
 ### Fast-Forward Branching
 
@@ -309,6 +340,10 @@ Edge cases handled:
 
 - If any env terminates during the FF prefix (e.g., accidental success),
   the collector falls back to a normal seed-aligned group for that group.
+- With `num_async_vector_env < group_size`, the post-FF branch point is
+  captured once (turn 1, via `get_scene_bundle`) and re-applied for turns
+  2..k — the lockstep FF prefix is **not** re-run on later turns (it would
+  diverge, since the model-query denoising noise is unseeded).
 - FF prefix steps are **not** counted in `episode.num_steps`, so
   time-scaled rewards compare post-branch effort fairly within a group.
 - `--debug-fast-forward` saves a per-group montage of camera views to
@@ -650,19 +685,21 @@ for essentially the whole epoch.
 
 ### Balanced Training
 
-An optional pair of mechanisms that address the common failure mode in
+Two **independent** mechanisms that address the common failure mode in
 early-stage GRPO where most rollouts fail: negative-advantage chunks
 vastly outnumber positives, individual mini-batches carry a weak or
 one-sided gradient signal, and a small number of sparse successes are
 over- or under-weighted relative to the training budget they warrant.
 
-Both mechanisms are on by default (`balanced_training = True`) and
-activate together. When off, training is bit-identical to the unmodified
-stratified-minibatch path.
+Each is controlled by its **own** flag — `balanced_minibatch_training`
+(mechanism 1) and `dynamic_epoch_training` (mechanism 2) — both default
+`True`. They are fully decoupled, so any of the four on/off combinations is
+valid. With both off, training is bit-identical to the unmodified
+stratified-minibatch, fixed-epoch (`update_epochs`) path.
 
-#### Mechanism 1: balanced mini-batch sampling
+#### Mechanism 1: balanced mini-batch sampling (`balanced_minibatch_training`)
 
-**What it does.** Each mini-batch enforces `balanced_training_positive_adv_ratio`
+**What it does.** Each mini-batch enforces `balanced_minibatch_positive_adv_ratio`
 (X) in **both directions**. The sign class that is underrepresented relative to
 X is the "minority" and is oversampled with replacement; the overrepresented
 class is the "majority" and is drawn without replacement, controlling when the
@@ -702,7 +739,7 @@ epoch granularity (not within a single mini-batch), so the pairing
 requirement is satisfied regardless of whether fixed and jitter copies land
 in the same batch. The combination of both features is sound.
 
-#### Mechanism 2: dynamic epoch count
+#### Mechanism 2: dynamic epoch count (`dynamic_epoch_training`)
 
 **What it does.** Scales `update_epochs` using a **tent function** of the
 positive-advantage fraction, implemented via exact integer arithmetic:
@@ -751,28 +788,37 @@ implementations at specific episode counts when `update_epochs ≥ 6`.
 #### CLI usage
 
 ```bash
+# Both mechanisms are ON by default. Use the tyro switch flags to toggle them
+# (--flag enables, --no-flag disables); booleans take no value.
 uv run python scripts/grpo/train_grpo.py \
-    --balanced-training True \
-    --balanced-training-positive-adv-ratio 0.5 \
+    --no-dynamic-epoch-training \
+    --balanced-minibatch-positive-adv-ratio 0.7 \
     --update-epochs 5 \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env
 ```
 
-The startup banner prints `Balanced training: ON (positive_adv_ratio=…,
-dynamic epochs=max(1, floor(2·min(sf,1-sf)·N+0.5)))`. A per-iteration line
-`Balanced training: X/Y positive-advantage live-group episodes (tent scale=Z)
-→ A/N epochs` is printed whenever the epoch count differs from `update_epochs`.
-TensorBoard logs `balanced/actual_epochs` and
-`balanced/success_fraction` whenever at least one optimizer step fired
-in that iteration.
+The two flags are independent — e.g. the run above keeps the balanced
+sampler (`balanced_minibatch_training` stays on) but runs exactly
+`update_epochs` epochs every iteration (`--no-dynamic-epoch-training`). To do
+the reverse, pass `--no-balanced-minibatch-training` and leave the dynamic
+epochs on.
+
+The startup banner prints one line per enabled mechanism:
+`Balanced mini-batch sampling: ON (positive_adv_ratio=…)` and/or
+`Dynamic epoch count: ON (tent epochs=max(1, floor(2·min(sf,1-sf)·N+0.5)))`.
+When `dynamic_epoch_training` is on, a per-iteration line `Dynamic epochs:
+X/Y positive-advantage live-group episodes (tent scale=Z) → A/N epochs` is
+printed. TensorBoard logs `balanced/actual_epochs` and
+`balanced/success_fraction` (gated on `dynamic_epoch_training` and at least
+one optimizer step in that iteration).
 
 #### Files touched
 
 | File | Change |
 |------|--------|
-| `grpo_config.py` | Adds `balanced_training: bool = True` and `balanced_training_positive_adv_ratio: float = 0.5` with `__post_init__` validation (ratio strictly in `(0, 1)` when feature is on). |
-| `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` via integer tent formula from live-group episode counts. Dispatches to `_iter_balanced_minibatches` when enabled. `_iter_balanced_minibatches` applies the target ratio bidirectionally — cycles the minority sign class with replacement, drains the majority without replacement. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `n_updates > 0`). |
-| `test_balanced_fixes.py` | Unit tests for both mechanisms: per-batch ratio in both directions (too-few-positives and too-many-positives), epoch-length anchor, minority cycling, all fallback paths, tent formula correctness including integer ULP cases. |
+| `grpo_config.py` | Adds `balanced_minibatch_training: bool = True`, `dynamic_epoch_training: bool = True`, and `balanced_minibatch_positive_adv_ratio: float = 0.5` with `__post_init__` validation (ratio strictly in `(0, 1)` when `balanced_minibatch_training=True`). |
+| `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` via the integer tent formula when `dynamic_epoch_training` is on (else `update_epochs`), and dispatches to `_iter_balanced_minibatches` when `balanced_minibatch_training` is on (else `_iter_stratified_minibatches`). `_iter_balanced_minibatches` applies the target ratio bidirectionally — cycles the minority sign class with replacement, drains the majority without replacement. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `dynamic_epoch_training` and `n_updates > 0`). |
+| `test_balanced_fixes.py` | Unit tests for both mechanisms plus their independence (all four on/off combinations): per-batch ratio in both directions, epoch-length anchor, minority cycling, fallback paths, tent formula correctness including integer ULP cases. |
 
 ---
 
@@ -1292,8 +1338,13 @@ uv run python scripts/grpo/train_grpo.py \
   `proj_out_{1,2}`). ~20M trainable params at rank=16.
 
 **Episode collection**
-- `group_size` (G) — rollouts per group; also the number of parallel
-  envs. Default 4.
+- `group_size` (G) — logical rollouts per group. Default 4.
+- `num_async_vector_env` — physical parallel-env workers per group. Default
+  `None` → `group_size` (one worker per rollout, unchanged). Set lower (must
+  divide `group_size` and be `<=` it) to collect each group over
+  `group_size // num_async_vector_env` sequential turns and cap peak worker
+  RAM. See "Decoupling group size from worker count". Bake-time: must match
+  `collector_server.py --num-async-vector-env`.
 - `num_groups` — minimum groups per iter. Default 5.
 - `min_successful_groups` / `max_groups` — see "Dynamic group
   collection". Default 4 / 10.
@@ -1328,12 +1379,14 @@ uv run python scripts/grpo/train_grpo.py \
 - `mini_batch_size` (default 8 chunks)
 - `kl_coef` (default 0.1)
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
-- `balanced_training` (default `True`) — see "Balanced Training". When
-  `True`, activates balanced mini-batch sampling and dynamic epoch count.
-- `balanced_training_positive_adv_ratio` (default `0.5`) — target fraction
+- `balanced_minibatch_training` (default `True`) — balanced mini-batch
+  sampling; see "Balanced Training" mechanism 1.
+- `dynamic_epoch_training` (default `True`) — tent-function epoch scaling;
+  see "Balanced Training" mechanism 2. Independent of the flag above.
+- `balanced_minibatch_positive_adv_ratio` (default `0.5`) — target fraction
   of positive-advantage chunks per mini-batch. Must be strictly in `(0, 1)`.
-  Only active when `balanced_training=True`. Raise above 0.5 (e.g. 0.7) to
-  bias more gradient steps toward success examples.
+  Only active when `balanced_minibatch_training=True`. Raise above 0.5 (e.g.
+  0.7) to bias more gradient steps toward success examples.
 
 **Optimizer**
 - `learning_rate` (default 1e-5; ~10× lower than supervised FT because RL
@@ -1359,7 +1412,7 @@ mismatch internally.
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
 `train/{loss,clip_loss,kl_loss,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
 `train/learning_rate`, `time/iteration_seconds`, and (when
-`balanced_training=True` and at least one gradient step fired)
+`dynamic_epoch_training=True` and at least one gradient step fired)
 `balanced/{actual_epochs,success_fraction}`. `mean_log_ratio_abs`
 is the primary diagnostic for DPPO-style surrogates: large values mean
 the FM-MSE log-prob is noisy enough that most updates clip.
@@ -1370,9 +1423,11 @@ the FM-MSE log-prob is noisy enough that most updates clip.
 
 - **GPU**: a single 24-GB+ NVIDIA GPU (training keeps frozen base in
   bf16, only LoRA params in fp32). Tested on A10G with `mini_batch_size=8`.
-- **CPU/RAM**: the collector spawns `group_size` MuJoCo workers per env;
-  in long-running mode, `len(env_names) × group_size` total. 64+ GB
-  RAM is comfortable for 8 tasks × 5 workers.
+- **CPU/RAM**: the collector spawns `num_async_vector_env` MuJoCo workers
+  per env (default `group_size`); in long-running mode,
+  `len(env_names) × num_async_vector_env` total. 64+ GB RAM is comfortable
+  for 8 tasks × 5 workers. Lower `num_async_vector_env` (collecting each
+  group over multiple turns) to fit larger groups on a RAM-limited host.
 - **Robocasa venv**: located at
   `gr00t/eval/sim/robocasa/robocasa_uv/.venv/`. The subprocess collector
   path hard-codes this path; if you've put robocasa elsewhere, switch to

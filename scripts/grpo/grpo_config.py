@@ -76,8 +76,24 @@ class GRPOConfig:
     # Different rollouts diverge due to policy noise (denoising randomness).
     # Advantages are computed by comparing outcomes WITHIN a group.
     # Same as grpo_cont.py's args.num_envs = 5
-    # Also determines the number of parallel environments (one env per rollout).
+    # Also the DEFAULT number of parallel environments (one env per rollout),
+    # unless num_async_vector_env overrides it (see below).
     group_size: int = 4
+
+    # Number of physical AsyncVectorEnv workers used to collect each group.
+    # None → resolves to group_size (one worker per rollout — behavior 100%
+    # unchanged from before this knob existed). When set, it must satisfy
+    # 1 <= num_async_vector_env <= group_size AND
+    # group_size % num_async_vector_env == 0. Each logical group of group_size
+    # rollouts is then collected over k = group_size // num_async_vector_env
+    # sequential "turns" of num_async_vector_env rollouts each, every turn
+    # restarting from the same bit-identical branch-point state (captured via
+    # apply_scene_bundle) and tagged with the same group_id. Within-group
+    # diversity still comes only from per-query denoising noise (unseeded), so
+    # turns are genuinely diverse. Lower this to cap peak worker RAM
+    # (group_size MuJoCo workers can exceed host RAM) at the cost of ~k×
+    # collection wall time per group.
+    num_async_vector_env: Optional[int] = None
 
     # Number of groups per iteration ("questions per iteration")
     # Each group gets a unique seed → unique initial kitchen/object configuration.
@@ -218,37 +234,39 @@ class GRPOConfig:
     # Same as grpo_cont.py's args.update_epochs = 10
     update_epochs: int = 5
 
-    # ─── Balanced Training ───────────────────────────────────────────────────
-    # Addresses gradient instability from skewed episode outcomes. Two
-    # complementary mechanisms activate together when enabled:
+    # ─── Balanced Training (two independent mechanisms) ──────────────────────
+    # Both address gradient instability from skewed episode outcomes, and each
+    # is now toggled by its OWN flag — any of the four on/off combinations is
+    # valid. (Previously a single `balanced_training` flag gated both at once.)
     #
-    #   1. Balanced mini-batch sampling: each mini-batch enforces the target
-    #      pos/neg ratio in BOTH directions. The underrepresented sign class is
-    #      the "minority" and is oversampled with replacement; the
-    #      overrepresented class is the "majority" and is drawn without
-    #      replacement, controlling when the epoch ends.
+    #   1. balanced_minibatch_training — balanced mini-batch sampling: each
+    #      mini-batch enforces the target pos/neg ratio in BOTH directions. The
+    #      underrepresented sign class is the "minority" and is oversampled with
+    #      replacement; the overrepresented class is the "majority" and is drawn
+    #      without replacement, controlling when the epoch ends.
     #        - natural_pos_frac < pos_ratio: too few positives → cycle positives
     #        - natural_pos_frac > pos_ratio: too few negatives → cycle negatives
-    #      Falls back to stratified sampling only when one sign class is
-    #      entirely absent (no positives or no negatives).
+    #      Falls back to stratified sampling only when one sign class is entirely
+    #      absent (no positives or no negatives). When False, uses the plain
+    #      stratified-minibatch path.
     #
-    #   2. Dynamic epoch count via a tent function of success_frac:
+    #   2. dynamic_epoch_training — dynamic epoch count via a tent function of
+    #      success_frac:
     #        m = min(successful_eps, total_eps − successful_eps)
     #        actual_epochs = max(1, (4·m·update_epochs + total_eps) // (2·total_eps))
-    #      Peaks at success_frac=0.5 (→ full update_epochs); decays to 1 at
-    #      both 0% and 100% success. Reduces training at asymmetric extremes
-    #      in either direction, preventing both under-training (sparse signal)
-    #      and over-training (highly asymmetric advantages at high success).
-    #
-    # When False, both mechanisms are disabled and training is identical to
-    # the unmodified stratified-minibatch path.
-    balanced_training: bool = True
+    #      Peaks at success_frac=0.5 (→ full update_epochs); decays to 1 at both
+    #      0% and 100% success. Reduces training at asymmetric extremes in either
+    #      direction, preventing both under-training (sparse signal) and
+    #      over-training (highly asymmetric advantages at high success). When
+    #      False, always runs exactly update_epochs epochs.
+    balanced_minibatch_training: bool = True
+    dynamic_epoch_training: bool = True
 
     # Target fraction of positive-advantage chunks in each mini-batch.
-    # Must be strictly in (0.0, 1.0). Only active when balanced_training=True.
+    # Must be strictly in (0.0, 1.0). Only active when balanced_minibatch_training=True.
     # Default 0.5: equal split between positive and negative advantages.
     # Set higher (e.g. 0.7) to bias the gradient more toward success examples.
-    balanced_training_positive_adv_ratio: float = 0.5
+    balanced_minibatch_positive_adv_ratio: float = 0.5
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
@@ -357,6 +375,34 @@ class GRPOConfig:
             raise ValueError(f"num_groups must be >= 1, got {self.num_groups}")
         if self.group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {self.group_size}")
+        # num_async_vector_env: None means "one worker per rollout" (= group_size,
+        # the original coupling). When set, it must evenly divide group_size and
+        # not exceed it (collecting more physical envs than the logical group
+        # size is out of scope and rejected). Validate the RESOLVED value so the
+        # stored field can stay None and downstream resolves it identically.
+        resolved_nave = (
+            self.group_size
+            if self.num_async_vector_env is None
+            else self.num_async_vector_env
+        )
+        if resolved_nave < 1:
+            raise ValueError(
+                f"num_async_vector_env must be >= 1, got "
+                f"{self.num_async_vector_env}"
+            )
+        if resolved_nave > self.group_size:
+            raise ValueError(
+                f"num_async_vector_env ({resolved_nave}) cannot exceed "
+                f"group_size ({self.group_size}); collecting more physical envs "
+                f"than the logical group size is out of scope."
+            )
+        if self.group_size % resolved_nave != 0:
+            raise ValueError(
+                f"group_size ({self.group_size}) must be divisible by "
+                f"num_async_vector_env ({resolved_nave}) so each group is "
+                f"collected in a whole number of equal turns "
+                f"(k = group_size // num_async_vector_env)."
+            )
         if self.save_interval < 1:
             raise ValueError(
                 f"save_interval must be >= 1, got {self.save_interval}"
@@ -405,13 +451,13 @@ class GRPOConfig:
                 f"reward; values outside [0, 1] flip the sign of the progress term."
             )
 
-        if self.balanced_training and not (
-            0.0 < self.balanced_training_positive_adv_ratio < 1.0
+        if self.balanced_minibatch_training and not (
+            0.0 < self.balanced_minibatch_positive_adv_ratio < 1.0
         ):
             raise ValueError(
-                f"balanced_training_positive_adv_ratio must be strictly in "
-                f"(0.0, 1.0) when balanced_training=True, got "
-                f"{self.balanced_training_positive_adv_ratio}. "
+                f"balanced_minibatch_positive_adv_ratio must be strictly in "
+                f"(0.0, 1.0) when balanced_minibatch_training=True, got "
+                f"{self.balanced_minibatch_positive_adv_ratio}. "
                 f"Use a value like 0.5 (equal split) or 0.7 (bias toward positives)."
             )
 

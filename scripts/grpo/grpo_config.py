@@ -78,7 +78,7 @@ class GRPOConfig:
     # Same as grpo_cont.py's args.num_envs = 5
     # Also the DEFAULT number of parallel environments (one env per rollout),
     # unless num_async_vector_env overrides it (see below).
-    group_size: int = 4
+    group_size: int = 8
 
     # Number of physical AsyncVectorEnv workers used to collect each group.
     # None → resolves to group_size (one worker per rollout — behavior 100%
@@ -93,7 +93,7 @@ class GRPOConfig:
     # turns are genuinely diverse. Lower this to cap peak worker RAM
     # (group_size MuJoCo workers can exceed host RAM) at the cost of ~k×
     # collection wall time per group.
-    num_async_vector_env: Optional[int] = None
+    num_async_vector_env: Optional[int] = 4
 
     # Number of groups per iteration ("questions per iteration")
     # Each group gets a unique seed → unique initial kitchen/object configuration.
@@ -102,7 +102,7 @@ class GRPOConfig:
     # With dynamic group collection (see min_successful_groups), this is the
     # MINIMUM number of groups; the collector may collect more (up to max_groups)
     # if the success criterion isn't met after the first num_groups.
-    num_groups: int = 5
+    num_groups: int = 3
 
     # Dynamic group collection: after collecting `num_groups` groups, if fewer
     # than `min_successful_groups` had at least one rollout succeed, the
@@ -110,14 +110,14 @@ class GRPOConfig:
     # or `max_groups` is reached. Set to 0 to disable (always exactly num_groups).
     # Useful when many groups time out or fail entirely (dead groups contribute
     # zero gradient signal — see the dead-group filter in train_grpo.py).
-    min_successful_groups: int = 4
+    min_successful_groups: int = 2
 
     # Hard cap on dynamic group collection. Bounds worst-case wall time when
     # the task is too hard for the current policy. Must be >= num_groups and
     # <= 100 (the GROUP_SEED_STRIDE limit in collect_episodes.py). The
     # subprocess and RPC timeouts auto-scale from this value at 7 min/group,
     # matching the original 35 min budget for 5 groups.
-    max_groups: int = 10
+    max_groups: int = 5
 
     # Maximum steps per episode before truncation (at 10Hz action rate).
     # Either a single int (applied to all envs) or a list of ints (one per env_name).
@@ -213,7 +213,7 @@ class GRPOConfig:
     # post-mortem inspection. Set to 0 to disable pruning (keep everything).
     # At 25 episodes/iter × 90 chunks × ~250KB/chunk ≈ 0.5 GB/iter, 200 iters
     # is ~100 GB if unpruned; /tmp on most GPU hosts is much smaller.
-    episode_dirs_to_keep: int = 3
+    episode_dirs_to_keep: int = 2
 
     # ─── Reward Shaping ──────────────────────────────────────────────────────
 
@@ -232,7 +232,7 @@ class GRPOConfig:
     # each epoch shuffles all action chunks from data collection
     # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
     # Same as grpo_cont.py's args.update_epochs = 10
-    update_epochs: int = 5
+    update_epochs: int = 2
 
     # ─── Balanced Training (two independent mechanisms) ──────────────────────
     # Both address gradient instability from skewed episode outcomes, and each
@@ -260,7 +260,7 @@ class GRPOConfig:
     #      over-training (highly asymmetric advantages at high success). When
     #      False, always runs exactly update_epochs epochs.
     balanced_minibatch_training: bool = True
-    dynamic_epoch_training: bool = True
+    dynamic_epoch_training: bool = False
 
     # Target fraction of positive-advantage chunks in each mini-batch.
     # Must be strictly in (0.0, 1.0). Only active when balanced_minibatch_training=True.

@@ -582,7 +582,7 @@ def main():
     print(f"  Group size:     {config.group_size}")
     print(f"  Mini-batch:     {config.mini_batch_size}")
     print(f"  KL coef:        {config.kl_coef}")
-    print(f"  Clip eps:       {config.clip_eps}")
+    print(f"  Clip eps lo/hi: {config.clip_eps_low} / {config.clip_eps_high}")
     print(f"  Jitter lambda:  {config.jitter_lambda}")
     print(f"  FF steps / pct: {config.fast_forward_steps} / "
           f"{config.fast_forward_pct}")

@@ -1714,7 +1714,7 @@ class GRPOTrainer:
                 # --- Clipped surrogate loss ---
                 surr1 = ready_advantages * ratio
                 surr2 = ready_advantages * torch.clamp(
-                    ratio, 1 - self.config.clip_eps, 1 + self.config.clip_eps
+                    ratio, 1 - self.config.clip_eps_low, 1 + self.config.clip_eps_high
                 )
                 clip_loss = -torch.min(surr1, surr2).mean()
 
@@ -1777,7 +1777,13 @@ class GRPOTrainer:
 
                 # --- Track statistics ---
                 with torch.no_grad():
-                    clipfrac = ((ratio - 1.0).abs() > self.config.clip_eps).float().mean().item()
+                    # Fraction of rows the clamp actually moved. With asymmetric
+                    # bounds this is the OR of the two one-sided clips rather than
+                    # a single |ratio - 1| > eps threshold.
+                    clipfrac = (
+                        (ratio < 1 - self.config.clip_eps_low)
+                        | (ratio > 1 + self.config.clip_eps_high)
+                    ).float().mean().item()
                     clipfracs.append(clipfrac)
                     total_loss += loss.item()
                     total_clip_loss += clip_loss.item()
@@ -1819,8 +1825,10 @@ class GRPOTrainer:
                     # surface — if it shrinks across iters, the regularizer
                     # is working.
                     if lam > 0.0:
-                        abs_lr_diff = (ratio - 1.0).abs()
-                        over_clip = (abs_lr_diff > self.config.clip_eps).float()
+                        over_clip = (
+                            (ratio < 1 - self.config.clip_eps_low)
+                            | (ratio > 1 + self.config.clip_eps_high)
+                        ).float()
                         log_ratio_abs = log_ratio.abs()
                         fixed_mask = torch.tensor(
                             [m == "fixed" for m in ready_modes],

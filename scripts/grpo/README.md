@@ -828,7 +828,7 @@ one optimizer step in that iteration).
 ratio = (current_log_prob - ref_log_prob).exp()
 advantages = (A - A.mean()) / (A.std() + 1e-8)            # renorm per-batch
 surr1 = A * ratio
-surr2 = A * clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+surr2 = A * clamp(ratio, 1 - clip_eps_low, 1 + clip_eps_high)
 clip_loss = -min(surr1, surr2).mean()
 
 # Schulman k3 KL estimator (non-negative pointwise, symmetric gradient):
@@ -1374,7 +1374,9 @@ uv run python scripts/grpo/train_grpo.py \
   groups early on.
 
 **GRPO algorithm**
-- `clip_eps` (default 0.2)
+- `clip_eps_low` / `clip_eps_high` (both default 0.2) — asymmetric clip
+  bounds; ratio clamped to `[1 - clip_eps_low, 1 + clip_eps_high]`. Must
+  satisfy `clip_eps_low <= clip_eps_high`.
 - `update_epochs` (default 5)
 - `mini_batch_size` (default 8 chunks)
 - `kl_coef` (default 0.1)

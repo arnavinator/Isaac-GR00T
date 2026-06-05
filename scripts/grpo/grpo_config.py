@@ -224,9 +224,15 @@ class GRPOConfig:
     # ─── GRPO Algorithm ──────────────────────────────────────────────────────
     # These directly mirror grpo_cont.py's clipped objective args
 
-    # Clipping epsilon — prevents too-large policy updates
-    # Same as grpo_cont.py's args.clip_eps = 0.2
-    clip_eps: float = 0.2
+    # Clipping epsilons — prevent too-large policy updates. Split into separate
+    # lower and upper bounds (DAPO-style "Clip-Higher") so the clipped surrogate
+    # can be asymmetric: clamp(ratio, 1 - clip_eps_low, 1 + clip_eps_high).
+    # Both default to 0.2 — the symmetric clip identical to the original single
+    # clip_eps = 0.2 (same as grpo_cont.py's args.clip_eps = 0.2). Raise
+    # clip_eps_high above clip_eps_low to allow more upside exploration.
+    # Constraint: clip_eps_low <= clip_eps_high (validated in __post_init__).
+    clip_eps_low: float = 0.2
+    clip_eps_high: float = 0.2
 
     # Number of optimization epochs over collected data per each iteration
     # each epoch shuffles all action chunks from data collection
@@ -438,6 +444,18 @@ class GRPOConfig:
             raise ValueError(
                 f"jitter_lambda must be in [0.0, 1.0), got {self.jitter_lambda}. "
                 f"Variance preservation requires λ < 1; use 0.0 to disable."
+            )
+        # The clipped surrogate clamps the importance ratio to
+        # [1 - clip_eps_low, 1 + clip_eps_high]. A lower bound above the upper
+        # bound would invert the clip window (empty/negative-width interval),
+        # so require clip_eps_low <= clip_eps_high. Equality is allowed — it is
+        # the symmetric clip and the default (both 0.2).
+        if self.clip_eps_low > self.clip_eps_high:
+            raise ValueError(
+                f"clip_eps_low ({self.clip_eps_low}) must be <= clip_eps_high "
+                f"({self.clip_eps_high}); the clipped surrogate clamps the ratio "
+                f"to [1 - clip_eps_low, 1 + clip_eps_high], so a lower bound above "
+                f"the upper bound inverts the clip window."
             )
         # success_weight is a probability-like blend weight in the shaped
         # reward (success_weight * success + (1-success_weight) * max_progress);

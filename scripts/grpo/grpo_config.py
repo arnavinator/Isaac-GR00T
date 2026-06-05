@@ -230,7 +230,8 @@ class GRPOConfig:
     # Both default to 0.2 — the symmetric clip identical to the original single
     # clip_eps = 0.2 (same as grpo_cont.py's args.clip_eps = 0.2). Raise
     # clip_eps_high above clip_eps_low to allow more upside exploration.
-    # Constraint: clip_eps_low <= clip_eps_high (validated in __post_init__).
+    # Constraint: each must lie in (0.0, 1.0) (validated in __post_init__). No
+    # ordering constraint between the two — any low/high pair is allowed.
     clip_eps_low: float = 0.2
     clip_eps_high: float = 0.2
 
@@ -446,16 +447,25 @@ class GRPOConfig:
                 f"Variance preservation requires λ < 1; use 0.0 to disable."
             )
         # The clipped surrogate clamps the importance ratio to
-        # [1 - clip_eps_low, 1 + clip_eps_high]. A lower bound above the upper
-        # bound would invert the clip window (empty/negative-width interval),
-        # so require clip_eps_low <= clip_eps_high. Equality is allowed — it is
-        # the symmetric clip and the default (both 0.2).
-        if self.clip_eps_low > self.clip_eps_high:
+        # [1 - clip_eps_low, 1 + clip_eps_high]. Each epsilon must lie in the
+        # open interval (0, 1); there is NO ordering constraint between them
+        # (any low/high pair is allowed, including clip_eps_low > clip_eps_high).
+        #   - Upper end (< 1): the importance ratio = exp(log_ratio) is always
+        #     strictly positive, so clip_eps_low >= 1 drops the lower bound
+        #     1 - clip_eps_low to <= 0 — a floor the ratio can never cross,
+        #     silently disabling the downside clip. The same cap is applied to
+        #     clip_eps_high for a uniform rule.
+        #   - Lower end (> 0): eps == 0 gives a zero-width clip on that side
+        #     (the bound is pinned to exactly 1), and eps < 0 inverts the
+        #     window; both are degenerate, so require strictly positive values.
+        if not (0.0 < self.clip_eps_low < 1.0) or not (0.0 < self.clip_eps_high < 1.0):
             raise ValueError(
-                f"clip_eps_low ({self.clip_eps_low}) must be <= clip_eps_high "
-                f"({self.clip_eps_high}); the clipped surrogate clamps the ratio "
-                f"to [1 - clip_eps_low, 1 + clip_eps_high], so a lower bound above "
-                f"the upper bound inverts the clip window."
+                f"clip_eps_low and clip_eps_high must each lie in (0.0, 1.0), got "
+                f"clip_eps_low={self.clip_eps_low}, clip_eps_high={self.clip_eps_high}. "
+                f"The surrogate clamps the ratio to [1 - clip_eps_low, "
+                f"1 + clip_eps_high]; a value >= 1 drops the lower bound to <= 0 "
+                f"(downside clip never fires), and a value <= 0 gives a zero-width "
+                f"or inverted clip window."
             )
         # success_weight is a probability-like blend weight in the shaped
         # reward (success_weight * success + (1-success_weight) * max_progress);

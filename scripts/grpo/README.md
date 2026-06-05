@@ -1375,8 +1375,8 @@ uv run python scripts/grpo/train_grpo.py \
 
 **GRPO algorithm**
 - `clip_eps_low` / `clip_eps_high` (both default 0.2) — asymmetric clip
-  bounds; ratio clamped to `[1 - clip_eps_low, 1 + clip_eps_high]`. Must
-  satisfy `clip_eps_low <= clip_eps_high`.
+  bounds; ratio clamped to `[1 - clip_eps_low, 1 + clip_eps_high]`. Each must
+  be in `(0, 1)` (no ordering constraint between them).
 - `update_epochs` (default 5)
 - `mini_batch_size` (default 8 chunks)
 - `kl_coef` (default 0.1)

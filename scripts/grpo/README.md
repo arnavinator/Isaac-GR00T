@@ -833,9 +833,16 @@ clip_loss = -min(surr1, surr2).mean()
 
 # Schulman k3 KL estimator (non-negative pointwise, symmetric gradient):
 inv = ref_log_prob - current_log_prob
-kl_loss = kl_coef * (inv.exp() - inv - 1).mean()
+kl_loss_last_iter = kl_coef_last_iter * (inv.exp() - inv - 1).mean()
 
-loss = clip_loss + kl_loss
+# Optional KL anchor to the base frozen DiT (LoRA disabled). Skipped when
+# kl_coef_base_model = 0; otherwise base_log_prob is pre-computed once per
+# iter inside the same no_grad pass that produces ref_log_prob, with
+# `with disabled_adapters(model.action_head.model)`.
+inv_base = base_log_prob - current_log_prob
+kl_loss_base_model = kl_coef_base_model * (inv_base.exp() - inv_base - 1).mean()
+
+loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
 ```
 
 NaN/Inf guard: a minibatch with non-finite loss (typically bf16 ratio
@@ -1083,10 +1090,11 @@ VRAM cost: `xi + noise_for_input ≈ 2 × 614 KB` per minibatch at
 
 ### Per-branch metrics (`*_fixed` / `*_jitter` TB scalars)
 
-The KL is refactored to expose `kl_per_row_full` as a named intermediate so
-it can be indexed by branch. The final `kl_loss = kl_coef *
-kl_per_row_full.mean()` is numerically identical to the previous inlined
-form.
+The KL is refactored to expose `kl_per_row_last_iter` (and optionally
+`kl_per_row_base_model`) as named intermediates so they can be indexed by
+branch. The final `kl_loss_last_iter = kl_coef_last_iter *
+kl_per_row_last_iter.mean()` is numerically identical to the previous
+inlined form.
 
 Inside the no-grad accumulator block, **gated on `lam > 0.0`**, we split
 the per-row tensors by mode and accumulate row-level sums:
@@ -1099,11 +1107,13 @@ if lam > 0.0:
     n_f = int(fixed_mask.sum().item())
     n_j = int(jit_mask.sum().item())
     if n_f > 0:
-        ratio_sum_fixed         += ratio[fixed_mask].sum().item()
-        log_ratio_abs_sum_fixed += log_ratio_abs[fixed_mask].sum().item()
-        clipfrac_sum_fixed      += int(over_clip[fixed_mask].sum().item())
-        kl_per_row_sum_fixed    += kl_per_row_full[fixed_mask].sum().item()
-        n_rows_fixed            += n_f
+        ratio_sum_fixed                  += ratio[fixed_mask].sum().item()
+        log_ratio_abs_sum_fixed          += log_ratio_abs[fixed_mask].sum().item()
+        clipfrac_sum_fixed               += int(over_clip[fixed_mask].sum().item())
+        kl_per_row_sum_last_iter_fixed   += kl_per_row_last_iter[fixed_mask].sum().item()
+        if compute_base:
+            kl_per_row_sum_base_model_fixed += kl_per_row_base_model[fixed_mask].sum().item()
+        n_rows_fixed                     += n_f
     # ... analogous for jitter
 ```
 
@@ -1112,10 +1122,12 @@ least one row of that branch fired:
 
 ```python
 if n_rows_fixed > 0:
-    result["clipfrac_fixed"]           = clipfrac_sum_fixed / n_rows_fixed
-    result["mean_ratio_fixed"]         = ratio_sum_fixed / n_rows_fixed
-    result["mean_log_ratio_abs_fixed"] = log_ratio_abs_sum_fixed / n_rows_fixed
-    result["kl_loss_fixed"]            = kl_coef * (kl_per_row_sum_fixed / n_rows_fixed)
+    result["clipfrac_fixed"]                 = clipfrac_sum_fixed / n_rows_fixed
+    result["mean_ratio_fixed"]               = ratio_sum_fixed / n_rows_fixed
+    result["mean_log_ratio_abs_fixed"]       = log_ratio_abs_sum_fixed / n_rows_fixed
+    result["kl_loss_last_iter_fixed"]        = kl_coef_last_iter * (kl_per_row_sum_last_iter_fixed / n_rows_fixed)
+    if compute_base:
+        result["kl_loss_base_model_fixed"]   = kl_coef_base_model * (kl_per_row_sum_base_model_fixed / n_rows_fixed)
 # ... analogous for jitter
 ```
 
@@ -1126,23 +1138,24 @@ False, and no `_fixed`/`_jitter` keys are emitted. Vanilla GRPO runs see
 exactly the same TB curves they always did.
 
 **Aggregation note.** Legacy aggregated metrics (`clipfrac`, `mean_ratio`,
-`mean_log_ratio_abs`, `kl_loss`) are means-of-per-mb-means — each minibatch
-contributes one entry regardless of size. The new `*_fixed` / `*_jitter`
-metrics are **row-weighted** (sum / n_rows). The two will differ slightly
-when minibatch sizes vary across the iter (e.g., the last mb is smaller
-than `mb_size`).
+`mean_log_ratio_abs`, `kl_loss_last_iter`, `kl_loss_base_model`) are
+means-of-per-mb-means — each minibatch contributes one entry regardless of
+size. The new `*_fixed` / `*_jitter` metrics are **row-weighted**
+(sum / n_rows). The two will differ slightly when minibatch sizes vary
+across the iter (e.g., the last mb is smaller than `mb_size`).
 
 ### TB / wandb writing (`_log_metrics`)
 
 A small loop in `_log_metrics` iterates `for branch in ("fixed", "jitter")`
 × `for metric in ("clipfrac", "mean_ratio", "mean_log_ratio_abs",
-"kl_loss")` and writes `train/<metric>_<branch>` only if the key is
-present in `update_stats`:
+"kl_loss_last_iter", "kl_loss_base_model")` and writes
+`train/<metric>_<branch>` only if the key is present in `update_stats`:
 
 ```python
 for branch in ("fixed", "jitter"):
     for metric in ("clipfrac", "mean_ratio",
-                   "mean_log_ratio_abs", "kl_loss"):
+                   "mean_log_ratio_abs",
+                   "kl_loss_last_iter", "kl_loss_base_model"):
         key = f"{metric}_{branch}"
         if key in update_stats:
             self.writer.add_scalar(f"train/{key}", update_stats[key], iteration)
@@ -1321,7 +1334,7 @@ overrides go through `tyro`:
 
 ```bash
 uv run python scripts/grpo/train_grpo.py \
-    --lora-rank 32 --kl-coef 0.005 \
+    --lora-rank 32 --kl-coef-last-iter 0.005 --kl-coef-base-model 0.005 \
     --num-iterations 500 \
     --tau-centers 0.0 0.3 0.5 0.7 0.9
 ```
@@ -1379,7 +1392,11 @@ uv run python scripts/grpo/train_grpo.py \
   be in `(0, 1)` (no ordering constraint between them).
 - `update_epochs` (default 5)
 - `mini_batch_size` (default 8 chunks)
-- `kl_coef` (default 0.1)
+- `kl_coef_last_iter` (default 0.1) — KL anchor to this iter's start-of-update
+  policy snapshot. Bounds per-iter drift.
+- `kl_coef_base_model` (default 0.0) — KL anchor to the pretrained DiT
+  (LoRA disabled). Bounds cumulative drift from the base policy. 0.0 disables
+  the term entirely (no extra forward pass per iter, no per-mb KL formula).
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
 - `balanced_minibatch_training` (default `True`) — balanced mini-batch
   sampling; see "Balanced Training" mechanism 1.
@@ -1412,7 +1429,7 @@ mismatch internally.
 - `use_wandb` + `wandb_project` + `wandb_run_name` for optional W&B.
 
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
-`train/{loss,clip_loss,kl_loss,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
+`train/{loss,clip_loss,kl_loss_last_iter,kl_loss_base_model,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
 `train/learning_rate`, `time/iteration_seconds`, and (when
 `dynamic_epoch_training=True` and at least one gradient step fired)
 `balanced/{actual_epochs,success_fraction}`. `mean_log_ratio_abs`

@@ -8,7 +8,7 @@ This dataclass mirrors the structure of grpo_cont.py's `init_args()` but adapted
 
 Usage:
     config = GRPOConfig()                         # defaults
-    config = GRPOConfig(lora_rank=32, kl_coef=0.005)  # override
+    config = GRPOConfig(lora_rank=32, kl_coef_last_iter=0.005)  # override
     # Or from CLI via tyro:
     # config = tyro.cli(GRPOConfig)
 """
@@ -280,9 +280,23 @@ class GRPOConfig:
     # Smaller = more updates per epoch but noisier gradients
     mini_batch_size: int = 8
 
-    # KL divergence penalty coefficient (regularization toward reference policy)
-    # Same role as grpo_cont.py's args.kl_coef = 0.002
-    kl_coef: float = 0.1
+    # KL divergence penalty coefficient — anchor toward THIS ITER'S start-of-update
+    # policy (the "ref" snapshot taken in _compute_ref_log_probs before the GRPO
+    # epochs fire). Bounds per-iter policy drift to prevent the clipped surrogate
+    # from racing too far on noisy gradients within a single iter.
+    # Same role as grpo_cont.py's args.kl_coef = 0.002.
+    kl_coef_last_iter: float = 0.1
+
+    # KL divergence penalty coefficient — anchor toward the BASE FROZEN DiT
+    # (= current model with LoRA adapters disabled, so no extra params loaded).
+    # Bounds CUMULATIVE drift from the pretrained policy across all iters,
+    # complementing kl_coef_last_iter's per-iter bound. The base log-prob is
+    # pre-computed once per iter inside the same no_grad pass that produces
+    # ref_log_probs, then cached on each chunk — extra cost is one DiT forward
+    # per iter (no second model in VRAM, no LoRA-disabled forward per minibatch).
+    # 0.0 disables the term entirely (skips the extra pre-compute pass and the
+    # per-mb KL formula). Suggested starting value: same order as kl_coef_last_iter.
+    kl_coef_base_model: float = 0.0
 
     # Jitter-GRPO Jacobian regularizer strength (paired scheduling).
     # When > 0, every action chunk produces TWO entries per epoch: a "fixed"
@@ -445,6 +459,29 @@ class GRPOConfig:
             raise ValueError(
                 f"jitter_lambda must be in [0.0, 1.0), got {self.jitter_lambda}. "
                 f"Variance preservation requires λ < 1; use 0.0 to disable."
+            )
+        # KL coefficients must be NON-NEGATIVE. Each is multiplied by a Schulman
+        # k3 KL term (non-negative pointwise) and added to the loss; a negative
+        # coef inverts the sign and turns the anchor into a *reward for
+        # divergence* — the policy actively flees the anchor. Worse, the
+        # base-model branch is gated `compute_base = kl_coef_base_model > 0.0`,
+        # so a negative value would silently disable the term entirely (no
+        # warning, no anchoring effect at all). Fail fast with a clear message
+        # so a CLI typo like `--kl-coef-last-iter -0.1` doesn't quietly run a
+        # divergence-reward training campaign for hours.
+        if self.kl_coef_last_iter < 0.0:
+            raise ValueError(
+                f"kl_coef_last_iter must be >= 0, got {self.kl_coef_last_iter}. "
+                f"Use 0.0 to disable; negative values would invert the anchor "
+                f"into a reward for divergence."
+            )
+        if self.kl_coef_base_model < 0.0:
+            raise ValueError(
+                f"kl_coef_base_model must be >= 0, got {self.kl_coef_base_model}. "
+                f"Use 0.0 to disable (skips the base-model forward entirely); "
+                f"negative values silently disable via the `> 0.0` gate AND "
+                f"would invert the anchor's gradient direction if the gate "
+                f"were ever loosened."
             )
         # The clipped surrogate clamps the importance ratio to
         # [1 - clip_eps_low, 1 + clip_eps_high]. Each epsilon must lie in the

@@ -44,6 +44,7 @@ from lora_dit import (
     save_lora_checkpoint,
     load_lora_checkpoint,
     print_trainable_params,
+    disabled_adapters,
 )
 from fm_log_prob import compute_fm_log_prob, _sample_jittered_timesteps
 from episode_buffer import EpisodeBuffer, ActionChunk
@@ -412,6 +413,15 @@ class GRPOTrainer:
             )
         print(f"  Update epochs: {self.config.update_epochs}")
         print(f"  Mini-batch size: {self.config.mini_batch_size}")
+        # Surface KL anchor strengths so the operator can confirm at a glance
+        # whether the base-model anchor is active (default 0.0 = disabled).
+        # Without this, an operator inspecting only logs has no way to tell
+        # the two coefs apart from a typo'd CLI flag.
+        print(
+            f"  KL anchors: last_iter={self.config.kl_coef_last_iter} "
+            f"base_model={self.config.kl_coef_base_model}"
+            f"{' (disabled)' if self.config.kl_coef_base_model == 0.0 else ''}"
+        )
         if self.config.balanced_minibatch_training:
             print(
                 f"  Balanced mini-batch sampling: ON "
@@ -1251,6 +1261,7 @@ class GRPOTrainer:
         # otherwise race our forward pass.
 
         n_computed = 0
+        compute_base = self.config.kl_coef_base_model > 0.0
         with self._model_lock, torch.no_grad():
             for start in range(0, len(chunks), batch_size):
                 batch = chunks[start:start + batch_size]
@@ -1289,6 +1300,28 @@ class GRPOTrainer:
                     n_samples=K,
                 )
 
+                # Optionally compute BASE-MODEL log-prob with LoRA adapters
+                # disabled — same (τ, ε), same cached backbone features (the
+                # backbone has no LoRA so its output is identical regardless
+                # of adapter state). The disabled_adapters() context just
+                # toggles every LoraLayer's _disable_adapters flag, so no
+                # second model is loaded and peak VRAM is unchanged from the
+                # ref-only pass. Skipped entirely when kl_coef_base_model=0
+                # so vanilla runs incur no extra DiT forward.
+                if compute_base:
+                    with disabled_adapters(self.model.action_head.model):
+                        base_lp = compute_fm_log_prob(
+                            action_head=self.model.action_head,
+                            backbone_output=batch_data["backbone_output"],
+                            state_features=batch_data["state_features"],
+                            embodiment_id=batch_data["embodiment_id"],
+                            actions=batch_data["actions"],
+                            action_mask=batch_data["action_masks"],
+                            timesteps=timesteps,
+                            noise=batch_data["initial_noise"],
+                            n_samples=K,
+                        )
+
                 # --- Cache per-chunk encoded features for _grpo_update reuse ---
                 # The Eagle backbone + state encoder are frozen, so their output
                 # is identical across all GRPO epochs. We only need to run them
@@ -1300,9 +1333,18 @@ class GRPOTrainer:
                 for i, chunk in enumerate(valid_batch):
                     chunk.ref_log_prob = ref_lp[i].item()
                     chunk.tau_samples = tau_cpu[:, i].astype(np.float32)
+                if compute_base:
+                    for i, chunk in enumerate(valid_batch):
+                        chunk.base_log_prob = base_lp[i].item()
                 n_computed += len(valid_batch)
 
-        print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
+        if compute_base:
+            print(
+                f"  Pre-computed ref_log_probs + base_log_probs for "
+                f"{n_computed} chunks"
+            )
+        else:
+            print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
 
     def _cache_encoded_features(self, valid_batch, batch_data):
         """Store per-chunk slices of the batched backbone/state output onto
@@ -1432,7 +1474,14 @@ class GRPOTrainer:
 
         total_loss = 0.0
         total_clip_loss = 0.0
-        total_kl = 0.0
+        # Two KL accumulators: one per anchor target.
+        #   - last_iter: KL(ref || current), where ref is the start-of-iter
+        #     policy snapshot (always active when kl_coef_last_iter > 0).
+        #   - base_model: KL(base || current), where base is the pretrained
+        #     DiT (LoRA adapters disabled). Skipped when kl_coef_base_model=0
+        #     so vanilla runs incur no extra compute or memory.
+        total_kl_last_iter = 0.0
+        total_kl_base_model = 0.0
         total_ratio = 0.0
         total_log_ratio_abs = 0.0
         clipfracs = []
@@ -1446,6 +1495,11 @@ class GRPOTrainer:
         n_updates = 0
         n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
 
+        # Whether the base-model KL anchor is active this run. Cached locally
+        # so the per-mb hot path skips the dict lookup. Drives the decision
+        # to load base_log_probs and compute KL(base || current) below.
+        compute_base = self.config.kl_coef_base_model > 0.0
+
         # Per-branch row-level accumulators (Jitter-GRPO). Aggregated metrics
         # above stay per-mb so the jitter_lambda=0 path produces bit-identical
         # TB curves; per-branch metrics use row-weighted means since the
@@ -1456,8 +1510,10 @@ class GRPOTrainer:
         log_ratio_abs_sum_jitter = 0.0
         clipfrac_sum_fixed = 0
         clipfrac_sum_jitter = 0
-        kl_per_row_sum_fixed = 0.0
-        kl_per_row_sum_jitter = 0.0
+        kl_per_row_sum_last_iter_fixed = 0.0
+        kl_per_row_sum_last_iter_jitter = 0.0
+        kl_per_row_sum_base_model_fixed = 0.0
+        kl_per_row_sum_base_model_jitter = 0.0
         n_rows_fixed = 0
         n_rows_jitter = 0
 
@@ -1566,7 +1622,10 @@ class GRPOTrainer:
 
                 # --- Compute importance ratio ---
                 # Use pre-computed ref_log_probs (from _compute_ref_log_probs)
-                # and stored tau_samples for consistency.
+                # and stored tau_samples for consistency. When the base-model
+                # KL anchor is active, base_log_prob is also required (computed
+                # in the same no_grad pass as ref_log_prob, so absence here is
+                # only possible across config edits between save/load).
                 # Build ready_indices directly instead of calling list.index(c):
                 # ActionChunk is a @dataclass(eq=True) with ndarray fields, and
                 # comparing numpy arrays raises "truth value is ambiguous", so
@@ -1575,6 +1634,7 @@ class GRPOTrainer:
                 ready_indices = [
                     i for i, c in enumerate(valid_batch)
                     if c.ref_log_prob is not None and c.tau_samples is not None
+                    and (not compute_base or c.base_log_prob is not None)
                 ]
                 if not ready_indices:
                     continue
@@ -1607,6 +1667,16 @@ class GRPOTrainer:
                     [c.ref_log_prob for c in ready_batch],
                     device=self.device, dtype=torch.float32,
                 )
+                # Pre-load base_log_probs only when the base-model anchor is
+                # active. Skipping the tensor allocation when disabled keeps
+                # the vanilla path unchanged.
+                if compute_base:
+                    base_log_probs = torch.tensor(
+                        [c.base_log_prob for c in ready_batch],
+                        device=self.device, dtype=torch.float32,
+                    )
+                else:
+                    base_log_probs = None
 
                 # Reconstruct timesteps from stored per-chunk tau_samples.
                 # Both copies of a paired chunk reuse the SAME tau_samples
@@ -1718,27 +1788,50 @@ class GRPOTrainer:
                 )
                 clip_loss = -torch.min(surr1, surr2).mean()
 
-                # --- KL divergence penalty (Schulman k3 estimator) ---
-                # KL(ref || current) ≈ E[exp(ref - current) - (ref - current) - 1]
-                # Identity: e^x - x - 1 ≥ 0 for all x, with equality iff x=0.
-                # Properties vs the naive (ref - current).mean():
+                # --- KL divergence penalties (Schulman k3 estimator) ---
+                # KL(p || q) ≈ E[exp(p_lp - q_lp) - (p_lp - q_lp) - 1] with the
+                # log-prob of the ANCHOR target on the left. Identity:
+                # e^x - x - 1 ≥ 0 for all x, with equality iff x=0. Properties
+                # vs the naive (anchor - current).mean():
                 #   - Non-negative POINTWISE, not just in expectation.
-                #   - Minimum at current ≡ ref → gradient pulls policies together
-                #     symmetrically (the naive estimator's gradient was one-sided
-                #     and could *reward* current >> ref).
-                #   - Same expected value (still estimates KL(ref||current)).
+                #   - Minimum at current ≡ anchor → gradient pulls policies
+                #     together symmetrically (the naive estimator's gradient
+                #     was one-sided and could *reward* current >> anchor).
+                #   - Same expected value (still estimates KL(anchor||current)).
                 #   - Lower variance.
-                # See Schulman 2020 "Approximating KL Divergence" for the derivation.
+                # See Schulman 2020 "Approximating KL Divergence" for derivation.
                 #
-                # Computed per-row first so we can split it by branch in the
-                # accumulator below; (coef * x).mean() == coef * x.mean() so
-                # the final scalar is numerically identical to the prior code.
+                # Two anchor targets, summed into total loss:
+                #   - last_iter: ref_log_probs (this iter's start-of-update
+                #     snapshot). Bounds per-iter drift.
+                #   - base_model: base_log_probs (pretrained DiT, LoRA off).
+                #     Bounds CUMULATIVE drift from the pretrained policy.
+                # Per-row tensors are kept around (not just the mean) so the
+                # per-branch fixed/jitter accumulator below can split each
+                # term separately.
                 inv_log_ratio = ref_log_probs - current_log_probs  # = -log_ratio
-                kl_per_row_full = inv_log_ratio.exp() - inv_log_ratio - 1.0
-                kl_loss = self.config.kl_coef * kl_per_row_full.mean()
+                kl_per_row_last_iter = inv_log_ratio.exp() - inv_log_ratio - 1.0
+                kl_loss_last_iter = (
+                    self.config.kl_coef_last_iter * kl_per_row_last_iter.mean()
+                )
+
+                if compute_base:
+                    inv_log_ratio_base = base_log_probs - current_log_probs
+                    kl_per_row_base_model = (
+                        inv_log_ratio_base.exp() - inv_log_ratio_base - 1.0
+                    )
+                    kl_loss_base_model = (
+                        self.config.kl_coef_base_model
+                        * kl_per_row_base_model.mean()
+                    )
+                else:
+                    kl_per_row_base_model = None
+                    kl_loss_base_model = torch.zeros(
+                        (), device=self.device, dtype=torch.float32
+                    )
 
                 # --- Total loss ---
-                loss = clip_loss + kl_loss
+                loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
 
                 # NaN/Inf guard: a single bad batch (e.g., bf16 overflow in
                 # ratio = log_ratio.exp() when log_ratio is large, or NaN
@@ -1787,7 +1880,9 @@ class GRPOTrainer:
                     clipfracs.append(clipfrac)
                     total_loss += loss.item()
                     total_clip_loss += clip_loss.item()
-                    total_kl += kl_loss.item()
+                    total_kl_last_iter += kl_loss_last_iter.item()
+                    if compute_base:
+                        total_kl_base_model += kl_loss_base_model.item()
                     total_ratio += ratio.mean().item()
                     # log_ratio magnitude is the primary diagnostic for DPPO-style
                     # FM log-prob surrogates: large values mean the MSE-based
@@ -1815,10 +1910,11 @@ class GRPOTrainer:
                     # per-mb CUDA syncs from .item() calls).
                     #
                     # Aggregation note: legacy aggregated metrics (clipfrac,
-                    # mean_ratio, mean_log_ratio_abs, kl_loss above) are
-                    # means-of-per-mb-means. The per-branch versions emitted
-                    # below are ROW-WEIGHTED (sum / n_rows). The two differ
-                    # when minibatch sizes vary (e.g., last mb smaller than
+                    # mean_ratio, mean_log_ratio_abs, kl_loss_last_iter,
+                    # kl_loss_base_model above) are means-of-per-mb-means.
+                    # The per-branch versions emitted below are ROW-WEIGHTED
+                    # (sum / n_rows). The two differ when minibatch sizes vary
+                    # (e.g., last mb smaller than
                     # mb_size). The clipfrac_fixed vs clipfrac_jitter gap
                     # (and analogous mean_log_ratio_abs gap) IS the empirical
                     # Jacobian-norm signal that Jitter-GRPO is designed to
@@ -1842,13 +1938,17 @@ class GRPOTrainer:
                             ratio_sum_fixed += ratio[fixed_mask].sum().item()
                             log_ratio_abs_sum_fixed += log_ratio_abs[fixed_mask].sum().item()
                             clipfrac_sum_fixed += int(over_clip[fixed_mask].sum().item())
-                            kl_per_row_sum_fixed += kl_per_row_full[fixed_mask].sum().item()
+                            kl_per_row_sum_last_iter_fixed += kl_per_row_last_iter[fixed_mask].sum().item()
+                            if compute_base:
+                                kl_per_row_sum_base_model_fixed += kl_per_row_base_model[fixed_mask].sum().item()
                             n_rows_fixed += n_f
                         if n_j > 0:
                             ratio_sum_jitter += ratio[jit_mask].sum().item()
                             log_ratio_abs_sum_jitter += log_ratio_abs[jit_mask].sum().item()
                             clipfrac_sum_jitter += int(over_clip[jit_mask].sum().item())
-                            kl_per_row_sum_jitter += kl_per_row_full[jit_mask].sum().item()
+                            kl_per_row_sum_last_iter_jitter += kl_per_row_last_iter[jit_mask].sum().item()
+                            if compute_base:
+                                kl_per_row_sum_base_model_jitter += kl_per_row_base_model[jit_mask].sum().item()
                             n_rows_jitter += n_j
 
         # Model remains in eval mode (it never left)
@@ -1869,7 +1969,7 @@ class GRPOTrainer:
         result = {
             "loss": total_loss / n_updates,
             "clip_loss": total_clip_loss / n_updates,
-            "kl_loss": total_kl / n_updates,
+            "kl_loss_last_iter": total_kl_last_iter / n_updates,
             "clipfrac": np.mean(clipfracs) if clipfracs else 0,
             "mean_ratio": total_ratio / n_updates,
             "mean_log_ratio_abs": total_log_ratio_abs / n_updates,
@@ -1881,6 +1981,11 @@ class GRPOTrainer:
             "ratio_min": float(np.min(ratio_mins)) if ratio_mins else 1.0,
             "actual_epochs": actual_num_epochs,
         }
+        # Only emit kl_loss_base_model when the anchor was active this iter.
+        # _log_metrics gates on key presence, so vanilla runs see no
+        # train/kl_loss_base_model curve at all.
+        if compute_base:
+            result["kl_loss_base_model"] = total_kl_base_model / n_updates
         if success_frac is not None:
             result["success_fraction"] = success_frac
         # Per-branch metrics (Jitter-GRPO). Only emitted when jitter_lambda > 0
@@ -1897,16 +2002,28 @@ class GRPOTrainer:
             result["clipfrac_fixed"]           = clipfrac_sum_fixed / n_rows_fixed
             result["mean_ratio_fixed"]         = ratio_sum_fixed / n_rows_fixed
             result["mean_log_ratio_abs_fixed"] = log_ratio_abs_sum_fixed / n_rows_fixed
-            result["kl_loss_fixed"] = (
-                self.config.kl_coef * (kl_per_row_sum_fixed / n_rows_fixed)
+            result["kl_loss_last_iter_fixed"] = (
+                self.config.kl_coef_last_iter
+                * (kl_per_row_sum_last_iter_fixed / n_rows_fixed)
             )
+            if compute_base:
+                result["kl_loss_base_model_fixed"] = (
+                    self.config.kl_coef_base_model
+                    * (kl_per_row_sum_base_model_fixed / n_rows_fixed)
+                )
         if n_rows_jitter > 0:
             result["clipfrac_jitter"]           = clipfrac_sum_jitter / n_rows_jitter
             result["mean_ratio_jitter"]         = ratio_sum_jitter / n_rows_jitter
             result["mean_log_ratio_abs_jitter"] = log_ratio_abs_sum_jitter / n_rows_jitter
-            result["kl_loss_jitter"] = (
-                self.config.kl_coef * (kl_per_row_sum_jitter / n_rows_jitter)
+            result["kl_loss_last_iter_jitter"] = (
+                self.config.kl_coef_last_iter
+                * (kl_per_row_sum_last_iter_jitter / n_rows_jitter)
             )
+            if compute_base:
+                result["kl_loss_base_model_jitter"] = (
+                    self.config.kl_coef_base_model
+                    * (kl_per_row_sum_base_model_jitter / n_rows_jitter)
+                )
         return result
 
     def _iter_stratified_minibatches(
@@ -2738,7 +2855,21 @@ class GRPOTrainer:
         if update_stats and update_stats.get("n_updates", 0) > 0:
             self.writer.add_scalar("train/loss", update_stats.get("loss", 0), iteration)
             self.writer.add_scalar("train/clip_loss", update_stats.get("clip_loss", 0), iteration)
-            self.writer.add_scalar("train/kl_loss", update_stats.get("kl_loss", 0), iteration)
+            # Two KL anchors: kl_loss_last_iter (KL to start-of-iter ref policy,
+            # always emitted when n_updates>0) and kl_loss_base_model (KL to
+            # the pretrained DiT, only emitted when kl_coef_base_model > 0 —
+            # the inner loop only adds the key in that case).
+            self.writer.add_scalar(
+                "train/kl_loss_last_iter",
+                update_stats.get("kl_loss_last_iter", 0),
+                iteration,
+            )
+            if "kl_loss_base_model" in update_stats:
+                self.writer.add_scalar(
+                    "train/kl_loss_base_model",
+                    update_stats["kl_loss_base_model"],
+                    iteration,
+                )
             self.writer.add_scalar("train/clipfrac", update_stats.get("clipfrac", 0), iteration)
             self.writer.add_scalar("train/mean_ratio", update_stats.get("mean_ratio", 1), iteration)
             self.writer.add_scalar(
@@ -2774,9 +2905,20 @@ class GRPOTrainer:
             # The fixed/jitter gap on mean_log_ratio_abs IS the empirical
             # Jacobian-norm signal that Jitter-GRPO is designed to surface —
             # if it shrinks across iters, the regularizer is doing its job.
+            #
+            # KL terms are split into _last_iter and _base_model variants.
+            # _base_model_{fixed,jitter} keys are only present when the
+            # base-model anchor is active AND that branch fired rows, so
+            # the `if key in update_stats` gate naturally suppresses them
+            # for vanilla runs and for runs with kl_coef_base_model=0.
             for branch in ("fixed", "jitter"):
-                for metric in ("clipfrac", "mean_ratio",
-                               "mean_log_ratio_abs", "kl_loss"):
+                for metric in (
+                    "clipfrac",
+                    "mean_ratio",
+                    "mean_log_ratio_abs",
+                    "kl_loss_last_iter",
+                    "kl_loss_base_model",
+                ):
                     key = f"{metric}_{branch}"
                     if key in update_stats:
                         self.writer.add_scalar(

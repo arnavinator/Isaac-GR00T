@@ -20,10 +20,13 @@ Reference:
 """
 
 from pathlib import Path
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 from peft import LoraConfig, inject_adapter_in_model
+from peft.tuners.lora import LoraLayer
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 
 # Single source of truth for the default LoRA target module list. Imported by
@@ -200,6 +203,62 @@ def load_lora_checkpoint(model: nn.Module, path: str | Path) -> None:
     current_state.update(lora_state)
     dit.load_state_dict(current_state, strict=True)
     print(f"  Loaded {len(lora_state)} LoRA parameters from {path}")
+
+
+@contextmanager
+def disabled_adapters(module: nn.Module):
+    """Temporarily disable every PEFT tuner adapter within `module` for forward passes.
+
+    Inside the `with` block, each tuner layer (LoraLayer and any other
+    ``BaseTunerLayer`` subclass) in `module` behaves as its base ``nn.Linear``
+    (no adapter contribution) — so the model produces the "base frozen DiT"
+    output WITHOUT loading a second copy of the model into VRAM.
+
+    Used by GRPO's KL-to-base anchor (kl_coef_base_model in GRPOConfig): with
+    adapters disabled, one forward pass yields the pretrained DiT's velocity
+    field, against which the LoRA-trained policy is anchored.
+
+    Toggles ``_disable_adapters`` directly — the private field that
+    ``LoraLayer.forward`` gates on. The public
+    ``layer.enable_adapters(False/True)`` API would also work but additionally
+    flips ``requires_grad`` on the adapter weights, which is irrelevant here
+    (callers wrap this in ``torch.no_grad()`` anyway) and adds churn the
+    optimizer can later observe through the param's grad-pinned state.
+
+    The isinstance filter uses ``BaseTunerLayer`` (the parent of every PEFT
+    tuner adapter — LoraLayer, IA3Layer, etc.) rather than ``LoraLayer``
+    specifically. This is defense-in-depth: today ``apply_lora_to_dit`` only
+    injects ``LoraLayer`` instances and the ``LoraConfig`` has no
+    ``modules_to_save`` (which would create ``AuxiliaryTrainingWrapper``
+    modules — a *separate* class hierarchy not covered here, and intentionally
+    so since modules_to_save is incompatible with the "base model = adapters
+    off" interpretation of this context manager). If a future config grows
+    additional tuner types beyond LoraLayer, they get correctly disabled. If
+    a future config adds ``modules_to_save``, the assertion at injection time
+    in ``apply_lora_to_dit`` should catch it before this context manager runs.
+
+    Preconditions (NOT verified by this function — caller's responsibility):
+      - ``LoraConfig.bias == "none"`` (else "disabled" still adds a bias).
+      - No adapter has been merged into base weights (``LoraLayer.forward``'s
+        disable branch silently calls ``unmerge()`` and does NOT re-merge on
+        exit, leaving the model permanently unmerged).
+    Both preconditions hold for this trainer's setup (see ``apply_lora_to_dit``
+    + the trainer never calls ``merge_lora_weights`` during training).
+
+    Args:
+        module: Any nn.Module whose subtree contains BaseTunerLayer instances —
+            typically `model.action_head.model` (the DiT). Modules outside
+            this subtree are unaffected.
+    """
+    layers = [m for m in module.modules() if isinstance(m, BaseTunerLayer)]
+    prev_states = [m._disable_adapters for m in layers]
+    try:
+        for m in layers:
+            m._disable_adapters = True
+        yield
+    finally:
+        for m, prev in zip(layers, prev_states):
+            m._disable_adapters = prev
 
 
 def merge_lora_weights(model: nn.Module) -> nn.Module:

@@ -77,6 +77,14 @@ class ActionChunk:
     # Pre-computed reference log-prob (set after collection, before GRPO update)
     ref_log_prob: float | None = None
 
+    # Pre-computed BASE-MODEL log-prob (set after collection, before GRPO update).
+    # Computed in the same no_grad pass as ref_log_prob but with LoRA adapters
+    # disabled — i.e., evaluated against the pretrained DiT. Used for KL anchoring
+    # to the base policy when GRPOConfig.kl_coef_base_model > 0; remains None when
+    # the term is disabled (default), and the GRPO update path skips its KL
+    # contribution accordingly.
+    base_log_prob: float | None = None
+
     # Timestep samples used for ref_log_prob computation (reused during training)
     tau_samples: np.ndarray | None = None  # (K,) float32
 

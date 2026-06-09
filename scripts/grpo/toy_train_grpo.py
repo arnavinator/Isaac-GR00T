@@ -581,7 +581,8 @@ def main():
     print(f"  Update epochs:  {config.update_epochs}")
     print(f"  Group size:     {config.group_size}")
     print(f"  Mini-batch:     {config.mini_batch_size}")
-    print(f"  KL coef:        {config.kl_coef}")
+    print(f"  KL coef:        last_iter={config.kl_coef_last_iter} "
+          f"base_model={config.kl_coef_base_model}")
     print(f"  Clip eps lo/hi: {config.clip_eps_low} / {config.clip_eps_high}")
     print(f"  Jitter lambda:  {config.jitter_lambda}")
     print(f"  FF steps / pct: {config.fast_forward_steps} / "

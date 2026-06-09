@@ -285,7 +285,7 @@ class GRPOConfig:
     # epochs fire). Bounds per-iter policy drift to prevent the clipped surrogate
     # from racing too far on noisy gradients within a single iter.
     # Same role as grpo_cont.py's args.kl_coef = 0.002.
-    kl_coef_last_iter: float = 0.1
+    kl_coef_last_iter: float = 0.2
 
     # KL divergence penalty coefficient — anchor toward the BASE FROZEN DiT
     # (= current model with LoRA adapters disabled, so no extra params loaded).
@@ -296,7 +296,7 @@ class GRPOConfig:
     # per iter (no second model in VRAM, no LoRA-disabled forward per minibatch).
     # 0.0 disables the term entirely (skips the extra pre-compute pass and the
     # per-mb KL formula). Suggested starting value: same order as kl_coef_last_iter.
-    kl_coef_base_model: float = 0.0
+    kl_coef_base_model: float = 0.2
 
     # Jitter-GRPO Jacobian regularizer strength (paired scheduling).
     # When > 0, every action chunk produces TWO entries per epoch: a "fixed"

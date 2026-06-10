@@ -348,6 +348,32 @@ class GRPOConfig:
     # If None, starts fresh training from the base pretrained model.
     resume_from: Optional[str] = None
 
+    # Skip the FIRST resumed iter's collection phase by loading episodes that
+    # are already on disk under episode_dir/iter_{start_iteration:04d}/. Only
+    # honored when resume_from is also set; rejected at config-construction
+    # time otherwise. Common case: a prior run crashed AFTER finishing
+    # collection but BEFORE the model update completed — the cached episodes
+    # were collected by the policy whose weights live in resume_from, so they
+    # remain on-policy for the resumed iter.
+    #
+    # The trainer pre-flight-validates the cache during setup() (dir exists,
+    # >= num_groups distinct group_ids, env_name matches the round-robin task
+    # for start_iteration, raw_action / action_mask / initial_noise keys
+    # present, min_successful_groups criterion satisfied or max_groups cap
+    # reached). Validation failures raise before the model is loaded so the
+    # operator gets immediate feedback. Only the first resumed iter consumes
+    # the cache; subsequent iters collect normally.
+    #
+    # When NOT to enable: do NOT set this flag if you've changed any
+    # collection-affecting config since the cache was written. The validator
+    # catches env_name and group-count mismatches but does NOT detect changes
+    # to n_action_steps, fast_forward_steps / fast_forward_pct,
+    # init_state_npz_path, max_episode_steps, or success_weight — the cached
+    # iter would silently train on episodes from the OLD config while
+    # subsequent iters collect under the new one. If in doubt, leave this
+    # disabled and pay the collection cost.
+    resume_from_collected_data: bool = False
+
     # Directory for checkpoints (LoRA weights + optimizer state)
     checkpoint_dir: str = "grpo_data/grpo_checkpoints"
 
@@ -396,6 +422,15 @@ class GRPOConfig:
             raise ValueError(f"num_groups must be >= 1, got {self.num_groups}")
         if self.group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {self.group_size}")
+        # env_names drives both the round-robin task selection per iter
+        # (`env_names[(iteration - 1) % len(env_names)]`) and the
+        # cached-data validator's expected-env check. An empty list raises
+        # ZeroDivisionError on first iter — fail clearly at construction.
+        if not self.env_names:
+            raise ValueError(
+                "env_names must be a non-empty list (at least one env to "
+                "train on). Got empty list."
+            )
         # num_async_vector_env: None means "one worker per rollout" (= group_size,
         # the original coupling). When set, it must evenly divide group_size and
         # not exceed it (collecting more physical envs than the logical group
@@ -525,6 +560,41 @@ class GRPOConfig:
                 f"{self.balanced_minibatch_positive_adv_ratio}. "
                 f"Use a value like 0.5 (equal split) or 0.7 (bias toward positives)."
             )
+
+        # resume_from_collected_data is meaningless without a checkpoint to
+        # resume from: the cache it would reuse was collected by the policy
+        # whose weights live in resume_from. Reject at construction time so a
+        # CLI typo doesn't silently fall through to fresh collection.
+        #
+        # Use `not self.resume_from` (truthy check) instead of `is None` so
+        # an empty/whitespace string is also rejected — `is None` would let
+        # `--resume-from ""` through, and the trainer's later `if config.
+        # resume_from:` check would silently fall through to start_iteration=1
+        # while still treating the cache flag as enabled, leading to a
+        # fresh-weight model trained on iter_0001/'s cached episodes.
+        if self.resume_from_collected_data:
+            if not self.resume_from or not self.resume_from.strip():
+                raise ValueError(
+                    "resume_from_collected_data=True requires resume_from "
+                    "to be a non-empty path. The flag tells the trainer to "
+                    "reuse episodes that were collected by the policy at "
+                    "resume_from's checkpoint; without a checkpoint, the "
+                    "cached episodes have no on-policy guarantee."
+                )
+
+        # Resolve episode_dir to an absolute path so a CWD change between
+        # config-construction (or setup()) and `train()` cannot make the
+        # cached path point at a different filesystem location. Mirrors the
+        # `init_state_npz_path` resolution pattern below — same motivation.
+        # Path.resolve() works on non-existent paths (the trainer creates
+        # episode_dir lazily), so this is safe at construction time.
+        # Without this, a relative `--episode-dir grpo_data/...` combined
+        # with a between-setup-and-train CWD change (notebook context, a
+        # `gr00t/` import that os.chdir's, etc.) makes the loader emit a
+        # confusing "directory was deleted" error pointing at a phantom
+        # filesystem race.
+        from pathlib import Path as _Path
+        self.episode_dir = str(_Path(self.episode_dir).expanduser().resolve())
 
         # ── init_state_npz_path validations ─────────────────────────────────
         # These run at config-construction time so failures surface BEFORE the

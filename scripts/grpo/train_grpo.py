@@ -23,10 +23,12 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 import sys
 import math
 import os
+import re
 import shutil
 import threading
 import time
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -48,6 +50,17 @@ from lora_dit import (
 )
 from fm_log_prob import compute_fm_log_prob, _sample_jittered_timesteps
 from episode_buffer import EpisodeBuffer, ActionChunk
+
+
+# Canonical iter directory name pattern: 'iter_<ASCII digits>'.
+# Exposed at module scope so the test suite can import it instead of
+# duplicating the regex literal — duplicating the literal lets test and
+# prod silently drift apart (e.g., a test using `\d+` would still pass
+# even if prod regressed to `\d+`, missing Bug A4's regression coverage).
+# [0-9]+ is intentionally narrower than `\d+` (which matches all
+# Unicode digit categories, ~580 codepoints including full-width '０'-'９')
+# so a checkpoint named with non-ASCII digits doesn't silently parse.
+ITER_DIR_RE = re.compile(r"iter_([0-9]+)")
 
 
 class GRPOTrainer:
@@ -175,9 +188,16 @@ class GRPOTrainer:
             )
 
     def setup(self):
-        """Load model, apply LoRA, setup optimizer, start server.
+        """Load the model + LoRA, configure optimizer, validate the resume
+        cache (when ``resume_from_collected_data=True``), and start the
+        persistent inference server thread.
 
-        This is separate from __init__ so that config can be modified before setup.
+        Heavy work that's deferred from ``__init__`` so a misconfigured
+        trainer fails fast at construction without paying for the multi-
+        minute model load. Note: ``__init__`` ALREADY binds to the
+        optional collector RPC server (``collector_server_*`` fields), so
+        those fields cannot be mutated post-construction; only the
+        non-RPC config fields are still mutable here.
         """
         import gr00t.model  # noqa: F401 — registers model classes
         from transformers import AutoModel, AutoProcessor
@@ -194,6 +214,40 @@ class GRPOTrainer:
         # produce deterministic LoRA initialization.
         torch.manual_seed(self.config.seed)
         np.random.seed(self.config.seed)
+
+        # Compute start_iteration up-front so cached-collection validation
+        # (when resume_from_collected_data=True) can run BEFORE the multi-
+        # minute model load + LoRA injection. The actual LoRA-load happens in
+        # Step 2b below; this block only parses the iter number from the
+        # resume path so both paths share one source of truth.
+        #
+        # Use re.fullmatch with [0-9]+ instead of `startswith("iter_") +
+        # split("_")[1]`: the old form silently accepted broken names
+        # (e.g., "iter_50.bak" raised a cryptic ValueError; "iter_50_v2"
+        # silently parsed as int("50") and ignored the v2 suffix;
+        # "iter_-5" silently produced a negative iter number that broke
+        # f-string padding downstream). The regex requires exactly "iter_"
+        # followed by ASCII digits — anything else (including Unicode
+        # digits like full-width "iter_０", which `\d+` would silently
+        # accept and `int()` would parse) is treated as non-iter and
+        # handled the same as a freshly named checkpoint ("best",
+        # "latest"). [0-9]+ is intentionally narrower than \d+ so the
+        # canonical-name guard is conservative.
+        start_iteration = self._parse_resume_iteration()
+        self._start_iteration = start_iteration
+        # Resumed checkpoint represents iter (start_iteration - 1)'s end-of-update
+        # state. For a fresh run, no update has fired yet → 0. The skip-save
+        # path keys off this value to name checkpoints after real progress.
+        self._last_updated_iteration = start_iteration - 1
+
+        # Pre-flight: when resume_from_collected_data=True, validate that the
+        # cached iter's episodes are usable BEFORE we sink minutes into model
+        # load. Validation failure raises here; train() never runs.
+        # The "should this iter use the cache?" decision is rederived in the
+        # train loop as `iteration == start_iteration AND flag is set` —
+        # cleaner than maintaining a one-shot mutable field across two methods.
+        if self.config.resume_from_collected_data:
+            self._validate_collected_data_cache(start_iteration)
 
         # --- Step 1: Load pretrained model ---
         print(f"\n[1/4] Loading model from {self.config.model_path}...")
@@ -242,21 +296,15 @@ class GRPOTrainer:
         stats = print_trainable_params(self.model)
 
         # --- Step 2b: Load LoRA checkpoint if resuming ---
-        start_iteration = 1
+        # start_iteration was already computed at the top of setup() (so the
+        # cached-collection pre-flight could see it). This block just performs
+        # the actual LoRA weight load.
         if self.config.resume_from:
             resume_path = Path(self.config.resume_from)
             print(f"\n  Resuming from: {resume_path}")
             load_lora_checkpoint(self.model, resume_path)
-            # Extract iteration number from directory name (e.g., "iter_0050" → 50)
-            dir_name = resume_path.name
-            if dir_name.startswith("iter_"):
-                start_iteration = int(dir_name.split("_")[1]) + 1
+            if start_iteration > 1:
                 print(f"  Continuing from iteration {start_iteration}")
-        self._start_iteration = start_iteration
-        # Resumed checkpoint represents iter (start_iteration - 1)'s end-of-update
-        # state. For a fresh run, no update has fired yet → 0. The skip-save
-        # path keys off this value to name checkpoints after real progress.
-        self._last_updated_iteration = start_iteration - 1
 
         # Snapshot the trainable LoRA params for cumulative-drift logging
         # (lora/weight_delta_norm in _log_metrics). Resumed runs snapshot at
@@ -478,9 +526,24 @@ class GRPOTrainer:
             print(f"\n{'─' * 50}")
             print(f"Iteration {iteration}/{self.config.num_iterations} | Task: {env_name.split('/')[-1]} | LR: {lr:.2e}")
 
-            # ═══ Phase 1: Collect episodes ═══
+            # ═══ Phase 1: Collect episodes (or reuse cached, when this iter
+            # is the first resumed iter and resume_from_collected_data=True) ═══
             phase1_start = time.time()
-            self._collect_episodes(env_name, task_idx, max_steps)
+            # Derive directly from the iter index instead of carrying a
+            # mutable one-shot field across setup() and train(). Cache
+            # validation has already passed in setup() (raised otherwise),
+            # so reaching `iteration == start_iteration` with the flag on
+            # means the cache is good to consume. After the first iter,
+            # `iteration > start_iteration` so this is False forever — same
+            # one-shot semantics, no field bookkeeping required.
+            used_cached_collection = (
+                self.config.resume_from_collected_data
+                and iteration == self._start_iteration
+            )
+            if used_cached_collection:
+                self._load_cached_episodes()
+            else:
+                self._collect_episodes(env_name, task_idx, max_steps)
             phase1_time = time.time() - phase1_start
 
             # ═══ Phase 2: Compute advantages ═══
@@ -495,9 +558,25 @@ class GRPOTrainer:
             # Skip update if no gradient signal (all same outcome)
             if stats.get("std_reward", 0) < 1e-8:
                 print(f"  Skipping update: all episodes have same reward (no gradient signal)")
+                # Pass lr and iter_time so train/learning_rate and
+                # time/iteration_seconds aren't dropped on the early-skip
+                # path — TB curves with gaps are harder to read than
+                # curves with continuous data including the skipped iters.
                 self._log_metrics(
                     iteration, stats, skip_reason="no_signal",
-                    phase_times={"collect": phase1_time, "advantage": phase2_time},
+                    lr=lr,
+                    iter_time=time.time() - iter_start,
+                    phase_times={
+                        # Same NaN sentinel as the Phase 4 log site — keeps
+                        # the cached-iter gap consistent across both the
+                        # normal-completion path and this early-skip path.
+                        "collect": (
+                            float("nan")
+                            if used_cached_collection
+                            else phase1_time
+                        ),
+                        "advantage": phase2_time,
+                    },
                     lora_delta_norm=self._compute_lora_delta_norm(),
                 )
                 # Save under the LAST UPDATED iter's name (not the current loop
@@ -520,7 +599,7 @@ class GRPOTrainer:
 
             # Treat an iter as "updated" only if at least one optimizer.step()
             # actually fired. Two paths lead to n_updates=0 here that the
-            # outer std_reward<1e-8 skip-check (line 427) does NOT catch:
+            # outer std_reward<1e-8 skip-check above does NOT catch:
             #   1. Every minibatch had non-finite loss (bf16 ratio overflow).
             #   2. Every group's per-group std<1e-4 (so the dead-chunk filter
             #      in _grpo_update_inner left zero live chunks), but the
@@ -547,15 +626,29 @@ class GRPOTrainer:
             self._log_metrics(
                 iteration, stats, update_stats, lr, iter_time,
                 phase_times={
-                    "collect": phase1_time,
+                    # NaN sentinel marks "no real collection ran" — the
+                    # cached load is a few seconds (decompressing .npz video
+                    # tensors), and logging that as a data point against an
+                    # axis dominated by ~7 min × num_groups normal-collection
+                    # points would compress the chart's autoscale toward zero
+                    # for the rest of the run. _log_metrics skips NaN entries
+                    # so TB shows a clean gap at the resumed iter.
+                    "collect": (
+                        float("nan") if used_cached_collection else phase1_time
+                    ),
                     "advantage": phase2_time,
                     "update": phase3_time,
                 },
                 lora_delta_norm=self._compute_lora_delta_norm(),
             )
 
+            collect_label = (
+                f"cached ({phase1_time:.2f}s)"
+                if used_cached_collection
+                else f"{phase1_time:.0f}s"
+            )
             print(
-                f"  Time: collect={phase1_time:.0f}s, "
+                f"  Time: collect={collect_label}, "
                 f"advantage={phase2_time:.1f}s, "
                 f"update={phase3_time:.0f}s, "
                 f"total={iter_time:.0f}s"
@@ -770,29 +863,132 @@ class GRPOTrainer:
         # drop in episode count usually points to MuJoCo worker crashes,
         # IPC stalls, or env-side termination bugs — worth seeing in the
         # log so the operator can investigate.
-        # In dynamic mode the collector may produce more groups than
-        # `num_groups`, so the static `group_size * num_groups` lower bound
-        # would suppress this warning when actual collection > num_groups
-        # but lost episodes within those groups. Use the max of (configured
-        # minimum, actually-loaded distinct group_ids) as the expected
-        # group count: catches partial-loss within loaded groups AND
-        # static-mode under-collection. Doesn't catch entirely-missing
-        # groups in dynamic mode (no signal in the buffer for that).
-        loaded_group_ids = (
-            len(set(ep.group_id for ep in self.buffer.episodes))
-            if self.buffer.episodes
-            else 0
-        )
+        self._warn_partial_collection(n_loaded, source="collection")
+
+    def _warn_partial_collection(self, n_loaded: int, *, source: str) -> None:
+        """Emit a 'fewer episodes than expected' warning, common to both the
+        live-collection (`_collect_episodes`) and cached-load
+        (`_load_cached_episodes`) paths.
+
+        In dynamic mode the collector may produce more groups than
+        `num_groups`, so the static `group_size * num_groups` lower bound
+        would suppress this warning when actual collection > num_groups
+        but lost episodes within those groups. Use the max of (configured
+        minimum, actually-loaded distinct group_ids) as the expected
+        group count — catches partial-loss within loaded groups AND
+        static-mode under-collection. Doesn't catch entirely-missing
+        groups in dynamic mode (no signal in the buffer for that).
+
+        `source` toggles the warning's tail between "some workers may have
+        failed silently" (live collection — likely transient subprocess
+        failure) and "partial cache" (cached path — partial cache that
+        nonetheless passed the validator's undercount-warns policy).
+        """
+        if not self.buffer.episodes:
+            # Empty buffer is handled by the caller's failure path; nothing
+            # meaningful to warn about here.
+            return
+        loaded_group_ids = len(set(ep.group_id for ep in self.buffer.episodes))
         expected_groups = max(self.config.num_groups, loaded_group_ids)
         expected_total = self.config.group_size * expected_groups
         if n_loaded < expected_total:
             pct = 100 * n_loaded / expected_total if expected_total > 0 else 0
+            tail = (
+                "some workers may have failed silently"
+                if source == "collection"
+                else "partial cache"
+            )
             print(
                 f"  WARNING: Only {n_loaded}/{expected_total} episodes "
                 f"({pct:.0f}%) loaded across {loaded_group_ids} group(s) — "
-                f"some workers may have failed silently. "
-                f"Failure counter NOT incremented."
+                f"{tail}. Failure counter NOT incremented."
             )
+
+    def _load_cached_episodes(self) -> None:
+        """Load pre-collected episodes for the resumed iter — bypass collection.
+
+        Mirrors the post-load tail of _collect_episodes (clear buffer, load,
+        log success, surface partial-collection warnings, reset failure
+        counter) but skips both the dispatch (subprocess / RPC) and the
+        stale-file wipe — the cache IS the data we want to consume.
+
+        Setup() has already validated this cache exists, has >= num_groups
+        groups, and matches the round-robin task; reaching this method with
+        an empty buffer would mean the directory was deleted between setup
+        and train(), which we treat as a hard error (the operator's
+        invariant is broken — better to stop than silently fall through).
+
+        Takes no env_name/task_idx/max_steps args — unlike _collect_episodes,
+        the cached path doesn't dispatch to any collector that would need
+        them. The iter directory name is derived from self.iteration alone.
+        """
+        self.buffer.clear()
+
+        # Deliberately do NOT prune older iter dirs here. _prune_old_episode_dirs
+        # runs inside _collect_episodes BEFORE the new iter's dir is created;
+        # for cached iters there's no new dir to create, and the cached iter
+        # itself is the dir we'd want to keep. The next iter's normal collect
+        # path will run pruning, so on-disk count is bounded one iter later
+        # than usual — fine.
+        episode_dir = Path(self.config.episode_dir) / f"iter_{self.iteration:04d}"
+        print(
+            f"  resume_from_collected_data: reusing cached episodes at "
+            f"{episode_dir} (skipping collection)."
+        )
+
+        n_loaded = self.buffer.load_episodes(episode_dir)
+        if n_loaded == 0:
+            # Setup validated len(npz_files) > 0, so reaching here means the
+            # cache was deleted out from under us. Don't fall through to
+            # fresh collection — that would defeat the explicit user opt-in
+            # and waste minutes.
+            raise RuntimeError(
+                f"resume_from_collected_data: cache validated at setup but "
+                f"load_episodes returned 0 from {episode_dir}. Likely cause: "
+                f"the directory was deleted between setup() and train() "
+                f"(filesystem race or external cleanup)."
+            )
+
+        # Reset the consecutive-failure counter, mirroring the success path
+        # in _collect_episodes. A successful cached load is still a successful
+        # collection from the trainer's standpoint.
+        self._consecutive_collect_failures = 0
+        print(f"  Loaded {n_loaded} episodes ({self.buffer.num_chunks} chunks)")
+
+        # Defense-in-depth against heterogeneous cache corruption that the
+        # validator's spot-check (which only inspects npz_files[0]) would
+        # miss. Concrete scenario the spot-check passes but this catches:
+        # the operator manually merged a pre-FM-instrumentation cache with
+        # a post-FM cache — file 0 has all the keys, files 1+ don't. The
+        # loader silently sets raw_action=None on the missing files, then
+        # _prepare_batch silently drops those chunks at training time
+        # (filter on `c.raw_action is not None`), producing a mostly-dead
+        # minibatch with no warning. Surface it loudly here.
+        n_chunks_total = self.buffer.num_chunks
+        n_chunks_with_fm = sum(
+            1
+            for ep in self.buffer.episodes
+            for raw, mask, noise in zip(
+                ep.raw_actions, ep.action_masks, ep.initial_noises
+            )
+            if raw is not None and mask is not None and noise is not None
+        )
+        if n_chunks_with_fm < n_chunks_total:
+            raise RuntimeError(
+                f"resume_from_collected_data: validator spot-check passed "
+                f"on {episode_dir.name}/episode_0000.npz, but only "
+                f"{n_chunks_with_fm}/{n_chunks_total} loaded chunks have "
+                f"raw_action / action_mask / initial_noise populated. This "
+                f"usually indicates a manual cache merge across collector "
+                f"versions, or a partial save that left some files with "
+                f"truncated chunk data. Disable the flag and re-collect."
+            )
+
+        # Surface partial-collection (mirrors the post-load tail of
+        # _collect_episodes via the shared _warn_partial_collection helper).
+        # The cache may contain partial groups even after passing setup
+        # validation, since partial groups are warned-not-raised there too.
+        self._warn_partial_collection(n_loaded, source="cache")
 
     def _resolved_num_async_vector_env(self) -> int:
         """Physical AsyncVectorEnv worker count per group (config value, or
@@ -1063,6 +1259,403 @@ class GRPOTrainer:
             idx = self.config.env_names.index(env_name)
             return self.config.max_episode_steps[idx]
         return self.config.max_episode_steps
+
+    def _parse_resume_iteration(self) -> int:
+        """Parse the iter number from `resume_from`'s basename, returning the
+        next iter to run.
+
+        Returns 1 for fresh runs (resume_from is unset) AND for non-canonical
+        resume paths (e.g., 'best/', 'latest/') — the latter preserves
+        backward compat for operators using non-iter-style names.
+
+        When resume_from_collected_data is set, requires canonical
+        `iter_NNNN/` naming (raises ValueError otherwise) so the cache
+        validator can deterministically infer the iter number; without
+        canonical naming the validator would silently fall back to
+        iter_0001/, almost certainly the wrong cache.
+        """
+        if not self.config.resume_from:
+            return 1
+        dir_name = Path(self.config.resume_from).name
+        m = ITER_DIR_RE.fullmatch(dir_name)
+        if m:
+            return int(m.group(1)) + 1
+        if self.config.resume_from_collected_data:
+            raise ValueError(
+                f"resume_from_collected_data=True requires resume_from "
+                f"to follow the canonical iter_NNNN/ naming pattern; "
+                f"got {self.config.resume_from!r} (basename "
+                f"{dir_name!r}). The cache validator infers the iter "
+                f"number from this directory name, and a non-canonical "
+                f"name would silently fall back to validating iter_0001/ "
+                f"— almost certainly the wrong cache. Either rename the "
+                f"checkpoint dir to iter_<integer> (e.g., iter_0050) or "
+                f"unset --resume-from-collected-data to start fresh "
+                f"collection."
+            )
+        return 1
+
+    def _validate_collected_data_cache(self, iter_num: int) -> None:
+        """Pre-flight check that cached episodes for `iter_num` are usable.
+
+        Called from setup() when resume_from_collected_data=True. Fails LOUDLY
+        on any mismatch so the operator can't silently train on a stale cache
+        from a prior config (the alternative — falling through to fresh
+        collection — would defeat the whole point of the flag, since the user
+        explicitly asked to skip the ~7-min × num_groups collection cost).
+
+        Validates (in order):
+          1. Cache directory exists and contains episode_*.npz files.
+          2. Per-file reads (single pass over all .npz):
+              a. file is parseable; per-file dtypes for `success` and
+                 `group_id` are sane (bool/int/uint/float for success;
+                 int/uint for group_id). Catches a future collector that
+                 saves these as strings or floats.
+              b. `group_id` is REQUIRED; missing key (old format) raises.
+              c. `env_name` matches the round-robin task that train()
+                 would assign to iter_num — `(iter_num - 1) % len(env_names)`.
+          3. Spot-check the first .npz for FM-log-prob keys
+             (raw_action_*, action_mask_*, initial_noise_* per chunk),
+             with `num_chunks` dtype validation and a `> 0` guard
+             (`num_chunks <= 0` would silently make the loop empty AND
+             break the within-group `Σ A_chunk = 0` invariant downstream).
+          4. Group-count invariants:
+              a. `n_obs >= num_groups` (dynamic mode produced enough groups);
+              b. `n_obs <= max_groups` UNCONDITIONALLY (collector never
+                 produces more than max_groups; an over-collected cache
+                 indicates manual merge or config drift);
+              c. `min_successful_groups` criterion satisfied OR
+                 `n_obs == max_groups` (legitimate collector exit when
+                 the task is too hard for the current policy).
+          5. Group sizes equal config.group_size:
+              a. UNDERCOUNT (size < group_size) warns but doesn't raise
+                 (mirrors the trainer's existing partial-collection policy
+                 for live-collected episodes);
+              b. OVERCOUNT (size > group_size) RAISES — within-group
+                 `env_seed` invariant is broken.
+
+        On success, prints a one-line summary so the operator can confirm at
+        a glance which iter is being skipped and what the cache looked like.
+        """
+        if not self.config.resume_from:
+            # Belt-and-suspenders: __post_init__ already enforces this. The
+            # double-check makes the caller's contract explicit and protects
+            # against direct setup() invocation that bypassed the dataclass
+            # validation (e.g., a future refactor that mutates config fields
+            # post-construction).
+            raise ValueError(
+                "_validate_collected_data_cache called without resume_from set "
+                "(should have been rejected by GRPOConfig.__post_init__)."
+            )
+
+        cache_dir = Path(self.config.episode_dir) / f"iter_{iter_num:04d}"
+
+        # Wrap is_dir() in try/except: when the parent has no read/exec
+        # permission, Path.is_dir() raises PermissionError instead of
+        # returning False. Without this guard, the operator sees a raw
+        # OSError stack trace instead of the actionable wrap-around.
+        try:
+            is_dir = cache_dir.is_dir()
+        except OSError as e:
+            raise RuntimeError(
+                f"resume_from_collected_data: failed to stat {cache_dir} "
+                f"({type(e).__name__}: {e}). Check that "
+                f"{self.config.episode_dir} and its ancestors are readable "
+                f"by the trainer process."
+            ) from e
+        if not is_dir:
+            raise FileNotFoundError(
+                f"resume_from_collected_data=True but cache directory does not "
+                f"exist: {cache_dir}. Either disable the flag (start fresh "
+                f"collection) or check that the prior run's collection for "
+                f"iter {iter_num} actually completed."
+            )
+
+        # Use os.listdir + manual filter instead of Path.glob: when the
+        # directory is unreadable (chmod 000), Path.glob silently returns
+        # an empty iterator and the validator falsely reports "Cache is
+        # empty" — operator might `rm -rf` the cache trying to fix it.
+        # listdir surfaces the PermissionError directly so the operator
+        # sees a `chmod` hint rather than a misleading "empty" message.
+        try:
+            all_entries = os.listdir(cache_dir)
+        except OSError as e:
+            raise RuntimeError(
+                f"resume_from_collected_data: failed to list {cache_dir} "
+                f"({type(e).__name__}: {e}). Check directory permissions; "
+                f"the cache exists but the trainer process cannot read it."
+            ) from e
+        npz_files = sorted(
+            cache_dir / name
+            for name in all_entries
+            if name.startswith("episode_") and name.endswith(".npz")
+        )
+        if not npz_files:
+            raise FileNotFoundError(
+                f"resume_from_collected_data=True but no episode_*.npz files "
+                f"in {cache_dir}. Cache is empty — disable the flag, or check "
+                f"the prior collection actually wrote files (it may have "
+                f"crashed before save_episodes())."
+            )
+
+        # The round-robin task selection here MUST match train()'s formula at
+        # the head of the iteration loop (`task_idx = (iteration - 1) %
+        # len(env_names)`). If those drift apart, this validator silently
+        # accepts caches that train() will later complain about.
+        expected_env = self.config.env_names[
+            (iter_num - 1) % len(self.config.env_names)
+        ]
+
+        # Single pass over the cache: read just the small scalar fields
+        # (env_name, group_id, success) per file. .npz is a zip directory, so
+        # numpy reads the metadata header without decompressing the large
+        # video/state/action arrays — this is cheap (~50ms for 25 files).
+        #
+        # `with np.load(...) as data:` releases the underlying zipfile +
+        # file descriptor on EVERY exit path (success, raise, GC). The
+        # bare `data = np.load(...)` form leaks the FD until refcount-GC
+        # runs, which is fragile across interpreter changes and not
+        # guaranteed if a field read raises mid-block.
+        group_to_successes: dict[int, list[bool]] = defaultdict(list)
+        for path in npz_files:
+            try:
+                with np.load(path, allow_pickle=True) as data:
+                    # Wrap the field reads inside the same try/except so a
+                    # partial/corrupted file (e.g., missing 'success') produces
+                    # the helpful "cache may be corrupted" message instead of
+                    # a raw KeyError that bubbles up unwrapped.
+                    actual_env = (
+                        str(data["env_name"])
+                        if "env_name" in data.files
+                        else None
+                    )
+                    # group_id is REQUIRED. Old caches that lack it would
+                    # silently default to 0 and merge unrelated rollouts
+                    # into one synthetic group, breaking the within-group
+                    # env_seed invariant that GRPO advantage normalization
+                    # relies on. Hard-fail rather than silently corrupt
+                    # training signal.
+                    if "group_id" not in data.files:
+                        raise KeyError(
+                            f"missing 'group_id' key — likely a pre-group-id "
+                            f"collector format. Disable "
+                            f"resume_from_collected_data and re-collect with "
+                            f"the current trainer."
+                        )
+                    # Tight dtype validation. A future collector that saved
+                    # group_id as np.float64 (e.g., a debug-mode patch)
+                    # would silently truncate via `int()` (`int(2.5) == 2`,
+                    # collapsing groups 2.0 and 2.5 onto gid 2). A string-
+                    # serialized success ("True"/"False") would evaluate
+                    # `bool("False") == True` (non-empty string is truthy)
+                    # and silently mark every episode successful. Dtype
+                    # checks make these silent regressions impossible.
+                    gid_arr = data["group_id"]
+                    if gid_arr.dtype.kind not in ("i", "u"):
+                        raise TypeError(
+                            f"group_id has unexpected dtype "
+                            f"{gid_arr.dtype} (expected integer)"
+                        )
+                    gid = int(gid_arr)
+                    if gid < 0:
+                        raise ValueError(
+                            f"group_id={gid} is negative; expected >= 0"
+                        )
+                    succ_arr = data["success"]
+                    # bool ('b'), int ('i'/'u'), float ('f') are the
+                    # historical save formats. Reject objects/strings.
+                    if succ_arr.dtype.kind not in ("b", "i", "u", "f"):
+                        raise TypeError(
+                            f"success has unexpected dtype "
+                            f"{succ_arr.dtype} (expected bool/int/float)"
+                        )
+                    success = bool(succ_arr)
+            except Exception as e:
+                raise RuntimeError(
+                    f"resume_from_collected_data: failed to read {path}: "
+                    f"{type(e).__name__}: {e}. Cache may be corrupted; "
+                    f"disable the flag and re-collect."
+                )
+            if actual_env != expected_env:
+                raise RuntimeError(
+                    f"resume_from_collected_data: env_name mismatch in "
+                    f"{path.name}. Expected {expected_env!r} (round-robin "
+                    f"task for iter {iter_num} given env_names="
+                    f"{self.config.env_names}); cached file has "
+                    f"{actual_env!r}. Likely cause: env_names config changed "
+                    f"between save and resume, or the resume point's iter "
+                    f"index doesn't align with the cached task. Disable the "
+                    f"flag, or pick a resume_from where iter_num modulo "
+                    f"len(env_names) lands on the cached task."
+                )
+            group_to_successes[gid].append(success)
+
+        # Spot-check the first .npz for the FM-log-prob keys. All files in
+        # an iter come from the same collector run, so a single sample is
+        # representative — checking every file would just multiply I/O for
+        # zero added safety.
+        try:
+            with np.load(npz_files[0], allow_pickle=True) as sample:
+                sample_keys = set(sample.files)
+                num_chunks_arr = sample["num_chunks"]
+                if num_chunks_arr.dtype.kind not in ("i", "u"):
+                    raise TypeError(
+                        f"num_chunks has unexpected dtype "
+                        f"{num_chunks_arr.dtype} (expected integer)"
+                    )
+                num_chunks = int(num_chunks_arr)
+        except Exception as e:
+            raise RuntimeError(
+                f"resume_from_collected_data: failed to read sample file "
+                f"{npz_files[0]}: {type(e).__name__}: {e}. Cache may be "
+                f"corrupted; disable the flag and re-collect."
+            )
+        # num_chunks <= 0 would make `range(num_chunks)` empty and the
+        # FM-key loop trivially pass — but the file has no chunks at all,
+        # which propagates downstream: `_load_single_episode` builds a
+        # 0-chunk episode that consumes one advantage in compute_advantages
+        # (per-group success vote) without contributing any chunks back to
+        # _build_chunks. The within-group `Σ A_chunk = 0` invariant that
+        # the GRPO clipped surrogate relies on is broken — fail loudly.
+        if num_chunks <= 0:
+            raise RuntimeError(
+                f"resume_from_collected_data: cached sample file "
+                f"{npz_files[0].name} has num_chunks={num_chunks}; expected "
+                f"a positive integer. Cache may be corrupted; disable the "
+                f"flag and re-collect."
+            )
+        for chunk_idx in range(num_chunks):
+            for prefix in ("raw_action_", "action_mask_", "initial_noise_"):
+                key = f"{prefix}{chunk_idx}"
+                if key not in sample_keys:
+                    raise RuntimeError(
+                        f"resume_from_collected_data: cached episode "
+                        f"{npz_files[0].name} is missing key {key!r}. The FM "
+                        f"log-prob surrogate requires raw_action / "
+                        f"action_mask / initial_noise per chunk (see "
+                        f"collect_episodes.save_episodes). Likely cause: "
+                        f"cache predates the GRPOPolicyWrapper instrumentation "
+                        f"that captures these tensors. Disable the flag and "
+                        f"re-collect."
+                    )
+
+        n_groups_observed = len(group_to_successes)
+        n_successful_groups = sum(
+            1 for s in group_to_successes.values() if any(s)
+        )
+
+        # Dynamic mode is allowed to have produced MORE groups than num_groups,
+        # so the bound is `>=` not `==`. A cache with fewer groups than
+        # configured means the prior collection either crashed mid-run or was
+        # collected under a smaller num_groups setting — both cases want a
+        # fresh collection.
+        if n_groups_observed < self.config.num_groups:
+            raise RuntimeError(
+                f"resume_from_collected_data: cache has {n_groups_observed} "
+                f"distinct group_ids in {cache_dir}, but config requires "
+                f"num_groups={self.config.num_groups}. Likely cause: prior "
+                f"collection crashed before completing all groups, or "
+                f"num_groups was raised between save and resume. Disable the "
+                f"flag and re-collect."
+            )
+
+        # Unconditional upper bound. The collector never produces more than
+        # max_groups by construction (EpisodeCollector.collect's loop caps
+        # at max_groups). A cache with `n_obs > max_groups` therefore
+        # indicates either a manual merge across iters or that the cache
+        # was collected under a LARGER max_groups setting than the current
+        # config admits. Both cases break the operator's stated config —
+        # reject loudly. This check runs BEFORE the min_successful_groups
+        # gate so it fires regardless of how many groups succeeded
+        # (the min_successful gate is intentionally short-circuited when
+        # `n_succ >= min_succ`, which would otherwise silently pass an
+        # over-collected cache).
+        if n_groups_observed > self.config.max_groups:
+            raise RuntimeError(
+                f"resume_from_collected_data: cache has {n_groups_observed} "
+                f"groups in {cache_dir}, exceeding max_groups="
+                f"{self.config.max_groups}. The collector never produces "
+                f"more than max_groups; the cache was either manually "
+                f"merged across iters, or collected under a larger "
+                f"max_groups setting that has since been lowered. Disable "
+                f"the flag and re-collect."
+            )
+
+        # min_successful_groups is satisfied either by hitting the explicit
+        # success criterion OR by hitting the max_groups cap exactly (the
+        # collector itself terminates on either condition — see
+        # EpisodeCollector.collect in collect_episodes.py:865-870). Match
+        # that exact contract here so caches accepted by the collector are
+        # also accepted by this validator.
+        #
+        # Use `!=` not `<`: a `<` check would silently accept a cache with
+        # MORE than max_groups groups (e.g., user lowered max_groups between
+        # save and resume). The cache was collected under a different
+        # max_groups setting, so the collector's exit reasoning doesn't
+        # apply — fail loudly. `==` allows the cap-hit escape; anything
+        # else (more or less) means the cache and config disagree.
+        if (
+            self.config.min_successful_groups > 0
+            and n_successful_groups < self.config.min_successful_groups
+            and n_groups_observed != self.config.max_groups
+        ):
+            raise RuntimeError(
+                f"resume_from_collected_data: cache has {n_successful_groups} "
+                f"groups with >=1 success, but config requires "
+                f"min_successful_groups={self.config.min_successful_groups}. "
+                f"Cache has {n_groups_observed} groups vs config "
+                f"max_groups={self.config.max_groups} — neither the "
+                f"min_successful criterion nor the max_groups cap was hit "
+                f"exactly, so the prior collection terminated abnormally "
+                f"(or was collected under a different max_groups). Disable "
+                f"the flag and re-collect."
+            )
+
+        # Partial groups (worker crashes during the original collection) are
+        # surfaced but NOT a hard failure — _collect_episodes handles partial
+        # collections the same way (warn, don't increment failure counter).
+        # Forcing a full re-collection here would diverge from that policy.
+        #
+        # OVERCOLLECTED groups (size > group_size) are different: they
+        # indicate either a manual cache merge (two iters' episodes glued
+        # into one dir) or a collector bug that re-ran a group. Either way
+        # the within-group `env_seed` invariant that GRPO advantage
+        # computation relies on is broken, so reject loudly.
+        expected_size = self.config.group_size
+        undercount = [
+            (gid, len(s))
+            for gid, s in group_to_successes.items()
+            if len(s) < expected_size
+        ]
+        overcount = [
+            (gid, len(s))
+            for gid, s in group_to_successes.items()
+            if len(s) > expected_size
+        ]
+        if overcount:
+            raise RuntimeError(
+                f"resume_from_collected_data: {len(overcount)} group(s) in "
+                f"{cache_dir} have MORE than group_size={expected_size} "
+                f"episodes: {overcount}. This usually indicates a manual "
+                f"merge of two iters' caches into one dir, or a collector "
+                f"bug that re-ran a group. The within-group env_seed "
+                f"invariant that GRPO advantage normalization relies on is "
+                f"broken — disable the flag and re-collect."
+            )
+        if undercount:
+            for gid, sz in undercount:
+                print(
+                    f"  WARNING: cached group {gid} has {sz}/{expected_size} "
+                    f"episodes — worker(s) likely failed during the original "
+                    f"collection. Continuing with partial group."
+                )
+
+        print(
+            f"  resume_from_collected_data: validated cache at {cache_dir} "
+            f"({len(npz_files)} episodes, {n_groups_observed} groups, "
+            f"{n_successful_groups} with >=1 success). Iter {iter_num} will "
+            f"skip collection."
+        )
 
     def _validate_optimizer_param_names(self, saved_names: list[str]) -> None:
         """Verify the saved optimizer's param order matches the current model.
@@ -2934,9 +3527,16 @@ class GRPOTrainer:
         # Phase-time breakdown (collect / advantage / update). The trainer
         # already times each phase for its console summary; surface them
         # here so TB can answer "which phase regressed?" without parsing logs.
+        # NaN values are sentinels indicating "no real work ran this iter
+        # for this phase" (e.g., collect=nan when the iter reused cached
+        # episodes via resume_from_collected_data) — skip them so the curve
+        # has a clean gap rather than a misleading data point at ~0.
         if phase_times is not None:
             for phase_name, secs in phase_times.items():
-                self.writer.add_scalar(f"time/{phase_name}_seconds", secs, iteration)
+                if not math.isnan(secs):
+                    self.writer.add_scalar(
+                        f"time/{phase_name}_seconds", secs, iteration
+                    )
 
         # Cumulative L2 distance of LoRA params from their setup-time snapshot.
         # The "has the policy actually moved?" diagnostic: if this stays near
@@ -2977,7 +3577,14 @@ class GRPOTrainer:
                 if lr is not None:
                     log_dict["train/lr"] = lr
                 if phase_times is not None:
-                    log_dict.update({f"time/{k}_seconds": v for k, v in phase_times.items()})
+                    # Skip NaN entries — same sentinel as the TB path. wandb
+                    # would otherwise log nan and break its chart autoscale
+                    # for the rest of the run.
+                    log_dict.update({
+                        f"time/{k}_seconds": v
+                        for k, v in phase_times.items()
+                        if not math.isnan(v)
+                    })
                 if lora_delta_norm is not None:
                     log_dict["lora/weight_delta_norm"] = lora_delta_norm
                 if (self.config.dynamic_epoch_training and update_stats is not None
@@ -3091,10 +3698,16 @@ def main():
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
-    # Create trainer and run
+    # Create trainer and run. Both setup() and train() are wrapped so that
+    # shutdown() runs even when setup() raises mid-way — important because
+    # __init__ may have already opened a ZMQ collector_client (and started
+    # background threads inside zmq.Context), and setup() itself has many
+    # raise paths (cache validator, optimizer state validation, LoRA load
+    # mismatch). Without the wrap, those raises bypass shutdown() entirely
+    # and leak the collector socket / context.
     trainer = GRPOTrainer(config)
-    trainer.setup()
     try:
+        trainer.setup()
         trainer.train()
     finally:
         trainer.shutdown()

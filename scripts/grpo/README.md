@@ -1293,8 +1293,69 @@ On resume:
 3. `optimizer.pt` is loaded with `_validate_optimizer_param_names`
    (positional order) + `_validate_optimizer_state` (param count +
    exp_avg shape) — both raise actionable errors on mismatch.
-4. `start_iteration = int(dir_name.split("_")[1]) + 1`, so the next iter
-   is the one after the checkpoint.
+4. `start_iteration` is parsed from the basename via
+   `re.fullmatch(r"iter_([0-9]+)", dir_name)` (ASCII digits only — Unicode
+   digits like `iter_０` are rejected). Non-canonical names (`best/`,
+   `latest/`, `iter_50.bak`) silently fall back to `start_iteration=1`,
+   preserving backward compat for unstructured checkpoint names.
+
+### Resume + reuse cached collection (`resume_from_collected_data`)
+
+When a prior run crashed AFTER finishing collection but BEFORE the model
+update completed, the on-disk `episode_dir/iter_NNNN/` already contains
+fully-collected episodes that are still on-policy for the resumed
+checkpoint (they were produced by the policy whose weights live in
+`resume_from`). Set `--resume-from-collected-data` to skip the FIRST
+resumed iter's ~7 min × num_groups simulation and load those `.npz`
+files directly:
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --resume-from grpo_data/grpo_checkpoints/iter_0050 \
+    --resume-from-collected-data
+```
+
+Validation runs in `setup()` BEFORE the model loads, so misconfigured
+caches fail fast. The validator checks (in order):
+
+1. `resume_from` follows the canonical `iter_NNNN/` pattern (required —
+   without it the validator can't infer which iter dir to load).
+2. `episode_dir/iter_{start_iteration:04d}/` exists and is readable
+   (PermissionError surfaces with a `chmod` hint, not a misleading "Cache
+   is empty").
+3. Per-file scalars are present and well-typed: `env_name` matches the
+   round-robin task for `start_iteration`, `group_id` is a non-negative
+   int (no silent default to 0), `success` is bool/int/float (no string
+   coercion), `num_chunks` is a positive int.
+4. The first `.npz` exposes `raw_action_*` / `action_mask_*` /
+   `initial_noise_*` keys for every chunk (FM log-prob surrogate
+   prerequisite).
+5. Group counts: `num_groups <= n_observed <= max_groups`, with the
+   `min_successful_groups` criterion satisfied OR `n_observed ==
+   max_groups` exactly (the collector's exit conditions).
+6. Per-group sizes: undercount warns (mirrors `_collect_episodes`'s
+   partial-collection policy), overcount raises (manual cache merge or
+   collector bug — within-group `env_seed` invariant broken).
+
+Only the FIRST resumed iter consumes the cache; subsequent iters collect
+normally. The decision is rederived as `iteration ==
+self._start_iteration AND config.resume_from_collected_data`, no mutable
+flag carried across phases.
+
+**When NOT to use:** do NOT enable when you've changed any
+collection-affecting config since the cache was written. The validator
+catches `env_name` and group-count mismatches but does NOT detect changes
+to `n_action_steps`, `fast_forward_steps` / `fast_forward_pct`,
+`init_state_npz_path`, `max_episode_steps`, or `success_weight` — the
+cached iter would silently train on episodes from the old config while
+subsequent iters collect under the new one. If in doubt, leave this
+disabled and pay the collection cost.
+
+**TB cosmetic:** the cached iter's `time/collect_seconds` is logged as
+NaN (filtered out by `_log_metrics`) so the curve shows a clean gap at
+the resumed iter rather than a near-zero plunge that distorts autoscale.
+Other phase-time scalars (`advantage`, `update`) and overall
+`time/iteration_seconds` log normally.
 
 ### Skip semantics (preserves iteration budget)
 
@@ -1421,6 +1482,11 @@ mismatch internally.
 **Training loop**
 - `num_iterations` (default 200)
 - `resume_from` (default None)
+- `resume_from_collected_data` (default False) — see "Resume + reuse
+  cached collection". Only valid when `resume_from` is also set; rejected
+  at config-construction time otherwise. Skips the first resumed iter's
+  collection by loading on-disk episodes from
+  `episode_dir/iter_{start_iteration:04d}/`.
 - `checkpoint_dir`, `save_interval` (default every 2 iters)
 - `seed` (default 67)
 

@@ -99,18 +99,30 @@ class GRPOConfig:
     # Each group gets a unique seed → unique initial kitchen/object configuration.
     # More groups = more diverse gradient signal per update.
     # Same as grpo_cont.py's args.num_groups = 5
-    # With dynamic group collection (see min_successful_groups), this is the
+    # With dynamic group collection (see min_alive_groups), this is the
     # MINIMUM number of groups; the collector may collect more (up to max_groups)
-    # if the success criterion isn't met after the first num_groups.
+    # if the alive criterion isn't met after the first num_groups.
     num_groups: int = 3
 
     # Dynamic group collection: after collecting `num_groups` groups, if fewer
-    # than `min_successful_groups` had at least one rollout succeed, the
-    # collector keeps adding one group at a time until the criterion is met
-    # or `max_groups` is reached. Set to 0 to disable (always exactly num_groups).
-    # Useful when many groups time out or fail entirely (dead groups contribute
-    # zero gradient signal — see the dead-group filter in train_grpo.py).
-    min_successful_groups: int = 2
+    # than `min_alive_groups` are ALIVE (mixed: 0 < group_successes <
+    # group_size, equivalently per-group reward std > 0 under success_weight=
+    # 1.0 with time-scaling disabled), the collector keeps adding one group at
+    # a time until the criterion is met or `max_groups` is reached. Set to 0
+    # to disable (always exactly num_groups).
+    #
+    # Why "alive" not "≥1 success": only mixed groups produce non-zero
+    # gradient signal (compute_advantages in episode_buffer.py drops any
+    # group with std < 1e-4 to advantage=0). All-success groups have
+    # group_successes=group_size > 0 but std=0 and contribute nothing — under
+    # the previous "≥1 success" criterion they were silently counted as
+    # satisfying the gate, so an iteration where the policy got too good on
+    # a scene could wrap collection happily and then train on zero live
+    # chunks. The alive predicate fixes this: in the early/low-success
+    # regime it is bit-identical to the old criterion (mixed iff ≥1 success
+    # iff ≥1 success AND ≥1 fail when no group is fully solved); in the
+    # transition regime it correctly demands actual gradient signal.
+    min_alive_groups: int = 2
 
     # Hard cap on dynamic group collection. Bounds worst-case wall time when
     # the task is too hard for the current policy. Must be >= num_groups and
@@ -167,8 +179,10 @@ class GRPOConfig:
     #   - Internally short-circuits the fast-forward path; fast_forward_steps /
     #     fast_forward_pct are ignored. Set fast_forward_pct=0.0 explicitly to
     #     make the intent visible in logs.
-    #   - min_successful_groups should be 0 — every group starts from the same
-    #     hard state, so "N groups had >=1 success" is not the criterion you want.
+    #   - min_alive_groups should be 0 — every group starts from the same
+    #     hard state, so "N alive groups" is also not the criterion you want
+    #     (and the dynamic loop is meaningless when every group has the same
+    #     scene).
     #   - success_weight < 1.0 is strongly recommended; from a hard saved state
     #     binary-only reward typically produces dead groups (every rollout fails
     #     identically → std=0 → zero advantage → no learning). With shaped reward
@@ -359,7 +373,7 @@ class GRPOConfig:
     # The trainer pre-flight-validates the cache during setup() (dir exists,
     # >= num_groups distinct group_ids, env_name matches the round-robin task
     # for start_iteration, raw_action / action_mask / initial_noise keys
-    # present, min_successful_groups criterion satisfied or max_groups cap
+    # present, min_alive_groups criterion satisfied or max_groups cap
     # reached). Validation failures raise before the model is loaded so the
     # operator gets immediate feedback. Only the first resumed iter consumes
     # the cache; subsequent iters collect normally.
@@ -479,14 +493,14 @@ class GRPOConfig:
                 f"is 100_000 in train_grpo.py, group stride is 1000 in "
                 f"collect_episodes.py)."
             )
-        if self.min_successful_groups < 0:
+        if self.min_alive_groups < 0:
             raise ValueError(
-                f"min_successful_groups must be >= 0, got "
-                f"{self.min_successful_groups}"
+                f"min_alive_groups must be >= 0, got "
+                f"{self.min_alive_groups}"
             )
-        if self.min_successful_groups > self.max_groups:
+        if self.min_alive_groups > self.max_groups:
             raise ValueError(
-                f"min_successful_groups ({self.min_successful_groups}) cannot "
+                f"min_alive_groups ({self.min_alive_groups}) cannot "
                 f"exceed max_groups ({self.max_groups}) — criterion would be "
                 f"unsatisfiable."
             )
@@ -637,18 +651,18 @@ class GRPOConfig:
             self.init_state_npz_path = str(_init_path)
 
             # NOTE: deliberately do NOT warn on success_weight=1.0 +
-            # init_state or on min_successful_groups>0 + init_state. Both
+            # init_state or on min_alive_groups>0 + init_state. Both
             # are valid choices:
             #   - success_weight=1.0: pure sparse binary reward is a
             #     legitimate setup; the operator may know the policy
             #     succeeds intermittently from this state, or may want to
             #     deliberately avoid mixing in dense-progress shaping.
-            #   - min_successful_groups>0: with all groups starting from
-            #     the same saved state, requiring ≥N "successful" groups
-            #     is a stability mechanism — each group draws independent
-            #     denoising noise, so ≥N alive groups gives a less noisy
-            #     gradient direction and reduces policy-collapse risk
-            #     from few-group updates.
+            #   - min_alive_groups>0: with all groups starting from
+            #     the same saved state, requiring ≥N alive groups is a
+            #     stability mechanism — each group draws independent
+            #     denoising noise, so ≥N alive (mixed) groups gives a
+            #     less noisy gradient direction and reduces policy-
+            #     collapse risk from few-group updates.
 
             # Multiple env_names + a single saved npz is almost certainly a
             # config bug: the npz's sim_state has dims tied to one env's

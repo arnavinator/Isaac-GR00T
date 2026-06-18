@@ -88,7 +88,7 @@ def _make_cache(
     env_name: str,
     n_groups: int,
     group_size: int,
-    n_successful_groups: int | None = None,
+    n_alive_groups: int | None = None,
     drop_keys: tuple[str, ...] = (),
     drop_top_keys: tuple[str, ...] = (),
     partial_group_id: int | None = None,
@@ -96,15 +96,16 @@ def _make_cache(
 ) -> Path:
     """Create cache_root/iter_NNNN/ populated with synthetic episodes.
 
-    n_successful_groups defaults to n_groups (every group has >=1 success).
-    Set lower to exercise the min_successful_groups path.
+    n_alive_groups defaults to n_groups (every group is mixed/alive: 1
+    success, group_size-1 failures). Set lower to exercise the
+    min_alive_groups path.
 
     partial_group_id (if set) overrides that group's episode count to
     partial_group_actual_size. Use a value < group_size for undercount
     (partial-group warning), or > group_size for overcount (raises).
     """
-    if n_successful_groups is None:
-        n_successful_groups = n_groups
+    if n_alive_groups is None:
+        n_alive_groups = n_groups
     iter_dir = cache_root / f"iter_{iter_num:04d}"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,11 +116,12 @@ def _make_cache(
             if gid == partial_group_id
             else group_size
         )
-        # First episode of group gets success if this group is "successful";
-        # rest of the group fails. Gives each group at most one success,
-        # enough to satisfy any min_successful_groups calculation.
+        # First episode of group gets success if this group is "alive"
+        # (mixed); rest of the group fails. Gives each group exactly
+        # one success out of group_size, which is mixed under the
+        # collector / validator's `0 < successes < len(s)` predicate.
         for in_group_idx in range(size):
-            success = (gid < n_successful_groups) and (in_group_idx == 0)
+            success = (gid < n_alive_groups) and (in_group_idx == 0)
             _write_synthetic_npz(
                 iter_dir,
                 ep_idx,
@@ -139,7 +141,7 @@ def _make_trainer(
     env_names: list[str],
     num_groups: int = 3,
     group_size: int = 4,
-    min_successful_groups: int = 0,
+    min_alive_groups: int = 0,
     max_groups: int | None = None,
     resume_from: str = "grpo_data/grpo_checkpoints/iter_0050",
 ):
@@ -162,7 +164,7 @@ def _make_trainer(
         num_groups=num_groups,
         group_size=group_size,
         num_async_vector_env=group_size,  # avoid divisibility complaints
-        min_successful_groups=min_successful_groups,
+        min_alive_groups=min_alive_groups,
         max_groups=max_groups,
         resume_from=resume_from,
         resume_from_collected_data=True,
@@ -206,12 +208,12 @@ def test_happy_path_dynamic_mode_extra_groups():
         _make_cache(
             root, iter_num=51,
             env_name=env, n_groups=5, group_size=4,
-            n_successful_groups=2,
+            n_alive_groups=2,
         )
         trainer = _make_trainer(
             cache_root=root, env_names=[env],
             num_groups=3, group_size=4,
-            min_successful_groups=2, max_groups=5,
+            min_alive_groups=2, max_groups=5,
         )
         trainer._validate_collected_data_cache(51)
     print("  PASS: happy path dynamic mode (extra groups)")
@@ -346,34 +348,34 @@ def test_too_few_groups():
     print("  PASS: too few groups raises RuntimeError")
 
 
-def test_min_successful_not_met_below_max():
-    """Dynamic mode: min_successful not met AND not at max_groups cap → RuntimeError."""
+def test_min_alive_not_met_below_max():
+    """Dynamic mode: min_alive not met AND not at max_groups cap → RuntimeError."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         env = "robocasa_panda_omron/Task_A"
-        # 3 groups, only 1 successful — but config wants 2 successful.
+        # 3 groups, only 1 alive — but config wants 2 alive.
         # Cache is at num_groups (3) but max_groups is 5, so it didn't hit
         # the cap → unfinished collection.
         _make_cache(
             root, iter_num=51,
             env_name=env, n_groups=3, group_size=4,
-            n_successful_groups=1,
+            n_alive_groups=1,
         )
         trainer = _make_trainer(
             cache_root=root, env_names=[env],
             num_groups=3, group_size=4,
-            min_successful_groups=2, max_groups=5,
+            min_alive_groups=2, max_groups=5,
         )
         try:
             trainer._validate_collected_data_cache(51)
             assert False, "expected RuntimeError"
         except RuntimeError as e:
-            assert "min_successful_groups" in str(e), f"unexpected message: {e}"
-    print("  PASS: min_successful unmet below max_groups raises RuntimeError")
+            assert "min_alive_groups" in str(e), f"unexpected message: {e}"
+    print("  PASS: min_alive unmet below max_groups raises RuntimeError")
 
 
-def test_min_successful_not_met_but_at_max_cap():
-    """Dynamic mode: min_successful not met but cache hit max_groups cap → ACCEPT.
+def test_min_alive_not_met_but_at_max_cap():
+    """Dynamic mode: min_alive not met but cache hit max_groups cap → ACCEPT.
 
     Hitting max_groups is a legitimate collector exit condition (the task is
     too hard, but we tried), so the cache should be accepted.
@@ -381,20 +383,20 @@ def test_min_successful_not_met_but_at_max_cap():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         env = "robocasa_panda_omron/Task_A"
-        # 5 groups (= max_groups), only 1 successful — collector exhausted budget.
+        # 5 groups (= max_groups), only 1 alive — collector exhausted budget.
         _make_cache(
             root, iter_num=51,
             env_name=env, n_groups=5, group_size=4,
-            n_successful_groups=1,
+            n_alive_groups=1,
         )
         trainer = _make_trainer(
             cache_root=root, env_names=[env],
             num_groups=3, group_size=4,
-            min_successful_groups=2, max_groups=5,
+            min_alive_groups=2, max_groups=5,
         )
         # Should NOT raise — hitting the cap is a valid exit condition.
         trainer._validate_collected_data_cache(51)
-    print("  PASS: min_successful unmet but at max_groups cap → ACCEPT")
+    print("  PASS: min_alive unmet but at max_groups cap → ACCEPT")
 
 
 def test_partial_group_warns_not_raises():
@@ -494,10 +496,10 @@ def test_max_groups_lowered_rejects_cache():
     """Cache has more groups than current max_groups → reject (Bug B + Bug A1).
 
     User collected with max_groups=5, then lowered to max_groups=3 between
-    save and resume. Cache has 5 groups + only 1 success but min_successful=2.
+    save and resume. Cache has 5 groups + only 1 alive but min_alive=2.
     Original audit (Bug B) made `n_obs != max_groups` reject this case via
-    the min_successful gate. Round-2 audit (Bug A1) added an UNCONDITIONAL
-    `n_obs > max_groups` check that fires first, regardless of n_succ —
+    the min_alive gate. Round-2 audit (Bug A1) added an UNCONDITIONAL
+    `n_obs > max_groups` check that fires first, regardless of n_alive —
     this test now hits that path.
     """
     with tempfile.TemporaryDirectory() as tmp:
@@ -506,12 +508,12 @@ def test_max_groups_lowered_rejects_cache():
         _make_cache(
             root, iter_num=51,
             env_name=env, n_groups=5, group_size=4,
-            n_successful_groups=1,
+            n_alive_groups=1,
         )
         trainer = _make_trainer(
             cache_root=root, env_names=[env],
             num_groups=3, group_size=4,
-            min_successful_groups=2, max_groups=3,
+            min_alive_groups=2, max_groups=3,
         )
         try:
             trainer._validate_collected_data_cache(51)
@@ -524,16 +526,16 @@ def test_max_groups_lowered_rejects_cache():
 
 
 def test_max_groups_exceeded_with_sufficient_success_still_rejects():
-    """Bug A1: n_obs > max_groups must reject even when n_succ >= min_succ.
+    """Bug A1: n_obs > max_groups must reject even when n_alive >= min_alive.
 
-    Round-2 audit found that the old min_successful_groups gate
-    short-circuits when `n_succ >= min_succ`, allowing an over-collected
+    Round-2 audit found that the old min_alive_groups gate
+    short-circuits when `n_alive >= min_alive`, allowing an over-collected
     cache to pass silently. The unconditional upper-bound check catches
     this case.
 
-    Setup: cache has 5 groups, 3 successful (>= min_succ=2). Config has
+    Setup: cache has 5 groups, 3 alive (>= min_alive=2). Config has
     max_groups=3. Old check (`n_obs != max_groups` gated behind
-    `n_succ < min_succ`) would have skipped because the n_succ gate is
+    `n_alive < min_alive`) would have skipped because the n_alive gate is
     False. New unconditional `n_obs > max_groups` correctly rejects.
     """
     with tempfile.TemporaryDirectory() as tmp:
@@ -542,12 +544,12 @@ def test_max_groups_exceeded_with_sufficient_success_still_rejects():
         _make_cache(
             root, iter_num=51,
             env_name=env, n_groups=5, group_size=4,
-            n_successful_groups=3,  # ABOVE min_succ → old gate skipped
+            n_alive_groups=3,  # ABOVE min_alive → old gate skipped
         )
         trainer = _make_trainer(
             cache_root=root, env_names=[env],
             num_groups=3, group_size=4,
-            min_successful_groups=2, max_groups=3,
+            min_alive_groups=2, max_groups=3,
         )
         try:
             trainer._validate_collected_data_cache(51)
@@ -1177,8 +1179,8 @@ def main():
         test_missing_raw_action_key,
         test_missing_initial_noise_key,
         test_too_few_groups,
-        test_min_successful_not_met_below_max,
-        test_min_successful_not_met_but_at_max_cap,
+        test_min_alive_not_met_below_max,
+        test_min_alive_not_met_but_at_max_cap,
         test_partial_group_warns_not_raises,
         # Round-1 audit fixes
         test_overcount_raises,                             # Bug C

@@ -269,7 +269,7 @@ def phase_b(env_name: str, server_host: str, server_port: int,
             success_weight=1.0,
             fast_forward_steps=12,
             fast_forward_pct=1.0,
-            min_successful_groups=0,
+            min_alive_groups=0,
         )
     finally:
         collector.close()

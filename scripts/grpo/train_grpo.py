@@ -138,7 +138,7 @@ class GRPOTrainer:
             sys.path.insert(0, str(Path(__file__).parent))
             from collector_server import CollectorClient
             # Scale RPC timeout from the EFFECTIVE upper bound on groups
-            # this iter. With dynamic mode active (min_successful_groups>0
+            # this iter. With dynamic mode active (min_alive_groups>0
             # and max_groups>num_groups in EpisodeCollector.collect), the
             # collector may run up to max_groups groups; otherwise it stops
             # at exactly num_groups. ~7 min/group on the user's setup. With
@@ -147,7 +147,7 @@ class GRPOTrainer:
             # (turns_per_group == 1 in the default one-env-per-rollout case).
             effective_max_groups = (
                 self.config.max_groups
-                if self.config.min_successful_groups > 0
+                if self.config.min_alive_groups > 0
                 and self.config.max_groups > self.config.num_groups
                 else self.config.num_groups
             )
@@ -437,7 +437,7 @@ class GRPOTrainer:
         print(f"\nStarting training: {self.config.num_iterations} iterations")
         total_eps = self.config.group_size * self.config.num_groups
         is_dynamic = (
-            self.config.min_successful_groups > 0
+            self.config.min_alive_groups > 0
             and self.config.max_groups > self.config.num_groups
         )
         if is_dynamic:
@@ -446,7 +446,7 @@ class GRPOTrainer:
                 f"  Episodes per iteration: {total_eps}-{max_eps} "
                 f"({self.config.num_groups}-{self.config.max_groups} groups × "
                 f"{self.config.group_size}; dynamic, target "
-                f">={self.config.min_successful_groups} successful groups)"
+                f">={self.config.min_alive_groups} alive groups)"
             )
         else:
             print(
@@ -797,7 +797,7 @@ class GRPOTrainer:
 
         total_episodes = self.config.group_size * self.config.num_groups
         is_dynamic = (
-            self.config.min_successful_groups > 0
+            self.config.min_alive_groups > 0
             and self.config.max_groups > self.config.num_groups
         )
         if is_dynamic:
@@ -1048,9 +1048,9 @@ class GRPOTrainer:
             # the iter boundary (iter N's last seed == iter N+1's first seed).
             "--seed", str(self.config.seed + self.iteration * 100_000),
             # Dynamic group collection (config-driven). When
-            # min_successful_groups=0 in config, collector behaves identically
+            # min_alive_groups=0 in config, collector behaves identically
             # to the old fixed-num_groups path.
-            "--min-successful-groups", str(self.config.min_successful_groups),
+            "--min-alive-groups", str(self.config.min_alive_groups),
             "--max-groups", str(self.config.max_groups),
         ]
 
@@ -1069,12 +1069,12 @@ class GRPOTrainer:
         # read could wait forever).
         # Scale subprocess timeout from the EFFECTIVE upper bound on groups
         # this iter (matches the RPC client's scaling at __init__). When
-        # dynamic mode is disabled (min_successful_groups=0 or max_groups
+        # dynamic mode is disabled (min_alive_groups=0 or max_groups
         # equals num_groups), the collector stops at num_groups so there's
         # no need to grant the dynamic-mode worst-case 70-min budget.
         effective_max_groups = (
             self.config.max_groups
-            if self.config.min_successful_groups > 0
+            if self.config.min_alive_groups > 0
             and self.config.max_groups > self.config.num_groups
             else self.config.num_groups
         )
@@ -1154,7 +1154,7 @@ class GRPOTrainer:
                 success_weight=self.config.success_weight,
                 fast_forward_steps=ff_steps,
                 fast_forward_pct=self.config.fast_forward_pct,
-                min_successful_groups=self.config.min_successful_groups,
+                min_alive_groups=self.config.min_alive_groups,
                 max_groups=self.config.max_groups,
                 init_state_npz_path=self.config.init_state_npz_path,
             )
@@ -1324,7 +1324,7 @@ class GRPOTrainer:
               b. `n_obs <= max_groups` UNCONDITIONALLY (collector never
                  produces more than max_groups; an over-collected cache
                  indicates manual merge or config drift);
-              c. `min_successful_groups` criterion satisfied OR
+              c. `min_alive_groups` criterion satisfied OR
                  `n_obs == max_groups` (legitimate collector exit when
                  the task is too hard for the current policy).
           5. Group sizes equal config.group_size:
@@ -1540,8 +1540,18 @@ class GRPOTrainer:
                     )
 
         n_groups_observed = len(group_to_successes)
-        n_successful_groups = sum(
-            1 for s in group_to_successes.values() if any(s)
+        # "Alive" group = mixed (0 < group_successes < group_size). Matches
+        # the collector's exit criterion (collect_episodes.py:_collect) and
+        # the trainer's gradient-signal filter (advantage=0 for std<1e-4
+        # groups → dropped by the dead-group filter in
+        # _grpo_update_inner). Compare against `len(s)` rather than
+        # config.group_size so partial groups (worker crashes losing some
+        # rollouts) are evaluated by what's actually in the cache — which
+        # is what compute_advantages will see. For full groups
+        # (`len(s) == group_size`) the two are equivalent.
+        n_alive_groups = sum(
+            1 for s in group_to_successes.values()
+            if 0 < sum(s) < len(s)
         )
 
         # Dynamic mode is allowed to have produced MORE groups than num_groups,
@@ -1565,10 +1575,10 @@ class GRPOTrainer:
         # indicates either a manual merge across iters or that the cache
         # was collected under a LARGER max_groups setting than the current
         # config admits. Both cases break the operator's stated config —
-        # reject loudly. This check runs BEFORE the min_successful_groups
-        # gate so it fires regardless of how many groups succeeded
-        # (the min_successful gate is intentionally short-circuited when
-        # `n_succ >= min_succ`, which would otherwise silently pass an
+        # reject loudly. This check runs BEFORE the min_alive_groups
+        # gate so it fires regardless of how many groups were alive
+        # (the min_alive gate is intentionally short-circuited when
+        # `n_alive >= min_alive`, which would otherwise silently pass an
         # over-collected cache).
         if n_groups_observed > self.config.max_groups:
             raise RuntimeError(
@@ -1581,10 +1591,10 @@ class GRPOTrainer:
                 f"the flag and re-collect."
             )
 
-        # min_successful_groups is satisfied either by hitting the explicit
-        # success criterion OR by hitting the max_groups cap exactly (the
+        # min_alive_groups is satisfied either by hitting the explicit
+        # alive criterion OR by hitting the max_groups cap exactly (the
         # collector itself terminates on either condition — see
-        # EpisodeCollector.collect in collect_episodes.py:865-870). Match
+        # EpisodeCollector.collect in collect_episodes.py). Match
         # that exact contract here so caches accepted by the collector are
         # also accepted by this validator.
         #
@@ -1595,17 +1605,18 @@ class GRPOTrainer:
         # apply — fail loudly. `==` allows the cap-hit escape; anything
         # else (more or less) means the cache and config disagree.
         if (
-            self.config.min_successful_groups > 0
-            and n_successful_groups < self.config.min_successful_groups
+            self.config.min_alive_groups > 0
+            and n_alive_groups < self.config.min_alive_groups
             and n_groups_observed != self.config.max_groups
         ):
             raise RuntimeError(
-                f"resume_from_collected_data: cache has {n_successful_groups} "
-                f"groups with >=1 success, but config requires "
-                f"min_successful_groups={self.config.min_successful_groups}. "
+                f"resume_from_collected_data: cache has {n_alive_groups} "
+                f"alive (mixed: 0 < group_successes < group_size) groups, "
+                f"but config requires "
+                f"min_alive_groups={self.config.min_alive_groups}. "
                 f"Cache has {n_groups_observed} groups vs config "
                 f"max_groups={self.config.max_groups} — neither the "
-                f"min_successful criterion nor the max_groups cap was hit "
+                f"min_alive criterion nor the max_groups cap was hit "
                 f"exactly, so the prior collection terminated abnormally "
                 f"(or was collected under a different max_groups). Disable "
                 f"the flag and re-collect."
@@ -1653,7 +1664,7 @@ class GRPOTrainer:
         print(
             f"  resume_from_collected_data: validated cache at {cache_dir} "
             f"({len(npz_files)} episodes, {n_groups_observed} groups, "
-            f"{n_successful_groups} with >=1 success). Iter {iter_num} will "
+            f"{n_alive_groups} alive/mixed). Iter {iter_num} will "
             f"skip collection."
         )
 

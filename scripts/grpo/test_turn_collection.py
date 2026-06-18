@@ -488,7 +488,7 @@ def test_collect_driver_multi_group_multi_turn():
         success_weight=1.0,
         fast_forward_steps=0,      # FF disabled → normal seed-aligned groups
         fast_forward_pct=0.0,
-        min_successful_groups=0,   # no dynamic extension → exactly num_groups
+        min_alive_groups=0,   # no dynamic extension → exactly num_groups
         max_groups=None,
     )
     check("total episodes == num_groups * group_size (8)", len(eps) == 8, f"got {len(eps)}")

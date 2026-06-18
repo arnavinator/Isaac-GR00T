@@ -365,7 +365,7 @@ uv run python scripts/grpo/train_grpo.py \
     --init-state-npz-path /path/to/ep000_step010.npz \
     --success-weight 0.3 \
     --fast-forward-pct 0.0 \
-    --min-successful-groups 0 \
+    --min-alive-groups 0 \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
     --num-iterations 50
 ```
@@ -394,14 +394,14 @@ Interactions with other knobs:
   `fast_forward_pct` are ignored when `init_state_npz_path` is set
   (logged at iter start). Set `fast_forward_pct=0.0` on the CLI too if
   you want the intent visible in logs without trusting the override.
-- **`min_successful_groups` is a gradient-stability knob.** With every
+- **`min_alive_groups` is a gradient-stability knob.** With every
   group starting from the same saved state, each group is an independent
-  sample of the per-group success-rate distribution (different denoising
-  noise → different outcomes). Requiring ≥N alive groups via
-  `min_successful_groups=N` reduces gradient noise and the risk of
-  policy collapse from low-alive-group updates — at the cost of more
-  wall time when the success rate is low (the dynamic loop extends
-  toward `max_groups`).
+  sample of the per-group outcome distribution (different denoising
+  noise → different mixes of success/failure). Requiring ≥N alive
+  (mixed) groups via `min_alive_groups=N` reduces gradient noise and
+  the risk of policy collapse from low-alive-group updates — at the
+  cost of more wall time when the success rate is at an extreme (the
+  dynamic loop extends toward `max_groups`).
 - **`success_weight` choice.** Default `1.0` (pure binary reward) is
   fully supported and a common choice. Setting `success_weight < 1.0`
   blends in `max_progress`, which provides advantage variance even
@@ -490,33 +490,45 @@ avoid wasting an iteration on a buffer with zero live signal:
 
 ```
 config.num_groups = 5              # MINIMUM groups per iter (was fixed)
-config.min_successful_groups = 4   # keep adding groups until ≥4 had ≥1 success
+config.min_alive_groups = 4        # keep adding groups until ≥4 are alive (mixed)
 config.max_groups = 10             # hard cap on dynamic collection
 ```
 
 After the first `num_groups` groups, the collector keeps adding **one
 group at a time** until either:
 
-1. `successful_groups >= min_successful_groups` (a group is "successful"
-   if at least one of its rollouts succeeded), or
+1. `alive_groups >= min_alive_groups` (a group is "alive" if it is
+   mixed: `0 < group_successes < group_size`, equivalently per-group
+   reward std > 0 under `success_weight=1.0` with time-scaling
+   disabled — the only regime this exact predicate is valid for; for
+   `success_weight<1.0` the criterion would have to inspect shaped-
+   reward variance, which the collector does not currently compute),
+   or
 2. `group_idx >= max_groups` (hard cap, logs a WARNING).
 
-To disable dynamic collection entirely, set `min_successful_groups = 0` —
+The "alive" predicate matches the trainer's gradient-signal filter
+exactly: `compute_advantages` zeros the advantage of any group with
+std < 1e-4, and the GRPO update drops zero-advantage chunks before
+backward (`abs(c.advantage) < 1e-12`). All-success groups
+(`group_successes == group_size`) and all-fail groups
+(`group_successes == 0`) both have std = 0 and contribute zero
+gradient — neither is "alive". An earlier version of this loop used
+"≥1 success" as a proxy, which silently counted all-success groups
+as satisfying the gate; that has been replaced by the exact mixed
+criterion. In the early/low-success regime (no group fully solved
+yet) the two criteria are equivalent.
+
+To disable dynamic collection entirely, set `min_alive_groups = 0` —
 the collector then always stops at exactly `num_groups`.
 
 Constraints (enforced in `GRPOConfig.__post_init__`):
 
 - `max_groups >= num_groups`
 - `max_groups <= 100` (seed-stride collision boundary)
-- `min_successful_groups <= max_groups`
+- `min_alive_groups <= max_groups`
 
 Subprocess/RPC timeouts auto-scale at 7 min/group:
 `timeout = 420 * effective_max_groups` seconds.
-
-The dead-group threshold used here ("group had ≥1 success") is an
-approximation for "group will produce non-zero gradient signal". The
-strict condition is per-group reward std > 1e-4 — see "Minibatch
-construction" below for the actual filter.
 
 ---
 
@@ -1331,8 +1343,10 @@ caches fail fast. The validator checks (in order):
    `initial_noise_*` keys for every chunk (FM log-prob surrogate
    prerequisite).
 5. Group counts: `num_groups <= n_observed <= max_groups`, with the
-   `min_successful_groups` criterion satisfied OR `n_observed ==
-   max_groups` exactly (the collector's exit conditions).
+   `min_alive_groups` criterion satisfied OR `n_observed ==
+   max_groups` exactly (the collector's exit conditions). Alive is
+   defined as `0 < group_successes < group_size` (mixed) — same
+   predicate the live collector uses.
 6. Per-group sizes: undercount warns (mirrors `_collect_episodes`'s
    partial-collection policy), overcount raises (manual cache merge or
    collector bug — within-group `env_seed` invariant broken).
@@ -1420,8 +1434,8 @@ uv run python scripts/grpo/train_grpo.py \
   RAM. See "Decoupling group size from worker count". Bake-time: must match
   `collector_server.py --num-async-vector-env`.
 - `num_groups` — minimum groups per iter. Default 5.
-- `min_successful_groups` / `max_groups` — see "Dynamic group
-  collection". Default 4 / 10.
+- `min_alive_groups` / `max_groups` — see "Dynamic group
+  collection". Default 2 / 5.
 - `max_episode_steps: int | list[int]` — per-env truncation horizon.
   Default 480.
 - `n_action_steps` — sub-steps to execute from each 16-step chunk.

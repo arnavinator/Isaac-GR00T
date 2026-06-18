@@ -679,10 +679,12 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for environment initialization.",
     )
     parser.add_argument(
-        "--min-successful-groups", type=int, default=0,
-        help="Min groups with >=1 success before stopping. 0 = disabled "
-             "(always collect exactly num_groups). When >0, collector continues "
-             "past num_groups (capped at max_groups) until criterion is met.",
+        "--min-alive-groups", type=int, default=0,
+        help="Min ALIVE groups (mixed: 0 < group_successes < group_size, "
+             "i.e., per-group reward std > 0 under success_weight=1.0) before "
+             "stopping. 0 = disabled (always collect exactly num_groups). "
+             "When >0, collector continues past num_groups (capped at "
+             "max_groups) until criterion is met.",
     )
     parser.add_argument(
         "--max-groups", type=int, default=None,
@@ -840,7 +842,7 @@ class EpisodeCollector:
         success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
-        min_successful_groups: int = 0,
+        min_alive_groups: int = 0,
         max_groups: int | None = None,
         init_state_npz_path: str | None = None,
     ) -> list[dict]:
@@ -861,18 +863,20 @@ class EpisodeCollector:
         approaches `fast_forward_pct` because each call gets a different
         `base_seed` from the trainer.
 
-        Dynamic group collection: when min_successful_groups > 0, after
+        Dynamic group collection: when min_alive_groups > 0, after
         collecting `num_groups` groups the collector keeps adding one more
-        group at a time until either (a) at least `min_successful_groups`
-        groups have produced at least one successful rollout, or (b)
-        `max_groups` groups have been collected (warning logged).
+        group at a time until either (a) at least `min_alive_groups` groups
+        are ALIVE (mixed: 0 < group_successes < group_size — equivalently,
+        per-group reward std > 0 under success_weight=1.0 with time-scaling
+        disabled, the only regime this binary-mixed predicate is exact for),
+        or (b) `max_groups` groups have been collected (warning logged).
         """
         # Default max_groups = num_groups (disables dynamic mode regardless
-        # of min_successful_groups, since we can't go beyond num_groups).
+        # of min_alive_groups, since we can't go beyond num_groups).
         if max_groups is None:
             max_groups = num_groups
 
-        dynamic_mode = min_successful_groups > 0 and max_groups > num_groups
+        dynamic_mode = min_alive_groups > 0 and max_groups > num_groups
 
         # Validation. These constraints are also enforced statically in the
         # trainer config, but a misconfigured manual CLI invocation would
@@ -885,9 +889,9 @@ class EpisodeCollector:
             raise ValueError(
                 f"max_groups ({max_groups}) must be >= num_groups ({num_groups})"
             )
-        if min_successful_groups > max_groups:
+        if min_alive_groups > max_groups:
             raise ValueError(
-                f"min_successful_groups ({min_successful_groups}) cannot "
+                f"min_alive_groups ({min_alive_groups}) cannot "
                 f"exceed max_groups ({max_groups}) — criterion would be unsatisfiable."
             )
         # GROUP_SEED_STRIDE × max_groups must stay below the trainer's per-iter
@@ -943,8 +947,7 @@ class EpisodeCollector:
             )
             print(
                 f"  Dynamic: continue past {num_groups} groups until "
-                f">={min_successful_groups} groups have >=1 success "
-                f"(or hit cap)."
+                f">={min_alive_groups} ALIVE (mixed) groups (or hit cap)."
             )
         else:
             total_episodes = self.group_size * num_groups
@@ -964,7 +967,7 @@ class EpisodeCollector:
             # the FF prints above which are also unguarded for the same reason.
             print(f"  Init-state override: every group restores from {init_state_npz_path}")
 
-        successful_groups = 0
+        alive_groups = 0
         group_idx = 0
         while True:
             # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart
@@ -991,26 +994,28 @@ class EpisodeCollector:
             all_episodes.extend(group_episodes)
 
             group_successes = sum(e["success"] for e in group_episodes)
-            # "Successful group" = at least one rollout succeeded. This is
-            # an approximation for "group will produce a non-zero gradient
-            # signal" — the strict condition is per-group reward std > 1e-4
-            # (see episode_buffer.py:compute_advantages). Edge cases where
-            # the approximation differs:
-            #   - All G rollouts succeed at IDENTICAL num_steps: rewards
-            #     all equal → std=0 → group dead, but counted here.
-            #   - All G rollouts fail with IDENTICAL max_progress (only
-            #     matters when success_weight<1.0): same situation.
-            # Both require zero policy-noise-induced variance on
-            # success/failure timing, which is vanishingly rare on
-            # non-trivial RoboCasa tasks (typical num_steps spreads over
-            # 10s of substeps within a successful group). If you observe
-            # dynamic mode terminating with 4 "successful" groups but
-            # _grpo_update_inner reports `Filtering N/N chunks ... dead
-            # groups`, switch this criterion to a per-group reward std check
-            # (would require the collector to compute time-scaled rewards,
-            # which it doesn't currently do).
-            if group_successes > 0:
-                successful_groups += 1
+            # "Alive group" = mixed: at least one rollout succeeded AND at
+            # least one failed. This matches the trainer's gradient-signal
+            # criterion exactly: under success_weight=1.0 with time-scaling
+            # disabled (see episode_buffer.py:351-376 for why time-scaling
+            # is off), per-group reward std > 0 iff the rewards span both
+            # 0 and 1 — i.e., 0 < group_successes < group_size. Pure all-
+            # success groups (group_successes == group_size) and pure all-
+            # fail groups (group_successes == 0) both have std=0 and get
+            # advantage-zeroed by compute_advantages, so neither contributes
+            # gradient signal.
+            #
+            # NOTE: this binary-mixed predicate is exact only when
+            # success_weight=1.0 with time-scaling disabled — the regime
+            # this codebase trains in. For success_weight<1.0 or time-
+            # scaled rewards, the strict criterion is per-group shaped-
+            # reward std > 1e-4, which the collector does not currently
+            # compute. If you switch reward shaping back on, audit this
+            # site (and the resume_from_collected_data validator in
+            # train_grpo.py:_validate_collected_data_cache) for the
+            # same predicate.
+            if 0 < group_successes < self.group_size:
+                alive_groups += 1
 
             group_idx += 1
 
@@ -1019,7 +1024,7 @@ class EpisodeCollector:
             rate = n_done / elapsed * 60 if elapsed > 0 else 0
             if dynamic_mode:
                 progress_str = (
-                    f"successful groups: {successful_groups}/{min_successful_groups}, "
+                    f"alive groups: {alive_groups}/{min_alive_groups}, "
                     f"eps: {n_done}"
                 )
                 count_str = f"{group_idx}/{num_groups}+"
@@ -1038,7 +1043,7 @@ class EpisodeCollector:
             have_min_groups = group_idx >= num_groups
             have_signal = (
                 not dynamic_mode
-                or successful_groups >= min_successful_groups
+                or alive_groups >= min_alive_groups
             )
             at_max_cap = group_idx >= max_groups
 
@@ -1048,8 +1053,8 @@ class EpisodeCollector:
                 if not have_signal:
                     print(
                         f"  WARNING: hit max_groups={max_groups} cap with only "
-                        f"{successful_groups}/{min_successful_groups} successful "
-                        f"groups — proceeding with what was collected."
+                        f"{alive_groups}/{min_alive_groups} alive "
+                        f"(mixed) groups — proceeding with what was collected."
                     )
                 break
 
@@ -1068,7 +1073,7 @@ class EpisodeCollector:
         print(
             f"Success rate: {successes}/{total_eps} "
             f"({success_pct:.0f}% episodes), "
-            f"successful groups: {successful_groups}/{group_idx}"
+            f"alive groups: {alive_groups}/{group_idx}"
         )
         # Only report dense progress when it actually contributed to the shaped
         # reward — with success_weight=1.0 (the default) the progress term is
@@ -1869,7 +1874,7 @@ def main():
             success_weight=args.success_weight,
             fast_forward_steps=args.fast_forward_steps,
             fast_forward_pct=args.fast_forward_pct,
-            min_successful_groups=args.min_successful_groups,
+            min_alive_groups=args.min_alive_groups,
             max_groups=args.max_groups,
             init_state_npz_path=args.init_state_npz_path,
         )

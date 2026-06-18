@@ -283,7 +283,7 @@ class CollectorServer:
             success_weight=float(data.get("success_weight", 1.0)),
             fast_forward_steps=int(data.get("fast_forward_steps", 0)),
             fast_forward_pct=float(data.get("fast_forward_pct", 0.5)),
-            min_successful_groups=int(data.get("min_successful_groups", 0)),
+            min_alive_groups=int(data.get("min_alive_groups", 0)),
         )
         if "max_groups" in data and data["max_groups"] is not None:
             collect_kwargs["max_groups"] = int(data["max_groups"])
@@ -382,7 +382,7 @@ class CollectorClient:
         success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
-        min_successful_groups: int = 0,
+        min_alive_groups: int = 0,
         max_groups: int | None = None,
         init_state_npz_path: str | None = None,
     ) -> dict:
@@ -394,7 +394,7 @@ class CollectorClient:
             "success_weight": float(success_weight),
             "fast_forward_steps": int(fast_forward_steps),
             "fast_forward_pct": float(fast_forward_pct),
-            "min_successful_groups": int(min_successful_groups),
+            "min_alive_groups": int(min_alive_groups),
         }
         # Only include max_groups when set so older servers (which don't know
         # this key) keep the EpisodeCollector default behaviour.

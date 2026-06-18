@@ -82,7 +82,7 @@ class ToyGRPOConfig(GRPOConfig):
     # episodes-per-iter. Match the real (fixed-seed) count.
     num_groups: int = len(FIXED_SEEDS)
 
-    min_successful_groups: int = 0
+    min_alive_groups: int = 0
 
     max_groups: int = 8
 
@@ -98,7 +98,7 @@ class ToyGRPOTrainer(GRPOTrainer):
     """Trainer variant that draws env seeds from a FIXED list each iter.
 
     Mechanism: temporarily mutate (config.seed, config.num_groups,
-    config.min_successful_groups, config.max_groups, self.iteration) around
+    config.min_alive_groups, config.max_groups, self.iteration) around
     each subprocess call so the existing _collect_via_subprocess emits one
     group at the exact seed we want. State is restored in a finally block
     before returning, so the rest of the trainer (LR sched, advantage
@@ -108,13 +108,14 @@ class ToyGRPOTrainer(GRPOTrainer):
     (the subprocess always writes group_id=0 when num_groups=1; without
     re-tagging, every attempt's episodes would collapse into a single
     pseudo-group spanning the iter) and the slot's env_seed (which
-    _log_metrics buckets by). When config.min_successful_groups > 0,
-    also runs an outer round-robin retry of any slot whose group had
-    no task-successful rollouts, until config.min_successful_groups
-    slots have succeeded or config.max_groups total subprocess attempts
-    have been made — mirroring the production dynamic-collection
-    semantics from collect_episodes.EpisodeCollector.collect, scoped
-    to the FIXED_SEEDS list instead of fresh seeds. See
+    _log_metrics buckets by). When config.min_alive_groups > 0,
+    also runs an outer round-robin retry of any slot whose group was
+    not ALIVE (mixed: 0 < group_successes < group_size), until
+    config.min_alive_groups slots have produced an alive group or
+    config.max_groups total subprocess attempts have been made —
+    mirroring the production dynamic-collection semantics from
+    collect_episodes.EpisodeCollector.collect, scoped to the
+    FIXED_SEEDS list instead of fresh seeds. See
     _collect_episodes for the full retry algorithm.
     """
 
@@ -153,21 +154,23 @@ class ToyGRPOTrainer(GRPOTrainer):
             )
 
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int) -> None:
-        """One subprocess call per fixed seed, retrying failed seeds until
-        min_successful_groups slots succeed or max_groups attempts are made.
+        """One subprocess call per fixed seed, retrying not-alive seeds until
+        min_alive_groups slots produce an alive group or max_groups attempts
+        are made.
 
         Retry semantics match the production dynamic-collection path
-        (collect_episodes.EpisodeCollector.collect): a "successful" group has
-        at least one rollout that completed the task (group_successes > 0;
-        see collect_episodes.py:714). After the initial pass through
-        FIXED_SEEDS, if fewer than config.min_successful_groups slots have
-        produced a successful group, round-robin retry the still-failed
+        (collect_episodes.EpisodeCollector.collect): an "alive" group has
+        at least one rollout that completed the task AND at least one
+        that failed (0 < group_successes < group_size; see
+        collect_episodes.py for the predicate). After the initial pass
+        through FIXED_SEEDS, if fewer than config.min_alive_groups slots
+        have produced an alive group, round-robin retry the still-not-alive
         slots one at a time until any of:
-          - >= min_successful_groups slots have succeeded
+          - >= min_alive_groups slots have produced an alive group
           - total attempts reaches config.max_groups
-          - all slots have already succeeded (criterion exceeds
-            len(FIXED_SEEDS), which is unsatisfiable by adding more
-            attempts since each slot contributes at most 1).
+          - all slots have already produced an alive group (criterion
+            exceeds len(FIXED_SEEDS), which is unsatisfiable by adding
+            more attempts since each slot contributes at most 1).
 
         Each subprocess call gets a globally-unique group_id within the
         iter (incremented per attempt), so retries accumulate in the
@@ -186,7 +189,7 @@ class ToyGRPOTrainer(GRPOTrainer):
         duplicate-FIXED_SEEDS pattern (e.g., [305067, 305067, 305067])
         already relies on.
 
-        Note: ToyGRPOConfig defaults min_successful_groups=0, so by
+        Note: ToyGRPOConfig defaults min_alive_groups=0, so by
         default no retries happen and behavior reduces to the original
         single-pass iteration over FIXED_SEEDS.
         """
@@ -212,55 +215,55 @@ class ToyGRPOTrainer(GRPOTrainer):
             ff_steps = self.config.fast_forward_steps
 
         n_slots = len(self.fixed_seeds)
-        min_succ = self.config.min_successful_groups
+        min_alive = self.config.min_alive_groups
         # max_attempts caps total subprocess calls per iter (initial pass
         # plus any retries). __init__ enforces max_groups >= n_slots so the
         # initial pass always fits the budget, leaving room for >= 0 retries.
         max_attempts = self.config.max_groups
-        # Per-attempt log display: when min_succ=0 Phase 2 is skipped, so
+        # Per-attempt log display: when min_alive=0 Phase 2 is skipped, so
         # the actual cap on attempts is n_slots — not max_attempts. Pick
         # the right one so "Attempt N/M" reads honestly.
-        attempt_cap_display = max_attempts if min_succ > 0 else n_slots
-        if min_succ > 0:
+        attempt_cap_display = max_attempts if min_alive > 0 else n_slots
+        if min_alive > 0:
             print(
                 f"  [TOY] Collecting {n_slots} fixed seeds × "
                 f"{self.config.group_size} rollouts each, then retrying "
-                f"failed seeds round-robin until {min_succ} slots succeed "
-                f"or {max_attempts} total attempts "
+                f"not-alive seeds round-robin until {min_alive} slots "
+                f"are alive or {max_attempts} total attempts "
                 f"(one subprocess per attempt)..."
             )
         else:
             print(
                 f"  [TOY] Collecting {n_slots} fixed seeds × "
                 f"{self.config.group_size} rollouts each "
-                f"(no retry: min_successful_groups=0)..."
+                f"(no retry: min_alive_groups=0)..."
             )
 
         # Snapshot every field we mutate inside the per-attempt helper,
         # so the restoration in `finally` is exact even on exceptions.
         orig_num_groups = self.config.num_groups
-        orig_min_succ = self.config.min_successful_groups
+        orig_min_alive = self.config.min_alive_groups
         orig_max_groups = self.config.max_groups
         orig_seed = self.config.seed
         orig_iter = self.iteration
 
         # Per-slot tracking. A "slot" is an index into FIXED_SEEDS; a slot
-        # has "succeeded" once any of its attempts produced a group with
-        # >= 1 task-successful rollout (matches the production
-        # group_successes>0 criterion in collect_episodes.py:714).
+        # is "alive" once any of its attempts produced a MIXED group
+        # (0 < group_successes < group_size — matches the production
+        # alive predicate in collect_episodes.py).
         slot_attempts = [0] * n_slots
-        slot_succeeded = [False] * n_slots
+        slot_alive = [False] * n_slots
         n_attempts = 0           # total subprocess calls this iter
-        n_successful_slots = 0   # distinct slots with >= 1 successful attempt
+        n_alive_slots = 0        # distinct slots with >= 1 alive attempt
         next_group_id = 0        # globally-unique within this iter
 
         def _run_one_attempt(slot_idx: int, group_id: int) -> bool:
             """One subprocess call for FIXED_SEEDS[slot_idx], tagging
             loaded episodes with `group_id` and the slot's env_seed.
-            Returns True iff the loaded group had >= 1 task-successful
-            rollout. Side effects: appends loaded episodes to
-            self.buffer.episodes; increments n_attempts and
-            slot_attempts[slot_idx].
+            Returns True iff the loaded group was ALIVE (mixed:
+            0 < n_success_in_group < n_loaded). Side effects: appends
+            loaded episodes to self.buffer.episodes; increments
+            n_attempts and slot_attempts[slot_idx].
             """
             nonlocal n_attempts
             fixed_seed = self.fixed_seeds[slot_idx]
@@ -355,85 +358,89 @@ class ToyGRPOTrainer(GRPOTrainer):
                 ep.env_seed = fixed_seed
                 if ep.success:
                     n_success_in_group += 1
-            had_success = n_success_in_group > 0
+            # ALIVE = mixed (0 < successes < loaded). Compare against
+            # n_loaded rather than self.config.group_size so a group with
+            # a missing rollout (worker crash) is still evaluated by what
+            # compute_advantages will actually see.
+            had_alive = 0 < n_success_in_group < n_loaded
             print(
                 f"  [TOY]   loaded {n_loaded} episodes, "
                 f"{n_success_in_group}/{n_loaded} succeeded "
-                f"(group {'ALIVE' if had_success else 'failed'})"
+                f"(group {'ALIVE' if had_alive else 'dead'})"
             )
-            return had_success
+            return had_alive
 
         try:
             # Force the subprocess to emit exactly one group per call.
-            # `min_successful_groups=0` disables the subprocess's own
+            # `min_alive_groups=0` disables the subprocess's own
             # dynamic mode; `max_groups=1` satisfies the validator's
             # max_groups>=num_groups invariant. The toy's outer Python
             # loop replaces subprocess-side dynamic collection.
             self.config.num_groups = 1
-            self.config.min_successful_groups = 0
+            self.config.min_alive_groups = 0
             self.config.max_groups = 1
 
             # Phase 1: full initial pass through every fixed seed.
-            # Independent of min_successful_groups — every seed always
+            # Independent of min_alive_groups — every seed always
             # gets at least one attempt, matching the toy's
             # "fixed seed" diagnostic intent.
             for slot_idx in range(n_slots):
-                had_success = _run_one_attempt(slot_idx, next_group_id)
+                had_alive = _run_one_attempt(slot_idx, next_group_id)
                 next_group_id += 1
-                if had_success and not slot_succeeded[slot_idx]:
-                    slot_succeeded[slot_idx] = True
-                    n_successful_slots += 1
+                if had_alive and not slot_alive[slot_idx]:
+                    slot_alive[slot_idx] = True
+                    n_alive_slots += 1
 
-            # Phase 2: round-robin retry of still-failed slots. Skipped
-            # entirely when min_successful_groups==0 (default) — in that
+            # Phase 2: round-robin retry of still-not-alive slots. Skipped
+            # entirely when min_alive_groups==0 (default) — in that
             # case behavior is identical to the original single-pass toy.
             # Each successful retry takes its slot out of the rotation;
-            # the toy's interest is per-slot success, not extra
-            # successful attempts on already-good slots.
+            # the toy's interest is per-slot alive-ness, not extra
+            # alive attempts on already-alive slots.
             retry_cursor = 0
             while (
-                min_succ > 0
-                and n_successful_slots < min_succ
+                min_alive > 0
+                and n_alive_slots < min_alive
                 and n_attempts < max_attempts
             ):
                 # True fixed-order round-robin: walk slot indices forward
-                # from retry_cursor (wrapping), skipping already-succeeded
+                # from retry_cursor (wrapping), skipping already-alive
                 # slots. Naive `still_failed[cursor % len(still_failed)]`
-                # was incorrect: removing a slot when it succeeds shifts
+                # was incorrect: removing a slot when it goes alive shifts
                 # later slots' positions in the list, so the cursor
-                # silently skipped a still-failed slot in the next pick.
+                # silently skipped a still-not-alive slot in the next pick.
                 slot_idx: int | None = None
                 for offset in range(n_slots):
                     cand = (retry_cursor + offset) % n_slots
-                    if not slot_succeeded[cand]:
+                    if not slot_alive[cand]:
                         slot_idx = cand
                         retry_cursor = (cand + 1) % n_slots
                         break
                 if slot_idx is None:
-                    # All slots have succeeded but criterion is still
-                    # unmet — only possible when min_successful_groups
+                    # All slots are alive but criterion is still
+                    # unmet — only possible when min_alive_groups
                     # > len(FIXED_SEEDS), since each slot can
-                    # contribute at most 1 to n_successful_slots.
-                    # Adding more attempts to already-succeeded slots
+                    # contribute at most 1 to n_alive_slots.
+                    # Adding more attempts to already-alive slots
                     # wouldn't help; stop.
                     print(
-                        f"  [TOY] All {n_slots} slots have succeeded "
-                        f"but min_successful_groups={min_succ} > "
+                        f"  [TOY] All {n_slots} slots are alive "
+                        f"but min_alive_groups={min_alive} > "
                         f"len(FIXED_SEEDS)={n_slots} — criterion is "
                         f"unsatisfiable. Stopping retries."
                     )
                     break
-                had_success = _run_one_attempt(slot_idx, next_group_id)
+                had_alive = _run_one_attempt(slot_idx, next_group_id)
                 next_group_id += 1
-                if had_success:
-                    # First success for this slot — bump the count.
-                    # (We only pick still-failed slots above, so
-                    # slot_succeeded[slot_idx] is guaranteed False here.)
-                    slot_succeeded[slot_idx] = True
-                    n_successful_slots += 1
+                if had_alive:
+                    # First alive group for this slot — bump the count.
+                    # (We only pick still-not-alive slots above, so
+                    # slot_alive[slot_idx] is guaranteed False here.)
+                    slot_alive[slot_idx] = True
+                    n_alive_slots += 1
         finally:
             self.config.num_groups = orig_num_groups
-            self.config.min_successful_groups = orig_min_succ
+            self.config.min_alive_groups = orig_min_alive
             self.config.max_groups = orig_max_groups
             self.config.seed = orig_seed
             self.iteration = orig_iter
@@ -468,26 +475,26 @@ class ToyGRPOTrainer(GRPOTrainer):
         summary = (
             f"  [TOY] Loaded {len(self.buffer.episodes)} episodes from "
             f"{n_groups_loaded} groups across {n_attempts} subprocess attempts; "
-            f"{n_successful_slots}/{n_slots} slots had >= 1 successful rollout"
+            f"{n_alive_slots}/{n_slots} slots produced an alive (mixed) group"
         )
-        if min_succ > 0:
-            summary += f" (target: {min_succ})"
+        if min_alive > 0:
+            summary += f" (target: {min_alive})"
         summary += f" ({self.buffer.num_chunks} chunks total)"
         print(summary)
         # Final warning only when the attempt cap was the actual reason
         # for stopping short. The unsatisfiable-criterion branch
-        # (min_succ > len(FIXED_SEEDS)) already printed its own message
+        # (min_alive > len(FIXED_SEEDS)) already printed its own message
         # above and exits with n_attempts < max_attempts, so don't
         # mislabel it as "hit attempt cap".
         if (
-            min_succ > 0
-            and n_successful_slots < min_succ
+            min_alive > 0
+            and n_alive_slots < min_alive
             and n_attempts >= max_attempts
         ):
             print(
                 f"  [TOY] WARNING: hit attempt cap "
                 f"({n_attempts}/{max_attempts}) with only "
-                f"{n_successful_slots}/{min_succ} successful slots."
+                f"{n_alive_slots}/{min_alive} alive slots."
             )
 
     def _log_metrics(

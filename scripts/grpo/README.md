@@ -24,6 +24,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `dense_reward.py` | Per-task continuous progress extraction (drawers, doors, PnP, stove, microwave). Used when `success_weight < 1.0`. |
+| `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. |
 
 ---
@@ -221,6 +222,99 @@ Caveats:
 - **For A/B comparisons**, build a second `DenoisingLab` instance for the
   base model rather than trying to "uninject" LoRA — `merge_lora_weights`
   (`lora_dit.py:205`) is irreversible and there is no `unmerge` helper.
+
+### Parallel evaluation from a saved sim state via `eval_lora_from_npz.py`
+
+`scripts/grpo/eval_lora_from_npz.py` is the eval-side counterpart to the
+"Init from saved sim state" training mode (covered later in this README): it
+loads the same `interactive_rollout.py` `.npz` (`__sim_state__`,
+`__model_xml__`, `__ep_meta__`, optional `__step_info__`) and runs
+`--num-attempts` parallel rollouts, all starting bit-identically from that
+state. Use it to measure how often a LoRA succeeds from a specific
+intermediate state and at what speed — complementary to
+`robocasa_eval_benchmark.py`, which measures end-to-end performance from
+fresh randomized scenes.
+
+Within-attempt diversity comes from the server's unseeded `torch.randn`
+during denoising, NOT from env randomness. AsyncVectorEnv subprocess
+workers parallelize the MuJoCo cost: with `--num-envs W < --num-attempts N`,
+the script collects N rollouts over `N // W` sequential turns of W rollouts
+each (mirroring `num_async_vector_env` in training).
+
+**Terminal 1 — model venv, GRPO server with the LoRA loaded:**
+
+```bash
+uv run python scripts/grpo/grpo_server.py \
+    --model-path nvidia/GR00T-N1.6-3B \
+    --embodiment-tag ROBOCASA_PANDA_OMRON \
+    --lora-checkpoint grpo_data/grpo_checkpoints/iter_0100 \
+    --use-sim-policy-wrapper --port 5555
+```
+
+**Terminal 2 — sim venv:**
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/grpo/eval_lora_from_npz.py \
+    --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --obs-path /tmp/saved_observations/ep000_step010.npz \
+    --num-attempts 100 --num-envs 10 \
+    --max-episode-steps 480 --n-action-steps 8 \
+    --output-dir /tmp/eval_iter_0100 \
+    --lora-checkpoint grpo_data/grpo_checkpoints/iter_0100
+```
+
+The script writes `results.json` to `--output-dir`:
+
+```json
+{
+  "lineage": {
+    "obs_path": "...", "lora_checkpoint": "...",
+    "branch_step": 10, "saved_n_action_steps": 8,
+    "consumed_substeps": 80, "remaining_substeps_budget": 400,
+    "seed": 42, "timestamp": "...", "duration_s": 432.5,
+    "...": "..."
+  },
+  "summary": {
+    "total": 100, "successes": 47, "success_rate": 0.47,
+    "mean_num_steps_all": 234.5,
+    "mean_num_steps_successful": 156.2,
+    "mean_num_steps_failed": 314.6
+  },
+  "attempts": [{"attempt_idx": 0, "success": true, "num_steps": 142,
+                "termination": "success"}, "..."]
+}
+```
+
+Constraints and caveats:
+
+- **`--num-attempts` must be divisible by `--num-envs`** (the script
+  reuses `EpisodeCollector`'s `group_size % num_async_vector_env == 0`
+  invariant). The error message lists divisors of the chosen
+  `--num-attempts` so you can adjust either knob.
+- **`--lora-checkpoint` is metadata only.** The script records the path
+  in `results.json` but does NOT load weights itself — the server in
+  Terminal 1 is responsible. Mismatch (server running base model or a
+  different LoRA than the path you record) cannot be detected
+  client-side; verify the server's startup log shows the expected
+  checkpoint path before running.
+- **Pre-spawn ping fails fast on server-down.** Before paying the
+  ~10-20 s robocasa import + AsyncVectorEnv worker spawn cost, the
+  script pings the GRPO server with explicit ZMQ `RCVTIMEO`/`SNDTIMEO`
+  (5 s budget). If Terminal 1 isn't running, you get a
+  `ConnectionError` with a corrected start command, not a 20 s wait
+  followed by a hang inside the first `get_action`.
+- **No video / image / per-step observation saving.** The
+  `EvalCollector` subclass overrides `_extract_video_single` /
+  `_extract_state_single` / `_get_actions_from_server` to drop those
+  recordings (~12 GB + ~460 MB savings on a 100-attempt Panda run). If
+  you want per-step inspection, use `branching_rollout.py` for
+  single-trajectory analysis instead.
+- **`consumed_substeps` accounting is correct across an
+  `n_action_steps` change.** The .npz's saved `n_action_steps` (in
+  `__step_info__`) drives `consumed_substeps`, not the eval-time
+  `--n-action-steps`, so a chunk-size change between save and replay
+  doesn't break budget bookkeeping.
 
 ---
 

@@ -251,7 +251,7 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
 ```
 
 Key features:
-- **Reproducible**: every episode gets an explicit seed (`--seed 42` → seeds 42, 43, 44, …) regardless of `--n-envs`
+- **Reproducible**: every episode gets an explicit seed (`--seed 42` → seeds 42, 43, 44, …) regardless of `--n-envs`. Pass `--seed-step S` to space seeds by `S` instead of 1 (e.g. `--seed 42 --seed-step 100` → seeds 42, 142, 242, …); useful for sampling a different deterministic subset of episodes without overlapping a previous run. Default is 1, so existing invocations are unchanged.
 - **Batched inference**: `--n-envs N` (N > 1) processes episodes in batches of N using `AsyncVectorEnv`, sending N observations to the server in each `get_action` call for better GPU utilisation. Each batch resets all envs with explicit seeds, steps until every env in the batch finishes, then moves to the next batch
 - **Crash-recoverable**: each episode result is appended to `episodes.jsonl` immediately
 - **Multi-env**: pass multiple `--env-names` to benchmark across tasks in one run

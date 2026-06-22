@@ -73,9 +73,9 @@ except ImportError:  # pragma: no cover
 # Seed generation
 # ---------------------------------------------------------------------------
 
-def generate_seeds(base_seed: int, n_episodes: int) -> list[int]:
-    """Return deterministic seed list ``[base_seed, base_seed+1, ...]``."""
-    return [base_seed + i for i in range(n_episodes)]
+def generate_seeds(base_seed: int, n_episodes: int, step: int = 1) -> list[int]:
+    """Return deterministic seed list ``[base_seed, base_seed+step, ...]``."""
+    return [base_seed + i * step for i in range(n_episodes)]
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +502,7 @@ def write_summary(
             "env_names": args.env_names,
             "n_episodes": args.n_episodes,
             "seed": args.seed,
+            "seed_step": args.seed_step,
             "max_episode_steps": args.max_episode_steps,
             "n_action_steps": args.n_action_steps,
             "n_envs": args.n_envs,
@@ -549,6 +550,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Base seed for reproducibility",
+    )
+    parser.add_argument(
+        "--seed-step",
+        type=int,
+        default=1,
+        help="Increment between consecutive episode seeds",
     )
     parser.add_argument(
         "--n-action-steps",
@@ -637,7 +644,7 @@ def main() -> None:
         return
     print("Server connected.\n")
 
-    seeds = generate_seeds(args.seed, args.n_episodes)
+    seeds = generate_seeds(args.seed, args.n_episodes, args.seed_step)
     all_records: dict[str, list[dict[str, Any]]] = {}
     wall_start = time.monotonic()
 

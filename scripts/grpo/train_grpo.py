@@ -2112,14 +2112,28 @@ class GRPOTrainer:
         ratio_sum_jitter = 0.0
         log_ratio_abs_sum_fixed = 0.0
         log_ratio_abs_sum_jitter = 0.0
-        clipfrac_sum_fixed = 0
-        clipfrac_sum_jitter = 0
         kl_per_row_sum_last_iter_fixed = 0.0
         kl_per_row_sum_last_iter_jitter = 0.0
         kl_per_row_sum_base_model_fixed = 0.0
         kl_per_row_sum_base_model_jitter = 0.0
         n_rows_fixed = 0
         n_rows_jitter = 0
+        # Clipfrac split into {fixed,jitter} × {pos,neg} buckets, where
+        # pos/neg is the chunk's PRE-renormalization advantage sign (the
+        # group-relative GRPO advantage from the buffer — i.e., "good
+        # chunk we want to reinforce" vs "bad chunk we want to suppress").
+        # The asymmetric clip (clip_eps_low ≠ clip_eps_high) only activates
+        # on one side per advantage sign — upper bound for pos, lower for
+        # neg — so splitting by sign separates the two clipping mechanisms
+        # that share the combined `clipfrac` headline number.
+        clipfrac_sum_fixed_pos = 0
+        clipfrac_sum_fixed_neg = 0
+        clipfrac_sum_jitter_pos = 0
+        clipfrac_sum_jitter_neg = 0
+        n_rows_fixed_pos = 0
+        n_rows_fixed_neg = 0
+        n_rows_jitter_pos = 0
+        n_rows_jitter_neg = 0
 
         # ── Balanced training: dynamic epoch count ───────────────────────────
         # When dynamic_epoch_training=True, scale update_epochs using a tent function
@@ -2379,6 +2393,17 @@ class GRPOTrainer:
                 # minibatches — variance of the z-scored output is exactly 1 by
                 # construction in either case. Net iter-wide gradient direction
                 # is unchanged.
+
+                # Capture advantage sign BEFORE per-mb renormalization for
+                # the per-branch×sign clipfrac split. The renorm subtracts
+                # the mb mean — for an all-positive-adv mb this puts half
+                # the rows below zero, so a post-renorm sign would mean
+                # "above/below mb mean" rather than "good/bad chunk". The
+                # pre-renorm sign matches the buffer's group-relative GRPO
+                # classification, which is what the diagnostic should
+                # surface.
+                pre_renorm_pos_adv_mask = ready_advantages > 0
+
                 if ready_advantages.numel() > 1:
                     ready_advantages = (
                         (ready_advantages - ready_advantages.mean())
@@ -2518,12 +2543,12 @@ class GRPOTrainer:
                     # kl_loss_base_model above) are means-of-per-mb-means.
                     # The per-branch versions emitted below are ROW-WEIGHTED
                     # (sum / n_rows). The two differ when minibatch sizes vary
-                    # (e.g., last mb smaller than
-                    # mb_size). The clipfrac_fixed vs clipfrac_jitter gap
-                    # (and analogous mean_log_ratio_abs gap) IS the empirical
-                    # Jacobian-norm signal that Jitter-GRPO is designed to
-                    # surface — if it shrinks across iters, the regularizer
-                    # is working.
+                    # (e.g., last mb smaller than mb_size). The fixed-vs-
+                    # jitter gap on mean_log_ratio_abs (and on each of the
+                    # sign-split clipfrac_{branch}_{pos,neg} pairs) IS the
+                    # empirical Jacobian-norm signal that Jitter-GRPO is
+                    # designed to surface — if it shrinks across iters, the
+                    # regularizer is working.
                     if lam > 0.0:
                         over_clip = (
                             (ratio < 1 - self.config.clip_eps_low)
@@ -2535,13 +2560,19 @@ class GRPOTrainer:
                             device=self.device, dtype=torch.bool,
                         )
                         jit_mask = ~fixed_mask
+                        # Pre-renorm sign masks for the 4-way clipfrac split.
+                        # See pre_renorm_pos_adv_mask capture above.
+                        neg_adv_mask = ~pre_renorm_pos_adv_mask
+                        fixed_pos_mask = fixed_mask & pre_renorm_pos_adv_mask
+                        fixed_neg_mask = fixed_mask & neg_adv_mask
+                        jit_pos_mask = jit_mask & pre_renorm_pos_adv_mask
+                        jit_neg_mask = jit_mask & neg_adv_mask
 
                         n_f = int(fixed_mask.sum().item())
                         n_j = int(jit_mask.sum().item())
                         if n_f > 0:
                             ratio_sum_fixed += ratio[fixed_mask].sum().item()
                             log_ratio_abs_sum_fixed += log_ratio_abs[fixed_mask].sum().item()
-                            clipfrac_sum_fixed += int(over_clip[fixed_mask].sum().item())
                             kl_per_row_sum_last_iter_fixed += kl_per_row_last_iter[fixed_mask].sum().item()
                             if compute_base:
                                 kl_per_row_sum_base_model_fixed += kl_per_row_base_model[fixed_mask].sum().item()
@@ -2549,11 +2580,32 @@ class GRPOTrainer:
                         if n_j > 0:
                             ratio_sum_jitter += ratio[jit_mask].sum().item()
                             log_ratio_abs_sum_jitter += log_ratio_abs[jit_mask].sum().item()
-                            clipfrac_sum_jitter += int(over_clip[jit_mask].sum().item())
                             kl_per_row_sum_last_iter_jitter += kl_per_row_last_iter[jit_mask].sum().item()
                             if compute_base:
                                 kl_per_row_sum_base_model_jitter += kl_per_row_base_model[jit_mask].sum().item()
                             n_rows_jitter += n_j
+                        # Clipfrac split — accumulate independently per
+                        # (branch, adv_sign) bucket. Each bucket may be
+                        # empty in a given mb (e.g., a stratified mb that
+                        # happens to draw only positive-adv chunks for the
+                        # fixed branch), so each .sum().item() is gated on
+                        # its own row count to skip the CUDA sync when 0.
+                        n_fp = int(fixed_pos_mask.sum().item())
+                        n_fn = int(fixed_neg_mask.sum().item())
+                        n_jp = int(jit_pos_mask.sum().item())
+                        n_jn = int(jit_neg_mask.sum().item())
+                        if n_fp > 0:
+                            clipfrac_sum_fixed_pos += int(over_clip[fixed_pos_mask].sum().item())
+                            n_rows_fixed_pos += n_fp
+                        if n_fn > 0:
+                            clipfrac_sum_fixed_neg += int(over_clip[fixed_neg_mask].sum().item())
+                            n_rows_fixed_neg += n_fn
+                        if n_jp > 0:
+                            clipfrac_sum_jitter_pos += int(over_clip[jit_pos_mask].sum().item())
+                            n_rows_jitter_pos += n_jp
+                        if n_jn > 0:
+                            clipfrac_sum_jitter_neg += int(over_clip[jit_neg_mask].sum().item())
+                            n_rows_jitter_neg += n_jn
 
         # Model remains in eval mode (it never left)
         if n_updates == 0:
@@ -2603,7 +2655,6 @@ class GRPOTrainer:
         # the legacy `clipfrac` / `mean_ratio` / etc. above (mean-of-mb-means);
         # at jitter > 0 with variable mb sizes the two will differ slightly.
         if n_rows_fixed > 0:
-            result["clipfrac_fixed"]           = clipfrac_sum_fixed / n_rows_fixed
             result["mean_ratio_fixed"]         = ratio_sum_fixed / n_rows_fixed
             result["mean_log_ratio_abs_fixed"] = log_ratio_abs_sum_fixed / n_rows_fixed
             result["kl_loss_last_iter_fixed"] = (
@@ -2616,7 +2667,6 @@ class GRPOTrainer:
                     * (kl_per_row_sum_base_model_fixed / n_rows_fixed)
                 )
         if n_rows_jitter > 0:
-            result["clipfrac_jitter"]           = clipfrac_sum_jitter / n_rows_jitter
             result["mean_ratio_jitter"]         = ratio_sum_jitter / n_rows_jitter
             result["mean_log_ratio_abs_jitter"] = log_ratio_abs_sum_jitter / n_rows_jitter
             result["kl_loss_last_iter_jitter"] = (
@@ -2628,6 +2678,18 @@ class GRPOTrainer:
                     self.config.kl_coef_base_model
                     * (kl_per_row_sum_base_model_jitter / n_rows_jitter)
                 )
+        # Clipfrac split by advantage sign — each {branch}_{sign} bucket
+        # is gated on its own row count so a bucket that drew zero rows
+        # this iter is simply absent from the result dict (and the TB
+        # curve has a gap), rather than emitting a misleading 0.
+        if n_rows_fixed_pos > 0:
+            result["clipfrac_fixed_pos"] = clipfrac_sum_fixed_pos / n_rows_fixed_pos
+        if n_rows_fixed_neg > 0:
+            result["clipfrac_fixed_neg"] = clipfrac_sum_fixed_neg / n_rows_fixed_neg
+        if n_rows_jitter_pos > 0:
+            result["clipfrac_jitter_pos"] = clipfrac_sum_jitter_pos / n_rows_jitter_pos
+        if n_rows_jitter_neg > 0:
+            result["clipfrac_jitter_neg"] = clipfrac_sum_jitter_neg / n_rows_jitter_neg
         return result
 
     def _iter_stratified_minibatches(
@@ -3517,13 +3579,22 @@ class GRPOTrainer:
             # for vanilla runs and for runs with kl_coef_base_model=0.
             for branch in ("fixed", "jitter"):
                 for metric in (
-                    "clipfrac",
                     "mean_ratio",
                     "mean_log_ratio_abs",
                     "kl_loss_last_iter",
                     "kl_loss_base_model",
                 ):
                     key = f"{metric}_{branch}"
+                    if key in update_stats:
+                        self.writer.add_scalar(
+                            f"train/{key}", update_stats[key], iteration
+                        )
+                # Clipfrac is split by advantage sign (pos/neg) — see
+                # `clipfrac_sum_fixed_pos` etc. in _grpo_update_inner.
+                # Gated independently of the other branch metrics: a bucket
+                # with zero rows this iter is just absent from update_stats.
+                for sign in ("pos", "neg"):
+                    key = f"clipfrac_{branch}_{sign}"
                     if key in update_stats:
                         self.writer.add_scalar(
                             f"train/{key}", update_stats[key], iteration

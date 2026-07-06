@@ -266,7 +266,6 @@ def phase_b(env_name: str, server_host: str, server_port: int,
         episodes = collector.collect(
             num_groups=num_groups,
             base_seed=777,
-            success_weight=1.0,
             fast_forward_steps=12,
             fast_forward_pct=1.0,
             min_alive_groups=0,

@@ -124,8 +124,6 @@ class FakeVectorEnv:
         if method == "apply_scene_bundle":
             self.apply_bundle_args.append(args[0])
             return tuple(_one_obs() for _ in range(self.num_envs))
-        if method == "compute_dense_progress":
-            return tuple(0.0 for _ in range(self.num_envs))
         raise ValueError(f"unexpected RPC call: {method}")
 
     def step(self, actions_full):
@@ -241,7 +239,7 @@ def test_unchanged_when_num_envs_equals_group_size():
     check("num_envs == group_size", c.num_envs == 4)
     check("turns_per_group == 1", c.turns_per_group == 1)
 
-    eps = c._collect_one_group(group_seed=1000, group_id=0, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=1000, group_id=0)
     env = c.envs
     check("group_size episodes returned", len(eps) == 4, f"got {len(eps)}")
     check("reset called exactly once", len(env.reset_calls) == 1, f"{env.reset_calls}")
@@ -266,7 +264,7 @@ def test_multi_turn_divisible():
     check("num_envs == 2", c.num_envs == 2)
     check("turns_per_group == 2", c.turns_per_group == 2)
 
-    eps = c._collect_one_group(group_seed=2000, group_id=3, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=2000, group_id=3)
     env = c.envs
     check("group_size (4) episodes returned across 2 turns", len(eps) == 4, f"got {len(eps)}")
     check("all episodes share group_id==3", all(e["group_id"] == 3 for e in eps))
@@ -312,7 +310,7 @@ def test_multi_turn_sync_num_envs_one():
     check("turns_per_group == 3", c.turns_per_group == 3)
     check("uses SyncVectorEnv (not async)", c._uses_async is False)
 
-    eps = c._collect_one_group(group_seed=500, group_id=1, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=500, group_id=1)
     env = c.envs
     check("group_size (3) episodes returned", len(eps) == 3, f"got {len(eps)}")
     check("all share group_id==1", all(e["group_id"] == 1 for e in eps))
@@ -339,7 +337,7 @@ def test_singleton_group():
     print("\n[Turn] Singleton group_size==1 (no bundle needed)")
     c = _make_collector(group_size=1, num_async_vector_env=1)
     check("turns_per_group == 1", c.turns_per_group == 1)
-    eps = c._collect_one_group(group_seed=7, group_id=0, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=7, group_id=0)
     env = c.envs
     check("1 episode returned", len(eps) == 1, f"got {len(eps)}")
     # Singleton path returns reset obs directly — no scene-bundle RPCs.
@@ -357,7 +355,7 @@ def test_fast_forward_multi_turn():
     c.envs.terminate_after = 2  # FF prefix (2 lockstep steps) stays non-terminal
 
     eps = c._collect_one_group_with_fast_forward(
-        group_seed=300, group_id=5, fast_forward_steps=2, success_weight=1.0,
+        group_seed=300, group_id=5, fast_forward_steps=2,
     )
     env = c.envs
     check("group_size (4) episodes returned", len(eps) == 4, f"got {len(eps)}")
@@ -414,7 +412,7 @@ def test_init_state_refetches_each_turn():
 
     c._get_init_bundle = _fake_get_init_bundle
 
-    eps = c._collect_one_group(group_seed=900, group_id=2, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=900, group_id=2)
     env = c.envs
     check("group_size (4) episodes returned", len(eps) == 4, f"got {len(eps)}")
     check("all share group_id==2", all(e["group_id"] == 2 for e in eps))
@@ -461,7 +459,7 @@ def test_ff_fallback_yields_full_group():
     c.envs.terminate_after = 0
 
     eps = c._collect_one_group_with_fast_forward(
-        group_seed=400, group_id=7, fast_forward_steps=3, success_weight=1.0,
+        group_seed=400, group_id=7, fast_forward_steps=3,
     )
     env = c.envs
     check("fallback still yields group_size (4) episodes", len(eps) == 4, f"got {len(eps)}")
@@ -485,7 +483,6 @@ def test_collect_driver_multi_group_multi_turn():
     eps = c.collect(
         num_groups=2,
         base_seed=1000,
-        success_weight=1.0,
         fast_forward_steps=0,      # FF disabled → normal seed-aligned groups
         fast_forward_pct=0.0,
         min_alive_groups=0,   # no dynamic extension → exactly num_groups
@@ -518,7 +515,7 @@ def test_staggered_termination_within_turn():
     print("\n[Turn] staggered within-turn termination (collector bookkeeping)")
     c = _make_collector(group_size=2, num_async_vector_env=2)  # 1 turn, 2 envs
     c.envs.terminate_at = [0, 2]  # env0 done after outer step 1; env1 after step 3
-    eps = c._collect_one_group(group_seed=42, group_id=9, success_weight=1.0)
+    eps = c._collect_one_group(group_seed=42, group_id=9)
     check("2 episodes returned", len(eps) == 2, f"got {len(eps)}")
     check("both share group_id==9", all(e["group_id"] == 9 for e in eps))
     chunk_counts = sorted(len(e["actions"]) for e in eps)

@@ -3,7 +3,7 @@
 This dataclass mirrors the structure of grpo_cont.py's `init_args()` but adapted for:
 - Flow-matching diffusion (FM log-prob surrogate instead of Gaussian policy)
 - Server-client episode collection (instead of vectorized envs)
-- Episodic sparse+shaped rewards (instead of per-step dense rewards)
+- Episodic sparse binary rewards (instead of per-step dense rewards)
 - LoRA finetuning (instead of full parameter updates)
 
 Usage:
@@ -106,10 +106,9 @@ class GRPOConfig:
 
     # Dynamic group collection: after collecting `num_groups` groups, if fewer
     # than `min_alive_groups` are ALIVE (mixed: 0 < group_successes <
-    # group_size, equivalently per-group reward std > 0 under success_weight=
-    # 1.0 with time-scaling disabled), the collector keeps adding one group at
-    # a time until the criterion is met or `max_groups` is reached. Set to 0
-    # to disable (always exactly num_groups).
+    # group_size, equivalently per-group reward std > 0), the collector keeps
+    # adding one group at a time until the criterion is met or `max_groups` is
+    # reached. Set to 0 to disable (always exactly num_groups).
     #
     # Why "alive" not "≥1 success": only mixed groups produce non-zero
     # gradient signal (compute_advantages in episode_buffer.py drops any
@@ -183,25 +182,15 @@ class GRPOConfig:
     #     hard state, so "N alive groups" is also not the criterion you want
     #     (and the dynamic loop is meaningless when every group has the same
     #     scene).
-    #   - success_weight < 1.0 is strongly recommended; from a hard saved state
-    #     binary-only reward typically produces dead groups (every rollout fails
-    #     identically → std=0 → zero advantage → no learning). With shaped reward
-    #     enabled, max_progress varies with denoising noise and provides signal.
+    #   - From a hard saved state, binary-only reward can produce dead groups
+    #     early (every rollout fails identically → std=0 → zero advantage → no
+    #     learning). Pick a branch point the policy solves at least
+    #     intermittently, or the iteration yields no gradient signal.
     init_state_npz_path: Optional[str] = None
 
     # ZMQ server host and port for model inference during collection
     server_host: str = "127.0.0.1"
     server_port: int = 5555
-
-    # Optional long-running collector server (collector_server.py). When
-    # collector_server_host is non-empty, the trainer connects via
-    # CollectorClient instead of spawning `python collect_episodes.py` per
-    # iteration — eliminates the ~10-20s startup cost (robocasa imports +
-    # AsyncVectorEnv worker spawn). The server must be started separately
-    # with --env-names matching this config; mismatched env_names raise on
-    # the first collect() request. Empty host = subprocess fallback.
-    collector_server_host: str = ""
-    collector_server_port: int = 5556
 
     # RoboCasa environment names to train on.
     # Tasks are selected round-robin: iteration 1 → task 0, iteration 2 → task 1, etc.
@@ -228,12 +217,6 @@ class GRPOConfig:
     # At 25 episodes/iter × 90 chunks × ~250KB/chunk ≈ 0.5 GB/iter, 200 iters
     # is ~100 GB if unpruned; /tmp on most GPU hosts is much smaller.
     episode_dirs_to_keep: int = 2
-
-    # ─── Reward Shaping ──────────────────────────────────────────────────────
-
-    # Weight of binary success signal in shaped reward
-    # reward = success_weight * success + (1 - success_weight) * max_progress
-    success_weight: float = 1.0
 
     # ─── GRPO Algorithm ──────────────────────────────────────────────────────
     # These directly mirror grpo_cont.py's clipped objective args
@@ -382,7 +365,7 @@ class GRPOConfig:
     # collection-affecting config since the cache was written. The validator
     # catches env_name and group-count mismatches but does NOT detect changes
     # to n_action_steps, fast_forward_steps / fast_forward_pct,
-    # init_state_npz_path, max_episode_steps, or success_weight — the cached
+    # init_state_npz_path, or max_episode_steps — the cached
     # iter would silently train on episodes from the OLD config while
     # subsequent iters collect under the new one. If in doubt, leave this
     # disabled and pay the collection cost.
@@ -415,9 +398,7 @@ class GRPOConfig:
     # collector failures, non-finite-loss skips, partial collections — are NOT
     # affected. The trainer propagates this to the collector subprocess via the
     # GRPO_CLEAN_OUTPUT=1 env var, so AsyncVectorEnv workers (spawn) pick it up
-    # too. Note: the long-running collector_server (when collector_server_host
-    # is set) is launched separately — to silence its output, start it with
-    # GRPO_CLEAN_OUTPUT=1 in the env yourself.
+    # too.
     clean_output: bool = True
 
     def __post_init__(self):
@@ -425,8 +406,8 @@ class GRPOConfig:
 
         Catches misconfigurations BEFORE the trainer spends ~1 minute on
         model load + server bind, so the operator gets immediate feedback
-        instead of the "subprocess exited 1" or RPC FatalCollectorError
-        path that would otherwise surface the same error several minutes in.
+        instead of the "subprocess exited 1" path that would otherwise
+        surface the same error several minutes in.
 
         Mirror constraints with EpisodeCollector.collect()'s runtime
         validation (collect_episodes.py:508-525), but check here too so a
@@ -553,17 +534,6 @@ class GRPOConfig:
                 f"(downside clip never fires), and a value <= 0 gives a zero-width "
                 f"or inverted clip window."
             )
-        # success_weight is a probability-like blend weight in the shaped
-        # reward (success_weight * success + (1-success_weight) * max_progress);
-        # values outside [0, 1] silently invert the progress term (e.g.,
-        # success_weight=2.5 → reward = 2.5*success - 1.5*max_progress) and
-        # corrupt the training signal without crashing. Cheap to range-check.
-        if not (0.0 <= self.success_weight <= 1.0):
-            raise ValueError(
-                f"success_weight must be in [0.0, 1.0], got {self.success_weight}. "
-                f"It blends binary success and dense max_progress in the shaped "
-                f"reward; values outside [0, 1] flip the sign of the progress term."
-            )
 
         if self.balanced_minibatch_training and not (
             0.0 < self.balanced_minibatch_positive_adv_ratio < 1.0
@@ -614,8 +584,8 @@ class GRPOConfig:
         # These run at config-construction time so failures surface BEFORE the
         # trainer spends minutes on model load + server bind. The npz path
         # also needs to be resolved to an absolute path here so it remains
-        # valid across processes: the long-running collector_server (and the
-        # robocasa-venv subprocess) may have a different CWD than the trainer.
+        # valid across processes: the robocasa-venv subprocess may have a
+        # different CWD than the trainer.
         if self.init_state_npz_path is not None:
             # Empty / whitespace path is almost certainly a CLI typo; reject
             # rather than waste a subprocess on np.load("").
@@ -646,23 +616,17 @@ class GRPOConfig:
                     f"init_state_npz_path is not a regular file: {_init_path} "
                     f"(maybe a directory?). Pass the .npz file path itself."
                 )
-            # Overwrite with the resolved absolute path so subprocess /
-            # collector_server consumers don't depend on CWD.
+            # Overwrite with the resolved absolute path so the subprocess
+            # collector doesn't depend on CWD.
             self.init_state_npz_path = str(_init_path)
 
-            # NOTE: deliberately do NOT warn on success_weight=1.0 +
-            # init_state or on min_alive_groups>0 + init_state. Both
-            # are valid choices:
-            #   - success_weight=1.0: pure sparse binary reward is a
-            #     legitimate setup; the operator may know the policy
-            #     succeeds intermittently from this state, or may want to
-            #     deliberately avoid mixing in dense-progress shaping.
-            #   - min_alive_groups>0: with all groups starting from
-            #     the same saved state, requiring ≥N alive groups is a
-            #     stability mechanism — each group draws independent
-            #     denoising noise, so ≥N alive (mixed) groups gives a
-            #     less noisy gradient direction and reduces policy-
-            #     collapse risk from few-group updates.
+            # NOTE: deliberately do NOT warn on min_alive_groups>0 +
+            # init_state — it's a valid choice: with all groups starting
+            # from the same saved state, requiring ≥N alive groups is a
+            # stability mechanism — each group draws independent denoising
+            # noise, so ≥N alive (mixed) groups gives a less noisy gradient
+            # direction and reduces policy-collapse risk from few-group
+            # updates.
 
             # Multiple env_names + a single saved npz is almost certainly a
             # config bug: the npz's sim_state has dims tied to one env's

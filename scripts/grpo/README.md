@@ -19,11 +19,9 @@ Flow-Matching (FM) log-probability surrogate.
 | `grpo_config.py` | `GRPOConfig` dataclass — every tunable knob lives here. |
 | `grpo_server.py` | Extends `PolicyServer` to capture per-call denoising noise + raw `(B, 50, 128)` action. Required for FM log-prob. |
 | `collect_episodes.py` | Runs in the robocasa venv. `EpisodeCollector` does group rollouts via `AsyncVectorEnv`, including fast-forward branching and scene-bundle alignment. |
-| `collector_server.py` | Long-running ZMQ collector daemon. Skips per-iter robocasa import + worker-spawn cost (~10-20s/iter). |
 | `episode_buffer.py` | `EpisodeBuffer`, `GRPOEpisode`, `ActionChunk`. Loads `.npz` episodes, computes group-relative advantages. |
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
-| `dense_reward.py` | Per-task continuous progress extraction (drawers, doors, PnP, stove, microwave). Used when `success_weight < 1.0`. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. |
 
@@ -31,21 +29,19 @@ Flow-Matching (FM) log-probability surrogate.
 
 ## Architecture
 
-Three processes share the work:
+Two processes share the work:
 
 ```
 ┌─────────────────────────┐   ZMQ obs/action    ┌──────────────────────────┐
 │ Trainer (main .venv)    │ ◄──────────────────►│ Collector (robocasa venv)│
 │  GPU model + LoRA       │  port 5555          │  AsyncVectorEnv workers  │
 │  In-process PolicyServer│                     │  Writes .npz per iter    │
-└────────────┬────────────┘                     └──────────────────────────┘
-             │ optional ZMQ RPC (port 5556)
-             ▼
-┌──────────────────────────┐
-│ collector_server.py      │  long-running collector for the trainer to call
-│ (robocasa venv)          │  (skips per-iter startup)
-└──────────────────────────┘
+└─────────────────────────┘                     └──────────────────────────┘
 ```
+
+Each iteration the trainer spawns one `collect_episodes.py` subprocess in the
+robocasa venv, which connects back to the in-process policy server over ZMQ,
+runs the group rollouts, and writes the episodes as `.npz` files.
 
 The trainer spawns the policy server **in a background thread** of its own
 process, so the LoRA weights it updates are immediately visible to the next
@@ -61,10 +57,10 @@ and gym wrappers that don't coexist cleanly with the main training stack.
 
 ## Quick Start
 
-### 1. Subprocess mode (simpler, ~10-20s/iter startup tax)
+### 1. Run training
 
-Just run the trainer; it spawns one `collect_episodes.py` subprocess per
-iteration:
+Run the trainer; it spawns one `collect_episodes.py` subprocess per iteration
+(in the robocasa venv) to collect the group rollouts:
 
 ```bash
 uv run python scripts/grpo/train_grpo.py \
@@ -75,36 +71,7 @@ uv run python scripts/grpo/train_grpo.py \
     --checkpoint-dir grpo_data/grpo_checkpoints
 ```
 
-### 2. Long-running collector mode (recommended for multi-task runs)
-
-**Terminal 1** — start the collector daemon in the robocasa venv. It will
-boot one `EpisodeCollector` per `--env-names` entry, paying the import +
-worker-spawn cost once.
-
-```bash
-gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
-    scripts/grpo/collector_server.py \
-    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
-                robocasa_panda_omron/OpenDoubleDoor_PandaOmron_Env \
-    --max-episode-steps 480 480 \
-    --group-size 4 --n-action-steps 8 \
-    --policy-server-host 127.0.0.1 --policy-server-port 5555 \
-    --listen-port 5556
-```
-
-**Terminal 2** — start the trainer, pointing it at the collector daemon:
-
-```bash
-uv run python scripts/grpo/train_grpo.py \
-    --collector-server-host 127.0.0.1 --collector-server-port 5556
-```
-
-The trainer pings the collector at startup and **fails fast** if the
-daemon's bake-time args (`--group-size`, `--n-action-steps`, per-env
-`--max-episode-steps`, env-name set) don't match its own config. Restart
-the daemon with matching flags if it does.
-
-### 3. Standalone server (debug / eval only)
+### 2. Standalone server (debug / eval only)
 
 `scripts/grpo/grpo_server.py` is the standalone variant of the in-process
 policy server. Use it to serve a trained LoRA checkpoint without spinning up
@@ -348,9 +315,7 @@ Per-task tuning:
   or a list parallel to `env_names`.
 - `fast_forward_steps: int | list[int]` — same convention.
 
-With 8 tasks × 200 iters, each task gets 25 updates. The
-`collector_server` validates that its boot-time env list matches the
-trainer's `env_names` and raises on mismatch.
+With 8 tasks × 200 iters, each task gets 25 updates.
 
 ### AsyncVectorEnv + scene-bundle alignment
 
@@ -388,11 +353,7 @@ is then collected over `k = group_size // num_async_vector_env` sequential
   (`torch.randn`) is unseeded, so each turn's fresh query yields distinct
   rollouts even from the identical initial state.
 - **Cost:** ~`k`× collection wall time per group (turns are sequential). The
-  trainer scales its subprocess / RPC collector timeouts by `k`
-  automatically.
-- Bake-time, like `group_size`: pass `--num-async-vector-env` to
-  `collector_server.py` so it matches the trainer; the ping check fails fast
-  with a restart hint on mismatch.
+  trainer scales its collector subprocess timeout by `k` automatically.
 
 ### Fast-Forward Branching
 
@@ -457,7 +418,6 @@ that state without burning compute on the upstream approach.
 ```bash
 uv run python scripts/grpo/train_grpo.py \
     --init-state-npz-path /path/to/ep000_step010.npz \
-    --success-weight 0.3 \
     --fast-forward-pct 0.0 \
     --min-alive-groups 0 \
     --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
@@ -496,12 +456,10 @@ Interactions with other knobs:
   the risk of policy collapse from low-alive-group updates — at the
   cost of more wall time when the success rate is at an extreme (the
   dynamic loop extends toward `max_groups`).
-- **`success_weight` choice.** Default `1.0` (pure binary reward) is
-  fully supported and a common choice. Setting `success_weight < 1.0`
-  blends in `max_progress`, which provides advantage variance even
-  before any rollout succeeds — useful if early-iter all-failure dead
-  groups would stall training. Pick whichever fits the analysis; the
-  trainer does not warn for either choice.
+- **Sparse binary reward only.** From a hard saved state, binary-only reward
+  can produce dead groups early (every rollout fails identically → std=0 →
+  zero advantage → no learning). Pick a branch point the policy already
+  solves at least intermittently, or the iteration yields no gradient signal.
 
 #### Budget accounting (`consumed_substeps`)
 
@@ -593,11 +551,8 @@ group at a time** until either:
 
 1. `alive_groups >= min_alive_groups` (a group is "alive" if it is
    mixed: `0 < group_successes < group_size`, equivalently per-group
-   reward std > 0 under `success_weight=1.0` with time-scaling
-   disabled — the only regime this exact predicate is valid for; for
-   `success_weight<1.0` the criterion would have to inspect shaped-
-   reward variance, which the collector does not currently compute),
-   or
+   reward std > 0 under the sparse binary reward with time-scaling
+   disabled), or
 2. `group_idx >= max_groups` (hard cap, logs a WARNING).
 
 The "alive" predicate matches the trainer's gradient-signal filter
@@ -621,7 +576,7 @@ Constraints (enforced in `GRPOConfig.__post_init__`):
 - `max_groups <= 100` (seed-stride collision boundary)
 - `min_alive_groups <= max_groups`
 
-Subprocess/RPC timeouts auto-scale at 7 min/group:
+Subprocess timeouts auto-scale at 7 min/group:
 `timeout = 420 * effective_max_groups` seconds.
 
 ---
@@ -637,10 +592,10 @@ for iteration in range(start, num_iterations + 1):
 
     # Phase 1: collect this iter's task
     env_name = env_names[(iter-1) % len(env_names)]
-    _collect_episodes(env_name)                            # via subprocess OR RPC
+    _collect_episodes(env_name)                            # via collect_episodes.py subprocess
 
     # Phase 2: compute advantages
-    buffer.compute_advantages(success_weight, max_steps)   # per-group z-score
+    buffer.compute_advantages(max_steps)                   # per-group z-score
 
     # Phase 2b: pre-compute reference log-probs (current model == ref before update)
     _compute_ref_log_probs()                               # caches backbone features
@@ -652,30 +607,31 @@ for iteration in range(start, num_iterations + 1):
     if iteration % save_interval == 0: _save_checkpoint(...)
 ```
 
-### Reward shaping → advantage
+### Reward → advantage
 
 ```
-shaped = success_weight * success + (1 - success_weight) * max_progress
-scaled = shaped / num_steps * max_episode_steps          # faster = better
-A_episode = (scaled - group_mean) / (group_std + 1e-8)   # PER GROUP
+reward = float(success)                                  # sparse binary (1.0 on success)
+scaled = reward / num_steps * max_episode_steps          # faster = better (currently DISABLED)
+A_episode = (reward - group_mean) / (group_std + 1e-8)   # PER GROUP
 A_chunk = A_episode / num_chunks_in_episode
 ```
 
-- `success_weight = 1.0` (default) → pure binary reward, time-scaled. The
-  collector skips `compute_dense_progress` entirely in this mode.
-- `success_weight < 1.0` → blend in continuous progress from
-  `dense_reward.py` (per-task: drawer/door joint position, PnP distance to
-  target, stove knob state, etc.). Variance even in all-fail groups.
-- Time-scaling (`/ num_steps * max_episode_steps`) means faster solutions
+- The reward is **sparse binary**: `1.0` on task success, `0.0` otherwise.
+  There is no reward shaping — the codebase does not compute dense progress.
+- Time-scaling (`/ num_steps * max_episode_steps`) would make faster solutions
   get larger reward, creating advantage variance even within all-success
-  groups.
+  groups. It is currently **DISABLED** in `compute_advantages`
+  (see the block comment there for the ablation rationale); the reward fed to
+  the group-relative normalization is the raw binary value.
 - `A_chunk = A_episode / num_chunks` preserves the within-group
   zero-sum invariant at the chunk level, so every trajectory contributes
   equal **total** gradient weight regardless of length.
 
 A group with reward std < 1e-4 is **dead**: its chunks get advantage
 exactly 0 and are filtered out before any forward pass (see "Minibatch
-construction").
+construction"). Under the binary reward this happens for all-success groups
+(every rollout succeeds) and all-fail groups (every rollout fails) — only
+**mixed** groups produce a gradient.
 
 ### FM log-prob surrogate
 
@@ -879,11 +835,11 @@ implementations at specific episode counts when `update_epochs ≥ 6`.
   keeping `actual_num_epochs` near `update_epochs` when real signal is
   sparse.
 - `successful_eps` counts live-group episodes with **positive advantage**
-  (`self.buffer.advantages[i] > 0`), not `ep.success`. This is intentional:
-  with shaped rewards (`success_weight < 1.0`) a failing episode with high
-  `max_progress` can contribute positive advantage, and `ep.success` would
-  undercount it. Using advantage sign keeps the epoch formula consistent
-  with mechanism 1, which oversamples chunks with `c.advantage > 0`.
+  (`self.buffer.advantages[i] > 0`), not `ep.success`. Under the sparse
+  binary reward these coincide for live (mixed) groups — a group's successes
+  get positive advantage, its failures negative — so this equals counting
+  `ep.success`, while keeping the epoch formula consistent with mechanism 1,
+  which oversamples chunks with `c.advantage > 0`.
 
 **Examples.** 5 groups × 4 rollouts, `update_epochs = 4`:
 - `success_frac = 0.25` (2/8 positive): `m=2`, `(32+8)//16 = 2` epochs
@@ -1454,7 +1410,7 @@ flag carried across phases.
 collection-affecting config since the cache was written. The validator
 catches `env_name` and group-count mismatches but does NOT detect changes
 to `n_action_steps`, `fast_forward_steps` / `fast_forward_pct`,
-`init_state_npz_path`, `max_episode_steps`, or `success_weight` — the
+`init_state_npz_path`, or `max_episode_steps` — the
 cached iter would silently train on episodes from the old config while
 subsequent iters collect under the new one. If in doubt, leave this
 disabled and pay the collection cost.
@@ -1525,8 +1481,7 @@ uv run python scripts/grpo/train_grpo.py \
   `None` → `group_size` (one worker per rollout, unchanged). Set lower (must
   divide `group_size` and be `<=` it) to collect each group over
   `group_size // num_async_vector_env` sequential turns and cap peak worker
-  RAM. See "Decoupling group size from worker count". Bake-time: must match
-  `collector_server.py --num-async-vector-env`.
+  RAM. See "Decoupling group size from worker count".
 - `num_groups` — minimum groups per iter. Default 5.
 - `min_alive_groups` / `max_groups` — see "Dynamic group
   collection". Default 2 / 5.
@@ -1545,15 +1500,6 @@ uv run python scripts/grpo/train_grpo.py \
 **ZMQ wiring**
 - `server_host` / `server_port` — in-process policy server (default
   `127.0.0.1:5555`).
-- `collector_server_host` / `collector_server_port` — long-running
-  collector daemon. Empty host disables it (subprocess fallback).
-
-**Reward shaping**
-- `success_weight` (0-1) — binary weight in shaped reward. Default 1.0
-  (pure binary, no dense progress collected). Set < 1.0 to blend in
-  `max_progress`, which provides continuous advantage variance from
-  denoising noise; useful when binary-only would produce all-failure
-  groups early on.
 
 **GRPO algorithm**
 - `clip_eps_low` / `clip_eps_high` (both default 0.2) — asymmetric clip
@@ -1616,27 +1562,22 @@ the FM-MSE log-prob is noisy enough that most updates clip.
 
 - **GPU**: a single 24-GB+ NVIDIA GPU (training keeps frozen base in
   bf16, only LoRA params in fp32). Tested on A10G with `mini_batch_size=8`.
-- **CPU/RAM**: the collector spawns `num_async_vector_env` MuJoCo workers
-  per env (default `group_size`); in long-running mode,
-  `len(env_names) × num_async_vector_env` total. 64+ GB RAM is comfortable
-  for 8 tasks × 5 workers. Lower `num_async_vector_env` (collecting each
-  group over multiple turns) to fit larger groups on a RAM-limited host.
+- **CPU/RAM**: each iteration's collector subprocess spawns
+  `num_async_vector_env` MuJoCo workers (default `group_size`) for the one
+  task being collected. 64+ GB RAM is comfortable for 5 workers. Lower
+  `num_async_vector_env` (collecting each group over multiple turns) to fit
+  larger groups on a RAM-limited host.
 - **Robocasa venv**: located at
   `gr00t/eval/sim/robocasa/robocasa_uv/.venv/`. The subprocess collector
-  path hard-codes this path; if you've put robocasa elsewhere, switch to
-  long-running mode and just point the trainer at it.
+  path hard-codes this path (see `_collect_via_subprocess` in
+  `train_grpo.py`); if you've put robocasa elsewhere, edit that path.
 - **Memory creep**: there are small leaks in robosuite/MuJoCo's model
   reload path. The collector workers `gc.collect()` + `malloc_trim(0)`
   after every `apply_scene_bundle`; the trainer does the same at the
-  start of each iter. Even so, restart the long-running collector every
-  ~50-100 iterations as a hygiene measure — the trainer's
-  consecutive-failure budget will simply retry on the next iter once the
-  collector is back up.
+  start of each iter. Because a fresh collector subprocess is spawned and
+  torn down every iteration, cross-iteration creep in the collector is
+  bounded by construction.
 - **Consecutive-failure abort**: the trainer aborts after 3 consecutive
   collector failures (timeout, non-zero exit, zero episodes loaded). The
   log line right before the abort lists common causes (wrong venv path,
-  stuck port, missing MuJoCo backend, OOM, collector not running).
-- **Fatal vs transient errors**: `FatalCollectorError` (raised on
-  `ValueError`-class server errors, primarily env-name mismatches) is
-  re-raised immediately rather than burning the retry budget. The error
-  message includes the exact restart command needed.
+  stuck port, missing MuJoCo backend, OOM).

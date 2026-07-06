@@ -35,7 +35,7 @@ def _write_synthetic_npz(
     """Write one episode_NNNN.npz with the keys EpisodeBuffer expects.
 
     The minimum keys to satisfy load_episodes + the resume-cache validator:
-        language, env_name, success, max_progress, num_steps, num_chunks,
+        language, env_name, success, num_steps, num_chunks,
         group_id, env_seed, action_{i}, action_mask_{i}, raw_action_{i},
         initial_noise_{i}, video_{cam}_{i}, state_{key}_{i}.
 
@@ -51,7 +51,6 @@ def _write_synthetic_npz(
         "language": "test instruction",
         "env_name": env_name,
         "success": success,
-        "max_progress": 1.0 if success else 0.3,
         "num_steps": 50,
         "num_chunks": num_chunks,
         "group_id": group_id,
@@ -173,7 +172,6 @@ def _make_trainer(
         device="cpu",
         balanced_minibatch_training=False,
         clean_output=True,
-        collector_server_host="",
     )
     return GRPOTrainer(cfg)
 

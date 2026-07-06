@@ -12,7 +12,7 @@ The advantage computation directly mirrors grpo_cont.py lines 325-364:
 
 Key difference from grpo_cont.py:
 - grpo_cont.py computes per-step rewards, then discounts them into a trajectory reward
-- We use episodic rewards (binary success + dense progress) — no discounting needed
+- We use episodic sparse binary rewards (task success) — no discounting needed
 - Each episode gets ONE advantage, which is then divided by num_chunks and
   broadcast to each chunk in _build_chunks (mirroring grpo_cont.py:368-369).
   The division preserves the group-zero-sum invariant at the chunk level so
@@ -127,8 +127,7 @@ class GRPOEpisode:
 
     # Episode-level reward signals
     success: bool                                # Binary task completion
-    max_progress: float                          # Dense progress metric [0, 1]
-    shaped_reward: float                         # Computed: w*success + (1-w)*progress
+    shaped_reward: float                         # Computed reward for advantages (binary success, time-scaled if enabled)
 
     # Metadata
     env_name: str
@@ -148,7 +147,7 @@ class EpisodeBuffer:
     Usage:
         buffer = EpisodeBuffer()
         buffer.load_episodes("/tmp/grpo_episodes/iter_005/")
-        buffer.compute_advantages(success_weight=0.7)
+        buffer.compute_advantages()
         for batch in buffer.iter_minibatches(batch_size=8):
             # train on batch
             ...
@@ -218,7 +217,6 @@ class EpisodeBuffer:
             - initial_noise_{chunk_idx}: (50, 128) float32
             - language: string
             - success: bool
-            - max_progress: float
             - env_name: string
             - num_steps: int
             - num_chunks: int
@@ -233,7 +231,6 @@ class EpisodeBuffer:
         language = str(data["language"])
         env_name = str(data["env_name"])
         success = bool(data["success"])
-        max_progress = float(data["max_progress"])
         num_steps = int(data["num_steps"])
         group_id = int(data["group_id"]) if "group_id" in data else 0
         env_seed = int(data["env_seed"]) if "env_seed" in data else 0
@@ -299,7 +296,6 @@ class EpisodeBuffer:
             action_masks=action_masks,
             initial_noises=initial_noises,
             success=success,
-            max_progress=max_progress,
             shaped_reward=0.0,  # Computed in compute_advantages()
             env_name=env_name,
             episode_idx=len(self.episodes),
@@ -308,7 +304,7 @@ class EpisodeBuffer:
             env_seed=env_seed,
         )
 
-    def compute_advantages(self, success_weight: float = 1.0, max_episode_steps: int = 520) -> np.ndarray:
+    def compute_advantages(self, max_episode_steps: int = 520) -> np.ndarray:
         """Compute group-relative advantages for all episodes (one per episode).
 
         This is the CORE GRPO computation, mirroring grpo_cont.py lines 362-364:
@@ -320,17 +316,15 @@ class EpisodeBuffer:
         group_id / env_seed). This compares rollouts from the same initial state,
         isolating the effect of policy noise from environmental randomness.
 
-        After shaped reward computation, rewards are time-scaled: faster solutions
-        get higher reward (reward / num_steps * max_episode_steps). This creates
-        variance even in all-success groups where binary rewards are identical.
+        Rewards are sparse binary (1.0 on task success, 0.0 otherwise). The
+        time-scaling step below (faster solutions get higher reward) is
+        currently DISABLED; see the block comment for the ablation rationale.
 
         Note: this returns ONE advantage per episode. The per-chunk division
         (A_episode / num_chunks, matching grpo_cont.py:368-369) happens later in
         _build_chunks when episodes are flattened into ActionChunks.
 
         Args:
-            success_weight: Weight for binary success in shaped reward.
-                reward = success_weight * success + (1 - success_weight) * max_progress
             max_episode_steps: Maximum episode steps (used for time-scaling normalization).
 
         Returns:
@@ -342,11 +336,8 @@ class EpisodeBuffer:
             self._n_dead_groups = 0
             return self.advantages
 
-        # Step 1: Compute shaped rewards per episode
-        rewards = np.array([
-            success_weight * float(ep.success) + (1 - success_weight) * ep.max_progress
-            for ep in self.episodes
-        ])
+        # Step 1: Sparse binary reward per episode (1.0 on success, else 0.0).
+        rewards = np.array([float(ep.success) for ep in self.episodes])
 
         # Step 1b: Time-scale rewards (faster solutions get higher reward)
         # DISABLED. The single-scene ablation experiments (toy_lr3.0e-5_v2/v3
@@ -521,13 +512,6 @@ class EpisodeBuffer:
             return 0.0
         return sum(ep.success for ep in self.episodes) / len(self.episodes)
 
-    @property
-    def mean_progress(self) -> float:
-        """Average dense progress across episodes."""
-        if not self.episodes:
-            return 0.0
-        return np.mean([ep.max_progress for ep in self.episodes])
-
     def stats(self) -> dict:
         """Summary statistics for logging."""
         if not self.episodes:
@@ -554,7 +538,6 @@ class EpisodeBuffer:
             "num_episodes": self.num_episodes,
             "num_chunks": self.num_chunks,
             "success_rate": self.success_rate,
-            "mean_progress": self.mean_progress,
             "mean_reward": float(np.mean(rewards)),
             "std_reward": float(np.std(rewards)),
             "mean_advantage": float(self.advantages.mean()) if self.advantages is not None else 0,
@@ -604,7 +587,6 @@ if __name__ == "__main__":
             action_masks=[np.ones((50, 128))],
             initial_noises=[np.zeros((50, 128))],
             success=(i % 5 >= 2) if group_id == 0 else (i % 5 == 0),
-            max_progress=(i % 5) / 5.0,
             shaped_reward=0.0,
             env_name="test_env",
             episode_idx=i,
@@ -614,7 +596,7 @@ if __name__ == "__main__":
         )
         buffer.episodes.append(ep)
 
-    advantages = buffer.compute_advantages(success_weight=0.7)
+    advantages = buffer.compute_advantages()
 
     print("Rewards:", [f"{ep.shaped_reward:.3f}" for ep in buffer.episodes])
     print("Group IDs:", [ep.group_id for ep in buffer.episodes])
@@ -643,7 +625,7 @@ if __name__ == "__main__":
         video_frames=[{}], states=[{}], language="test",
         actions=[np.zeros((16, 12))], raw_actions=[np.zeros((50,128))],
         action_masks=[np.ones((50,128))], initial_noises=[np.zeros((50, 128))],
-        success=True, max_progress=1.0, shaped_reward=0.0,
+        success=True, shaped_reward=0.0,
         env_name="test", episode_idx=0, num_steps=8,
         group_id=0, env_seed=42,
     ))

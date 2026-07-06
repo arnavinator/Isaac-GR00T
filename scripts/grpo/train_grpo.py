@@ -125,68 +125,6 @@ class GRPOTrainer:
         self._consecutive_collect_failures = 0
         self._max_consecutive_collect_failures = 3
 
-        # Optional long-running collector server. When configured, collection
-        # is an RPC call instead of a subprocess spawn — eliminates per-iter
-        # robocasa import + worker startup cost (~10-20s/iter). The server
-        # must be started separately (see scripts/grpo/collector_server.py).
-        # We ping at __init__ to fail fast if the server is unreachable, is
-        # missing any of our configured env_names, or was booted with
-        # bake-time args (group_size, n_action_steps, max_episode_steps)
-        # that don't match this trainer's config.
-        self._collector_client = None
-        if self.config.collector_server_host:
-            sys.path.insert(0, str(Path(__file__).parent))
-            from collector_server import CollectorClient
-            # Scale RPC timeout from the EFFECTIVE upper bound on groups
-            # this iter. With dynamic mode active (min_alive_groups>0
-            # and max_groups>num_groups in EpisodeCollector.collect), the
-            # collector may run up to max_groups groups; otherwise it stops
-            # at exactly num_groups. ~7 min/group on the user's setup. With
-            # num_async_vector_env < group_size each group is collected over
-            # turns_per_group sequential turns, so scale by that factor too
-            # (turns_per_group == 1 in the default one-env-per-rollout case).
-            effective_max_groups = (
-                self.config.max_groups
-                if self.config.min_alive_groups > 0
-                and self.config.max_groups > self.config.num_groups
-                else self.config.num_groups
-            )
-            self._collector_client = CollectorClient(
-                host=self.config.collector_server_host,
-                port=self.config.collector_server_port,
-                # Cap below ZMQ's int32 RCVTIMEO limit (~2.147e9 ms). The scaled
-                # value can exceed it at extreme configs (e.g. group_size>=52,
-                # num_envs=1, max_groups=100 → turns_per_group=52), which would
-                # otherwise raise OverflowError at socket setup. ~2e9 ms (~23
-                # days) is effectively unbounded for collection anyway.
-                timeout_ms=min(
-                    420_000 * effective_max_groups * self._turns_per_group(),
-                    2_000_000_000,
-                ),
-            )
-            try:
-                info = self._collector_client.ping()
-            except Exception as e:
-                raise RuntimeError(
-                    f"Could not reach collector server at "
-                    f"{self.config.collector_server_host}:{self.config.collector_server_port}: "
-                    f"{type(e).__name__}: {e}. "
-                    f"Start it first with: "
-                    f"`gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python "
-                    f"scripts/grpo/collector_server.py --env-names ... "
-                    f"--max-episode-steps ... --listen-port "
-                    f"{self.config.collector_server_port}`."
-                )
-            self._validate_collector_server_config(info)
-            print(
-                f"  Collector server: {self.config.collector_server_host}:"
-                f"{self.config.collector_server_port} "
-                f"(envs: {sorted(info.get('envs', []))}, "
-                f"group_size={info.get('group_size')}, "
-                f"num_async_vector_env={info.get('num_async_vector_env')}, "
-                f"n_action_steps={info.get('n_action_steps')})"
-            )
-
     def setup(self):
         """Load the model + LoRA, configure optimizer, validate the resume
         cache (when ``resume_from_collected_data=True``), and start the
@@ -194,10 +132,7 @@ class GRPOTrainer:
 
         Heavy work that's deferred from ``__init__`` so a misconfigured
         trainer fails fast at construction without paying for the multi-
-        minute model load. Note: ``__init__`` ALREADY binds to the
-        optional collector RPC server (``collector_server_*`` fields), so
-        those fields cannot be mutated post-construction; only the
-        non-RPC config fields are still mutable here.
+        minute model load.
         """
         import gr00t.model  # noqa: F401 — registers model classes
         from transformers import AutoModel, AutoProcessor
@@ -408,18 +343,10 @@ class GRPOTrainer:
         print("=" * 60)
 
     def shutdown(self):
-        """Clean up resources (server thread, tensorboard writer, collector client)."""
+        """Clean up resources (server thread, tensorboard writer)."""
         if hasattr(self, '_server_handle') and self._server_handle is not None:
             self._stop_server_thread(self._server_handle)
             self._server_handle = None
-        # Close collector RPC client (the server itself stays running for the
-        # next trainer instance — that's the whole point of long-running mode).
-        if getattr(self, '_collector_client', None) is not None:
-            try:
-                self._collector_client.close()
-            except Exception as e:
-                print(f"WARN: failed to close collector client: {e}")
-            self._collector_client = None
         if self.writer is not None:
             self.writer.close()
 
@@ -549,7 +476,6 @@ class GRPOTrainer:
             # ═══ Phase 2: Compute advantages ═══
             phase2_start = time.time()
             self.buffer.compute_advantages(
-                success_weight=self.config.success_weight,
                 max_episode_steps=max_steps,
             )
             stats = self.buffer.stats()
@@ -757,11 +683,9 @@ class GRPOTrainer:
     def _collect_episodes(self, env_name: str, task_idx: int, max_steps: int):
         """Collect episodes for one iteration into self.buffer.
 
-        Dispatches to a long-running collector_server (when
-        config.collector_server_host is set) or to a fresh subprocess of
-        collect_episodes.py. Both paths write episodes as .npz files to
-        episode_dir; we then load them into self.buffer and run the same
-        failure handling for both modes.
+        Spawns a fresh subprocess of collect_episodes.py (in the robocasa
+        venv), which writes episodes as .npz files to episode_dir; we then
+        load them into self.buffer and run failure handling.
         """
         self.buffer.clear()
 
@@ -813,14 +737,10 @@ class GRPOTrainer:
                 f"{self.config.group_size} = {total_episodes} episodes..."
             )
 
-        # Run collection: RPC to long-running server if configured, else
-        # spawn a fresh subprocess.
-        if self._collector_client is not None:
-            failure_reason = self._collect_via_server(env_name, episode_dir, ff_steps)
-        else:
-            failure_reason = self._collect_via_subprocess(
-                env_name, episode_dir, max_steps, ff_steps,
-            )
+        # Run collection: spawn a fresh subprocess in the robocasa venv.
+        failure_reason = self._collect_via_subprocess(
+            env_name, episode_dir, max_steps, ff_steps,
+        )
 
         # Common post-processing: load episodes, then handle any failure.
         n_loaded = 0
@@ -847,8 +767,7 @@ class GRPOTrainer:
                     f"Collector failed {self._consecutive_collect_failures} consecutive "
                     f"iterations. Last reason: {failure_reason}. "
                     f"Common causes: robocasa venv path wrong, server port stuck in "
-                    f"TIME_WAIT, MUJOCO_GL backend missing, model OOM during inference, "
-                    f"or (server mode) collector_server.py not running. "
+                    f"TIME_WAIT, MUJOCO_GL backend missing, or model OOM during inference. "
                     f"Check the [collector] log lines above this message."
                 )
             return
@@ -1017,7 +936,7 @@ class GRPOTrainer:
 
         Returns a failure_reason string, or None on success. Pays the full
         startup cost (robocasa imports + AsyncVectorEnv worker spawn) every
-        call — _collect_via_server is the long-running alternative.
+        call.
         """
         robocasa_python = str(
             Path(__file__).parent.parent.parent
@@ -1037,7 +956,6 @@ class GRPOTrainer:
             "--n-action-steps", str(self.config.n_action_steps),
             "--fast-forward-steps", str(ff_steps),
             "--fast-forward-pct", str(self.config.fast_forward_pct),
-            "--success-weight", str(self.config.success_weight),
             "--server-host", self.config.server_host,
             "--server-port", str(self.config.server_port),
             "--output-dir", str(episode_dir),
@@ -1120,145 +1038,6 @@ class GRPOTrainer:
         if proc.returncode != 0:
             return f"non-zero exit code {proc.returncode}"
         return None
-
-    def _collect_via_server(
-        self,
-        env_name: str,
-        episode_dir: Path,
-        ff_steps: int,
-    ) -> str | None:
-        """Run collection via the long-running collector_server.
-
-        Returns a failure_reason string, or None on success. The server holds
-        its own max_episode_steps per env (set at server startup), so we
-        don't pass max_steps here — if the trainer's config diverges from
-        the server's, restart the server with the new values.
-
-        Distinguishes FATAL server errors (config mismatches like env_name
-        typo) from transient ones (timeouts, connection blips). Fatal errors
-        re-raise immediately rather than burning the consecutive-failure
-        retry budget — there's no point retrying when the cause won't
-        self-correct.
-        """
-        from collector_server import FatalCollectorError
-        try:
-            result = self._collector_client.collect(
-                env_name=env_name,
-                output_dir=str(episode_dir),
-                # Iter-stride 100_000 must match _collect_via_subprocess so
-                # both transports produce identical group seeds for a given
-                # (config.seed, iteration). See GROUP_SEED_STRIDE in
-                # collect_episodes.py for the within-iter spacing.
-                base_seed=self.config.seed + self.iteration * 100_000,
-                num_groups=self.config.num_groups,
-                success_weight=self.config.success_weight,
-                fast_forward_steps=ff_steps,
-                fast_forward_pct=self.config.fast_forward_pct,
-                min_alive_groups=self.config.min_alive_groups,
-                max_groups=self.config.max_groups,
-                init_state_npz_path=self.config.init_state_npz_path,
-            )
-        except FatalCollectorError as e:
-            raise RuntimeError(
-                f"Collector server reports fatal config error: {e}. This "
-                f"won't fix itself on retry — restart the collector server "
-                f"with --env-names / --max-episode-steps / --group-size / "
-                f"--num-async-vector-env / --n-action-steps matching this "
-                f"trainer's config "
-                f"(env_names={self.config.env_names}, "
-                f"group_size={self.config.group_size}, "
-                f"num_async_vector_env={self._resolved_num_async_vector_env()}, "
-                f"n_action_steps={self.config.n_action_steps})."
-            ) from e
-        except TimeoutError as e:
-            return f"collector_server timeout: {e}"
-        except RuntimeError as e:
-            # Server-reported transient error.
-            return f"collector_server error: {e}"
-        except Exception as e:
-            return f"collector_server connection error ({type(e).__name__}): {e}"
-
-        print(
-            f"    [collector_server] {result['n_episodes']} episodes, "
-            f"{result['n_successes']} successes in {result['elapsed_s']}s"
-        )
-        return None
-
-    def _validate_collector_server_config(self, info: dict) -> None:
-        """Check that the server's bake-time args match this trainer's config.
-
-        Mismatches mean episodes will be collected with values inconsistent
-        with what the trainer expects (advantage shape, chunking math).
-        Fail fast at __init__ with the exact restart command rather than
-        producing silently corrupt training data.
-        """
-        available_envs = set(info.get("envs", []))
-        missing_envs = [e for e in self.config.env_names if e not in available_envs]
-        if missing_envs:
-            raise RuntimeError(
-                f"Collector server is missing envs that this trainer needs: "
-                f"{missing_envs}. Restart the server with --env-names "
-                f"matching this config: {self.config.env_names}"
-            )
-
-        server_group_size = info.get("group_size")
-        if server_group_size != self.config.group_size:
-            raise RuntimeError(
-                f"group_size mismatch: trainer config = {self.config.group_size}, "
-                f"server (boot-time) = {server_group_size}. Restart the "
-                f"collector server with --group-size {self.config.group_size}."
-            )
-
-        # num_async_vector_env: resolve both sides to the effective worker count
-        # before comparing, so a trainer with None (→ group_size) matches a
-        # server booted with --num-async-vector-env group_size and vice-versa.
-        # An OLD server (pre-this-feature) returns None for the key → resolves
-        # to its group_size; this passes silently when the trainer also uses the
-        # default and correctly fails (with a restart hint) when the trainer
-        # lowers num_async_vector_env below group_size.
-        trainer_nave = self._resolved_num_async_vector_env()
-        server_nave_raw = info.get("num_async_vector_env")
-        server_nave = (
-            server_group_size if server_nave_raw is None else server_nave_raw
-        )
-        if server_nave != trainer_nave:
-            raise RuntimeError(
-                f"num_async_vector_env mismatch: trainer config = {trainer_nave}, "
-                f"server (boot-time) = {server_nave}. Restart the collector "
-                f"server with --num-async-vector-env {trainer_nave}."
-            )
-
-        server_n_action_steps = info.get("n_action_steps")
-        if server_n_action_steps != self.config.n_action_steps:
-            raise RuntimeError(
-                f"n_action_steps mismatch: trainer config = "
-                f"{self.config.n_action_steps}, server (boot-time) = "
-                f"{server_n_action_steps}. Restart the collector server with "
-                f"--n-action-steps {self.config.n_action_steps}."
-            )
-
-        server_env_max_steps = info.get("env_max_steps", {})
-        for env_name in self.config.env_names:
-            expected = self._resolve_max_steps_for_env(env_name)
-            actual = server_env_max_steps.get(env_name)
-            if actual != expected:
-                raise RuntimeError(
-                    f"max_episode_steps mismatch for {env_name!r}: trainer "
-                    f"config = {expected}, server (boot-time) = {actual}. "
-                    f"Restart the collector server with --max-episode-steps "
-                    f"matching the per-env values in this trainer config."
-                )
-
-    def _resolve_max_steps_for_env(self, env_name: str) -> int:
-        """Look up max_episode_steps for one env_name from the trainer config.
-
-        config.max_episode_steps can be an int (broadcast to all envs) or a
-        list parallel to config.env_names.
-        """
-        if isinstance(self.config.max_episode_steps, list):
-            idx = self.config.env_names.index(env_name)
-            return self.config.max_episode_steps[idx]
-        return self.config.max_episode_steps
 
     def _parse_resume_iteration(self) -> int:
         """Parse the iter number from `resume_from`'s basename, returning the
@@ -2169,9 +1948,10 @@ class GRPOTrainer:
         #
         # We use episode-level advantage sign (self.buffer.advantages[i] > 0)
         # rather than ep.success, for consistency with _iter_balanced_minibatches
-        # which oversamples chunks with c.advantage > 0. With shaped rewards
-        # (success_weight < 1.0), a failing episode with high max_progress can
-        # have positive advantage — ep.success would undercount these.
+        # which oversamples chunks with c.advantage > 0. Under the sparse binary
+        # reward these coincide for live groups (a mixed group's successes get
+        # positive advantage, failures negative), so this is equivalent to
+        # counting ep.success while keeping the two mechanisms aligned.
         if self.config.dynamic_epoch_training:
             live_group_ids = {c.group_id for c in live_chunks}
             live_ep_indices = [
@@ -3437,12 +3217,6 @@ class GRPOTrainer:
         # all-fail iter. Skip the whole episode/* block in that case.
         if stats:
             self.writer.add_scalar("episode/success_rate", stats.get("success_rate", 0), iteration)
-            # mean_progress is only meaningful when dense progress actually fed into
-            # the shaped reward. With success_weight=1.0 (default) the collector
-            # skips compute_dense_progress entirely, so max_progress is a constant 0
-            # and logging it here would just produce a flat zero curve.
-            if self.config.success_weight < 1.0:
-                self.writer.add_scalar("episode/mean_progress", stats.get("mean_progress", 0), iteration)
             self.writer.add_scalar("episode/mean_reward", stats.get("mean_reward", 0), iteration)
             self.writer.add_scalar("episode/std_reward", stats.get("std_reward", 0), iteration)
 
@@ -3781,12 +3555,11 @@ def main():
     np.random.seed(config.seed)
 
     # Create trainer and run. Both setup() and train() are wrapped so that
-    # shutdown() runs even when setup() raises mid-way — important because
-    # __init__ may have already opened a ZMQ collector_client (and started
-    # background threads inside zmq.Context), and setup() itself has many
+    # shutdown() runs even when setup() raises mid-way — setup() has many
     # raise paths (cache validator, optimizer state validation, LoRA load
-    # mismatch). Without the wrap, those raises bypass shutdown() entirely
-    # and leak the collector socket / context.
+    # mismatch) that can fire after the TensorBoard writer / background
+    # server thread are created. Without the wrap, those raises bypass
+    # shutdown() and leak the server socket / writer.
     trainer = GRPOTrainer(config)
     try:
         trainer.setup()

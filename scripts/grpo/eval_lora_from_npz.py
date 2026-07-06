@@ -53,8 +53,7 @@ from pathlib import Path
 import numpy as np
 import zmq
 
-# scripts/grpo/ on sys.path so we can import collect_episodes (which in turn
-# imports its sibling dense_reward via plain `import dense_reward`). When this
+# scripts/grpo/ on sys.path so we can import collect_episodes. When this
 # script is launched directly (`python scripts/grpo/eval_lora_from_npz.py ...`)
 # Python already puts the script's dir on sys.path[0]; this insert is defensive
 # for the imported-as-module case.
@@ -375,7 +374,6 @@ def main():
         episodes = collector.collect(
             num_groups=1,
             base_seed=args.seed,
-            success_weight=1.0,         # binary; skips dense progress RPC
             fast_forward_steps=0,
             fast_forward_pct=0.0,
             min_alive_groups=0,         # disables dynamic group collection

@@ -125,17 +125,6 @@ class ToyGRPOTrainer(GRPOTrainer):
             list(fixed_seeds) if fixed_seeds is not None else list(FIXED_SEEDS)
         )
 
-        # The collector-server route would need its own per-seed call surface
-        # (CollectorClient.collect takes a single base_seed). The toy targets
-        # subprocess mode; fail fast if the user accidentally points at a
-        # collector_server config so they don't get silent wrong behavior.
-        if self._collector_client is not None:
-            raise RuntimeError(
-                "ToyGRPOTrainer only supports subprocess collection. "
-                "Set --collector-server-host '' (or remove the flag) to use "
-                "the subprocess path, then re-launch."
-            )
-
         # The toy's Phase-1 initial pass unconditionally attempts every fixed
         # seed once before any retries — that's the diagnostic invariant.
         # max_groups < len(FIXED_SEEDS) would cap that pass mid-way, which

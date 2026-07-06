@@ -139,9 +139,6 @@ else:
 from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
 from gr00t.policy.server_client import PolicyClient
 
-# Local module: dense reward extraction (lives next to this script).
-import dense_reward
-
 
 # ---------------------------------------------------------------------------
 # Worker-side memory diagnostics + per-call OS-release cleanup
@@ -404,9 +401,8 @@ class GroupAlignmentWrapper(MultiStepWrapper):
     scripts/denoising_lab/eval/branching_rollout.py:399-427):
         set_ep_meta → reset → reset_from_xml_string → set_state_from_flattened.
 
-    Also exposes get_sim_state_flat (debug verification) and
-    compute_dense_progress (used when success_weight < 1.0). Both must cross
-    the IPC boundary in async mode, so the parent process can't reach into
+    Also exposes get_sim_state_flat (debug verification), which must cross the
+    IPC boundary in async mode since the parent process can't reach into
     wrapper.unwrapped.env directly.
     """
 
@@ -573,15 +569,6 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         """Read MuJoCo sim state as a flat array (used by debug verify)."""
         return np.array(self.env.unwrapped.env.sim.get_state().flatten())
 
-    def compute_dense_progress(self, task_type: str) -> float:
-        """Continuous task progress in [0, 1] (used when success_weight < 1.0).
-
-        Wrapped here because in async mode we can't reach into the underlying
-        robosuite env from the parent process — this method runs in the
-        subprocess worker via env.call().
-        """
-        return dense_reward.compute_dense_progress(self, task_type)
-
 
 # ---------------------------------------------------------------------------
 # Env factory (used by AsyncVectorEnv subprocess workers)
@@ -660,10 +647,6 @@ def parse_args():
         "--output-dir", type=str, required=True, help="Directory to save episode .npz files.",
     )
     parser.add_argument(
-        "--success-weight", type=float, default=1.0,
-        help="Weight for binary success in shaped reward (1.0 = pure binary + time-scaled).",
-    )
-    parser.add_argument(
         "--fast-forward-steps", type=int, default=0,
         help="Outer steps to fast-forward before branching (0=disabled).",
     )
@@ -681,7 +664,7 @@ def parse_args():
     parser.add_argument(
         "--min-alive-groups", type=int, default=0,
         help="Min ALIVE groups (mixed: 0 < group_successes < group_size, "
-             "i.e., per-group reward std > 0 under success_weight=1.0) before "
+             "i.e., per-group reward std > 0) before "
              "stopping. 0 = disabled (always collect exactly num_groups). "
              "When >0, collector continues past num_groups (capped at "
              "max_groups) until criterion is met.",
@@ -696,8 +679,8 @@ def parse_args():
         help="Override every group's branch point with a saved sim state from "
              "this .npz (must contain __sim_state__, __model_xml__, __ep_meta__ "
              "as produced by scripts/denoising_lab/eval/interactive_rollout.py). "
-             "Forces fast-forward off internally. Pair with --success-weight <1.0 "
-             "to avoid dead-gradient stalls when starting from a hard state.",
+             "Forces fast-forward off internally. Pick a branch point the policy "
+             "solves at least intermittently, or the group yields no gradient signal.",
     )
     return parser.parse_args()
 
@@ -713,7 +696,7 @@ class EpisodeCollector:
     Each episode records:
     - Per-chunk: observation frames, states, decoded actions, raw model output,
       action mask, and the initial denoising noise tensor.
-    - Episode-level: success, max progress, total substeps.
+    - Episode-level: success (sparse binary), total substeps.
 
     The initial noise tensor is captured by the GRPO server (grpo_server.py)
     via a hook on torch.randn. It's the ε₀ that was denoised into the action —
@@ -752,10 +735,8 @@ class EpisodeCollector:
             )
         self.turns_per_group = self.group_size // self.num_envs
         self.n_action_steps = n_action_steps
-        # max_episode_steps is exposed so callers (e.g., CollectorServer) can
-        # report it back to the trainer for cross-process config validation.
+        # max_episode_steps is stored for reference (per-env truncation horizon).
         self.max_episode_steps = max_episode_steps
-        self.task_type = dense_reward.classify_task_type(env_name)
         self.debug_fast_forward = debug_fast_forward
         self.output_dir = Path(output_dir)
 
@@ -824,7 +805,7 @@ class EpisodeCollector:
         self._active_init_bundle_path: str | None = None
 
         print(f"Collector initialized:")
-        print(f"  Env: {env_name} (task_type: {self.task_type})")
+        print(f"  Env: {env_name}")
         print(f"  Group size (logical rollouts/group): {self.group_size}")
         print(
             f"  Async vector envs (physical workers): {self.num_envs} "
@@ -839,7 +820,6 @@ class EpisodeCollector:
         self,
         num_groups: int,
         base_seed: int,
-        success_weight: float = 1.0,
         fast_forward_steps: int = 0,
         fast_forward_pct: float = 0.5,
         min_alive_groups: int = 0,
@@ -858,18 +838,16 @@ class EpisodeCollector:
         per group. With probability `fast_forward_pct`, ALL groups in this
         call use lockstep FF; otherwise NONE do. This eliminates within-
         iteration FF/non-FF mixing, which would distort cross-group reward
-        comparisons (FF rollouts have shorter num_steps and so larger time-
-        scaled rewards). Long-run FF fraction across iterations still
-        approaches `fast_forward_pct` because each call gets a different
-        `base_seed` from the trainer.
+        comparisons (FF rollouts have shorter num_steps). Long-run FF fraction
+        across iterations still approaches `fast_forward_pct` because each call
+        gets a different `base_seed` from the trainer.
 
         Dynamic group collection: when min_alive_groups > 0, after
         collecting `num_groups` groups the collector keeps adding one more
         group at a time until either (a) at least `min_alive_groups` groups
         are ALIVE (mixed: 0 < group_successes < group_size — equivalently,
-        per-group reward std > 0 under success_weight=1.0 with time-scaling
-        disabled, the only regime this binary-mixed predicate is exact for),
-        or (b) `max_groups` groups have been collected (warning logged).
+        per-group reward std > 0 under the sparse binary reward), or (b)
+        `max_groups` groups have been collected (warning logged).
         """
         # Default max_groups = num_groups (disables dynamic mode regardless
         # of min_alive_groups, since we can't go beyond num_groups).
@@ -980,14 +958,12 @@ class EpisodeCollector:
                     group_seed=group_seed,
                     group_id=group_idx,
                     fast_forward_steps=fast_forward_steps,
-                    success_weight=success_weight,
                 )
                 ff_label = f"(branched at step {fast_forward_steps})"
             else:
                 group_episodes = self._collect_one_group(
                     group_seed=group_seed,
                     group_id=group_idx,
-                    success_weight=success_weight,
                 )
                 ff_label = "(from seed)"
 
@@ -996,24 +972,13 @@ class EpisodeCollector:
             group_successes = sum(e["success"] for e in group_episodes)
             # "Alive group" = mixed: at least one rollout succeeded AND at
             # least one failed. This matches the trainer's gradient-signal
-            # criterion exactly: under success_weight=1.0 with time-scaling
-            # disabled (see episode_buffer.py:351-376 for why time-scaling
-            # is off), per-group reward std > 0 iff the rewards span both
-            # 0 and 1 — i.e., 0 < group_successes < group_size. Pure all-
-            # success groups (group_successes == group_size) and pure all-
-            # fail groups (group_successes == 0) both have std=0 and get
-            # advantage-zeroed by compute_advantages, so neither contributes
-            # gradient signal.
-            #
-            # NOTE: this binary-mixed predicate is exact only when
-            # success_weight=1.0 with time-scaling disabled — the regime
-            # this codebase trains in. For success_weight<1.0 or time-
-            # scaled rewards, the strict criterion is per-group shaped-
-            # reward std > 1e-4, which the collector does not currently
-            # compute. If you switch reward shaping back on, audit this
-            # site (and the resume_from_collected_data validator in
-            # train_grpo.py:_validate_collected_data_cache) for the
-            # same predicate.
+            # criterion exactly: under the sparse binary reward (time-scaling
+            # disabled; see episode_buffer.py for the ablation rationale),
+            # per-group reward std > 0 iff the rewards span both 0 and 1 —
+            # i.e., 0 < group_successes < group_size. Pure all-success groups
+            # (group_successes == group_size) and pure all-fail groups
+            # (group_successes == 0) both have std=0 and get advantage-zeroed
+            # by compute_advantages, so neither contributes gradient signal.
             if 0 < group_successes < self.group_size:
                 alive_groups += 1
 
@@ -1075,12 +1040,6 @@ class EpisodeCollector:
             f"({success_pct:.0f}% episodes), "
             f"alive groups: {alive_groups}/{group_idx}"
         )
-        # Only report dense progress when it actually contributed to the shaped
-        # reward — with success_weight=1.0 (the default) the progress term is
-        # multiplied by (1 - success_weight) = 0, so max_progress stays at the
-        # per-episode init value of 0.0 and reporting it would be misleading.
-        if success_weight < 1.0:
-            print(f"Mean progress: {np.mean([e['max_progress'] for e in all_episodes]):.3f}")
 
         return all_episodes
 
@@ -1090,13 +1049,12 @@ class EpisodeCollector:
         self,
         group_seed: int,
         group_id: int,
-        success_weight: float,
     ) -> list[dict]:
         """Collect one group (group_size rollouts) from the seed-aligned scene,
         across turns_per_group turns of num_envs rollouts each."""
         observations, branch_bundle = self._align_envs_to_group_scene(group_seed)
         return self._run_group_over_turns(
-            group_seed, group_id, success_weight, branch_bundle, observations
+            group_seed, group_id, branch_bundle, observations
         )
 
     def _collect_one_group_with_fast_forward(
@@ -1104,7 +1062,6 @@ class EpisodeCollector:
         group_seed: int,
         group_id: int,
         fast_forward_steps: int,
-        success_weight: float,
     ) -> list[dict]:
         """Collect one group with a lockstep fast-forward prefix.
 
@@ -1117,11 +1074,11 @@ class EpisodeCollector:
         Falls back to _collect_one_group if any env terminates during FF.
 
         We deliberately do NOT count the FF prefix in episodes[i].num_steps:
-        time-scaled rewards within a group should compare post-branch effort
-        fairly. Mixing FF and non-FF groups (fast_forward_pct < 1.0) means
-        cross-group comparisons (e.g., logged mean_reward) will favor branched
-        groups numerically — a known artifact of FF; group-relative advantages
-        are unaffected since they normalize WITHIN each group.
+        rewards within a group should compare post-branch effort fairly.
+        Mixing FF and non-FF groups (fast_forward_pct < 1.0) is avoided within
+        an iteration (collect() draws one Bernoulli per call); group-relative
+        advantages are unaffected regardless since they normalize WITHIN each
+        group.
         """
         observations, _seed_bundle = self._align_envs_to_group_scene(group_seed)
 
@@ -1133,9 +1090,7 @@ class EpisodeCollector:
                     "falling back to normal collection"
                 )
                 # Fallback collects the FULL multi-turn group from seed.
-                return self._collect_one_group(
-                    group_seed, group_id, success_weight
-                )
+                return self._collect_one_group(group_seed, group_id)
             observations = new_obs
 
         if self.debug_fast_forward:
@@ -1173,7 +1128,7 @@ class EpisodeCollector:
             )
 
         return self._run_group_over_turns(
-            group_seed, group_id, success_weight, post_ff_bundle, observations
+            group_seed, group_id, post_ff_bundle, observations
         )
 
     # ─── Multi-turn group driver ──────────────────────────────────────────
@@ -1221,7 +1176,6 @@ class EpisodeCollector:
         self,
         group_seed: int,
         group_id: int,
-        success_weight: float,
         branch_bundle: dict | None,
         first_turn_obs: list[dict],
     ) -> list[dict]:
@@ -1237,7 +1191,7 @@ class EpisodeCollector:
         (unseeded) — fresh on every turn — NOT from env randomness.
         """
         group_episodes = self._run_per_env_loop(
-            first_turn_obs, group_id, group_seed, success_weight
+            first_turn_obs, group_id, group_seed
         )
         for _turn in range(1, self.turns_per_group):
             # branch_bundle is None only for the true singleton (group_size==1,
@@ -1247,9 +1201,7 @@ class EpisodeCollector:
                 break
             turn_obs = self._restart_at_branch_point(branch_bundle, group_seed)
             group_episodes.extend(
-                self._run_per_env_loop(
-                    turn_obs, group_id, group_seed, success_weight
-                )
+                self._run_per_env_loop(turn_obs, group_id, group_seed)
             )
         return group_episodes
 
@@ -1384,7 +1336,6 @@ class EpisodeCollector:
         observations_per_env: list[dict],
         group_id: int,
         group_seed: int,
-        success_weight: float,
     ) -> list[dict]:
         """Step every env until it finishes, recording per-chunk data.
 
@@ -1418,13 +1369,6 @@ class EpisodeCollector:
             )
             actions_full = self._scatter_actions(actions_active, active_indices)
 
-            # Optional dense progress (per-env RPC; only when needed).
-            progresses = (
-                self.envs.call("compute_dense_progress", self.task_type)
-                if success_weight < 1.0
-                else None
-            )
-
             next_obs, _, terms, truncs, infos = self.envs.step(actions_full)
 
             for j, env_idx in enumerate(active_indices):
@@ -1456,17 +1400,9 @@ class EpisodeCollector:
                 else:
                     ep["num_steps"] += self.n_action_steps
 
-                if progresses is not None:
-                    ep["max_progress"] = max(
-                        ep["max_progress"], progresses[env_idx]
-                    )
-
                 if terms[env_idx] or truncs[env_idx]:
                     done_flags[env_idx] = True
                     ep["success"] = self._success_for_env(infos, env_idx)
-                    ep["shaped_reward"] = dense_reward.compute_shaped_reward(
-                        ep["success"], ep["max_progress"], success_weight
-                    )
 
             # Update obs only for envs we'll step again next iteration. Done
             # envs are never re-read (filtered out via active_indices), so we
@@ -1585,8 +1521,6 @@ class EpisodeCollector:
             "initial_noises": [],    # Initial noise tensors (50x128) used to denoise each action
             "language": None,        # Task instruction (extracted from first observation)
             "success": False,
-            "max_progress": 0.0,
-            "shaped_reward": 0.0,
             "env_name": self.env_name,
             "num_steps": 0,
             "group_id": group_id,
@@ -1784,7 +1718,6 @@ def save_episodes(episodes: list[dict], output_dir: str) -> None:
             "language": ep.get("language") or ep["env_name"].split("/")[-1],
             "env_name": ep["env_name"],
             "success": ep["success"],
-            "max_progress": ep["max_progress"],
             "num_steps": ep["num_steps"],
             "num_chunks": len(ep["actions"]),
             "group_id": ep.get("group_id", 0),
@@ -1871,7 +1804,6 @@ def main():
         episodes = collector.collect(
             num_groups=args.num_groups,
             base_seed=args.seed,
-            success_weight=args.success_weight,
             fast_forward_steps=args.fast_forward_steps,
             fast_forward_pct=args.fast_forward_pct,
             min_alive_groups=args.min_alive_groups,

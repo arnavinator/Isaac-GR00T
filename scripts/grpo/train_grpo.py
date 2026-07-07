@@ -407,12 +407,13 @@ class GRPOTrainer:
                 f"  Dynamic epoch count: ON "
                 f"(tent epochs=max(1, floor(2·min(sf,1-sf)·{self.config.update_epochs}+0.5)))"
             )
-        if self.config.jitter_lambda > 0.0:
+        if self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0:
             # Surface the doubled-step cost up-front so the user can confirm
             # update_epochs has been halved if they want to match vanilla
             # GRPO's per-iter step budget. Single line, only when active.
             print(
-                f"  Jitter-GRPO: lambda={self.config.jitter_lambda} "
+                f"  Jitter-GRPO: pos={self.config.jitter_pos} "
+                f"neg={self.config.jitter_neg} "
                 f"(paired scheduling — 2× minibatches per epoch; "
                 f"halve update_epochs to match vanilla per-iter step count)"
             )
@@ -1650,9 +1651,9 @@ class GRPOTrainer:
                 batch = chunks[start:start + batch_size]
                 # Wrap as (chunk, "fixed") tuples — _prepare_batch's new
                 # signature takes (chunk, mode) entries. The ref pass always
-                # uses original ε for the DiT input regardless of jitter_lambda
-                # (Jitter-GRPO anchors the cached ref at the original ε so
-                # both fixed and jitter branches share the same baseline),
+                # uses original ε for the DiT input regardless of jitter
+                # settings (Jitter-GRPO anchors the cached ref at the original
+                # ε so both fixed and jitter branches share the same baseline),
                 # so "fixed" is the correct tag here.
                 result = self._prepare_batch([(c, "fixed") for c in batch])
                 if result is None:
@@ -1839,15 +1840,17 @@ class GRPOTrainer:
         if n_live_chunks == 0:
             return {}
 
-        # Jitter-GRPO paired scheduling. When jitter_lambda > 0, every chunk
-        # produces TWO entries per epoch: a "fixed" entry (DiT input noise =
-        # original ε) and a "jitter" entry (DiT input noise = ε' = sqrt(1-λ²)·ε
-        # + λ·ξ). The stratified minibatcher then yields 2× as many minibatches
-        # → 2× optimizer steps per epoch. User halves update_epochs MANUALLY
-        # to match the per-iter step count of vanilla GRPO. When 0 (default),
-        # behavior is bit-identical to pre-jitter code (single "fixed" tag per
-        # chunk; ξ-sampling block below is skipped).
-        if self.config.jitter_lambda > 0.0:
+        # Jitter-GRPO paired scheduling. When jitter is active (jitter_pos or
+        # jitter_neg > 0), every chunk produces TWO entries per epoch: a
+        # "fixed" entry (DiT input noise = original ε) and a "jitter" entry
+        # (DiT input noise = ε' = sqrt(1-λ²)·ε + λ·ξ, where λ is jitter_pos or
+        # jitter_neg per the chunk's advantage sign). The stratified
+        # minibatcher then yields 2× as many minibatches → 2× optimizer steps
+        # per epoch. User halves update_epochs MANUALLY to match the per-iter
+        # step count of vanilla GRPO. When BOTH are 0 (default), behavior is
+        # bit-identical to pre-jitter code (single "fixed" tag per chunk;
+        # ξ-sampling block below is skipped).
+        if self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0:
             entries = (
                 [(c, "fixed") for c in live_chunks]
                 + [(c, "jitter") for c in live_chunks]
@@ -1884,7 +1887,7 @@ class GRPOTrainer:
         compute_base = self.config.kl_coef_base_model > 0.0
 
         # Per-branch row-level accumulators (Jitter-GRPO). Aggregated metrics
-        # above stay per-mb so the jitter_lambda=0 path produces bit-identical
+        # above stay per-mb so the jitter-off path produces bit-identical
         # TB curves; per-branch metrics use row-weighted means since the
         # fixed/jitter row counts in a single minibatch can differ.
         ratio_sum_fixed = 0.0
@@ -2089,16 +2092,19 @@ class GRPOTrainer:
                 # --- Jitter-GRPO: build per-K input noise tensor ---
                 # When any row in this minibatch is tagged "jitter", sample a
                 # fresh ξ ~ N(0, I) of shape [K, B, H, D] and construct
-                # noise_for_input[k, jitter_row] = sqrt(1-λ²)·ε + λ·ξ_k. Fixed
-                # rows keep noise_for_input[:, fixed_row] = ε (unchanged).
-                # The original ε (ready_noise) is still passed as `noise=...`
-                # below so velocity_target = a − ε is anchored at the original
-                # noise — that asymmetry is what makes the loss in expectation
-                # an FM-loss + Frobenius-norm Jacobian regularizer (the core
-                # Jitter-GRPO trick).
-                lam = self.config.jitter_lambda
+                # noise_for_input[k, jitter_row] = sqrt(1-λ²)·ε + λ·ξ_k, where
+                # λ is jitter_pos for positive-advantage rows and jitter_neg
+                # for negative — so each sign gets its own Jacobian-penalty
+                # strength. Fixed rows keep noise_for_input[:, fixed_row] = ε
+                # (unchanged). The original ε (ready_noise) is still passed as
+                # `noise=...` below so velocity_target = a − ε is anchored at
+                # the original noise — that asymmetry is what makes the loss in
+                # expectation an FM-loss + Frobenius-norm Jacobian regularizer
+                # (the core Jitter-GRPO trick).
+                lam_pos = self.config.jitter_pos
+                lam_neg = self.config.jitter_neg
                 if (
-                    lam > 0.0
+                    (lam_pos > 0.0 or lam_neg > 0.0)
                     and ready_noise is not None
                     and any(m == "jitter" for m in ready_modes)
                 ):
@@ -2120,18 +2126,37 @@ class GRPOTrainer:
                         device=self.device, dtype=torch.bool,
                     )
 
+                    # Per-row λ selected by the chunk's PRE-renormalization
+                    # advantage sign (same classification as the pos/neg
+                    # clipfrac split below): jitter_pos for adv > 0, jitter_neg
+                    # otherwise. Built in float32 so the scalar keeps full
+                    # precision through the sqrt/multiply (matches the old
+                    # single-lambda Python-float behavior). A row whose side is
+                    # 0.0 collapses to ε — its jitter copy is then identical to
+                    # the fixed row.
+                    lam_row = torch.where(
+                        ready_advantages > 0,
+                        ready_advantages.new_full((B_r,), lam_pos, dtype=torch.float32),
+                        ready_advantages.new_full((B_r,), lam_neg, dtype=torch.float32),
+                    )
+                    lam_j = lam_row[jitter_mask_dev]                    # [n_jit]
+                    sqrt_one_minus_j = (1.0 - lam_j * lam_j).sqrt()     # [n_jit]
+
                     # expand returns a view — clone() is REQUIRED before
                     # __setitem__ to allocate writable per-K rows; without
                     # it the assignment would alias across the K dimension.
                     noise_for_input = (
                         ready_noise.unsqueeze(0).expand(K, -1, -1, -1).clone()
                     )
-                    sqrt_one_minus = (1.0 - lam * lam) ** 0.5
+                    # Broadcast per-row λ over [K, n_jit, H, D]. The f32 math is
+                    # cast back to ready_noise.dtype explicitly — masked
+                    # index-put requires matching dtypes (it will NOT auto-cast
+                    # a f32 source into a bf16 destination).
                     noise_for_input[:, jitter_mask_dev] = (
-                        sqrt_one_minus
+                        sqrt_one_minus_j[None, :, None, None]
                         * ready_noise[jitter_mask_dev].unsqueeze(0)
-                        + lam * xi[:, jitter_mask_dev]
-                    )
+                        + lam_j[None, :, None, None] * xi[:, jitter_mask_dev]
+                    ).to(ready_noise.dtype)
                 else:
                     noise_for_input = None
 
@@ -2313,8 +2338,8 @@ class GRPOTrainer:
                     n_updates += 1
 
                     # --- Per-branch row-level accumulation (Jitter-GRPO) ---
-                    # Only runs when jitter is enabled. Gating on lam>0 makes
-                    # the jitter_lambda=0 path bit-identical at the metrics
+                    # Only runs when jitter is enabled. Gating on jitter-active
+                    # makes the jitter-off path bit-identical at the metrics
                     # layer (no `_fixed`/`_jitter` curves emitted, no extra
                     # per-mb CUDA syncs from .item() calls).
                     #
@@ -2329,7 +2354,7 @@ class GRPOTrainer:
                     # empirical Jacobian-norm signal that Jitter-GRPO is
                     # designed to surface — if it shrinks across iters, the
                     # regularizer is working.
-                    if lam > 0.0:
+                    if lam_pos > 0.0 or lam_neg > 0.0:
                         over_clip = (
                             (ratio < 1 - self.config.clip_eps_low)
                             | (ratio > 1 + self.config.clip_eps_high)
@@ -2424,9 +2449,10 @@ class GRPOTrainer:
             result["kl_loss_base_model"] = total_kl_base_model / n_updates
         if success_frac is not None:
             result["success_fraction"] = success_frac
-        # Per-branch metrics (Jitter-GRPO). Only emitted when jitter_lambda > 0
-        # — at jitter_lambda == 0 the per-branch accumulators stay at their
-        # zero defaults (the per-mb update block is gated on `lam > 0`), so
+        # Per-branch metrics (Jitter-GRPO). Only emitted when jitter is active
+        # — with jitter off (both jitter_pos and jitter_neg == 0) the
+        # per-branch accumulators stay at their zero defaults (the per-mb
+        # update block is gated on `lam_pos > 0 or lam_neg > 0`), so
         # n_rows_fixed and n_rows_jitter are both 0 and neither key block
         # below fires. _log_metrics' `if key in update_stats` then skips
         # the corresponding TB scalar, leaving vanilla GRPO runs without
@@ -3339,7 +3365,7 @@ class GRPOTrainer:
 
             # Per-branch metrics (Jitter-GRPO). Only emitted when the
             # corresponding branch fired any rows this iter — so vanilla
-            # GRPO runs (jitter_lambda=0) see no `_jitter` curves at all,
+            # GRPO runs (jitter off) see no `_jitter` curves at all,
             # and a partial iter where one branch's rows were all dead-group-
             # filtered just skips that iter's scalar instead of emitting 0.
             # The fixed/jitter gap on mean_log_ratio_abs IS the empirical

@@ -76,7 +76,8 @@ class ToyGRPOConfig(GRPOConfig):
     # update_epochs: int = 4
 
     update_epochs: int = 2
-    jitter_lambda: float = 0.05
+    jitter_pos: float = 0.05
+    jitter_neg: float = 0.05
 
     # Cosmetic alignment: parent's startup print uses num_groups to describe
     # episodes-per-iter. Match the real (fixed-seed) count.
@@ -580,7 +581,7 @@ def main():
     print(f"  KL coef:        last_iter={config.kl_coef_last_iter} "
           f"base_model={config.kl_coef_base_model}")
     print(f"  Clip eps lo/hi: {config.clip_eps_low} / {config.clip_eps_high}")
-    print(f"  Jitter lambda:  {config.jitter_lambda}")
+    print(f"  Jitter pos/neg: {config.jitter_pos} / {config.jitter_neg}")
     print(f"  FF steps / pct: {config.fast_forward_steps} / "
           f"{config.fast_forward_pct}")
     print("=" * 60)

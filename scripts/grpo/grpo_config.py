@@ -295,20 +295,33 @@ class GRPOConfig:
     # per-mb KL formula). Suggested starting value: same order as kl_coef_last_iter.
     kl_coef_base_model: float = 0.2
 
-    # Jitter-GRPO Jacobian regularizer strength (paired scheduling).
-    # When > 0, every action chunk produces TWO entries per epoch: a "fixed"
-    # version (DiT input noise = original ε) and a "jitter" version (DiT input
-    # noise = ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled per τ
-    # per minibatch from the global torch RNG). The velocity target a − ε
-    # stays at the ORIGINAL ε in both branches; the cached chunk.ref_log_prob
-    # (computed at original ε) is reused — the bias is O(λ²) and θ-independent,
-    # so the gradient direction is unaffected. In expectation this adds a
-    # Frobenius-norm Jacobian penalty (1-t)²·λ²·‖∇_x v_θ‖_F², encouraging the
-    # velocity field to be locally smooth around each rolled-out trajectory.
-    # Doubles optimizer steps per epoch — halve update_epochs MANUALLY for
-    # jitter runs to match the per-iter optimizer-step budget of vanilla GRPO.
-    # 0.0 disables (bit-identical to vanilla GRPO). Suggested value 0.05.
-    jitter_lambda: float = 0.0
+    # Jitter-GRPO Jacobian regularizer strength (paired scheduling), split by
+    # advantage sign: jitter_pos applies to positive-advantage chunks ("good"
+    # chunks we reinforce), jitter_neg to negative-advantage chunks ("bad"
+    # chunks we suppress). The sign is the chunk's PRE-renormalization
+    # group-relative GRPO advantage (matches the *_pos / *_neg metric split).
+    #
+    # When EITHER is > 0, every action chunk produces TWO entries per epoch: a
+    # "fixed" version (DiT input noise = original ε) and a "jitter" version
+    # (DiT input noise = ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled
+    # per τ per minibatch from the global torch RNG). Each jitter row uses
+    # λ = jitter_pos or jitter_neg per its advantage sign. The velocity target
+    # a − ε stays at the ORIGINAL ε in both branches; the cached
+    # chunk.ref_log_prob (computed at original ε) is reused — the bias is O(λ²)
+    # and θ-independent, so the gradient direction is unaffected. In
+    # expectation this adds a Frobenius-norm Jacobian penalty
+    # (1-t)²·λ²·‖∇_x v_θ‖_F² (with the per-sign λ), encouraging the velocity
+    # field to be locally smooth around each rolled-out trajectory.
+    #
+    # Doubles optimizer steps per epoch whenever jitter is active — halve
+    # update_epochs MANUALLY for jitter runs to match the per-iter
+    # optimizer-step budget of vanilla GRPO. Setting only ONE side to 0 still
+    # emits that sign's jitter copy, but with λ=0 it is identical to the fixed
+    # row (no Jacobian penalty on that sign, just a redundant forward pass);
+    # set BOTH to 0.0 to fully disable (bit-identical to vanilla GRPO).
+    # Suggested value 0.05 for each.
+    jitter_pos: float = 0.0
+    jitter_neg: float = 0.0
 
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
@@ -485,11 +498,15 @@ class GRPOConfig:
                 f"exceed max_groups ({self.max_groups}) — criterion would be "
                 f"unsatisfiable."
             )
-        if not (0.0 <= self.jitter_lambda < 1.0):
-            raise ValueError(
-                f"jitter_lambda must be in [0.0, 1.0), got {self.jitter_lambda}. "
-                f"Variance preservation requires λ < 1; use 0.0 to disable."
-            )
+        for _jname, _jval in (
+            ("jitter_pos", self.jitter_pos),
+            ("jitter_neg", self.jitter_neg),
+        ):
+            if not (0.0 <= _jval < 1.0):
+                raise ValueError(
+                    f"{_jname} must be in [0.0, 1.0), got {_jval}. "
+                    f"Variance preservation requires λ < 1; use 0.0 to disable."
+                )
         # KL coefficients must be NON-NEGATIVE. Each is multiplied by a Schulman
         # k3 KL term (non-negative pointwise) and added to the loss; a negative
         # coef inverts the sign and turns the anchor into a *reward for

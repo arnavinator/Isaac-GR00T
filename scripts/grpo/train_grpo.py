@@ -408,15 +408,24 @@ class GRPOTrainer:
                 f"(tent epochs=max(1, floor(2·min(sf,1-sf)·{self.config.update_epochs}+0.5)))"
             )
         if self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0:
-            # Surface the doubled-step cost up-front so the user can confirm
-            # update_epochs has been halved if they want to match vanilla
-            # GRPO's per-iter step budget. Single line, only when active.
-            print(
-                f"  Jitter-GRPO: pos={self.config.jitter_pos} "
-                f"neg={self.config.jitter_neg} "
-                f"(paired scheduling — 2× minibatches per epoch; "
-                f"halve update_epochs to match vanilla per-iter step count)"
-            )
+            # Surface the scheduling mode up-front. In paired mode, remind the
+            # user to halve update_epochs if they want to match vanilla GRPO's
+            # per-iter step budget; jitter-only mode already matches it.
+            if self.config.jitter_paired:
+                print(
+                    f"  Jitter-GRPO: pos={self.config.jitter_pos} "
+                    f"neg={self.config.jitter_neg} paired=True "
+                    f"(fixed+jitter — 2× minibatches per epoch; "
+                    f"halve update_epochs to match vanilla per-iter step count)"
+                )
+            else:
+                print(
+                    f"  Jitter-GRPO: pos={self.config.jitter_pos} "
+                    f"neg={self.config.jitter_neg} paired=False "
+                    f"(jitter-only — 1× minibatches per epoch, step count "
+                    f"matches vanilla at the same update_epochs; no `_fixed` "
+                    f"branch metrics)"
+                )
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
 
         for iteration in range(self._start_iteration, self.config.num_iterations + 1):
@@ -1840,21 +1849,28 @@ class GRPOTrainer:
         if n_live_chunks == 0:
             return {}
 
-        # Jitter-GRPO paired scheduling. When jitter is active (jitter_pos or
-        # jitter_neg > 0), every chunk produces TWO entries per epoch: a
-        # "fixed" entry (DiT input noise = original ε) and a "jitter" entry
-        # (DiT input noise = ε' = sqrt(1-λ²)·ε + λ·ξ, where λ is jitter_pos or
-        # jitter_neg per the chunk's advantage sign). The stratified
-        # minibatcher then yields 2× as many minibatches → 2× optimizer steps
-        # per epoch. User halves update_epochs MANUALLY to match the per-iter
-        # step count of vanilla GRPO. When BOTH are 0 (default), behavior is
-        # bit-identical to pre-jitter code (single "fixed" tag per chunk;
-        # ξ-sampling block below is skipped).
+        # Jitter-GRPO scheduling. When jitter is active (jitter_pos or
+        # jitter_neg > 0), each chunk's jitter entry uses DiT input noise
+        # ε' = sqrt(1-λ²)·ε + λ·ξ (λ = jitter_pos or jitter_neg per the chunk's
+        # advantage sign). jitter_paired decides how many entries a chunk gets:
+        #   - True  (default): "fixed" + "jitter" per chunk → 2× minibatches →
+        #     2× optimizer steps. Halve update_epochs MANUALLY to match a
+        #     vanilla per-iter step budget. Keeps the fixed-vs-jitter branch
+        #     diagnostic.
+        #   - False: "jitter" only → 1× minibatches, so the per-iter step count
+        #     matches a vanilla run at the same update_epochs (directly
+        #     comparable). No "fixed" rows → no `_fixed` per-branch metrics.
+        # When BOTH strengths are 0 (default), jitter is off and jitter_paired
+        # is N/A: behavior is bit-identical to pre-jitter code (single "fixed"
+        # tag per chunk; ξ-sampling block below is skipped).
         if self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0:
-            entries = (
-                [(c, "fixed") for c in live_chunks]
-                + [(c, "jitter") for c in live_chunks]
-            )
+            if self.config.jitter_paired:
+                entries = (
+                    [(c, "fixed") for c in live_chunks]
+                    + [(c, "jitter") for c in live_chunks]
+                )
+            else:
+                entries = [(c, "jitter") for c in live_chunks]
         else:
             entries = [(c, "fixed") for c in live_chunks]
 

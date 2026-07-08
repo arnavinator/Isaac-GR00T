@@ -793,14 +793,15 @@ balanced and vanilla runs. When the majority pool drains early, the epoch stops
 rather than yielding minority-only tail batches that would defeat the balance
 guarantee.
 
-**Relationship to Jitter-GRPO.** With jitter active (`jitter_pos` or
-`jitter_neg` > 0), `entries` is doubled (`fixed + jitter` copies of each
-chunk). Both copies of a positive chunk are independent entries in the
-positive pool. The balanced sampler draws from them in shuffled order; the
-Jacobian regularizer accumulates at epoch granularity (not within a single
-mini-batch), so the pairing requirement is satisfied regardless of whether
-fixed and jitter copies land in the same batch. The combination of both
-features is sound.
+**Relationship to Jitter-GRPO.** With paired jitter active (`jitter_pos` or
+`jitter_neg` > 0 and `jitter_paired=True`), `entries` is doubled (`fixed +
+jitter` copies of each chunk). Both copies of a positive chunk are independent
+entries in the positive pool. The balanced sampler draws from them in shuffled
+order; the Jacobian regularizer accumulates at epoch granularity (not within a
+single mini-batch), so the pairing requirement is satisfied regardless of
+whether fixed and jitter copies land in the same batch. In jitter-only mode
+(`jitter_paired=False`) each chunk contributes a single `jitter` entry, so the
+pool is the same size as vanilla. The combination of these features is sound.
 
 #### Mechanism 2: dynamic epoch count (`dynamic_epoch_training`)
 
@@ -991,17 +992,25 @@ group-relative advantage, matching the `*_pos` / `*_neg` metric split.
 - Setting only ONE side to `0.0` still emits that sign's jitter copy, but with
   λ=0 the copy is identical to its fixed row (a redundant forward pass, no
   Jacobian penalty on that sign). Set BOTH to `0.0` to fully disable.
-- The trainer prints a one-line `Jitter-GRPO: pos=… neg=…` banner at startup
-  when active, including the doubled-step warning.
+- Scheduling is controlled by `jitter_paired` (see next subsection): paired
+  (default, 2× steps) vs jitter-only (1× steps, directly comparable to
+  vanilla).
+- The trainer prints a one-line `Jitter-GRPO: pos=… neg=… paired=…` banner at
+  startup when active, including the step-budget note for the chosen mode.
 
-### Paired scheduling (entries doubling)
+### Scheduling: paired vs jitter-only (`jitter_paired`)
 
-Each live chunk produces TWO entries per epoch when jitter is active:
+`jitter_paired` (default `True`, `--no-jitter-paired` to disable) decides how
+many entries each chunk contributes per epoch when jitter is active. It is
+N/A when jitter is off.
+
+**Paired (`jitter_paired=True`, default).** Each live chunk produces TWO
+entries per epoch:
 
 ```python
 entries = (
-    [(c, "fixed") for c in live_chunks]      # always
-    + [(c, "jitter") for c in live_chunks]   # only when jitter active (pos or neg > 0)
+    [(c, "fixed") for c in live_chunks]      # DiT input = original ε
+    + [(c, "jitter") for c in live_chunks]   # DiT input = ε'
 )
 ```
 
@@ -1013,10 +1022,26 @@ pass: "fixed" rows use the original `ε`, "jitter" rows use
 chunks and `jitter_neg` for negative.
 
 Doubling the entries list doubles the number of optimizer steps per epoch.
-**Halve `update_epochs` MANUALLY** when running with jitter (e.g., 4 → 2)
+**Halve `update_epochs` MANUALLY** when running paired jitter (e.g., 4 → 2)
 to match the per-iter optimizer-step budget of vanilla GRPO. The trainer
 does not auto-halve — the relationship is left explicit so the user can
-audit it from the CLI.
+audit it from the CLI. This mode keeps the fixed-vs-jitter per-branch
+diagnostic (the `mean_log_ratio_abs` gap that estimates the Jacobian norm).
+
+**Jitter-only (`jitter_paired=False`).** Each live chunk produces ONLY its
+jitter entry:
+
+```python
+entries = [(c, "jitter") for c in live_chunks]   # DiT input = ε'
+```
+
+The per-iter optimizer-step count then matches a vanilla GRPO run at the
+**same** `update_epochs` — no manual halving, directly comparable curves.
+The trade-off: with no "fixed" rows, the `_fixed` per-branch metrics and the
+fixed-vs-jitter gap diagnostic are unavailable (only `_jitter` metrics are
+emitted), and the loss trains purely on the jittered input noise. Use this
+when you want an apples-to-apples step-budget comparison against a no-jitter
+baseline rather than the paired diagnostic.
 
 ### `compute_fm_log_prob`: per-τ jittered input noise
 
@@ -1294,7 +1319,8 @@ uv run python scripts/grpo/toy_train_grpo.py \
     --jitter-pos 0.05 --jitter-neg 0.05 --update-epochs 2
 ```
 
-Production (single-task or multi-task):
+Production, **paired** (2× steps — keeps the fixed-vs-jitter diagnostic;
+halve `update_epochs` to match vanilla's per-iter step budget):
 
 ```bash
 uv run python scripts/grpo/train_grpo.py \
@@ -1303,13 +1329,24 @@ uv run python scripts/grpo/train_grpo.py \
     --num-iterations 200
 ```
 
-To compare against vanilla GRPO at the **same per-iter step budget**, run
-a baseline at `--jitter-pos 0 --jitter-neg 0 --update-epochs 4`. Same total
-optimizer-step count; the difference is solely the Jacobian regularizer
-pressure on positive-advantage chunks (basin sharpening, strength
-`jitter_pos`) and negative-advantage chunks (neighborhood carve, strength
-`jitter_neg`). The two knobs can be tuned independently — e.g. jitter only
-positives with `--jitter-pos 0.05 --jitter-neg 0`.
+Production, **jitter-only** (`--no-jitter-paired`; 1× steps — directly
+comparable to a vanilla run at the same `update_epochs`, no manual halving):
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --jitter-pos 0.05 --jitter-neg 0.05 --no-jitter-paired --update-epochs 4 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --num-iterations 200
+```
+
+To compare against vanilla GRPO at the **same per-iter step budget**, either
+run paired jitter at half the epochs, or run jitter-only at the same epochs;
+the vanilla baseline is `--jitter-pos 0 --jitter-neg 0 --update-epochs 4`. The
+difference is solely the Jacobian regularizer pressure on positive-advantage
+chunks (basin sharpening, strength `jitter_pos`) and negative-advantage chunks
+(neighborhood carve, strength `jitter_neg`). The strength knobs tune
+independently — e.g. jitter only positives with `--jitter-pos 0.05
+--jitter-neg 0`.
 
 The toy script's startup banner prints `Jitter pos/neg: <pos> / <neg>` so you
 can confirm the flags flowed through. `grpo_data/` collisions between jitter
@@ -1321,17 +1358,17 @@ separate).
 
 | File | Change |
 |------|--------|
-| `grpo_config.py` | Adds `jitter_pos: float = 0.0` and `jitter_neg: float = 0.0` fields + per-side range check in `__post_init__`. |
+| `grpo_config.py` | Adds `jitter_pos: float = 0.0`, `jitter_neg: float = 0.0`, and `jitter_paired: bool = True` fields + per-side range check in `__post_init__`. |
 | `fm_log_prob.py` | `compute_fm_log_prob` accepts optional `noise_for_input: Tensor[K,B,H,D] \| None`. K-loop uses `eps_input_all[k]` per τ when provided; `velocity_target = actions - eps` unchanged. |
-| `train_grpo.py` | `_iter_stratified_minibatches` and `_prepare_batch` operate on `(chunk, mode)` entries. `_compute_ref_log_probs` wraps as `("fixed", chunk)` tuples. `_grpo_update_inner` builds doubled entries, samples ξ via global RNG, constructs `noise_for_input` with a per-row λ (`jitter_pos`/`jitter_neg` by advantage sign) via expand+clone, threads it into `compute_fm_log_prob`, and adds gated per-branch metric accumulators. `_log_metrics` writes the per-branch TB scalars. Startup banner prints jitter pos/neg when active. |
-| `toy_train_grpo.py` | Prints `Jitter pos/neg` in the startup banner; overrides both fields (default `0.05`), inherited from `GRPOConfig`. |
+| `train_grpo.py` | `_iter_stratified_minibatches` and `_prepare_batch` operate on `(chunk, mode)` entries. `_compute_ref_log_probs` wraps as `("fixed", chunk)` tuples. `_grpo_update_inner` builds entries per `jitter_paired` (fixed+jitter when True, jitter-only when False), samples ξ via global RNG, constructs `noise_for_input` with a per-row λ (`jitter_pos`/`jitter_neg` by advantage sign) via expand+clone, threads it into `compute_fm_log_prob`, and adds gated per-branch metric accumulators. `_log_metrics` writes the per-branch TB scalars. Startup banner prints jitter pos/neg and scheduling mode when active. |
+| `toy_train_grpo.py` | Prints `Jitter pos/neg` in the startup banner; overrides both strength fields (default `0.05`), inherited from `GRPOConfig` (paired by default). |
 
 ### Scope
 
-Implemented: paired scheduling on top of the existing single-chunk-per-row
-training loop, per-τ independent ξ_k jitter on the DiT input (one fresh ξ
-per τ in `tau_centers`), cached-ref reuse for both branches, gated
-per-branch TB metrics.
+Implemented: paired **and** jitter-only scheduling (`jitter_paired`) on top of
+the existing single-chunk-per-row training loop, per-τ independent ξ_k jitter
+on the DiT input (one fresh ξ per τ in `tau_centers`), cached-ref reuse for
+both branches, gated per-branch TB metrics.
 
 Not implemented: adaptive λ schedules, an offline noise-sensitivity
 validation eval (the per-branch `mean_log_ratio_abs` gap is the live

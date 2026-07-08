@@ -295,33 +295,50 @@ class GRPOConfig:
     # per-mb KL formula). Suggested starting value: same order as kl_coef_last_iter.
     kl_coef_base_model: float = 0.2
 
-    # Jitter-GRPO Jacobian regularizer strength (paired scheduling), split by
-    # advantage sign: jitter_pos applies to positive-advantage chunks ("good"
-    # chunks we reinforce), jitter_neg to negative-advantage chunks ("bad"
-    # chunks we suppress). The sign is the chunk's PRE-renormalization
-    # group-relative GRPO advantage (matches the *_pos / *_neg metric split).
+    # Jitter-GRPO Jacobian regularizer strength, split by advantage sign:
+    # jitter_pos applies to positive-advantage chunks ("good" chunks we
+    # reinforce), jitter_neg to negative-advantage chunks ("bad" chunks we
+    # suppress). The sign is the chunk's PRE-renormalization group-relative
+    # GRPO advantage (matches the *_pos / *_neg metric split).
     #
-    # When EITHER is > 0, every action chunk produces TWO entries per epoch: a
-    # "fixed" version (DiT input noise = original ε) and a "jitter" version
-    # (DiT input noise = ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled
-    # per τ per minibatch from the global torch RNG). Each jitter row uses
-    # λ = jitter_pos or jitter_neg per its advantage sign. The velocity target
-    # a − ε stays at the ORIGINAL ε in both branches; the cached
-    # chunk.ref_log_prob (computed at original ε) is reused — the bias is O(λ²)
-    # and θ-independent, so the gradient direction is unaffected. In
-    # expectation this adds a Frobenius-norm Jacobian penalty
-    # (1-t)²·λ²·‖∇_x v_θ‖_F² (with the per-sign λ), encouraging the velocity
-    # field to be locally smooth around each rolled-out trajectory.
+    # When EITHER is > 0, jitter is active. The jitter_paired flag (below)
+    # decides how many entries each chunk contributes; in the default paired
+    # mode every action chunk produces TWO entries per epoch: a "fixed" version
+    # (DiT input noise = original ε) and a "jitter" version (DiT input noise =
+    # ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled per τ per minibatch
+    # from the global torch RNG). Each jitter row uses λ = jitter_pos or
+    # jitter_neg per its advantage sign. The velocity target a − ε stays at the
+    # ORIGINAL ε in both branches; the cached chunk.ref_log_prob (computed at
+    # original ε) is reused — the bias is O(λ²) and θ-independent, so the
+    # gradient direction is unaffected. In expectation this adds a
+    # Frobenius-norm Jacobian penalty (1-t)²·λ²·‖∇_x v_θ‖_F² (with the per-sign
+    # λ), encouraging the velocity field to be locally smooth around each
+    # rolled-out trajectory.
     #
-    # Doubles optimizer steps per epoch whenever jitter is active — halve
-    # update_epochs MANUALLY for jitter runs to match the per-iter
-    # optimizer-step budget of vanilla GRPO. Setting only ONE side to 0 still
-    # emits that sign's jitter copy, but with λ=0 it is identical to the fixed
-    # row (no Jacobian penalty on that sign, just a redundant forward pass);
-    # set BOTH to 0.0 to fully disable (bit-identical to vanilla GRPO).
-    # Suggested value 0.05 for each.
+    # In the default paired mode this doubles optimizer steps per epoch — halve
+    # update_epochs MANUALLY to match the per-iter optimizer-step budget of
+    # vanilla GRPO (see jitter_paired for the jitter-only alternative that keeps
+    # a 1× budget). Setting only ONE side to 0 still emits that sign's jitter
+    # copy, but with λ=0 it is identical to the fixed row (no Jacobian penalty
+    # on that sign, just a redundant forward pass); set BOTH to 0.0 to fully
+    # disable (bit-identical to vanilla GRPO). Suggested value 0.05 for each.
     jitter_pos: float = 0.0
     jitter_neg: float = 0.0
+
+    # Jitter scheduling mode (only consulted when jitter is active, i.e.
+    # jitter_pos or jitter_neg > 0; otherwise N/A).
+    #   True  (default): every chunk produces BOTH a "fixed" and a "jitter"
+    #         entry per epoch — 2× minibatches → 2× optimizer steps. Halve
+    #         update_epochs MANUALLY to match a vanilla GRPO per-iter step
+    #         budget. Keeps the fixed-vs-jitter per-branch diagnostic (the
+    #         mean_log_ratio_abs gap that estimates the Jacobian norm).
+    #   False: every chunk produces ONLY its "jitter" entry — 1× minibatches,
+    #         so the per-iter optimizer-step count matches a vanilla run at the
+    #         same update_epochs (directly comparable, no manual halving). No
+    #         "fixed" rows means no `_fixed` per-branch metrics and no
+    #         fixed-vs-jitter gap diagnostic; the loss is trained purely on the
+    #         jittered input noise.
+    jitter_paired: bool = True
 
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).

@@ -581,7 +581,8 @@ def main():
     print(f"  KL coef:        last_iter={config.kl_coef_last_iter} "
           f"base_model={config.kl_coef_base_model}")
     print(f"  Clip eps lo/hi: {config.clip_eps_low} / {config.clip_eps_high}")
-    print(f"  Jitter pos/neg: {config.jitter_pos} / {config.jitter_neg}")
+    print(f"  Jitter pos/neg: {config.jitter_pos} / {config.jitter_neg} "
+          f"(paired={config.jitter_paired})")
     print(f"  FF steps / pct: {config.fast_forward_steps} / "
           f"{config.fast_forward_pct}")
     print("=" * 60)

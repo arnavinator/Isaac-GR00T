@@ -238,6 +238,44 @@ class GRPOConfig:
     # Same as grpo_cont.py's args.update_epochs = 10
     update_epochs: int = 2
 
+    # ─── Advantage normalization & positive-advantage weighting ──────────────
+
+    # Advantage normalization scope. False (default) = z-score PER MINIBATCH
+    # (current behavior). True = z-score once per ITERATION using the mean/std
+    # over ALL live chunks: ready_adv = (a − buffer_mean) / (buffer_std + 1e-8).
+    # buffer_mean ≈ 0 by group-relative construction (Σ A_ep = 0 per group), so
+    # this PRESERVES each chunk's good/bad SIGN — unlike per-minibatch renorm,
+    # which subtracts the (balanced-sampler-biased) minibatch mean and can flip
+    # a genuinely-good chunk negative. Also removes minibatch-composition
+    # coupling: a chunk's effective advantage no longer depends on its batchmates.
+    per_iteration_advantage_norm: bool = False
+
+    # When True, scale up the per-row clip loss on group-good rows by a live
+    # factor k that balances alive positive/negative loss mass (see train_grpo).
+    # False (default) = no weighting, bit-identical to current. Positives are
+    # rarely upper-clipped (r ≤ e^{MSE_ref} ≈ 1.008 in practice), so k scales the
+    # reinforcement gradient A·r·∂MSE_θ/∂θ directly; the ratio cap does not defeat
+    # it. Designed to pair with per_iteration_advantage_norm=True: under that norm
+    # a chunk's post-renorm sign equals its group sign, so the alive positive/
+    # negative mass classification is exact. Under per-minibatch norm renorm
+    # sign-flips make the classification approximate (k slightly off) but safe.
+    positive_advantage_weight_scaling: bool = False
+
+    # Hard cap on the dynamic weight (k is clamped to [1.0, this]). The natural
+    # dynamics are ~10× lopsided toward erosion, so low-single-digits is sensible;
+    # 5.0 is a moderate default. Only consulted when the scaling flag is True.
+    positive_advantage_weight_max: float = 5.0
+
+    # Desired POST-weighting ratio of amplified-positive loss mass to alive-
+    # negative (erosion) loss mass. k solves (k·D)/N = target_ratio, i.e.
+    # k = target_ratio · N/D, clamped to [1.0, max] (N = alive-negative mass,
+    # D = alive amplified-positive mass). 1.0 equalizes the two (weighted positive
+    # mass == erosion mass); because the FM surrogate lets negatives move the
+    # ratio ~10× further than positives, the natural balance skews toward erosion,
+    # so values > 1 tilt further toward reinforcement. Only consulted when the
+    # scaling flag is True.
+    positive_advantage_weight_target_ratio: float = 1.0
+
     # ─── Balanced Training (two independent mechanisms) ──────────────────────
     # Both address gradient instability from skewed episode outcomes, and each
     # is now toggled by its OWN flag — any of the four on/off combinations is
@@ -567,6 +605,23 @@ class GRPOConfig:
                 f"1 + clip_eps_high]; a value >= 1 drops the lower bound to <= 0 "
                 f"(downside clip never fires), and a value <= 0 gives a zero-width "
                 f"or inverted clip window."
+            )
+
+        # Dynamic positive-advantage weighting bounds (only meaningful when
+        # positive_advantage_weight_scaling=True, but validated unconditionally
+        # so a bad value is caught even if the flag is toggled on later). k is
+        # clamped to [1.0, max]; a cap <= 1 makes the weight a permanent no-op,
+        # and a non-positive target ratio is degenerate.
+        if self.positive_advantage_weight_max <= 1.0:
+            raise ValueError(
+                f"positive_advantage_weight_max must be > 1.0, got "
+                f"{self.positive_advantage_weight_max}. k is clamped to [1, max]; "
+                f"a cap <= 1 makes the dynamic weight a no-op."
+            )
+        if self.positive_advantage_weight_target_ratio <= 0.0:
+            raise ValueError(
+                f"positive_advantage_weight_target_ratio must be > 0, got "
+                f"{self.positive_advantage_weight_target_ratio}."
             )
 
         if self.balanced_minibatch_training and not (

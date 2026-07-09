@@ -63,6 +63,14 @@ from episode_buffer import EpisodeBuffer, ActionChunk
 ITER_DIR_RE = re.compile(r"iter_([0-9]+)")
 
 
+# Dynamic positive-advantage weighting (config.positive_advantage_weight_scaling).
+# The tunables (k cap, target ratio) are config fields; these are the fixed
+# smoothing constants. See _grpo_update_inner for the full algorithm.
+_POS_SCALE_BETA = 0.5    # cross-iteration EMA weight on history
+_POS_SCALE_PRIOR = 0.05  # within-iter seed from last iter's EMA (~a few % of an iter's mass)
+_POS_SCALE_EPS = 1e-8
+
+
 class GRPOTrainer:
     """GRPO training loop for GR00T N1.6 DiT with LoRA.
 
@@ -102,6 +110,15 @@ class GRPOTrainer:
 
         # Logging
         self.writer = None  # TensorBoard/wandb writer
+
+        # Dynamic positive-advantage weighting: cross-iteration EMA of the
+        # per-iter alive-negative (N) / positive (D) loss mass. None until the
+        # first update folds in its own masses. NOT persisted in checkpoints, so a
+        # resumed run drops pre-resume EMA history and re-warms: the first update
+        # after a fresh start OR a resume runs with k=1 (no weighting) while these
+        # are None, then re-seeds — safe, but not seamless across resume.
+        self._pos_scale_N_ema = None
+        self._pos_scale_D_ema = None
 
         # Re-entrant lock serializing ALL model forward/backward passes
         # between the server thread (serving inference for the collector
@@ -1849,6 +1866,23 @@ class GRPOTrainer:
         if n_live_chunks == 0:
             return {}
 
+        # Buffer-wide advantage stats for per-iteration normalization
+        # (config.per_iteration_advantage_norm). Computed ONCE over the live
+        # chunks' per-chunk advantages (A_ep / num_chunks). The buffer mean is
+        # ≈0 by group-relative construction (Σ A_ep = 0 within each group), so
+        # dividing by the buffer std preserves each chunk's good/bad sign — see
+        # grpo_config.per_iteration_advantage_norm. ddof=1 matches torch.std()
+        # (used by the per-minibatch path) and episode_buffer.compute_advantages.
+        # buffer_adv_std == 0.0 (from the <2-live-chunk fallback) disables the
+        # renorm below, mirroring the per-mb numel()>1 guard.
+        if self.config.per_iteration_advantage_norm and n_live_chunks > 1:
+            _adv_arr = np.array([c.advantage for c in live_chunks], dtype=np.float64)
+            buffer_adv_mean = float(_adv_arr.mean())
+            buffer_adv_std = float(_adv_arr.std(ddof=1))
+        else:
+            buffer_adv_mean = 0.0
+            buffer_adv_std = 0.0
+
         # Jitter-GRPO scheduling. When jitter is active (jitter_pos or
         # jitter_neg > 0), each chunk's jitter entry uses DiT input noise
         # ε' = sqrt(1-λ²)·ε + λ·ξ (λ = jitter_pos or jitter_neg per the chunk's
@@ -1896,6 +1930,10 @@ class GRPOTrainer:
         ratio_mins: list[float] = []
         n_updates = 0
         n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
+        # Sign-flip diagnostic: count of group-good chunks (pre-renorm adv > 0)
+        # that advantage renorm pushed to a non-positive z-scored value. >0 under
+        # per-minibatch norm (the artifact); exactly 0 under per-iteration norm.
+        n_pos_flipped = 0
 
         # Whether the base-model KL anchor is active this run. Cached locally
         # so the per-mb hot path skips the dict lookup. Drives the decision
@@ -2002,6 +2040,33 @@ class GRPOTrainer:
         else:
             actual_num_epochs = self.config.update_epochs
             success_frac = None  # Not computed; omit from stats
+
+        # --- Dynamic positive-advantage weighting: per-iteration state ---
+        # (config.positive_advantage_weight_scaling). N_iter/D_iter pool the
+        # UNWEIGHTED alive-negative / positive loss mass across ALL minibatches
+        # of this iteration; a light seed from last iter's EMA (prior * *_ema)
+        # warm-starts k within the iteration. `scaling` and `have_prior` are
+        # defined unconditionally (both gate the end-of-iter fold below).
+        # have_prior requires the prior EMA to hold a USABLE positive-mass
+        # denominator (D_ema > 0), not merely be non-None: a degenerate prior
+        # iteration with zero alive-positive mass (D_ema == 0) would otherwise
+        # leave D_seed == 0, and — since k now excludes the current minibatch's
+        # own mass — the first positives-bearing minibatch could divide N by only
+        # +eps and spuriously saturate k at the cap. Treating D_ema == 0 as
+        # "not warmed up" runs a safe k=1 iteration that re-seeds the EMA instead.
+        # (D_ema == 0 is unreachable under the intended per_iteration_advantage_norm
+        # pairing — mixed live groups always yield alive positive mass — so this is
+        # purely defensive for the off-label per-minibatch-norm combination.)
+        scaling = self.config.positive_advantage_weight_scaling
+        have_prior = (
+            self._pos_scale_D_ema is not None and self._pos_scale_D_ema > 0.0
+        )
+        if scaling:
+            N_seed = _POS_SCALE_PRIOR * self._pos_scale_N_ema if have_prior else 0.0
+            D_seed = _POS_SCALE_PRIOR * self._pos_scale_D_ema if have_prior else 0.0
+            N_iter = 0.0
+            D_iter = 0.0
+            k_last = 1.0
 
         for epoch in range(actual_num_epochs):
             # Stratified minibatch sampling: every minibatch contains
@@ -2193,13 +2258,25 @@ class GRPOTrainer:
                 log_ratio = current_log_probs - ref_log_probs
                 ratio = log_ratio.exp()
 
-                # --- Per-minibatch advantage renormalization (matches grpo_cont.py:413-417) ---
+                # --- Advantage renormalization ---
                 # After the A_episode/num_chunks division in _build_chunks, per-chunk
                 # advantages have small, heterogeneous magnitudes (varying with
-                # episode length). Re-normalizing within the minibatch stabilizes
-                # gradient scale across iterations and keeps the effective clip
-                # threshold meaningful relative to the advantage magnitude.
+                # episode length). Re-normalizing stabilizes gradient scale across
+                # iterations and keeps the effective clip threshold meaningful
+                # relative to the advantage magnitude.
                 #
+                # Two modes (config.per_iteration_advantage_norm):
+                #   - False (default): PER-MINIBATCH z-score (matches
+                #     grpo_cont.py:413-417). Subtracts the minibatch mean — which
+                #     the balanced sampler biases off zero — so a genuinely-good
+                #     chunk can be pushed to a negative z-scored advantage (sign
+                #     flip) and trained as if bad.
+                #   - True: BUFFER-WIDE z-score using buffer_adv_mean/std computed
+                #     once over all live chunks (above). buffer_adv_mean ≈ 0
+                #     (Σ A_ep = 0 per group), so sign is preserved (no flips) and a
+                #     chunk's effective advantage is independent of its batchmates.
+                #
+                # The duplicate-handling note below applies to the per-minibatch path:
                 # With Jitter-GRPO paired entries, a chunk's (fixed, jitter)
                 # copies share the SAME advantage value, so the minibatch's
                 # advantage tensor may have duplicates. Mean and std are still
@@ -2225,7 +2302,20 @@ class GRPOTrainer:
                 # surface.
                 pre_renorm_pos_adv_mask = ready_advantages > 0
 
-                if ready_advantages.numel() > 1:
+                if self.config.per_iteration_advantage_norm:
+                    # Buffer-wide (per-iteration) z-score: subtract the iteration
+                    # mean (≈0 by group-relative construction) and divide by the
+                    # iteration std computed ONCE over all live chunks. Because
+                    # buffer_adv_mean ≈ 0, sign is preserved → no good chunk flips
+                    # to a negative z-scored advantage, and the effective clip
+                    # threshold / gradient scale no longer depend on minibatch
+                    # composition. buffer_adv_std == 0.0 (< 2 live chunks) skips it.
+                    if buffer_adv_std > 1e-8:
+                        ready_advantages = (
+                            (ready_advantages - buffer_adv_mean)
+                            / (buffer_adv_std + 1e-8)
+                        )
+                elif ready_advantages.numel() > 1:
                     ready_advantages = (
                         (ready_advantages - ready_advantages.mean())
                         / (ready_advantages.std() + 1e-8)
@@ -2236,7 +2326,73 @@ class GRPOTrainer:
                 surr2 = ready_advantages * torch.clamp(
                     ratio, 1 - self.config.clip_eps_low, 1 + self.config.clip_eps_high
                 )
-                clip_loss = -torch.min(surr1, surr2).mean()
+                # UNWEIGHTED per-row loss — measured for the dynamic weight BEFORE
+                # weighting so the k estimate never feeds back on itself.
+                row_loss = -torch.min(surr1, surr2)
+
+                # Dynamic positive-advantage weight (config.positive_advantage_weight_scaling).
+                # Deferred commit: measure the alive loss mass and pick k now (k is
+                # needed to weight THIS minibatch), but fold the mass into the
+                # pooled N_iter/D_iter — and hence the persistent EMA — ONLY after
+                # the minibatch clears the non-finite-loss guard below. So a
+                # minibatch dropped for non-finite loss (incl. a base-model KL
+                # overflow while the ref ratio is finite) contributes no mass,
+                # keeping "pooled mass == trained rows" exactly true.
+                pending_pos_scale = None
+                if scaling:
+                    # Rows we amplify: group-good (pre-renorm adv > 0) AND still
+                    # reinforcing after renorm (post > 0). Under per-iteration norm
+                    # these coincide with the pre-renorm positives; the post-sign
+                    # term only bites under per-minibatch norm (renorm flips),
+                    # where it stops us amplifying a suppression term.
+                    pos_amp_mask = pre_renorm_pos_adv_mask & (ready_advantages > 0)
+
+                    # MEASURE (detached) this minibatch's ALIVE loss mass:
+                    #   N = alive erosion = negative-adv rows whose gradient still
+                    #       flows (DEAD iff ratio < 1 - clip_eps_low: the clamp
+                    #       saturates and torch.min picks the constant branch).
+                    #   D = alive reinforcement = exactly the rows we AMPLIFY that
+                    #       still have gradient (DEAD iff upper-clipped, i.e.
+                    #       ratio > 1 + clip_eps_high — rare here, but filtered so a
+                    #       dead winner never inflates D). Keying D on pos_amp_mask
+                    #       (not all pre-renorm positives) keeps the denominator
+                    #       equal to the mass k actually scales.
+                    with torch.no_grad():
+                        r_det = ratio.detach()
+                        rl_abs = row_loss.detach().abs()
+                        alive_neg_mask = (~pre_renorm_pos_adv_mask) & (
+                            r_det >= 1 - self.config.clip_eps_low
+                        )
+                        amp_alive_mask = pos_amp_mask & (
+                            r_det <= 1 + self.config.clip_eps_high
+                        )
+                        n_mass = float(rl_abs[alive_neg_mask].sum())
+                        d_mass = float(rl_abs[amp_alive_mask].sum())
+                    # k from the pool as finalized by prior TRAINED minibatches
+                    # (this mb's own mass is folded in post-guard, not here), so a
+                    # dropped minibatch never feeds k or the EMA. Mass is pooled per
+                    # trained row — both jitter_paired branches and balanced-sampler
+                    # duplicates count, since each applies a real gradient.
+                    if not have_prior:
+                        k = 1.0  # first update (fresh or post-resume): warm up
+                    else:
+                        k = min(max(
+                            self.config.positive_advantage_weight_target_ratio
+                            * (N_seed + N_iter) / (D_seed + D_iter + _POS_SCALE_EPS),
+                            1.0,
+                        ), self.config.positive_advantage_weight_max)
+                    # Stage the mass for post-guard commit (only if finite, so a
+                    # ratio overflow can never poison the pool or the EMA).
+                    if math.isfinite(n_mass) and math.isfinite(d_mass):
+                        pending_pos_scale = (k, n_mass, d_mass)
+                    # row_weight is exactly k on amplified rows, 1.0 elsewhere.
+                    # (Weighting an upper-clipped positive would be a no-op — its
+                    # gradient is already zero — so pos_amp_mask needs no alive
+                    # filter for the weighting itself.)
+                    row_weight = 1.0 + (k - 1.0) * pos_amp_mask.to(row_loss.dtype)
+                    row_loss = row_weight * row_loss
+
+                clip_loss = row_loss.mean()
 
                 # --- KL divergence penalties (Schulman k3 estimator) ---
                 # KL(p || q) ≈ E[exp(p_lp - q_lp) - (p_lp - q_lp) - 1] with the
@@ -2293,6 +2449,15 @@ class GRPOTrainer:
                 if not torch.isfinite(loss):
                     n_skipped_nonfinite += 1
                     continue
+
+                # Minibatch survived the non-finite guard → commit its dynamic-
+                # weight mass and k. Done here (not in the measure block) so a
+                # dropped minibatch never folds its mass into N_iter/D_iter or the
+                # cross-iteration EMA.
+                if pending_pos_scale is not None:
+                    k_last, _n_mass, _d_mass = pending_pos_scale
+                    N_iter += _n_mass
+                    D_iter += _d_mass
 
                 # --- Backward pass ---
                 self.optimizer.zero_grad()
@@ -2352,6 +2517,13 @@ class GRPOTrainer:
                     if math.isfinite(rmin):
                         ratio_mins.append(rmin)
                     n_updates += 1
+                    # Sign-flip diagnostic: group-good chunks (pre-renorm adv>0)
+                    # that renorm pushed to <= 0. Nonzero under per-minibatch norm;
+                    # 0 under per-iteration norm (buffer_mean≈0 preserves sign) and
+                    # also 0 whenever renorm was skipped (< 2 live chunks / std≈0).
+                    n_pos_flipped += int(
+                        (pre_renorm_pos_adv_mask & (ready_advantages <= 0)).sum().item()
+                    )
 
                     # --- Per-branch row-level accumulation (Jitter-GRPO) ---
                     # Only runs when jitter is enabled. Gating on jitter-active
@@ -2457,7 +2629,33 @@ class GRPOTrainer:
             "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
             "ratio_min": float(np.min(ratio_mins)) if ratio_mins else 1.0,
             "actual_epochs": actual_num_epochs,
+            "n_pos_flipped_by_renorm": n_pos_flipped,
         }
+        # --- Dynamic positive-advantage weighting: fold this iter's pooled
+        # masses into the cross-iteration EMA and surface k. Reached only on the
+        # success path (n_updates > 0 is guaranteed by the early return above),
+        # so a dead iteration never drags the EMA toward zero. have_prior was
+        # snapshotted at iteration start: on the first-ever update it's False, so
+        # the EMA is seeded from this iter's own masses.
+        # Note: N_iter/D_iter pool across all epochs, so their absolute scale
+        # tracks the epoch count. Under a fixed update_epochs (default) the scale
+        # is constant across iters and the seed stays a fixed ~prior fraction;
+        # under dynamic_epoch_training the count varies, which only shifts how
+        # much the seed anchors — k is a RATIO, so this is a second-order
+        # smoothing effect, not a bias in k.
+        if scaling:
+            if not have_prior:
+                self._pos_scale_N_ema, self._pos_scale_D_ema = N_iter, D_iter
+            else:
+                self._pos_scale_N_ema = (
+                    _POS_SCALE_BETA * self._pos_scale_N_ema + (1 - _POS_SCALE_BETA) * N_iter
+                )
+                self._pos_scale_D_ema = (
+                    _POS_SCALE_BETA * self._pos_scale_D_ema + (1 - _POS_SCALE_BETA) * D_iter
+                )
+            result["pos_adv_weight_k"] = k_last
+            result["pos_adv_alive_neg_mass"] = N_iter
+            result["pos_adv_pos_mass"] = D_iter
         # Only emit kl_loss_base_model when the anchor was active this iter.
         # _log_metrics gates on key presence, so vanilla runs see no
         # train/kl_loss_base_model curve at all.
@@ -3415,6 +3613,21 @@ class GRPOTrainer:
                         self.writer.add_scalar(
                             f"train/{key}", update_stats[key], iteration
                         )
+
+            # Dynamic positive-advantage weight (pos_adv_*: present only when
+            # positive_advantage_weight_scaling ran this iter) and the sign-flip
+            # counter (n_pos_flipped_by_renorm: emitted every successful iter).
+            # pos_adv_weight_k is the headline curve (sits in [1, ..._max]); the
+            # mass terms show what drove it. n_pos_flipped_by_renorm reads 0 under
+            # per-iteration norm and >0 under per-minibatch norm (the artifact).
+            for key in (
+                "pos_adv_weight_k",
+                "pos_adv_alive_neg_mass",
+                "pos_adv_pos_mass",
+                "n_pos_flipped_by_renorm",
+            ):
+                if key in update_stats:
+                    self.writer.add_scalar(f"train/{key}", update_stats[key], iteration)
 
         if lr is not None:
             self.writer.add_scalar("train/learning_rate", lr, iteration)

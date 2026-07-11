@@ -264,7 +264,7 @@ class GRPOConfig:
     # Hard cap on the dynamic weight (k is clamped to [1.0, this]). The natural
     # dynamics are ~10× lopsided toward erosion, so low-single-digits is sensible;
     # 5.0 is a moderate default. Only consulted when the scaling flag is True.
-    positive_advantage_weight_max: float = 5.0
+    positive_advantage_weight_max: float = 10.0
 
     # Desired POST-weighting ratio of amplified-positive loss mass to alive-
     # negative (erosion) loss mass. k solves (k·D)/N = target_ratio, i.e.

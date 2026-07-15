@@ -2068,6 +2068,17 @@ class GRPOTrainer:
             D_iter = 0.0
             k_last = 1.0
 
+        # Effective balanced-sampler positive ratio this iter, for logging — the
+        # same value _iter_balanced_minibatches will use (via _effective_pos_ratio).
+        # None when balanced sampling is off or there are no entries. Under the
+        # dynamic flag this rises toward balanced_minibatch_positive_adv_ratio_max
+        # as success climbs, which is how you SEE the sampler back off failure
+        # oversampling at high success.
+        eff_pos_ratio = None
+        if self.config.balanced_minibatch_training and entries:
+            _nat_pos_frac = sum(1 for (c, _m) in entries if c.advantage > 0) / len(entries)
+            eff_pos_ratio = self._effective_pos_ratio(_nat_pos_frac)
+
         for epoch in range(actual_num_epochs):
             # Stratified minibatch sampling: every minibatch contains
             # chunks from all live groups (best-effort) — see
@@ -2631,6 +2642,10 @@ class GRPOTrainer:
             "actual_epochs": actual_num_epochs,
             "n_pos_flipped_by_renorm": n_pos_flipped,
         }
+        # Effective balanced-sampler positive ratio (only when balanced sampling
+        # ran with entries present). With the dynamic flag it tracks success.
+        if eff_pos_ratio is not None:
+            result["balanced_pos_ratio"] = eff_pos_ratio
         # --- Dynamic positive-advantage weighting: fold this iter's pooled
         # masses into the cross-iteration EMA and surface k. Reached only on the
         # success path (n_updates > 0 is guaranteed by the early return above),
@@ -2841,6 +2856,27 @@ class GRPOTrainer:
 
             yield [entries[i] for i in batch_idx_list]
 
+    def _effective_pos_ratio(self, natural_pos_frac: float) -> float:
+        """Target positive-advantage fraction for the balanced sampler.
+
+        Fixed at ``balanced_minibatch_positive_adv_ratio`` by default. When
+        ``balanced_minibatch_positive_adv_ratio_dynamic`` is set, track the
+        natural positive fraction (≈ success rate), clamped to
+        ``[balanced_minibatch_positive_adv_ratio,
+        balanced_minibatch_positive_adv_ratio_max]`` — so at HIGH success the
+        sampler stops oversampling the rare, large-advantage failures (the
+        policy-collapse driver), while the floor preserves positive oversampling
+        (reinforcement signal) at low success. Single source of truth so the
+        sampler and the logged ``balanced_pos_ratio`` never drift.
+        """
+        base = self.config.balanced_minibatch_positive_adv_ratio
+        if not self.config.balanced_minibatch_positive_adv_ratio_dynamic:
+            return base
+        return min(
+            self.config.balanced_minibatch_positive_adv_ratio_max,
+            max(base, natural_pos_frac),
+        )
+
     def _iter_balanced_minibatches(
         self,
         entries: list[tuple[ActionChunk, str]],
@@ -2882,8 +2918,6 @@ class GRPOTrainer:
         if not entries:
             return
 
-        pos_ratio = self.config.balanced_minibatch_positive_adv_ratio
-
         # Split entries by advantage sign. The per-chunk advantage inherits its
         # sign directly from the episode-level group-relative normalization;
         # live_chunks already filtered out zero-advantage (dead group) entries.
@@ -2897,6 +2931,9 @@ class GRPOTrainer:
             return
 
         natural_pos_frac = len(pos_indices) / len(entries)
+        # Target positive fraction: fixed config value, or (dynamic mode) the
+        # natural fraction clamped to [base, max]. See _effective_pos_ratio.
+        pos_ratio = self._effective_pos_ratio(natural_pos_frac)
 
         mb_size = self.config.mini_batch_size
         n_pos_per_batch = max(1, round(pos_ratio * mb_size))
@@ -3625,6 +3662,7 @@ class GRPOTrainer:
                 "pos_adv_alive_neg_mass",
                 "pos_adv_pos_mass",
                 "n_pos_flipped_by_renorm",
+                "balanced_pos_ratio",
             ):
                 if key in update_stats:
                     self.writer.add_scalar(f"train/{key}", update_stats[key], iteration)

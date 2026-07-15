@@ -308,7 +308,29 @@ class GRPOConfig:
     # Must be strictly in (0.0, 1.0). Only active when balanced_minibatch_training=True.
     # Default 0.5: equal split between positive and negative advantages.
     # Set higher (e.g. 0.7) to bias the gradient more toward success examples.
+    # When balanced_minibatch_positive_adv_ratio_dynamic=True this value is the
+    # FLOOR of the dynamic ratio (see below).
     balanced_minibatch_positive_adv_ratio: float = 0.5
+
+    # Dynamic positive-advantage ratio. When True, the sampler no longer targets a
+    # fixed positive fraction; it tracks the NATURAL positive fraction (≈ success
+    # rate) per iteration, clamped to
+    # [balanced_minibatch_positive_adv_ratio, balanced_minibatch_positive_adv_ratio_max].
+    # Why: a fixed 0.5 oversamples whichever sign is RARE. At LOW success that's the
+    # positives (desirable — preserves reinforcement signal). But at HIGH success
+    # the rare class is the FAILURES, and oversampling those few large-advantage
+    # failures — which on a single scene share structure with the successes —
+    # over-suppresses the good behavior and can collapse the policy. Tracking the
+    # natural fraction stops that negative-oversampling at high success while the
+    # floor keeps positive oversampling at low success. Only active when
+    # balanced_minibatch_training=True.
+    balanced_minibatch_positive_adv_ratio_dynamic: bool = False
+
+    # Upper cap for the dynamic positive-advantage ratio (only consulted when
+    # balanced_minibatch_positive_adv_ratio_dynamic=True). Keeps SOME negative
+    # (failure-avoidance) signal even at very high success. Must lie in (0, 1) and
+    # be >= balanced_minibatch_positive_adv_ratio.
+    balanced_minibatch_positive_adv_ratio_max: float = 0.75
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
@@ -632,6 +654,30 @@ class GRPOConfig:
                 f"(0.0, 1.0) when balanced_minibatch_training=True, got "
                 f"{self.balanced_minibatch_positive_adv_ratio}. "
                 f"Use a value like 0.5 (equal split) or 0.7 (bias toward positives)."
+            )
+
+        # Dynamic-ratio cap. Range is checked unconditionally (catches typos even
+        # before the flag is flipped on); the ordering (cap >= base) is required
+        # only when the dynamic mode is active, since that's when the sampler
+        # clamps the natural fraction to [base, cap] — an inverted interval would
+        # be degenerate.
+        if not (0.0 < self.balanced_minibatch_positive_adv_ratio_max < 1.0):
+            raise ValueError(
+                f"balanced_minibatch_positive_adv_ratio_max must be strictly in "
+                f"(0.0, 1.0), got {self.balanced_minibatch_positive_adv_ratio_max}."
+            )
+        if (
+            self.balanced_minibatch_positive_adv_ratio_dynamic
+            and self.balanced_minibatch_positive_adv_ratio_max
+            < self.balanced_minibatch_positive_adv_ratio
+        ):
+            raise ValueError(
+                f"balanced_minibatch_positive_adv_ratio_max "
+                f"({self.balanced_minibatch_positive_adv_ratio_max}) must be >= "
+                f"balanced_minibatch_positive_adv_ratio "
+                f"({self.balanced_minibatch_positive_adv_ratio}) when "
+                f"balanced_minibatch_positive_adv_ratio_dynamic=True; the dynamic "
+                f"ratio is clamped to [base, max]."
             )
 
         # resume_from_collected_data is meaningless without a checkpoint to

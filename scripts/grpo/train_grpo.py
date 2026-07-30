@@ -21,6 +21,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 """
 
 import sys
+import dataclasses
 import math
 import os
 import re
@@ -347,6 +348,8 @@ class GRPOTrainer:
         log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(str(log_dir))
         print(f"  TensorBoard logs: {log_dir}")
+        self._log_config()
+        print("  Logged full run config to TensorBoard (tag: config)")
 
         # Create checkpoint directory
         Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -3470,6 +3473,36 @@ class GRPOTrainer:
                 server.socket.close(linger=0)
             except Exception:
                 pass
+
+    def _log_config(self):
+        """Log every GRPOConfig field to TensorBoard as a single text summary.
+
+        Called once from setup(), so every run (fresh or resumed) records the
+        exact hyperparameters that produced its curves — recoverable from the
+        TensorBoard log dir alone even after grpo_config.py's defaults have
+        since changed. Uses add_text rather than add_hparams: several fields
+        are lists or unions (e.g. lora_target_modules, env_names,
+        max_episode_steps: int | list[int]) that add_hparams' scalar-only
+        hparam_dict rejects, and add_text renders as a readable table in
+        TensorBoard's Text tab with no per-field type handling required.
+        """
+        if self.writer is None:
+            return
+        # Escape literal '|' in the repr'd value — otherwise a value that
+        # happens to contain one (e.g. a custom wandb_run_name or a path)
+        # would be misparsed as an extra markdown table column separator.
+        # (The replace() is kept out of the f-string's {} to stay valid on
+        # Python <3.12, which disallows backslashes inside f-string braces.)
+        def _fmt_value(value):
+            escaped = repr(value).replace("|", "\\|")
+            return escaped
+
+        rows = "\n".join(
+            f"| {f.name} | {_fmt_value(getattr(self.config, f.name))} |"
+            for f in dataclasses.fields(self.config)
+        )
+        table = f"| Parameter | Value |\n|---|---|\n{rows}"
+        self.writer.add_text("config", table, global_step=0)
 
     def _log_metrics(
         self,

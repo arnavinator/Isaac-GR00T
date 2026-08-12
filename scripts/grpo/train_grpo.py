@@ -546,12 +546,43 @@ class GRPOTrainer:
                 continue
 
             # ═══ Phase 2b: Pre-compute reference log-probs ═══
+            # VRAM accounting, part 1: snapshot BEFORE the ref pass populates
+            # the per-chunk feature cache, so `base` isolates the costs that do
+            # NOT scale with buffer size (frozen bf16 weights + fp32 LoRA +
+            # AdamW moments) from the cache, which scales with live-chunk count.
+            # Needed because peak VRAM decomposes as
+            #     base + per_chunk × n_live_chunks + per_row × mini_batch_size
+            # and only the last term is what raising mini_batch_size buys.
+            # Note: at iteration 1 `base` reads ~160 MB low — AdamW allocates
+            # exp_avg/exp_avg_sq lazily on the first step().
+            vram = self._vram_snapshot(reset_peak=True)
             self._compute_ref_log_probs()
+            if vram is not None:
+                vram["ref_peak"] = (
+                    torch.cuda.max_memory_allocated(self.device) / 1e9
+                )
+                # Live (not total) allocation after caching == base + cache.
+                vram["fixed"] = torch.cuda.memory_allocated(self.device) / 1e9
+                torch.cuda.reset_peak_memory_stats(self.device)
 
             # ═══ Phase 3: GRPO Policy Update ═══
             phase3_start = time.time()
-            update_stats = self._grpo_update()
+            try:
+                update_stats = self._grpo_update()
+            except RuntimeError as e:
+                # Report the measurement before propagating. An OOM here is the
+                # EXPECTED outcome when probing for the largest feasible
+                # mini_batch_size, and the per-row figure derived from the peak
+                # is exactly what that probe is after — losing it to the
+                # traceback would mean re-running the whole iteration to learn
+                # nothing new. Catches RuntimeError rather than
+                # torch.cuda.OutOfMemoryError so it also covers allocator paths
+                # (e.g. cuBLAS workspace) that raise a bare RuntimeError; the
+                # re-raise below means nothing is swallowed either way.
+                self._log_vram(vram, oom="out of memory" in str(e).lower())
+                raise
             phase3_time = time.time() - phase3_start
+            self._log_vram(vram)
 
             # Treat an iter as "updated" only if at least one optimizer.step()
             # actually fired. Two paths lead to n_updates=0 here that the
@@ -683,6 +714,83 @@ class GRPOTrainer:
             # AttributeError if the symbol is missing (unusual builds).
             # Never let an optional cleanup crash training.
             pass
+
+    def _vram_snapshot(self, reset_peak: bool = False) -> dict | None:
+        """Start a per-iter VRAM measurement; returns None on non-CUDA hosts.
+
+        Deliberately NOT gated on config.clean_output (unlike
+        _log_mem_snapshot): the mini_batch_size ceiling is a hard operational
+        constraint the operator has to size against, and clean_output defaults
+        True, so gating would hide the numbers in exactly the runs that need
+        them.
+        """
+        if not torch.cuda.is_available():
+            return None
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        return {"base": torch.cuda.memory_allocated(self.device) / 1e9}
+
+    def _log_vram(self, vram: dict | None, oom: bool = False) -> None:
+        """Print + log the VRAM decomposition for one iteration.
+
+        Peak VRAM during the update decomposes as
+
+            base + per_chunk × n_cached_chunks + per_row × mini_batch_size
+
+        Only the LAST term grows when mini_batch_size grows, which is why the
+        three are reported separately: `per_row` is what you extrapolate to
+        find the largest feasible mini_batch_size, while `cache` is a fixed
+        cost per iteration that grows with group_size × num_groups (and with
+        episode LENGTH, since chunks/episode = num_steps / n_action_steps).
+
+        `n_cached_chunks` varies iter to iter (dead groups shrink it, dynamic
+        group collection up to max_groups grows it), so size the budget against
+        the worst case — max_groups × group_size × chunks-per-episode — not
+        against whatever the first iteration happens to report.
+
+        Note `per_row` also absorbs the len(tau_centers) multiplier: the K-loop
+        in compute_fm_log_prob accumulates into one loss, so autograd retains
+        activations for all K DiT passes at once. Halving tau_centers roughly
+        halves per_row.
+        """
+        if vram is None:
+            return
+        # `fixed` is absent if the ref pass itself OOM'd before reporting.
+        fixed = vram.get("fixed")
+        if fixed is None:
+            return
+        peak = torch.cuda.max_memory_allocated(self.device) / 1e9
+        base = vram["base"]
+        mb = self.config.mini_batch_size
+        # Cheap: _build_chunks memoizes (episode_buffer.py:429), so this returns
+        # the same objects _compute_ref_log_probs hung the feature cache on.
+        n_cached = sum(
+            1
+            for c in self.buffer._build_chunks()
+            if c.cached_backbone_features is not None
+        )
+        per_row = (peak - fixed) / mb if mb > 0 else float("nan")
+        per_chunk_mb = (fixed - base) / n_cached * 1000 if n_cached > 0 else float("nan")
+        total_gb = (
+            torch.cuda.get_device_properties(self.device).total_memory / 1e9
+        )
+        print(
+            f"  [vram]{' OOM' if oom else ''} base={base:.2f} "
+            f"cache={fixed - base:.2f} fixed={fixed:.2f} "
+            f"ref_peak={vram['ref_peak']:.2f} upd_peak={peak:.2f} "
+            f"/ {total_gb:.1f}GB | per_row={per_row:.4f}GB (mb={mb}, "
+            f"K={len(self.config.tau_centers)}) "
+            f"per_chunk={per_chunk_mb:.2f}MB (n={n_cached})"
+        )
+        if self.writer is not None and not oom:
+            # Logged to TB as well as stdout so the ACROSS-iteration spread is
+            # visible — the first iteration is rarely the high-water mark.
+            for tag, val in (
+                ("base", base), ("cache", fixed - base), ("fixed", fixed),
+                ("ref_peak", vram["ref_peak"]), ("update_peak", peak),
+                ("per_row", per_row), ("n_cached_chunks", n_cached),
+            ):
+                self.writer.add_scalar(f"vram/{tag}", val, self.iteration)
 
     def _log_mem_snapshot(self, label: str) -> None:
         """Log RSS+Swap of the trainer process. Used to detect cross-iter

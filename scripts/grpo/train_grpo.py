@@ -585,7 +585,7 @@ class GRPOTrainer:
             self._log_vram(vram)
 
             # Treat an iter as "updated" only if at least one optimizer.step()
-            # actually fired. Two paths lead to n_updates=0 here that the
+            # actually fired. Three paths lead to n_updates=0 here that the
             # outer std_reward<1e-8 skip-check above does NOT catch:
             #   1. Every minibatch had non-finite loss (bf16 ratio overflow).
             #   2. Every group's per-group std<1e-4 (so the dead-chunk filter
@@ -593,7 +593,13 @@ class GRPOTrainer:
             #      GLOBAL std_reward exceeded 1e-8 — e.g., a mix of all-fail
             #      groups (rewards=0) and all-succeed-with-identical-num_steps
             #      groups (rewards=constant).
-            # In both cases the model + optimizer are bit-identical to the
+            #   3. Every accumulation window was dropped because its ACCUMULATED
+            #      gradient was non-finite (see _apply_accumulated_grads). Unlike
+            #      1 and 2 this one CAN coincide with n_micro_batches > 0 —
+            #      minibatches trained, but no step was allowed to reach the
+            #      weights. update_stats carries n_nonfinite_grad_steps so the
+            #      three cases are distinguishable in the logs.
+            # In all cases the model + optimizer are bit-identical to the
             # prior successful iter. Don't bump _last_updated_iteration, and
             # write the save (if scheduled) under the prior iter's name via
             # _save_checkpoint_for_skipped_iter — so resume retries this
@@ -2036,11 +2042,37 @@ class GRPOTrainer:
         # distribution tails. grad_norm answers "is there any signal hitting
         # the LoRA params?"; ratio_max/min reveal when a near-1 mean_ratio
         # hides outlier minibatches doing all the clipping work.
+        # Under gradient accumulation (config.gradient_accumulation_steps > 1)
+        # grad_norms holds ONE entry per optimizer step — the norm of the
+        # ACCUMULATED (1/k-averaged) gradient — while ratio_maxes/ratio_mins
+        # stay per-minibatch. Expect grad_norm_* to read lower at k > 1: that's
+        # noise cancelling between micro-batches, not weaker signal.
         grad_norms: list[float] = []
         ratio_maxes: list[float] = []
         ratio_mins: list[float] = []
+        # n_updates counts REAL optimizer.step() calls; n_micro_batches counts
+        # minibatches that actually contributed a backward(). They're equal at
+        # gradient_accumulation_steps=1 and differ by ~k above it. The split
+        # matters twice over: train()'s `did_update` gates checkpoint naming on
+        # n_updates (so it must mean "a step fired"), while every
+        # per-minibatch mean below (loss, clip_loss, kl, mean_ratio,
+        # mean_log_ratio_abs) divides by n_micro_batches so those curves stay
+        # comparable across k instead of being inflated k-fold.
         n_updates = 0
-        n_skipped_nonfinite = 0  # minibatches dropped for NaN/Inf loss
+        n_micro_batches = 0
+        # Minibatches dropped for NaN/Inf loss. The guard fires BEFORE
+        # backward(), so a dropped minibatch adds nothing to the gradient
+        # buffer and — see the accumulation block below — does not advance the
+        # accumulation window either. So this stays "minibatches whose
+        # contribution was discarded", exactly as before accumulation existed.
+        n_skipped_nonfinite = 0
+        # Optimizer steps SKIPPED because the accumulated gradient was
+        # non-finite (backward() produced inf/NaN even though the forward loss
+        # was finite). Distinct from n_skipped_nonfinite, which counts
+        # minibatches rejected at the forward guard. Non-zero here means the
+        # window's weights update was dropped to avoid writing NaN into the
+        # LoRA params — see _apply_accumulated_grads. Expected to stay 0.
+        n_nonfinite_grad_steps = 0
         # Sign-flip diagnostic: count of group-good chunks (pre-renorm adv > 0)
         # that advantage renorm pushed to a non-positive z-scored value. >0 under
         # per-minibatch norm (the artifact); exactly 0 under per-iteration norm.
@@ -2189,6 +2221,122 @@ class GRPOTrainer:
         if self.config.balanced_minibatch_training and entries:
             _nat_pos_frac = sum(1 for (c, _m) in entries if c.advantage > 0) / len(entries)
             eff_pos_ratio = self._effective_pos_ratio(_nat_pos_frac)
+
+        # ── Gradient accumulation (config.gradient_accumulation_steps = k) ────
+        # k minibatches per optimizer step. Peak VRAM is unchanged (each
+        # minibatch's graph is still freed by its own backward()); what changes
+        # is the update DIRECTION — k independently z-scored micro-batch
+        # gradients averaged together — and the step count, which drops by ~k.
+        #
+        # Window protocol, per micro-batch that survives the non-finite guard:
+        #   accum_count == 0  → zero_grad() (start a fresh window)
+        #   backward(loss / k) → contribute 1/k of this micro-batch's gradient
+        #   accum_count == k  → clip + step + reset (close the window)
+        # and at the END OF EVERY EPOCH any partial window is flushed, so a
+        # micro-batch's gradient is never silently dropped on the floor. That
+        # flush matters here in particular because _iter_balanced_minibatches
+        # anchors epoch length to ceil(len(entries) / mb_size) but can terminate
+        # EARLY when the majority pool drains — the number of micro-batches per
+        # epoch is not a fixed multiple of k, and neither is it known up front.
+        #
+        # accum_count advances only for minibatches that actually reached
+        # backward(), so a non-finite-loss skip neither pollutes the buffer nor
+        # shortens the window: every full window carries exactly k trained
+        # micro-batches. PAWS mass (N_iter/D_iter) likewise commits per trained
+        # micro-batch, independent of window boundaries, so the documented
+        # "pooled mass == trained rows" invariant is untouched by k.
+        accum_steps = self.config.gradient_accumulation_steps
+        accum_count = 0        # micro-batches currently in the gradient buffer
+        n_partial_windows = 0  # windows flushed with < k micro-batches
+
+        def _apply_accumulated_grads() -> None:
+            """Clip + step on the gradients accumulated so far, then reset.
+
+            Called at a full window boundary and at each epoch's trailing
+            flush. On the normal path: records ONE grad_norms entry (the
+            accumulated-gradient norm) and bumps n_updates by exactly one real
+            optimizer.step(). If the accumulated gradient is NON-FINITE the step
+            is SKIPPED instead (see below) — n_updates does not move, so it
+            always counts steps that actually reached the weights.
+            """
+            nonlocal accum_count, n_updates, n_nonfinite_grad_steps
+
+            # Gradient clipping. clip_grad_norm_ returns the TOTAL norm
+            # of the gradient vector BEFORE clipping — capture it for
+            # the train/grad_norm_* diagnostics (independent of whether
+            # clipping actually fired this step).
+            pre_clip_grad_norm = nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.config.max_grad_norm,
+            )
+            gnorm = float(pre_clip_grad_norm)
+
+            # Non-finite ACCUMULATED gradient → discard the window, don't step.
+            #
+            # `clip_grad_norm_` (error_if_nonfinite=False) returns inf/nan in two
+            # situations, and neither is salvageable:
+            #   - The gradient tensors themselves hold inf/NaN, because backward()
+            #     overflowed even though the forward `loss` was finite (so the
+            #     isfinite guard upstream passed) — e.g. a bf16 overflow inside
+            #     the DiT backward. Clipping makes it worse, not better: with
+            #     total_norm=inf the clip coefficient is 0, and inf * 0 = NaN, so
+            #     by this point the buffer is all-NaN.
+            #   - The gradients are finite but LARGE enough that the fp32
+            #     sum-of-squares in the norm itself overflows (|g| above roughly
+            #     1e17 for a LoRA-shaped tensor). Then clip_coef=0 multiplies a
+            #     finite buffer down to exactly 0.0 — a no-op step carrying only
+            #     AdamW momentum and weight decay. Also worth dropping.
+            # Either way the window's gradient is gone before we get here, so
+            # there is nothing to rescue by stepping.
+            #
+            # Stepping on it would write NaN into every LoRA parameter and
+            # permanently poison AdamW's moments; every later minibatch would
+            # then trip the forward guard, the iteration would still report
+            # n_updates > 0 (so did_update=True), and a save_interval boundary
+            # would persist a NaN checkpoint that a later --resume-from loads.
+            # Meanwhile grad_norm_* would look NORMAL, because the offending
+            # non-finite norm is excluded from grad_norms. That failure is
+            # unrecoverable and its first clear symptom arrives long after the
+            # corruption, so we drop the window instead:
+            #   - zero the buffer (it holds NaN, nothing is salvageable),
+            #   - leave the weights at their last good value,
+            #   - count + warn so the event is visible rather than inferred.
+            # Training continues with the next window. If EVERY window of an
+            # iteration is dropped this way, n_updates stays 0 and train()'s
+            # existing skip path treats the iteration as not-updated (model
+            # unchanged, checkpoint written under the prior iter's name) — which
+            # is exactly right, because the model IS unchanged.
+            if not math.isfinite(gnorm):
+                n_nonfinite_grad_steps += 1
+                print(
+                    f"  WARNING: non-finite accumulated gradient "
+                    f"({gnorm}) — skipping this optimizer step and "
+                    f"discarding the window ({accum_count} micro-batch(es)). "
+                    f"LoRA weights left unchanged."
+                )
+                # Explicit zero even though the next window would zero anyway:
+                # if this was the LAST window of the epoch, accum_count drops to
+                # 0 and the epoch-boundary flush won't fire, so without this the
+                # NaN buffer would sit there until the next iteration's first
+                # window. Cheap and refactor-proof.
+                self.optimizer.zero_grad()
+                accum_count = 0
+                return
+
+            grad_norms.append(gnorm)
+            self.optimizer.step()
+            n_updates += 1
+            accum_count = 0
+
+        # Announce the accumulation schedule only when it's actually on, so
+        # vanilla (k=1) runs keep byte-identical console output.
+        if accum_steps > 1:
+            print(
+                f"  Gradient accumulation: {accum_steps} × "
+                f"{self.config.mini_batch_size} rows = "
+                f"{accum_steps * self.config.mini_batch_size} rows per "
+                f"optimizer step (LR held fixed)"
+            )
 
         for epoch in range(actual_num_epochs):
             # Stratified minibatch sampling: every minibatch contains
@@ -2568,6 +2716,17 @@ class GRPOTrainer:
                 # silently corrupt the LoRA weights. clip_grad_norm_ does NOT
                 # rescue NaN gradients; it only bounds finite norms.
                 # Skip this minibatch and log a counter instead.
+                #
+                # Accumulation policy: skip ONLY this micro-batch's
+                # contribution — never the whole window. The guard fires before
+                # backward(), so nothing non-finite ever enters the gradient
+                # buffer, and the window's already-accumulated (finite,
+                # perfectly good) micro-batches are kept rather than thrown
+                # away. accum_count is deliberately NOT advanced below, so the
+                # window absorbs the next finite micro-batch instead and still
+                # closes on k TRAINED micro-batches. `continue` is safe with
+                # respect to the trailing flush because the flush lives outside
+                # this loop, at the epoch boundary.
                 if not torch.isfinite(loss):
                     n_skipped_nonfinite += 1
                     continue
@@ -2575,35 +2734,44 @@ class GRPOTrainer:
                 # Minibatch survived the non-finite guard → commit its dynamic-
                 # weight mass and k. Done here (not in the measure block) so a
                 # dropped minibatch never folds its mass into N_iter/D_iter or the
-                # cross-iteration EMA.
+                # cross-iteration EMA. Unaffected by accumulation: mass pools per
+                # TRAINED micro-batch, which is exactly the set of rows that
+                # reach backward() below, regardless of where window boundaries
+                # land. ONE rare exception: if a window is later dropped for a
+                # non-finite accumulated gradient, its rows' mass is already
+                # pooled even though no gradient reached the weights, so the pool
+                # over-counts by up to k micro-batches. Accepted rather than
+                # staged per window — it only occurs on an anomaly that already
+                # warrants investigation, and k is a RATIO so the effect is
+                # second-order (n_nonfinite_grad_steps surfaces it).
                 if pending_pos_scale is not None:
                     k_last, _n_mass, _d_mass = pending_pos_scale
                     N_iter += _n_mass
                     D_iter += _d_mass
 
-                # --- Backward pass ---
-                self.optimizer.zero_grad()
-                loss.backward()
+                # --- Backward pass (gradient accumulation window) ---
+                # zero_grad ONLY at the start of a window; otherwise this
+                # micro-batch's gradient would wipe its predecessors'. At
+                # accum_steps=1 that's every micro-batch, i.e. the original
+                # zero_grad → backward → clip → step sequence.
+                if accum_count == 0:
+                    self.optimizer.zero_grad()
+                # Scale by 1/k so the accumulated buffer holds the MEAN
+                # micro-batch gradient, keeping the gradient magnitude (and
+                # therefore the effective step size under max_grad_norm
+                # clipping) on the same scale as an un-accumulated run.
+                # accum_steps == 1 short-circuits to `loss` itself rather than
+                # `loss / 1`: mathematically identical, but it keeps the
+                # autograd graph and the resulting gradients bit-identical to
+                # the pre-accumulation code path with no extra div node.
+                if accum_steps == 1:
+                    loss.backward()
+                else:
+                    (loss / accum_steps).backward()
+                accum_count += 1
 
-                # Gradient clipping. clip_grad_norm_ returns the TOTAL norm
-                # of the gradient vector BEFORE clipping — capture it for
-                # the train/grad_norm_* diagnostics (independent of whether
-                # clipping actually fired this minibatch).
-                pre_clip_grad_norm = nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    self.config.max_grad_norm,
-                )
-                # `clip_grad_norm_` with default error_if_nonfinite=False can
-                # return inf/nan if backward introduced a non-finite gradient
-                # that didn't show up in the forward `loss` (which we already
-                # guard above). A single inf in `grad_norms` then poisons
-                # np.mean/np.max into inf and breaks TB chart autoscale for
-                # the rest of the run. Drop non-finite values silently —
-                # n_skipped_nonfinite already tracks the upstream loss case.
-                gnorm = float(pre_clip_grad_norm)
-                if math.isfinite(gnorm):
-                    grad_norms.append(gnorm)
-                self.optimizer.step()
+                if accum_count == accum_steps:
+                    _apply_accumulated_grads()
 
                 # --- Track statistics ---
                 with torch.no_grad():
@@ -2638,7 +2806,11 @@ class GRPOTrainer:
                         ratio_maxes.append(rmax)
                     if math.isfinite(rmin):
                         ratio_mins.append(rmin)
-                    n_updates += 1
+                    # Counts TRAINED minibatches, not optimizer steps (see the
+                    # n_updates / n_micro_batches split above). This is the
+                    # divisor for every per-minibatch mean in `result`, so those
+                    # curves are invariant to gradient_accumulation_steps.
+                    n_micro_batches += 1
                     # Sign-flip diagnostic: group-good chunks (pre-renorm adv>0)
                     # that renorm pushed to <= 0. Nonzero under per-minibatch norm;
                     # 0 under per-iteration norm (buffer_mean≈0 preserves sign) and
@@ -2722,9 +2894,56 @@ class GRPOTrainer:
                             clipfrac_sum_jitter_neg += int(over_clip[jit_neg_mask].sum().item())
                             n_rows_jitter_neg += n_jn
 
+            # ── Epoch boundary: flush a partial accumulation window ──────────
+            # Anything still in the gradient buffer belongs to trained
+            # micro-batches, so dropping it would silently discard real signal.
+            # A flush is REQUIRED here (not merely tidy) because the number of
+            # micro-batches per epoch is not a multiple of k in general:
+            # _iter_balanced_minibatches anchors epoch length to
+            # ceil(len(entries) / mb_size) and returns early when the majority
+            # pool drains, and the non-finite guard can drop micro-batches
+            # anywhere in the epoch. Consequence of the uniform 1/k scale: this
+            # step's gradient is (m/k)× the window average for m < k
+            # micro-batches — a proportionally smaller step, at most one per
+            # epoch. Guarded on accum_count > 0 so an epoch that trained nothing
+            # (every minibatch filtered or non-finite) never steps on an empty
+            # or stale buffer. When it does fire, accum_count is necessarily in
+            # [1, k-1] — a window that reached k already closed itself above —
+            # so this is always a genuinely partial window, and at k=1 the
+            # branch is unreachable (every micro-batch closes its own window).
+            # n_partial_windows counts flush ATTEMPTS: if this one is then
+            # dropped for a non-finite accumulated gradient it also lands in
+            # n_nonfinite_grad_steps, and n_updates (the source of truth for real
+            # steps) does not move.
+            if accum_count > 0:
+                n_partial_windows += 1
+                _apply_accumulated_grads()
+
         # Model remains in eval mode (it never left)
+        # n_updates counts steps that actually reached the weights, so
+        # n_updates == 0 means "the model is bit-identical to the start of this
+        # iteration" — exactly what train()'s `did_update` gate needs. Two ways
+        # to get here: nothing trained at all (no live chunks, every minibatch
+        # filtered or non-finite), or every window was dropped for a non-finite
+        # accumulated gradient (n_nonfinite_grad_steps > 0 with
+        # n_micro_batches > 0). The second case is why this is NOT the same as
+        # "n_micro_batches == 0" — report both counters so the operator can tell
+        # the two apart instead of seeing a bare empty dict. The divisions below
+        # stay safe either way: a step requires at least one backward(), so
+        # n_updates > 0 implies n_micro_batches > 0.
         if n_updates == 0:
-            early: dict = {"n_skipped_nonfinite": n_skipped_nonfinite} if n_skipped_nonfinite else {}
+            early: dict = {}
+            if n_skipped_nonfinite:
+                early["n_skipped_nonfinite"] = n_skipped_nonfinite
+            if n_nonfinite_grad_steps:
+                early["n_nonfinite_grad_steps"] = n_nonfinite_grad_steps
+                early["n_micro_batches"] = n_micro_batches
+                print(
+                    f"  No optimizer step survived this iter: "
+                    f"{n_nonfinite_grad_steps} window(s) dropped for non-finite "
+                    f"gradients over {n_micro_batches} trained minibatch(es). "
+                    f"Model unchanged."
+                )
             if self.config.dynamic_epoch_training:
                 early["actual_epochs"] = actual_num_epochs
                 if success_frac is not None:
@@ -2736,16 +2955,38 @@ class GRPOTrainer:
                 f"  WARNING: skipped {n_skipped_nonfinite} minibatch(es) for "
                 f"non-finite loss (NaN/Inf) — likely bf16 ratio overflow"
             )
+        if n_nonfinite_grad_steps > 0:
+            print(
+                f"  WARNING: dropped {n_nonfinite_grad_steps} optimizer step(s) "
+                f"for non-finite ACCUMULATED gradients (backward-side overflow; "
+                f"the forward loss was finite). LoRA weights were protected, but "
+                f"investigate — this is not expected."
+            )
 
+        # Per-minibatch means divide by n_micro_batches (NOT n_updates): with
+        # gradient_accumulation_steps=k these differ by ~k, and dividing by the
+        # step count would scale every loss/ratio/KL curve up by k — a pure
+        # logging artifact that would look like a k-fold jump in loss the moment
+        # accumulation is switched on. That keeps these curves on the same SCALE
+        # across k; it does not make them bit-identical across k (within a window
+        # all k micro-batches see the same un-stepped weights, so the log-probs
+        # differ from a k=1 run by a few percent). grad_norm_* is the deliberate
+        # exception: one sample per optimizer step, over the accumulated gradient.
         result = {
-            "loss": total_loss / n_updates,
-            "clip_loss": total_clip_loss / n_updates,
-            "kl_loss_last_iter": total_kl_last_iter / n_updates,
+            "loss": total_loss / n_micro_batches,
+            "clip_loss": total_clip_loss / n_micro_batches,
+            "kl_loss_last_iter": total_kl_last_iter / n_micro_batches,
             "clipfrac": np.mean(clipfracs) if clipfracs else 0,
-            "mean_ratio": total_ratio / n_updates,
-            "mean_log_ratio_abs": total_log_ratio_abs / n_updates,
+            "mean_ratio": total_ratio / n_micro_batches,
+            "mean_log_ratio_abs": total_log_ratio_abs / n_micro_batches,
             "n_updates": n_updates,
+            "n_micro_batches": n_micro_batches,
             "n_skipped_nonfinite": n_skipped_nonfinite,
+            # Optimizer steps dropped to protect the weights from a non-finite
+            # accumulated gradient. Emitted unconditionally (even at 0) so the
+            # TB curve is a flat zero line you can glance at, rather than a
+            # missing series you'd have to know to look for.
+            "n_nonfinite_grad_steps": n_nonfinite_grad_steps,
             "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
             "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
@@ -2753,6 +2994,19 @@ class GRPOTrainer:
             "actual_epochs": actual_num_epochs,
             "n_pos_flipped_by_renorm": n_pos_flipped,
         }
+        # Accumulation diagnostics, only when accumulation is actually on (k=1
+        # runs keep exactly the key set they had before, so no new constant-
+        # valued TB curves appear on vanilla runs). n_partial_windows counts
+        # end-of-epoch flushes that closed with < k micro-batches — each of
+        # those took a proportionally smaller step. It is bounded ABOVE by
+        # actual_epochs (at most one flush per epoch, see the flush site), so it
+        # simply reports how many epochs had a trained-micro-batch count that
+        # wasn't a multiple of k. It is NOT a drop detector: a non-finite skip
+        # can make the remainder divide evenly and LOWER this counter. Watch
+        # n_skipped_nonfinite for mid-epoch drops.
+        if accum_steps > 1:
+            result["grad_accum_steps"] = accum_steps
+            result["n_partial_windows"] = n_partial_windows
         # Effective balanced-sampler positive ratio (only when balanced sampling
         # ran with entries present). With the dynamic flag it tracks success.
         if eff_pos_ratio is not None:
@@ -2786,7 +3040,7 @@ class GRPOTrainer:
         # _log_metrics gates on key presence, so vanilla runs see no
         # train/kl_loss_base_model curve at all.
         if compute_base:
-            result["kl_loss_base_model"] = total_kl_base_model / n_updates
+            result["kl_loss_base_model"] = total_kl_base_model / n_micro_batches
         if success_frac is not None:
             result["success_fraction"] = success_frac
         # Per-branch metrics (Jitter-GRPO). Only emitted when jitter is active
@@ -3697,11 +3951,39 @@ class GRPOTrainer:
                 update_stats.get("n_updates", 0),
                 iteration,
             )
+            # Trained minibatches. Equal to n_updates without gradient
+            # accumulation and ~k× larger with it, so the pair separates "how
+            # much data did the update see" from "how many optimizer steps did
+            # it take". Logged unconditionally (same rationale as n_updates):
+            # `.get(..., 0)` is correct on the n_updates=0 early-return path,
+            # where no micro-batch trained either.
+            self.writer.add_scalar(
+                "train/n_micro_batches",
+                update_stats.get("n_micro_batches", 0),
+                iteration,
+            )
             self.writer.add_scalar(
                 "train/n_skipped_nonfinite",
                 update_stats.get("n_skipped_nonfinite", 0),
                 iteration,
             )
+            # Optimizer steps dropped because the accumulated gradient was
+            # non-finite. Logged unconditionally: a flat zero line is the
+            # healthy reading, and anything above zero means LoRA weights were
+            # protected from a NaN write — correlate with train/n_updates
+            # (which excludes the dropped step) and with the console WARNING.
+            self.writer.add_scalar(
+                "train/n_nonfinite_grad_steps",
+                update_stats.get("n_nonfinite_grad_steps", 0),
+                iteration,
+            )
+            # Accumulation-only counters: absent (no curve) unless
+            # gradient_accumulation_steps > 1.
+            for key in ("grad_accum_steps", "n_partial_windows"):
+                if key in update_stats:
+                    self.writer.add_scalar(
+                        f"train/{key}", update_stats[key], iteration
+                    )
 
         # Loss / ratio / grad scalars are only meaningful when at least one
         # optimizer.step() actually fired. `_grpo_update_inner` returns
@@ -3845,10 +4127,19 @@ class GRPOTrainer:
                     log_dict.update(stats)
                 if update_stats is not None:
                     # Counters always; loss/ratio/grad only when n_updates>0
-                    # (matching the TB-side gating).
+                    # (matching the TB-side gating). n_micro_batches is a
+                    # counter too, so it's mirrored here for TB parity — the
+                    # gated block below re-sets it to the same value when
+                    # n_updates>0, which is a harmless no-op.
                     log_dict["train/n_updates"] = update_stats.get("n_updates", 0)
+                    log_dict["train/n_micro_batches"] = (
+                        update_stats.get("n_micro_batches", 0)
+                    )
                     log_dict["train/n_skipped_nonfinite"] = (
                         update_stats.get("n_skipped_nonfinite", 0)
+                    )
+                    log_dict["train/n_nonfinite_grad_steps"] = (
+                        update_stats.get("n_nonfinite_grad_steps", 0)
                     )
                     if update_stats.get("n_updates", 0) > 0:
                         log_dict.update({

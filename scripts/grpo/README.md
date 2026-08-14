@@ -23,7 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
-| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. |
+| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. |
 
 ---
 
@@ -913,11 +913,129 @@ NaN/Inf guard: a minibatch with non-finite loss (typically bf16 ratio
 overflow when `|log_ratio|` is large) is **skipped**, the
 `n_skipped_nonfinite` counter increments, and training continues.
 `clip_grad_norm_` only bounds finite gradients — it does not rescue NaNs.
+The guard fires BEFORE `backward()`, so a skipped minibatch never puts
+anything into the gradient buffer (see "Gradient accumulation" for what that
+means when several minibatches share one optimizer step).
+
+Second, independent guard on the **gradient** side: if `clip_grad_norm_` reports
+a non-finite norm — either because `backward()` produced inf/NaN even though the
+forward loss was finite, or because the fp32 sum-of-squares of large-but-finite
+gradients overflowed — the optimizer step is **dropped**, the gradient buffer is
+zeroed, and `n_nonfinite_grad_steps` increments (with a console WARNING).
+Clipping cannot save that buffer: `total_norm = inf` gives a clip coefficient of
+0, so the buffer becomes either all-NaN (`inf * 0`) or exactly `0.0` (finite
+gradients scaled by 0) — nothing to rescue either way. Stepping on the NaN case
+would write NaN into every LoRA param, poison AdamW's moments for the rest of the
+run, and — because the iteration would still report `n_updates > 0` — persist a
+NaN checkpoint that a later `--resume-from` would load, all while `grad_norm_*`
+still looked normal (the offending norm is excluded from that average). Dropping
+the step instead leaves the weights at their last good value and training
+continues with the next window. Expected reading is a flat
+`train/n_nonfinite_grad_steps == 0`; anything above zero is worth investigating
+even though the run survives it.
 
 If ZERO minibatches commit a gradient step in an iteration (every batch
-non-finite, or every group dead), the iteration is treated as **skipped**
-and the resume checkpoint is saved under the last successfully-updated
-iter's name (see "Checkpointing").
+non-finite, every window dropped, or every group dead), the iteration is
+treated as **skipped** and the resume checkpoint is saved under the last
+successfully-updated iter's name (see "Checkpointing").
+
+### Gradient accumulation
+
+`gradient_accumulation_steps = k` (default 1) accumulates the gradients of `k`
+consecutive mini-batches into a single optimizer step:
+
+```
+per micro-batch that survives the non-finite guard:
+    if the window is empty:  optimizer.zero_grad()
+    (loss / k).backward()                  # 1/k → the buffer holds the MEAN
+    if the window now holds k:             # close the window
+        clip_grad_norm_(...); optimizer.step()
+at the end of EVERY epoch:
+    if the window is non-empty: clip_grad_norm_(...); optimizer.step()  # flush
+in either case: if the accumulated gradient is non-finite, drop the step,
+    zero the buffer, and count it (n_nonfinite_grad_steps) instead
+```
+
+**Why.** `mini_batch_size` cannot be raised: peak VRAM at `mini_batch_size=8`
+is ~21.5 GB of ~25.3 GB on an A10G (~1.48 GB per row → ~8-9 rows is the
+ceiling). The per-row cost is dominated by the K-loop in
+`compute_fm_log_prob`, which accumulates the log-prob across all
+`len(tau_centers)` DiT forward passes and calls `backward()` once — so autograd
+retains the activations of all K passes simultaneously. Accumulation is
+therefore the only route to a larger effective batch. Peak VRAM is unchanged
+(each micro-batch's graph is still freed by its own backward; the retained fp32
+grad buffers are ~80 MB at rank 16) and total forward/backward work is
+unchanged. What changes: the update direction averages `k` micro-batch
+gradients, and the optimizer-step count drops by ~`k`. **LR is per-iteration**
+(the monotone anneal ramp in `train()` — there is no warmup; iteration 1 already
+runs at the full configured LR), not per-step, so `k` does not rescale the step
+size — hold LR fixed.
+
+**Deliberately NOT one wide batch.** The advantage z-score still runs
+independently on each micro-batch of `mini_batch_size` rows
+(`per_iteration_advantage_norm` stays `False`), so what gets averaged is `k`
+independently normalized gradients. That is the intent, not an approximation:
+the group-relative binary-reward advantage is strongly asymmetric (at 12.5%
+success, +2.475 for a success vs −0.354 for a failure, ~7:1), and
+per-minibatch z-scoring restores symmetry. Switching to per-iteration norm to
+make accumulation "exact" passes that asymmetry straight through, strips the
+failure-avoidance signal, and silently pins `pos_adv_weight_k` to its 1.0 floor
+(disabling PAWS) — it measured much worse on matched iterations
+(success 0.125 / 0.25 / 0.083 / 0.29 vs 0.125 / 0.625 / 0.625 / 0.54).
+
+**Edges.**
+- A partial window at an epoch boundary is **flushed, never discarded**. The
+  scale is a uniform `1/k`, so a flushed window of `m < k` micro-batches steps
+  with `(m/k)×` the average gradient — at most one such step per epoch
+  (`train/n_partial_windows`). The flush is required, not cosmetic:
+  `_iter_balanced_minibatches` anchors epoch length to `ceil(n / mb_size)` but
+  returns early when the majority pool drains, so the micro-batch count per
+  epoch is not a multiple of `k`.
+- A minibatch dropped by the non-finite guard contributes nothing AND does not
+  advance the window, so every full window carries exactly `k` **trained**
+  micro-batches. PAWS mass (`N_iter` / `D_iter`) likewise commits per trained
+  micro-batch, so the "pooled mass == trained rows" invariant is unchanged —
+  except on the rare dropped-window path below, where up to `k` micro-batches'
+  mass is pooled without a weight update (accepted; `k` is a ratio, so the
+  effect is second-order).
+- If the accumulated gradient is non-finite the step is dropped and the window
+  discarded (`n_nonfinite_grad_steps`) — see the gradient-side guard under
+  "Clipped surrogate + KL". This protects a `k=1` run identically; the only
+  k-specific note is that a dropped `k > 1` window forfeits up to `k`
+  micro-batches of work instead of one.
+- `train/n_updates` counts real `optimizer.step()` calls that actually reached
+  the weights (so it drops by ~`k`, excludes dropped windows, and `did_update` /
+  checkpoint naming still mean "the model moved");
+  `train/n_micro_batches` counts trained mini-batches (unchanged by `k`). Every
+  per-minibatch mean — `loss`, `clip_loss`, `kl_loss_*`, `clipfrac`,
+  `mean_ratio`, `mean_log_ratio_abs` — divides by `n_micro_batches`, so these
+  curves are **not k-inflated** and stay on the same scale across `k`. They are
+  NOT bit-identical across `k`: within a window all `k` micro-batches see the
+  same un-stepped weights, so the log-probs (and hence loss / ratio / clipfrac)
+  shift by a few percent versus a `k=1` baseline — that is expected, not a
+  regression. The `_fixed` / `_jitter` branch metrics are row-weighted
+  (`sum / n_rows_*`) rather than per-minibatch means, and are likewise
+  unaffected by `k`. `train/grad_norm_*` is the deliberate exception: it
+  measures the ACCUMULATED gradient, so expect it to read lower at `k > 1` —
+  that is noise cancelling between micro-batches, not weaker signal.
+- `k = 1` is bit-identical to the pre-accumulation code path, and emits no
+  `grad_accum_steps` / `n_partial_windows` curves and no banner line.
+
+`test_grad_accum.py` covers all of the above by driving the real
+`_grpo_update` / `_grpo_update_inner` on CPU. It substitutes the GPU-bound and
+setup-bound pieces: `_prepare_batch` (tiny CPU tensors instead of a backbone
+re-encode), `compute_fm_log_prob` (a 2-parameter analytic stand-in for the
+K-loop DiT forward), the model, the episode buffer, and the optimizer (plain SGD
+so a reference trajectory is exactly reproducible — production uses AdamW), and
+it builds the trainer via `__new__` to skip `setup()`. The accumulation window,
+guards, flush, step cadence and every metric divisor are the production ones.
+
+```bash
+# k=2: ~150 optimizer steps/iter instead of ~300, same LR, same peak VRAM
+uv run python scripts/grpo/train_grpo.py \
+  --gradient-accumulation-steps 2 --learning-rate 1.5e-5 \
+  --group-size 12 --num-groups 4 --num-iterations 40
+```
 
 ### Reference log-prob caching
 
@@ -1540,13 +1658,13 @@ uv run python scripts/grpo/train_grpo.py \
   `proj_out_{1,2}`). ~20M trainable params at rank=16.
 
 **Episode collection**
-- `group_size` (G) — logical rollouts per group. Default 4.
-- `num_async_vector_env` — physical parallel-env workers per group. Default
+- `group_size` (G) — logical rollouts per group. Default 8.
+- `num_async_vector_env` — physical parallel-env workers per group. Default 4;
   `None` → `group_size` (one worker per rollout, unchanged). Set lower (must
   divide `group_size` and be `<=` it) to collect each group over
   `group_size // num_async_vector_env` sequential turns and cap peak worker
   RAM. See "Decoupling group size from worker count".
-- `num_groups` — minimum groups per iter. Default 5.
+- `num_groups` — minimum groups per iter. Default 3.
 - `min_alive_groups` / `max_groups` — see "Dynamic group
   collection". Default 2 / 5.
 - `max_episode_steps: int | list[int]` — per-env truncation horizon.
@@ -1569,17 +1687,22 @@ uv run python scripts/grpo/train_grpo.py \
 - `clip_eps_low` / `clip_eps_high` (both default 0.2) — asymmetric clip
   bounds; ratio clamped to `[1 - clip_eps_low, 1 + clip_eps_high]`. Each must
   be in `(0, 1)` (no ordering constraint between them).
-- `update_epochs` (default 5)
+- `update_epochs` (default 2)
 - `mini_batch_size` (default 8 chunks)
-- `kl_coef_last_iter` (default 0.1) — KL anchor to this iter's start-of-update
+- `gradient_accumulation_steps` (default 1) — mini-batches accumulated per
+  optimizer step; see "Gradient accumulation". 1 is bit-identical to no
+  accumulation. `k > 1` gives an effective batch of `k × mini_batch_size` rows
+  at constant peak VRAM and ~`1/k` the optimizer steps; LR is per-iteration so
+  it does NOT need rescaling. Must be `>= 1`.
+- `kl_coef_last_iter` (default 0.2) — KL anchor to this iter's start-of-update
   policy snapshot. Bounds per-iter drift.
-- `kl_coef_base_model` (default 0.0) — KL anchor to the pretrained DiT
+- `kl_coef_base_model` (default 0.2) — KL anchor to the pretrained DiT
   (LoRA disabled). Bounds cumulative drift from the base policy. 0.0 disables
   the term entirely (no extra forward pass per iter, no per-mb KL formula).
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
 - `balanced_minibatch_training` (default `True`) — balanced mini-batch
   sampling; see "Balanced Training" mechanism 1.
-- `dynamic_epoch_training` (default `True`) — tent-function epoch scaling;
+- `dynamic_epoch_training` (default `False`) — tent-function epoch scaling;
   see "Balanced Training" mechanism 2. Independent of the flag above.
 - `balanced_minibatch_positive_adv_ratio` (default `0.5`) — target fraction
   of positive-advantage chunks per mini-batch. Must be strictly in `(0, 1)`.
@@ -1587,7 +1710,7 @@ uv run python scripts/grpo/train_grpo.py \
   0.7) to bias more gradient steps toward success examples.
 
 **Optimizer**
-- `learning_rate` (default 1e-5; ~10× lower than supervised FT because RL
+- `learning_rate` (default 3e-5; ~3× lower than supervised FT because RL
   gradients are noisier)
 - `weight_decay` (1e-5)
 - `max_grad_norm` (0.5)
@@ -1614,6 +1737,10 @@ mismatch internally.
 
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
 `train/{loss,clip_loss,kl_loss_last_iter,kl_loss_base_model,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
+`train/{n_updates,n_micro_batches}` (optimizer steps vs trained mini-batches —
+these differ under gradient accumulation),
+`train/n_nonfinite_grad_steps` (steps dropped to protect the weights from a
+non-finite gradient; should stay flat at 0),
 `train/learning_rate`, `time/iteration_seconds`, and (when
 `dynamic_epoch_training=True` and at least one gradient step fired)
 `balanced/{actual_epochs,success_fraction}`. `mean_log_ratio_abs`

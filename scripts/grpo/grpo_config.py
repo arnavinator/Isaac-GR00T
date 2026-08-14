@@ -337,6 +337,67 @@ class GRPOConfig:
     # Smaller = more updates per epoch but noisier gradients
     mini_batch_size: int = 8
 
+    # Number of consecutive mini-batches whose gradients are ACCUMULATED into a
+    # single optimizer step ("k"). 1 (default) is bit-identical to the
+    # pre-accumulation behavior: zero_grad → backward → clip_grad_norm_ → step
+    # once per mini-batch. k > 1 zeroes the grad buffer once per WINDOW of k
+    # mini-batches, scales each mini-batch's loss by 1/k before backward(), and
+    # runs a single clip_grad_norm_ + step on the accumulated (averaged)
+    # gradient. Effective rows per optimizer step = k * mini_batch_size.
+    #
+    # Why this knob exists: mini_batch_size cannot be raised. Peak VRAM at
+    # mini_batch_size=8 is ~21.5 GB of ~25.3 GB on an A10G (~1.48 GB per row,
+    # so ~8-9 rows is the ceiling). The per-row cost is dominated by the K-loop
+    # in fm_log_prob.compute_fm_log_prob, which accumulates the log-prob across
+    # all len(tau_centers) DiT forward passes and calls backward() ONCE — so
+    # autograd retains the activations of all K passes simultaneously.
+    # Accumulation is therefore the only route to a larger effective batch: it
+    # holds peak VRAM and total forward/backward work constant while cutting the
+    # optimizer-step count by ~k and reducing update-direction noise. Step size
+    # is unaffected: the LR schedule is per-ITERATION (the monotone anneal ramp
+    # in train() — there is no warmup, iteration 1 already runs at the full
+    # configured LR), not per-step, so k does not rescale it — hold LR fixed.
+    #
+    # NOT equivalent to one true (k * mini_batch_size)-row batch, deliberately.
+    # The advantage z-score still runs INDEPENDENTLY on each micro-batch of
+    # mini_batch_size rows (per_iteration_advantage_norm stays False — see its
+    # comment above), so what this averages is k independently normalized
+    # micro-batch gradients. That is the intended semantics, not an
+    # approximation of a single wide batch: the group-relative binary-reward
+    # advantage is strongly asymmetric (at 12.5% success, +2.475 for a success
+    # vs -0.354 for a failure, ~7:1), and per-minibatch z-scoring restores
+    # symmetry. Switching to per-iteration norm to make accumulation "exact"
+    # passes that 7:1 asymmetry straight through, strips the failure-avoidance
+    # signal, and silently pins pos_adv_weight_k to its 1.0 floor (disabling
+    # PAWS) — it measured much worse on matched iterations.
+    #
+    # Behavior at the edges (see _grpo_update_inner for the implementation):
+    #   - A partial window at the end of an epoch is FLUSHED, never discarded.
+    #     Because the scale is a uniform 1/k, a flushed window of m < k
+    #     micro-batches yields (m/k)x the average gradient — a proportionally
+    #     smaller step. At most one such step per epoch.
+    #   - Mini-batches dropped by the non-finite-loss guard never reach
+    #     backward(), so they contribute nothing to the buffer AND do not count
+    #     toward the window: every full window holds exactly k TRAINED
+    #     micro-batches.
+    #   - If the ACCUMULATED gradient itself is non-finite (backward-side
+    #     overflow with a finite forward loss), the step is dropped and the
+    #     window discarded rather than written into the LoRA params — counted by
+    #     train/n_nonfinite_grad_steps. Independent of k (it protects a k=1 run
+    #     just the same), but note a k > 1 window discards up to k
+    #     micro-batches' work when it fires.
+    #   - train/n_updates counts real optimizer.step() calls (so it drops by ~k),
+    #     while train/n_micro_batches counts trained mini-batches (unchanged by
+    #     k). Per-micro-batch metrics (loss, clipfrac, mean_ratio, ...) divide by
+    #     n_micro_batches, so they are NOT k-inflated and stay on the same scale
+    #     across k — but they are not bit-identical either: within a window all k
+    #     micro-batches see the same un-stepped weights, so the log-probs (and
+    #     hence loss / ratio / clipfrac) shift somewhat vs a k=1 baseline. Expect
+    #     a few percent of difference; that is not a regression signal.
+    #     train/grad_norm_* now measures the ACCUMULATED gradient, which is
+    #     expected to read lower at k > 1 (noise averaging), not "less signal".
+    gradient_accumulation_steps: int = 1
+
     # KL divergence penalty coefficient — anchor toward THIS ITER'S start-of-update
     # policy (the "ref" snapshot taken in _compute_ref_log_probs before the GRPO
     # epochs fire). Bounds per-iter policy drift to prevent the clipped surrogate
@@ -574,6 +635,32 @@ class GRPOConfig:
                 f"min_alive_groups ({self.min_alive_groups}) cannot "
                 f"exceed max_groups ({self.max_groups}) — criterion would be "
                 f"unsatisfiable."
+            )
+        # Gradient accumulation window size. 1 = one optimizer step per
+        # mini-batch (no accumulation, bit-identical to the pre-accumulation
+        # code path). Values < 1 are degenerate in two DIFFERENT ways, both
+        # fatal, because `accum_count == k` is then unreachable from
+        # accum_count=1 and the 1/k scale is applied literally (k=1 is the only
+        # value that short-circuits the division):
+        #   k == 0: `(loss / 0).backward()` makes the loss non-finite, so
+        #     clip_grad_norm_ returns inf and its clip_coef of 0 turns the inf
+        #     gradients into NaN — the first end-of-epoch flush writes NaN into
+        #     every LoRA param and permanently poisons AdamW's moments. Loud
+        #     rather than silent (grad_norm_* reads 0.0 and every later
+        #     minibatch trips the non-finite guard, printing its WARNING), but
+        #     the damage is already done by then.
+        #   k < 0: the loss is finite and the curves look completely normal
+        #     (no warning, no banner — the banner is gated on k > 1), yet the
+        #     negative scale makes every flush apply the NEGATED sum of the
+        #     window's gradients, i.e. gradient ASCENT. This is the genuinely
+        #     silent one.
+        # Fail fast so `--gradient-accumulation-steps 0` can't burn a run.
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"gradient_accumulation_steps must be >= 1, got "
+                f"{self.gradient_accumulation_steps}. 1 = one optimizer step "
+                f"per mini-batch (no accumulation); k > 1 accumulates k "
+                f"mini-batches per step."
             )
         for _jname, _jval in (
             ("jitter_pos", self.jitter_pos),

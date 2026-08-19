@@ -119,9 +119,14 @@ Model outputs are **EEF deltas** (Operational Space Control), NOT joint angles o
   `skip_intermediate_render` (default ON, `MultiStepWrapper`): camera observables stay
   disabled for the whole chunk and the kept frame comes from a forced render after the
   last substep. Eval keeps it OFF (video recording needs every substep). Touching this
-  requires understanding robosuite's `Observable` sampling timer — `set_enabled()` resets
-  the timer but NOT `_sampled`, and the phase makes robosuite sample on the LAST physics
-  substep of a control step. See `scripts/grpo/README.md` before changing it.
+  requires understanding two things: robosuite's `Observable` sampling timer
+  (`set_enabled()` resets the timer but NOT `_sampled`, and the phase makes robosuite
+  sample on the LAST physics substep of a control step), and gymnasium's
+  `PassiveEnvChecker` — inserted by `gym.make()` — which asserts the observation key set
+  matches the space on EVERY step, so skipped substeps must still carry placeholder
+  frames. Note the collector venv pins gymnasium 0.29.1 (which forwards attributes
+  through wrappers and warns) while the main venv has 1.x (which does not).
+  See `scripts/grpo/README.md` before changing it.
 
 ## Architecture: Server-Client Evaluation
 Two terminals, two separate venvs (robocasa not in main venv):

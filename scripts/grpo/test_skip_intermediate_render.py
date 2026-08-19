@@ -236,13 +236,21 @@ class FakeSimEnv(gym.Env):
 
     # --- gym API -----------------------------------------------------------
     def _to_groot(self, raw):
-        """Mirror get_groot_observation: omit video keys that robosuite omitted."""
+        """Mirror get_basic_observation + get_groot_observation.
+
+        Crucially, a camera key robosuite omitted (observable disabled) is
+        BACKFILLED with a blank frame rather than dropped: gymnasium's
+        PassiveEnvChecker asserts exact key-set equality on every step.
+        """
         obs = {"state.pos": np.asarray(raw["state_pos"], dtype=np.float32),
                LANG_KEY: "do the thing"}
         for i, key in enumerate(CAM_KEYS):
             raw_key = f"cam_{i}_image"
-            if raw_key in raw:
-                obs[key] = np.asarray(raw[raw_key])
+            obs[key] = (
+                np.asarray(raw[raw_key])
+                if raw_key in raw
+                else np.zeros((FRAME_HW, FRAME_HW, 3), dtype=np.uint8)
+            )
         return obs
 
     def reset(self, seed=None, options=None):
@@ -481,9 +489,13 @@ def test_first_chunk_after_forced_update_is_real():
     print("  [PASS] first chunk after a forced update carries a real frame")
 
 
-def test_intermediate_substeps_carry_no_video_keys():
-    """Skipped substeps must omit video keys rather than fabricate frames, so a
-    blank frame cannot reach a consumer even if intra-chunk obs are ever read."""
+def test_every_substep_keeps_the_full_key_set():
+    """EVERY substep observation must carry the full key set, skipped or not.
+
+    gymnasium's PassiveEnvChecker (inserted by gym.make between MultiStepWrapper
+    and the base env) asserts observation keys == observation-space keys on
+    every step, so dropping the video keys on skipped substeps kills the worker.
+    """
     env, wrapper = _make(n_action_steps=8, skip=True)
     wrapper.reset()
     seen = []
@@ -491,7 +503,7 @@ def test_intermediate_substeps_carry_no_video_keys():
 
     def spy(self, action):
         out = real_step(self, action)
-        seen.append(sorted(k for k in out[0] if k.startswith("video.")))
+        seen.append(sorted(out[0]))
         return out
 
     FakeSimEnv.step = spy
@@ -499,16 +511,102 @@ def test_intermediate_substeps_carry_no_video_keys():
         wrapper.step(_action(8))
     finally:
         FakeSimEnv.step = real_step
+    expected = sorted(CAM_KEYS + ["state.pos", LANG_KEY])
     assert len(seen) == 8, seen
-    assert all(keys == [] for keys in seen), f"video keys leaked: {seen}"
-    print("  [PASS] intra-chunk observations carry no video keys at all")
+    for i, keys in enumerate(seen):
+        assert keys == expected, f"substep {i} key set changed: {keys}"
+    print("  [PASS] every substep observation keeps the full key set")
+
+
+def test_gym_make_chain_with_passive_env_checker():
+    """THE regression test for the production wrapper chain.
+
+    The collector builds envs with gym.make(), which inserts OrderEnforcing and
+    PassiveEnvChecker between MultiStepWrapper and the base env. Earlier tests
+    wrapped a bare env, so they never exercised the checker — and the checker is
+    what failed on the real stack.
+    """
+    env_id = "test/SkipRenderFake-v0"
+    if env_id not in gym.registry:
+        gym.register(id=env_id, entry_point=lambda **kw: FakeSimEnv(**kw))
+
+    made = gym.make(env_id)
+    chain = [type(t).__name__ for t in MultiStepWrapper._walk_chain(made)]
+    assert "PassiveEnvChecker" in chain, (
+        f"this test is only meaningful with the checker in the chain: {chain}"
+    )
+
+    wrapper = MultiStepWrapper(
+        made,
+        video_delta_indices=np.array([0]),
+        state_delta_indices=np.array([0]),
+        n_action_steps=8,
+        terminate_on_success=True,
+        skip_intermediate_render=True,
+    )
+    base = made.unwrapped
+    assert wrapper._render_gate is base, wrapper._render_gate
+
+    wrapper.reset(seed=0)
+    for chunk in range(3):
+        obs, _, done, _, _ = wrapper.step(_action(8))
+        _assert_real_frames(obs, f"gym.make chain, chunk {chunk}")
+        if done:
+            break
+    wrapper.close()
+    print(f"  [PASS] survives the real gym.make chain ({' -> '.join(chain)})")
+
+
+def test_gate_lookup_emits_no_warnings():
+    """Attribute probing must not rely on wrapper forwarding.
+
+    gymnasium 0.29.1 (pinned by the robocasa collector venv) forwards unknown
+    attributes down the chain and warns on every lookup; 1.x dropped forwarding.
+    Probing type()/__dict__ instead is silent and correct on both.
+    """
+    import warnings
+
+    env_id = "test/SkipRenderFake-v0"
+    if env_id not in gym.registry:
+        gym.register(id=env_id, entry_point=lambda **kw: FakeSimEnv(**kw))
+    made = gym.make(env_id)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gate = MultiStepWrapper._find_render_gate(made)
+        consumer = MultiStepWrapper._find_substep_obs_consumer(made)
+    made.close()
+    assert gate is not None and consumer is None
+    offenders = [
+        str(w.message)
+        for w in caught
+        if "set_camera_obs_enabled" in str(w.message)
+        or "recompute_observation" in str(w.message)
+        or "consumes_every_substep_obs" in str(w.message)
+    ]
+    assert not offenders, f"gate lookup triggered forwarding warnings: {offenders[:2]}"
+    print("  [PASS] gate lookup probes types directly (no forwarding warnings)")
 
 
 def test_sync_vector_env_roundtrip():
-    """The obs-space boundary is where a wrong dtype/shape actually blows up."""
+    """The obs-space boundary is where a wrong dtype/shape/key-set blows up.
+
+    Built through gym.make() so the chain matches what _make_collector_env
+    produces in production (OrderEnforcing + PassiveEnvChecker included) — a
+    bare env here would not exercise the checker.
+    """
+    env_id = "test/SkipRenderFake-v0"
+    if env_id not in gym.registry:
+        gym.register(id=env_id, entry_point=lambda **kw: FakeSimEnv(**kw))
+
     def make():
-        _, wrapper = _make(n_action_steps=8, skip=True)
-        return wrapper
+        return MultiStepWrapper(
+            gym.make(env_id),
+            video_delta_indices=np.array([0]),
+            state_delta_indices=np.array([0]),
+            n_action_steps=8,
+            terminate_on_success=True,
+            skip_intermediate_render=True,
+        )
 
     venv = SyncVectorEnv([make, make])
     try:
@@ -628,15 +726,19 @@ def test_rejects_multi_frame_video_horizon():
 
 
 def test_rejects_env_without_render_gate():
-    class PlainEnv(FakeSimEnv):
-        def __getattribute__(self, name):
-            if name in ("set_camera_obs_enabled", "recompute_observation"):
-                raise AttributeError(name)
-            return super().__getattribute__(name)
+    class GatelessEnv(gym.Env):
+        """An env that genuinely does not implement the gate — not a subclass
+        hiding it behind __getattribute__, which would still DECLARE the methods
+        on its type (see MultiStepWrapper._declares)."""
+
+        def __init__(self):
+            proto = FakeSimEnv()
+            self.observation_space = proto.observation_space
+            self.action_space = proto.action_space
 
     try:
         MultiStepWrapper(
-            PlainEnv(),
+            GatelessEnv(),
             video_delta_indices=np.array([0]),
             state_delta_indices=np.array([0]),
             n_action_steps=8,
@@ -691,7 +793,9 @@ TESTS = [
     test_frame_provenance_and_dtype_match_baseline,
     test_first_chunk_after_reset_is_real,
     test_first_chunk_after_forced_update_is_real,
-    test_intermediate_substeps_carry_no_video_keys,
+    test_every_substep_keeps_the_full_key_set,
+    test_gym_make_chain_with_passive_env_checker,
+    test_gate_lookup_emits_no_warnings,
     test_sync_vector_env_roundtrip,
     test_early_termination_still_returns_real_frames,
     test_truncation_mid_chunk_still_returns_real_frames,

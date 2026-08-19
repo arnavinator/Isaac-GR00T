@@ -97,14 +97,9 @@ class GrootRoboCasaEnv(RoboCasaEnv):
                 raise ValueError(f"Unknown key: {k}")
         mapped_names, camera_names, _, _ = self.key_converter.get_camera_config()
         for mapped_name, camera_name in zip(mapped_names, camera_names):
-            if camera_name + "_image" not in raw_obs:
-                # Camera observables disabled for this substep
-                # (skip_intermediate_render). Emit NO video keys rather than
-                # fabricating frames: this observation is never read — see
-                # MultiStepWrapper.step, which keeps only the observation
-                # recompute_observation() builds at the end of the chunk — and a
-                # fake frame could silently reach the policy if that changed.
-                continue
+            # Always present: RoboCasaEnv.get_basic_observation backfills a blank
+            # frame when the renders were skipped for this substep, so the key
+            # set stays constant for gymnasium's PassiveEnvChecker.
             obs[mapped_name] = GrootRoboCasaEnv.process_img(
                 raw_obs[camera_name + "_image"]
             )

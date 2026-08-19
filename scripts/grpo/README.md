@@ -389,10 +389,22 @@ render after the last substep, via `RoboCasaEnv.set_camera_obs_enabled` /
 - **`enabled`, not `active`:** `Observable.update` gates *computation* on
   `_enabled`; `_active` only gates whether the value is returned, so toggling
   `active` would drop the key without skipping the `sim.render`.
-- **Skipped substeps carry no `video.*` keys at all** — no placeholder frames are
-  fabricated, so a blank frame cannot reach the policy or an npz even if a future
-  change starts reading intra-chunk observations. Those observations never leave
-  the wrapper (`_get_obs` reads `self.obs[-1]`).
+- **Skipped substeps carry blank placeholder frames, and the key set NEVER
+  changes.** `RoboCasaEnv.get_basic_observation` backfills a blank frame for any
+  `*_image` key robosuite omitted, before any processing, so every derived key
+  (`res512_*`, `ego_view_*`) is produced normally. This is mandatory, not
+  cosmetic: `gym.make()` inserts gymnasium's `PassiveEnvChecker` between
+  `MultiStepWrapper` and the base env, and it asserts
+  observation-keys == observation-space-keys on EVERY step
+  (`gymnasium/utils/passive_env_checker.py`, `check_obs`). Dropping the video
+  keys on skipped substeps kills every AsyncVectorEnv worker on the first step.
+  The placeholders are never read — `_get_obs` returns `self.obs[-1]`, which is
+  always the forced end-of-chunk render.
+- **Attribute probing must not use `hasattr` on the chain.** gymnasium 0.29.1
+  (pinned by the collector venv, `setup_RoboCasa.sh`) forwards unknown
+  attributes down the wrapper chain and warns on every lookup; 1.x dropped
+  forwarding. `MultiStepWrapper._declares` inspects `type()`/`__dict__` instead,
+  which is silent and correct on both.
 - **Guards** (all raise at construction): `video_horizon` must be 1, since a
   longer horizon reads earlier substeps; an env in the chain must implement the
   two methods — resolved by walking `.env` because `gym.make` wraps the base env

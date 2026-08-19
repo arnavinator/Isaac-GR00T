@@ -164,6 +164,30 @@ class RoboCasaEnv(gym.Env):
         self.render_obs_key = f"{camera_names[0]}_image"
         self.render_cache = None
 
+        # Placeholder frames substituted for skipped renders
+        # (skip_intermediate_render). They MUST be present: gymnasium's
+        # PassiveEnvChecker — inserted by gym.make() between MultiStepWrapper and
+        # this env — asserts exact observation-key/observation-space equality on
+        # EVERY step (gymnasium/utils/passive_env_checker.py check_obs), so an
+        # omitted video key kills the worker. Feeding them through the normal
+        # processing path also means every derived key (res512_*, ego_view_*)
+        # is produced automatically. Sized per camera because the base robocasa
+        # copy allows per-camera dimensions.
+        widths = (
+            camera_widths
+            if isinstance(camera_widths, (list, tuple))
+            else [camera_widths] * len(camera_names)
+        )
+        heights = (
+            camera_heights
+            if isinstance(camera_heights, (list, tuple))
+            else [camera_heights] * len(camera_names)
+        )
+        self._blank_camera_frames = {
+            f"{name}_image": np.zeros((h, w, 3), dtype=np.uint8)
+            for name, w, h in zip(camera_names, widths, heights)
+        }
+
         # setup spaces
         action_space = spaces.Dict()
         for robot in self.env.robots:
@@ -263,6 +287,16 @@ class RoboCasaEnv(gym.Env):
         return self.get_basic_observation(raw_obs)
 
     def get_basic_observation(self, raw_obs):
+        # Camera observables disabled for this substep (skip_intermediate_render)
+        # → robosuite omitted the *_image keys. Fill them in BEFORE any
+        # processing so the observation keeps its exact shape: gymnasium's
+        # PassiveEnvChecker asserts key-set equality on every step, and every
+        # downstream derivation (process_img, res512_*, ego_view_*) then just
+        # works. A copy per substep keeps the shared buffers immutable.
+        for key, blank in self._blank_camera_frames.items():
+            if key not in raw_obs:
+                raw_obs[key] = blank.copy()
+
         raw_obs.update(gather_robot_observations(self.env))
 
         # Image are in (H, W, C), flip it upside down
@@ -284,14 +318,7 @@ class RoboCasaEnv(gym.Env):
                     (self.camera_heights, self.camera_widths, 3), dtype=np.uint8
                 )
 
-        # Camera observables may be disabled for this substep
-        # (skip_intermediate_render): robosuite then omits the *_image keys
-        # entirely. Leave them absent rather than fabricating frames — the only
-        # observation any consumer sees is the one recompute_observation()
-        # builds at the end of the chunk — and keep the previous render_cache
-        # instead of clobbering it with a fake frame.
-        if self.render_obs_key in raw_obs:
-            self.render_cache = raw_obs[self.render_obs_key]
+        self.render_cache = raw_obs[self.render_obs_key]
         raw_obs["language"] = self.env.get_ep_meta().get("lang", "")
 
         return raw_obs

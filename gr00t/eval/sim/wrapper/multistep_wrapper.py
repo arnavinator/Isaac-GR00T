@@ -224,16 +224,29 @@ class MultiStepWrapper(gym.Wrapper):
             yield target
             target = getattr(target, "env", None)
 
+    @staticmethod
+    def _declares(target, name):
+        """True if `target` ITSELF defines `name` — never via wrapper forwarding.
+
+        `hasattr` is wrong here across gymnasium versions: 0.29.1 (what the
+        robocasa collector venv pins) forwards unknown attributes down the
+        wrapper chain and emits a deprecation warning for each lookup, so a
+        plain hasattr on the outermost wrapper both returns True for attributes
+        it does not own AND spams one warning per attribute per env. 1.x dropped
+        forwarding entirely. Checking __dict__/type() is version-independent and
+        silent.
+        """
+        return name in vars(target) or hasattr(type(target), name)
+
     @classmethod
     def _find_render_gate(cls, env):
         """Return the first env in the wrapper chain that can gate rendering.
 
-        gym.make() wraps the base env (OrderEnforcing, PassiveEnvChecker, ...)
-        and gymnasium >= 1.0 dropped Wrapper.__getattr__ forwarding, so
-        `env.set_camera_obs_enabled` is not reachable from the outside — we have
-        to walk down to whoever actually implements it. Checking each level
-        before descending means a wrapper that overrides the pair (e.g. to
-        gate several sub-envs) wins over the base env.
+        gym.make() wraps the base env (OrderEnforcing, PassiveEnvChecker, ...),
+        so the gate is never the object handed to this wrapper — we walk down to
+        whoever actually implements it. Checking each level before descending
+        means a wrapper that overrides the pair (e.g. to gate several sub-envs)
+        wins over the base env.
 
         The gate's recompute_observation() must return observations in the same
         format step() does, so an observation-TRANSFORMING wrapper may not sit
@@ -246,7 +259,7 @@ class MultiStepWrapper(gym.Wrapper):
         Returns None when nothing in the chain supports it.
         """
         for target in cls._walk_chain(env):
-            if hasattr(target, "set_camera_obs_enabled") and hasattr(
+            if cls._declares(target, "set_camera_obs_enabled") and cls._declares(
                 target, "recompute_observation"
             ):
                 return target
@@ -261,7 +274,9 @@ class MultiStepWrapper(gym.Wrapper):
         produces video keys once per chunk.
         """
         for target in cls._walk_chain(env):
-            if getattr(target, "consumes_every_substep_obs", False):
+            if cls._declares(target, "consumes_every_substep_obs") and getattr(
+                target, "consumes_every_substep_obs", False
+            ):
                 return target
         return None
 

@@ -24,8 +24,6 @@ Flow-Matching (FM) log-probability surrogate.
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. |
-| `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
-| `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 
 ---
 
@@ -357,58 +355,6 @@ is then collected over `k = group_size // num_async_vector_env` sequential
 - **Cost:** ~`k`× collection wall time per group (turns are sequential). The
   trainer scales its collector subprocess timeout by `k` automatically.
 
-### Skipping intermediate-substep renders (`skip_intermediate_render`)
-
-Default **on** for collection (`GRPOConfig.skip_intermediate_render`), off for
-eval. Each outer step executes `n_action_steps` substeps, and robosuite renders
-every camera on every one of them — but the collector reads observations with
-`video_delta_indices=[0]`, so `MultiStepWrapper._get_obs` returns
-`self.obs[-1]` alone. For PandaOmron that means **21 of every 24 renders**
-(3 cameras × 8 substeps) were computed, flipped, resized to 256², and thrown
-away.
-
-With the flag on, `MultiStepWrapper.step` keeps the robosuite camera observables
-disabled for the **whole** chunk and takes the one frame it needs from a forced
-render after the last substep, via `RoboCasaEnv.set_camera_obs_enabled` /
-`recompute_observation`.
-
-- **Observationally exact, not an approximation.** robosuite samples a camera
-  observable once per control step, on the LAST of its
-  `control_timestep / model_timestep` physics substeps (the phase is established
-  by the `force_update` at the end of `MujocoEnv.reset`), so it sees the sim
-  state at the END of the control step — exactly what `recompute_observation()`
-  renders. Verified by simulating the real `robosuite.utils.observables`
-  `Observable` (`test_skip_intermediate_render.py`).
-- **Why not just re-enable on the last substep** (the obvious approach, which is
-  wrong): `Observable.set_enabled()` calls `Observable.reset()`, which zeroes the
-  sampling timer but does **not** clear `_sampled`. Every env reset ends with a
-  `force_update` that leaves `_sampled=True`, so a re-enabled observable cannot
-  sample for a full control step — the first chunk of every episode renders
-  nothing and returns `reset()`'s all-zero **float64** buffer, and later chunks
-  sample on the FIRST physics substep, i.e. one control step (48 ms) stale.
-- **`enabled`, not `active`:** `Observable.update` gates *computation* on
-  `_enabled`; `_active` only gates whether the value is returned, so toggling
-  `active` would drop the key without skipping the `sim.render`.
-- **Skipped substeps carry no `video.*` keys at all** — no placeholder frames are
-  fabricated, so a blank frame cannot reach the policy or an npz even if a future
-  change starts reading intra-chunk observations. Those observations never leave
-  the wrapper (`_get_obs` reads `self.obs[-1]`).
-- **Guards** (all raise at construction): `video_horizon` must be 1, since a
-  longer horizon reads earlier substeps; an env in the chain must implement the
-  two methods — resolved by walking `.env` because `gym.make` wraps the base env
-  and gymnasium ≥ 1.0 dropped `Wrapper.__getattr__` forwarding; and no wrapper in
-  the chain may be marked `consumes_every_substep_obs` (`VideoRecordingWrapper`
-  is, since it reads every substep's `video.*` keys).
-- Both robocasa copies carry the two methods: `external_dependencies/robocasa`
-  (installed into `gr00t/eval/sim/robocasa/robocasa_uv/.venv`, the venv the
-  collector subprocess uses) and `external_dependencies/robocasa-gr1-tabletop-tasks`.
-- Escape hatch: `skip_intermediate_render=False` in the config, or
-  `--no-skip-intermediate-render` on the collector CLI.
-- Tests: `test_skip_intermediate_render.py` — render counting, frame provenance
-  and dtype against a `skip=False` baseline driven through the real `Observable`
-  state machine, early-exit re-render, restore-on-exit, `SyncVectorEnv`
-  round-trip. Runs without MuJoCo.
-
 ### Fast-Forward Branching
 
 Tasks like "open the right drawer" spend most of an episode on the
@@ -660,31 +606,6 @@ for iteration in range(start, num_iterations + 1):
     # Phase 4: log + checkpoint
     if iteration % save_interval == 0: _save_checkpoint(...)
 ```
-
-Each phase is timed and logged to TensorBoard:
-
-| scalar | phase |
-|---|---|
-| `time/iteration_seconds` | `iter_start` → end of Phase 3 (excludes logging + checkpointing, which are sampled after it) |
-| `time/collect_seconds` | Phase 1 total |
-| `time/collect_rollout_seconds` | collector subprocess (imports + worker spawn + rollouts + npz writes) |
-| `time/collect_load_seconds` | trainer-side npz read-back into the buffer |
-| `time/advantage_seconds` | Phase 2 |
-| `time/ref_logprob_seconds` | Phase 2b |
-| `time/update_seconds` | Phase 3 |
-
-`collect_rollout + collect_load` is slightly LESS than `collect`: Phase 1 also
-covers `buffer.clear()`, `_prune_old_episode_dirs()` (an `rmtree` of aged iter
-dirs) and the stale-`.npz` unlink before the subprocess starts. Likewise
-`collect + advantage + ref_logprob + update` is slightly less than
-`iteration_seconds`, whose remainder is Phase 0 (`_release_memory_to_os()`: two
-`gc.collect()` passes + `malloc_trim`) plus the per-iter task/LR setup. Treat the
-residual as "untimed glue", not as a missing phase.
-
-A NaN sub-phase is skipped rather than logged as 0, so cached-episode iters
-(`resume_from_collected_data`) show a clean gap on `collect` / `collect_rollout`
-instead of dragging the autoscale toward zero — on those iters `collect_load` is
-the only Phase 1 curve with data. Covered by `test_phase_timing_logs.py`.
 
 ### Reward → advantage
 
@@ -1676,13 +1597,11 @@ cached iter would silently train on episodes from the old config while
 subsequent iters collect under the new one. If in doubt, leave this
 disabled and pay the collection cost.
 
-**TB cosmetic:** the cached iter's `time/collect_seconds` and
-`time/collect_rollout_seconds` are logged as NaN (filtered out by
-`_log_metrics`) so those curves show a clean gap at the resumed iter rather
-than a near-zero plunge that distorts autoscale. The scalars for work that
-genuinely ran — `time/collect_load_seconds` (the npz read-back is the whole of
-Phase 1 here), `advantage`, `ref_logprob`, `update`, and overall
-`time/iteration_seconds` — log normally.
+**TB cosmetic:** the cached iter's `time/collect_seconds` is logged as
+NaN (filtered out by `_log_metrics`) so the curve shows a clean gap at
+the resumed iter rather than a near-zero plunge that distorts autoscale.
+Other phase-time scalars (`advantage`, `update`) and overall
+`time/iteration_seconds` log normally.
 
 ### Skip semantics (preserves iteration budget)
 

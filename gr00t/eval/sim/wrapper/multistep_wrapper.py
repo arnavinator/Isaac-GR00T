@@ -128,18 +128,11 @@ class MultiStepWrapper(gym.Wrapper):
         max_episode_steps=None,
         reward_agg_method="max",
         terminate_on_success=False,
-        skip_intermediate_render=False,
     ):
         """
         video_delta_indices: np.ndarray[int], please check `assert_delta_indices` to see the requirements
         state_delta_indices: np.ndarray[int] | None, please check `assert_delta_indices` to see the requirements
           if None, it means the model is vision-only
-        skip_intermediate_render: bool, skip camera rendering on every substep
-          except the last one of each action chunk. See `step` for why that is
-          observationally equivalent, and the guards below for the two
-          requirements it places on the env / delta indices. Off by default
-          because consumers that read every substep's frames (e.g. eval video
-          recording in rollout_policy.py) need all of them.
         """
         super().__init__(env)
         # Assign action space
@@ -175,95 +168,6 @@ class MultiStepWrapper(gym.Wrapper):
         self.done = list()
         self.info = defaultdict(lambda: deque(maxlen=self.n_action_steps + 1))
         self.terminate_on_success = terminate_on_success
-
-        # --- skip_intermediate_render preconditions ---------------------------
-        # Both are correctness requirements, not conveniences, so fail at
-        # construction rather than silently feeding the policy black frames.
-        self.skip_intermediate_render = skip_intermediate_render
-        self._render_gate = None
-        if skip_intermediate_render:
-            if self.video_horizon != 1:
-                # With video_horizon > 1, _get_obs reads self.obs[-2], [-3], ...
-                # Those entries are EARLIER SUBSTEPS of the same chunk, whose
-                # frames we would have skipped — the policy would receive
-                # placeholders. Only the single-frame case is safe.
-                raise ValueError(
-                    "skip_intermediate_render requires video_horizon == 1 "
-                    f"(video_delta_indices={video_delta_indices}); with a longer "
-                    "video horizon, _get_obs reads intermediate substeps whose "
-                    "frames would be placeholders."
-                )
-            self._render_gate = self._find_render_gate(env)
-            if self._render_gate is None:
-                raise AttributeError(
-                    "skip_intermediate_render requires an env in the wrapper "
-                    "chain implementing set_camera_obs_enabled() and "
-                    "recompute_observation() (see RoboCasaEnv in "
-                    "robocasa/utils/gym_utils/gymnasium_basic.py). Innermost "
-                    f"env: {type(env.unwrapped).__name__}."
-                )
-            consumer = self._find_substep_obs_consumer(env)
-            if consumer is not None:
-                # e.g. VideoRecordingWrapper, which reads video.* out of every
-                # substep's observation. Skipped substeps carry no video keys,
-                # so it would fail its own "No video frame found" assertion.
-                raise ValueError(
-                    f"skip_intermediate_render is incompatible with "
-                    f"{type(consumer).__name__} in the wrapper chain: it reads "
-                    f"every substep's observation, but skipped substeps produce "
-                    f"no video keys. Disable one of the two."
-                )
-
-    @staticmethod
-    def _walk_chain(env):
-        """Yield env, env.env, ... guarding against cycles."""
-        target = env
-        seen = set()
-        while target is not None and id(target) not in seen:
-            seen.add(id(target))
-            yield target
-            target = getattr(target, "env", None)
-
-    @classmethod
-    def _find_render_gate(cls, env):
-        """Return the first env in the wrapper chain that can gate rendering.
-
-        gym.make() wraps the base env (OrderEnforcing, PassiveEnvChecker, ...)
-        and gymnasium >= 1.0 dropped Wrapper.__getattr__ forwarding, so
-        `env.set_camera_obs_enabled` is not reachable from the outside — we have
-        to walk down to whoever actually implements it. Checking each level
-        before descending means a wrapper that overrides the pair (e.g. to
-        gate several sub-envs) wins over the base env.
-
-        The gate's recompute_observation() must return observations in the same
-        format step() does, so an observation-TRANSFORMING wrapper may not sit
-        between this wrapper and the gate. The wrappers that appear there today
-        (gym.make's OrderEnforcing / PassiveEnvChecker / TimeLimit, and
-        VideoRecordingWrapper) all pass observations through unchanged —
-        VideoRecordingWrapper *reads* them, which is rejected separately by
-        _find_substep_obs_consumer.
-
-        Returns None when nothing in the chain supports it.
-        """
-        for target in cls._walk_chain(env):
-            if hasattr(target, "set_camera_obs_enabled") and hasattr(
-                target, "recompute_observation"
-            ):
-                return target
-        return None
-
-    @classmethod
-    def _find_substep_obs_consumer(cls, env):
-        """Return the first wrapper in the chain that reads EVERY substep's
-        observation (marked with `consumes_every_substep_obs`), or None.
-
-        Such a wrapper is incompatible with skip_intermediate_render, which only
-        produces video keys once per chunk.
-        """
-        for target in cls._walk_chain(env):
-            if getattr(target, "consumes_every_substep_obs", False):
-                return target
-        return None
 
     def convert_observation_space(self, observation_space, video_horizon, state_horizon):
         """
@@ -360,77 +264,28 @@ class MultiStepWrapper(gym.Wrapper):
         # (returns the cached obs with done=True) instead of crashing.
         env_state = {"states": [], "model": []}
         truncated = False
-        # skip_intermediate_render: exactly ONE camera frame per chunk is ever
-        # read. video_horizon == 1 is enforced at construction, so _get_obs below
-        # returns self.obs[-1] alone; the per-substep renders robosuite performs
-        # inside env.step() are pure waste (for RoboCasa, 3 x sim.render at full
-        # camera resolution plus a flip/copy and a resize, every substep).
-        #
-        # Strategy: camera observables stay off for the WHOLE chunk, and the one
-        # frame we keep comes from a forced render after the last substep, NOT
-        # from the sampling inside env.step(). That is observationally exact:
-        # robosuite samples a camera observable once per control step, on the
-        # LAST of its control_timestep/model_timestep physics substeps (the phase
-        # is established by the force_update at the end of MujocoEnv.reset), so
-        # it sees the sim state at the END of the control step — exactly the
-        # state recompute_observation() renders.
-        #
-        # Re-enabling on the last substep instead does NOT work, which is why
-        # this looks roundabout: Observable.set_enabled() calls reset(), which
-        # zeroes the sampling timer but leaves _sampled set. After any
-        # force_update (every env reset ends with one) _sampled is True, so a
-        # re-enabled observable cannot sample for a full control step — the first
-        # chunk renders nothing and yields reset()'s float64 zeros, and later
-        # chunks sample on the FIRST physics substep, one control step stale.
-        # Verified by simulating the real robosuite Observable.
-        skip_render = self.skip_intermediate_render and self.n_action_steps > 1
-        last_step = self.n_action_steps - 1
-        try:
-            if skip_render:
-                self._render_gate.set_camera_obs_enabled(False)
-            for step in range(self.n_action_steps):
-                act = {}
-                for key, value in action.items():
-                    act[key] = value[step, :]
-                if len(self.done) > 0 and self.done[-1]:
-                    # termination
-                    break
-                observation, reward, done, truncated, info = super().step(act)
-                # TODO: assign meaningful values
-                env_state = {"states": [], "model": []}
-                states.append(env_state["states"])
-                rewards.append(reward)
-                dones.append(done)
-                # NOTE: self.reward/self.done are updated BEFORE self.obs here
-                # (the original order was obs first) so that `done` — including
-                # the truncation override below — is known before we decide
-                # whether this substep is the one that needs the real frames.
-                # Nothing between the two reads self.obs, so the reorder is
-                # behavior-preserving.
-                self.reward.append(reward)
-                if (self.max_episode_steps is not None) and (
-                    len(self.reward) >= self.max_episode_steps
-                ):
-                    # truncation
-                    done = True
-                if skip_render and (done or step == last_step):
-                    # Last substep of the chunk, either because we ran them all
-                    # or because this one ended the episode (the loop breaks at
-                    # the top of the next iteration). Render the state we just
-                    # reached; no physics advances. Costs one extra resample of
-                    # the non-camera observables, which returns the same values
-                    # they already hold for this state.
-                    observation = self._render_gate.recompute_observation()
-                self.obs.append(observation)
-                self.done.append(done)
-                self._add_info(info)
-        finally:
-            if skip_render:
-                # Leave the env renderable. reset() and the scene save/restore
-                # RPCs build observations outside this loop and need real
-                # frames; the finally covers the early-break and exception
-                # paths too.
-                self._render_gate.set_camera_obs_enabled(True)
+        for step in range(self.n_action_steps):
+            act = {}
+            for key, value in action.items():
+                act[key] = value[step, :]
+            if len(self.done) > 0 and self.done[-1]:
+                # termination
+                break
+            observation, reward, done, truncated, info = super().step(act)
+            # TODO: assign meaningful values
+            env_state = {"states": [], "model": []}
+            states.append(env_state["states"])
+            rewards.append(reward)
+            dones.append(done)
+            self.obs.append(observation)
+            self.reward.append(reward)
+            if (self.max_episode_steps is not None) and (
+                len(self.reward) >= self.max_episode_steps
+            ):
+                # truncation
+                done = True
+            self.done.append(done)
+            self._add_info(info)
 
         observation = self._get_obs(self.video_delta_indices, self.state_delta_indices)
         reward = aggregate(self.reward, self.reward_agg_method)

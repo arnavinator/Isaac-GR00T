@@ -121,13 +121,6 @@ class VideoRecorder:
 
 
 class VideoRecordingWrapper(gym.Wrapper):
-    # Marks this wrapper as reading the video.* keys out of EVERY substep's
-    # observation (see step()), not just the one MultiStepWrapper surfaces.
-    # MultiStepWrapper refuses to enable skip_intermediate_render when a wrapper
-    # carrying this flag is in the chain, since skipped substeps carry no video
-    # keys at all.
-    consumes_every_substep_obs = True
-
     def __init__(
         self,
         env,

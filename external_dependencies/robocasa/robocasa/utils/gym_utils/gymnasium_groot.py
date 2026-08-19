@@ -97,14 +97,6 @@ class GrootRoboCasaEnv(RoboCasaEnv):
                 raise ValueError(f"Unknown key: {k}")
         mapped_names, camera_names, _, _ = self.key_converter.get_camera_config()
         for mapped_name, camera_name in zip(mapped_names, camera_names):
-            if camera_name + "_image" not in raw_obs:
-                # Camera observables disabled for this substep
-                # (skip_intermediate_render). Emit NO video keys rather than
-                # fabricating frames: this observation is never read — see
-                # MultiStepWrapper.step, which keeps only the observation
-                # recompute_observation() builds at the end of the chunk — and a
-                # fake frame could silently reach the policy if that changed.
-                continue
             obs[mapped_name] = GrootRoboCasaEnv.process_img(
                 raw_obs[camera_name + "_image"]
             )
@@ -123,10 +115,6 @@ class GrootRoboCasaEnv(RoboCasaEnv):
                 ] = np.copy(raw_obs[camera_name + "_image"])
         obs["annotation.human.action.task_description"] = raw_obs["language"]
         return obs
-
-    def recompute_observation(self):
-        """GR00T-format counterpart of RoboCasaEnv.recompute_observation."""
-        return self.get_groot_observation(super().recompute_observation())
 
     def reset(self, seed=None, options=None):
         raw_obs, info = super().reset(seed=seed, options=options)

@@ -143,6 +143,14 @@ class GRPOTrainer:
         self._consecutive_collect_failures = 0
         self._max_consecutive_collect_failures = 3
 
+        # Rollout/load split of Phase 1, refreshed per iteration by
+        # _collect_episodes / _load_cached_episodes and logged as
+        # time/collect_rollout_seconds and time/collect_load_seconds. NaN means
+        # "this sub-phase did not run", which _log_metrics turns into a gap
+        # rather than a 0 data point.
+        self._collect_rollout_time = float("nan")
+        self._collect_load_time = float("nan")
+
     def setup(self):
         """Load the model + LoRA, configure optimizer, validate the resume
         cache (when ``resume_from_collected_data=True``), and start the
@@ -486,6 +494,13 @@ class GRPOTrainer:
             # ═══ Phase 1: Collect episodes (or reuse cached, when this iter
             # is the first resumed iter and resume_from_collected_data=True) ═══
             phase1_start = time.time()
+            # Reset the Phase 1 sub-phase timers HERE rather than inside
+            # _collect_episodes / _load_cached_episodes: subclasses override
+            # those (toy_train_grpo.py does), and an override that doesn't set
+            # the timers would otherwise leave the previous iteration's values
+            # to be re-logged as if they were this iteration's.
+            self._collect_rollout_time = float("nan")
+            self._collect_load_time = float("nan")
             # Derive directly from the iter index instead of carrying a
             # mutable one-shot field across setup() and train(). Cache
             # validation has already passed in setup() (raised otherwise),
@@ -531,6 +546,8 @@ class GRPOTrainer:
                             if used_cached_collection
                             else phase1_time
                         ),
+                        "collect_rollout": self._collect_rollout_time,
+                        "collect_load": self._collect_load_time,
                         "advantage": phase2_time,
                     },
                     lora_delta_norm=self._compute_lora_delta_norm(),
@@ -556,7 +573,9 @@ class GRPOTrainer:
             # Note: at iteration 1 `base` reads ~160 MB low — AdamW allocates
             # exp_avg/exp_avg_sq lazily on the first step().
             vram = self._vram_snapshot(reset_peak=True)
+            phase2b_start = time.time()
             self._compute_ref_log_probs()
+            phase2b_time = time.time() - phase2b_start
             if vram is not None:
                 vram["ref_peak"] = (
                     torch.cuda.max_memory_allocated(self.device) / 1e9
@@ -629,7 +648,20 @@ class GRPOTrainer:
                     "collect": (
                         float("nan") if used_cached_collection else phase1_time
                     ),
+                    # Sub-phases of `collect`: rollout wall time (the collector
+                    # subprocess: robocasa import + worker spawn + rollouts +
+                    # npz writes) vs the trainer-side npz read-back. Without the
+                    # split, a rollout regression and an I/O regression look
+                    # identical on the `collect` curve. Both carry the NaN
+                    # sentinel when the phase didn't run (see
+                    # _collect_episodes / _load_cached_episodes).
+                    "collect_rollout": self._collect_rollout_time,
+                    "collect_load": self._collect_load_time,
                     "advantage": phase2_time,
+                    # Phase 2b. Previously untimed, which left ~10% of every
+                    # iteration unaccounted for when subtracting the logged
+                    # phases from time/iteration_seconds.
+                    "ref_logprob": phase2b_time,
                     "update": phase3_time,
                 },
                 lora_delta_norm=self._compute_lora_delta_norm(),
@@ -640,9 +672,22 @@ class GRPOTrainer:
                 if used_cached_collection
                 else f"{phase1_time:.0f}s"
             )
+            # Mirror the TB split in the console line: rollout vs npz read-back
+            # inside collect, and the ref-logprob pass that used to be invisible
+            # here (it was silently folded into `total`). Each part is shown only
+            # when it ran — on the cached path `load` is the ONLY real work, so
+            # they're reported independently rather than as a pair.
+            parts = []
+            if not math.isnan(self._collect_rollout_time):
+                parts.append(f"rollout={self._collect_rollout_time:.0f}s")
+            if not math.isnan(self._collect_load_time):
+                parts.append(f"load={self._collect_load_time:.1f}s")
+            if parts:
+                collect_label += f" [{', '.join(parts)}]"
             print(
                 f"  Time: collect={collect_label}, "
                 f"advantage={phase2_time:.1f}s, "
+                f"ref_logprob={phase2b_time:.0f}s, "
                 f"update={phase3_time:.0f}s, "
                 f"total={iter_time:.0f}s"
             )
@@ -830,7 +875,14 @@ class GRPOTrainer:
         Spawns a fresh subprocess of collect_episodes.py (in the robocasa
         venv), which writes episodes as .npz files to episode_dir; we then
         load them into self.buffer and run failure handling.
+
+        Records the rollout/load split into self._collect_rollout_time and
+        self._collect_load_time for the time/* TB curves. Both start as NaN so a
+        phase that didn't run (e.g. load, when the subprocess failed) logs a gap
+        instead of a misleading 0.
         """
+        self._collect_rollout_time = float("nan")
+        self._collect_load_time = float("nan")
         self.buffer.clear()
 
         # Prune BEFORE we create this iter's directory so the on-disk dir
@@ -882,14 +934,18 @@ class GRPOTrainer:
             )
 
         # Run collection: spawn a fresh subprocess in the robocasa venv.
+        rollout_start = time.time()
         failure_reason = self._collect_via_subprocess(
             env_name, episode_dir, max_steps, ff_steps,
         )
+        self._collect_rollout_time = time.time() - rollout_start
 
         # Common post-processing: load episodes, then handle any failure.
         n_loaded = 0
         if failure_reason is None:
+            load_start = time.time()
             n_loaded = self.buffer.load_episodes(episode_dir)
+            self._collect_load_time = time.time() - load_start
             if n_loaded == 0:
                 failure_reason = (
                     "zero episodes loaded (collector reported success but "
@@ -985,6 +1041,12 @@ class GRPOTrainer:
         the cached path doesn't dispatch to any collector that would need
         them. The iter directory name is derived from self.iteration alone.
         """
+        # No rollouts ran this iter, so the rollout timer keeps the NaN "did not
+        # run" sentinel set by the caller; the load below is real work and is
+        # timed. (Re-asserting NaN here keeps this method correct if it is ever
+        # called outside the train loop.)
+        self._collect_rollout_time = float("nan")
+        self._collect_load_time = float("nan")
         self.buffer.clear()
 
         # Deliberately do NOT prune older iter dirs here. _prune_old_episode_dirs
@@ -999,7 +1061,9 @@ class GRPOTrainer:
             f"{episode_dir} (skipping collection)."
         )
 
+        load_start = time.time()
         n_loaded = self.buffer.load_episodes(episode_dir)
+        self._collect_load_time = time.time() - load_start
         if n_loaded == 0:
             # Setup validated len(npz_files) > 0, so reaching here means the
             # cache was deleted out from under us. Don't fall through to
@@ -1122,6 +1186,11 @@ class GRPOTrainer:
             cmd.extend(
                 ["--init-state-npz-path", self.config.init_state_npz_path]
             )
+
+        # The collector skips intermediate-substep rendering by default, so only
+        # the opt-out needs to cross the CLI boundary.
+        if not self.config.skip_intermediate_render:
+            cmd.append("--no-skip-intermediate-render")
 
         # Stream collector output line-by-line so the user sees progress
         # instead of waiting for the whole subprocess to finish. Mirror the
@@ -4118,9 +4187,11 @@ class GRPOTrainer:
         if iter_time is not None:
             self.writer.add_scalar("time/iteration_seconds", iter_time, iteration)
 
-        # Phase-time breakdown (collect / advantage / update). The trainer
-        # already times each phase for its console summary; surface them
-        # here so TB can answer "which phase regressed?" without parsing logs.
+        # Phase-time breakdown (collect / collect_rollout / collect_load /
+        # advantage / ref_logprob / update). The trainer already times each
+        # phase for its console summary; surface them here so TB can answer
+        # "which phase regressed?" without parsing logs. `collect` is the total
+        # of Phase 1; collect_rollout + collect_load decompose it.
         # NaN values are sentinels indicating "no real work ran this iter
         # for this phase" (e.g., collect=nan when the iter reused cached
         # episodes via resume_from_collected_data) — skip them so the curve

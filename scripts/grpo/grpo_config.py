@@ -140,6 +140,20 @@ class GRPOConfig:
     # Remaining steps discarded, fresh observation taken, new chunk predicted
     n_action_steps: int = 8
 
+    # Take one camera render per action chunk instead of one per substep.
+    # The collector reads observations with video_delta_indices=[0], so only the
+    # frame at the end of the chunk ever reaches the policy or the saved episode
+    # — the other n_action_steps-1 renders (3 cameras each, for PandaOmron) are
+    # discarded. Skipping them is observationally equivalent, not an
+    # approximation: robosuite samples a camera observable on the LAST physics
+    # substep of each control step, which is the same sim state the wrapper's
+    # forced end-of-chunk render captures. See MultiStepWrapper.step for why
+    # re-enabling mid-chunk instead would yield blank/stale frames, and
+    # scripts/grpo/README.md for the full argument.
+    # Set False to restore the old render-every-substep behavior (e.g. to rule
+    # out a rendering-related regression).
+    skip_intermediate_render: bool = True
+
     # ─── Fast-Forward Branching ──────────────────────────────────────────────
     # Skip the early approach phase by fast-forwarding a single env, then
     # branching all group_size envs from that intermediate state. This focuses

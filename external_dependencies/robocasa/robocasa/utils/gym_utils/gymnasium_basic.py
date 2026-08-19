@@ -225,6 +225,52 @@ class RoboCasaEnv(gym.Env):
     def complete_rollout_dataset_dump(self):
         pass
 
+    def set_camera_obs_enabled(self, enabled):
+        """Enable/disable robosuite's camera observables.
+
+        Disabling stops `sim.render()` from running inside `env.step()`:
+        robosuite gates observable COMPUTATION on `_enabled` (see
+        Observable.update), while `_active` only gates whether the value is
+        returned — so toggling `active` would drop the key without saving the
+        render. While disabled, robosuite omits the `*_image` keys from the
+        observation entirely; `get_groot_observation` handles that by emitting no
+        video keys for that substep.
+
+        Used by MultiStepWrapper's skip_intermediate_render mode, where only the
+        frame taken at the END of an action chunk is read (see that method for
+        why the chunk's own substeps never render). Callers may invoke this
+        freely: it compares against each observable's REAL state and only
+        toggles what needs toggling, which matters because robosuite's
+        set_enabled() also resets the observable.
+        """
+        if not self.enable_render:
+            return
+        for name in self.camera_names:
+            obs_name = f"{name}_image"
+            # Deliberately not cached in an attribute: a cached flag can desync
+            # from the observables (robosuite rebuilds them on an XML reload),
+            # and then both the "already in that state" short-circuit and any
+            # belt-and-braces re-enable elsewhere would silently no-op.
+            observable = self.env._observables.get(obs_name)
+            if observable is not None and observable.is_enabled() != enabled:
+                self.env.modify_observable(obs_name, "enabled", enabled)
+
+    def recompute_observation(self):
+        """Rebuild a full observation from the CURRENT sim state, forcing a
+        camera render. No physics advances.
+
+        `force_update=True` cannot revive a DISABLED observable (robosuite's
+        Observable.update returns early on `not self._enabled`, before it checks
+        `force`), so re-enable first.
+        """
+        self.set_camera_obs_enabled(True)
+        raw_obs = (
+            self.env.viewer._get_observations(force_update=True)
+            if self.env.viewer_get_obs
+            else self.env._get_observations(force_update=True)
+        )
+        return self.get_basic_observation(raw_obs)
+
     def get_basic_observation(self, raw_obs):
         raw_obs.update(gather_robot_observations(self.env))
 
@@ -247,7 +293,14 @@ class RoboCasaEnv(gym.Env):
                     (height, width, 3), dtype=np.uint8
                 )
 
-        self.render_cache = raw_obs[self.render_obs_key]
+        # Camera observables may be disabled for this substep
+        # (skip_intermediate_render): robosuite then omits the *_image keys
+        # entirely. Leave them absent rather than fabricating frames — the only
+        # observation any consumer sees is the one recompute_observation()
+        # builds at the end of the chunk — and keep the previous render_cache
+        # instead of clobbering it with a fake frame.
+        if self.render_obs_key in raw_obs:
+            self.render_cache = raw_obs[self.render_obs_key]
         raw_obs["language"] = self.env.get_ep_meta().get("lang", "")
 
         return raw_obs

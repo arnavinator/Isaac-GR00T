@@ -493,6 +493,16 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         # but doesn't refresh robosuite's observable cache. Without force,
         # _get_observations() returns the XML-loaded observation (step 3
         # state), not the post-restore observation (step 4 state).
+        #
+        # Re-enable camera observables first: force_update cannot revive a
+        # DISABLED observable (robosuite's Observable.update returns early on
+        # `not self._enabled`, before it checks `force`), so a disabled camera
+        # here would silently yield a placeholder branch-point frame — the
+        # observation that seeds every rollout in the group.
+        # MultiStepWrapper.step's finally already restores this; belt-and-braces
+        # because the cost of being wrong is corrupt training data.
+        if hasattr(base_env, "set_camera_obs_enabled"):
+            base_env.set_camera_obs_enabled(True)
         raw_obs = robosuite_env._get_observations(force_update=True)
         basic_obs = base_env.get_basic_observation(raw_obs)
         groot_obs = base_env.get_groot_observation(basic_obs)
@@ -581,6 +591,7 @@ def _make_collector_env(
     total_n_envs: int,
     n_action_steps: int,
     max_episode_steps: int,
+    skip_intermediate_render: bool = True,
 ):
     """Build one wrapped env. Defined at module level so spawn workers can
     import it for unpickling.
@@ -588,6 +599,11 @@ def _make_collector_env(
     Mirrors gr00t.eval.rollout_policy.create_eval_env's structure but uses
     GroupAlignmentWrapper instead of plain MultiStepWrapper, which exposes
     the composite RPCs that EpisodeCollector needs.
+
+    skip_intermediate_render defaults True here (it is False in the wrapper, for
+    eval's benefit): with video_delta_indices=[0] the collector only ever reads
+    the last substep's frames, so rendering the other n_action_steps-1 substeps
+    is wasted sim time.
     """
     env = get_gym_env(env_name, env_idx, total_n_envs)
     return GroupAlignmentWrapper(
@@ -597,6 +613,7 @@ def _make_collector_env(
         n_action_steps=n_action_steps,
         max_episode_steps=max_episode_steps,
         terminate_on_success=True,
+        skip_intermediate_render=skip_intermediate_render,
     )
 
 
@@ -659,6 +676,15 @@ def parse_args():
         help="Save verification images after each branch point to --output-dir/debug_ff/.",
     )
     parser.add_argument(
+        "--no-skip-intermediate-render", dest="skip_intermediate_render",
+        action="store_false",
+        help="Render camera frames on EVERY substep instead of only the last "
+             "one of each action chunk. The default (skip) is observationally "
+             "equivalent — with video_delta_indices=[0] only the last substep's "
+             "frames are ever read — and much faster; pass this to fall back to "
+             "the old behavior if you suspect a rendering-related regression.",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for environment initialization.",
     )
     parser.add_argument(
@@ -715,6 +741,7 @@ class EpisodeCollector:
         debug_fast_forward: bool = False,
         output_dir: str = "/tmp/grpo_episodes",
         num_async_vector_env: int | None = None,
+        skip_intermediate_render: bool = True,
     ):
         self.env_name = env_name
         self.group_size = group_size            # LOGICAL rollouts per group
@@ -739,6 +766,7 @@ class EpisodeCollector:
         self.max_episode_steps = max_episode_steps
         self.debug_fast_forward = debug_fast_forward
         self.output_dir = Path(output_dir)
+        self.skip_intermediate_render = skip_intermediate_render
 
         env_fns = [
             partial(
@@ -748,6 +776,7 @@ class EpisodeCollector:
                 total_n_envs=self.num_envs,
                 n_action_steps=n_action_steps,
                 max_episode_steps=max_episode_steps,
+                skip_intermediate_render=skip_intermediate_render,
             )
             for i in range(self.num_envs)
         ]
@@ -1798,6 +1827,7 @@ def main():
         debug_fast_forward=args.debug_fast_forward,
         output_dir=args.output_dir,
         num_async_vector_env=args.num_async_vector_env,
+        skip_intermediate_render=args.skip_intermediate_render,
     )
 
     try:

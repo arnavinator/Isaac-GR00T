@@ -430,15 +430,21 @@ def test_partial_group_warns_not_raises():
     print("  PASS: partial group warns (not raises)")
 
 
-def test_post_init_rejects_flag_without_resume_from():
-    """GRPOConfig.__post_init__ rejects flag=True without resume_from."""
+def test_post_init_allows_flag_without_resume_from():
+    """flag=True with resume_from omitted is LEGAL: fresh model + cached iter_1.
+
+    This deliberately reversed in 2642b5d. Iteration 1 collects BEFORE any
+    optimizer.step(), so `episode_dir/iter_0001/` was produced by the
+    freshly-initialized policy — reusing it against a fresh model is on-policy
+    by construction, and lets a run whose UPDATE config was wrong restart
+    without paying the collection cost again. Only an explicit empty string is
+    rejected (see test_post_init_rejects_empty_resume_from).
+    """
     from grpo_config import GRPOConfig
-    try:
-        GRPOConfig(resume_from_collected_data=True)
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "requires resume_from" in str(e), f"unexpected message: {e}"
-    print("  PASS: __post_init__ rejects flag without resume_from")
+    cfg = GRPOConfig(resume_from_collected_data=True)
+    assert cfg.resume_from is None, cfg.resume_from
+    assert cfg.resume_from_collected_data is True
+    print("  PASS: __post_init__ allows flag without resume_from (fresh model)")
 
 
 def test_validator_belt_and_suspenders():
@@ -648,7 +654,12 @@ def test_canonical_iter_name_required_when_flag_set():
 
 
 def test_post_init_rejects_empty_resume_from():
-    """resume_from='' with flag=True → ValueError (Bug N)."""
+    """resume_from='' with flag=True → ValueError (Bug N).
+
+    Unlike an omitted resume_from (legal — see
+    test_post_init_allows_flag_without_resume_from), an empty/whitespace string
+    can only come from a quoting typo like `--resume-from ""`.
+    """
     from grpo_config import GRPOConfig
     for empty in ("", "  ", "\t\n"):
         try:
@@ -658,7 +669,7 @@ def test_post_init_rejects_empty_resume_from():
             )
             assert False, f"expected ValueError for resume_from={empty!r}"
         except ValueError as e:
-            assert "non-empty path" in str(e), f"unexpected message: {e}"
+            assert "empty/whitespace" in str(e), f"unexpected message: {e}"
     print("  PASS: empty/whitespace resume_from rejected")
 
 
@@ -1166,7 +1177,7 @@ def test_unicode_digits_in_resume_from_rejected():
 def main():
     tests = [
         # Original suite
-        test_post_init_rejects_flag_without_resume_from,
+        test_post_init_allows_flag_without_resume_from,
         test_validator_belt_and_suspenders,
         test_happy_path_static_mode,
         test_happy_path_dynamic_mode_extra_groups,
@@ -1208,8 +1219,23 @@ def main():
         test_load_cached_raises_on_heterogeneous_fm_corruption,  # FS-F4
     ]
     print(f"=== Running {len(tests)} cache-validation tests ===\n")
+    # Run every test even when one fails. Without this, a single stale assertion
+    # (e.g. one left behind by an intentional semantics change) silently hides
+    # every test after it in the list — this file had two such tests sitting
+    # first, so 34 of 36 never executed.
+    failures = []
     for t in tests:
-        t()
+        try:
+            t()
+        except Exception as e:
+            failures.append((t.__name__, e))
+            print(f"  FAIL: {t.__name__}: {type(e).__name__}: {e}")
+
+    if failures:
+        print(f"\n{len(failures)}/{len(tests)} tests FAILED:")
+        for name, err in failures:
+            print(f"  - {name}: {type(err).__name__}: {err}")
+        raise SystemExit(1)
     print(f"\nAll {len(tests)} tests PASSED.")
 
 

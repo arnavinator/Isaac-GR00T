@@ -30,14 +30,28 @@ gr00t/
     data/embodiment_configs.py  # Posttrain modality configs (pretrain configs in checkpoint)
 
 external_dependencies/
-  robocasa/                       # Base RoboCasa (UT Austin) — MuJoCo kitchen sim
-  robocasa-gr1-tabletop-tasks/
+  robocasa/                       # Base RoboCasa (UT Austin) — MuJoCo KITCHEN tasks.
+                                  # Installed into gr00t/eval/sim/robocasa/robocasa_uv/.venv
+                                  # by setup_RoboCasa.sh → this is the copy the GRPO
+                                  # collector subprocess imports (PandaOmron kitchen envs).
+  robocasa-gr1-tabletop-tasks/    # Fork adding TABLETOP tasks + GR1 support. Separate venv
+                                  # (setup_RoboCasaGR1TabletopTasks.sh).
+  # ⚠ BOTH copies ship their own robocasa/utils/gym_utils/{gymnasium_basic,gymnasium_groot}.py
+  #   and robocasa/models/robots/__init__.py. They have drifted (e.g. the fork adds
+  #   patch_panda_gripper_realism; the base copy emits extra res512/1280x800 video keys).
+  #   Editing one does NOT affect the other — check which venv runs your code path first.
     robocasa/models/robots/__init__.py      # Key converters (PandaOmronKeyConverter, etc.)
     robocasa/utils/gym_utils/
       gymnasium_groot.py                    # GrootRoboCasaEnv gym wrapper, env registration
       gymnasium_basic.py                    # RoboCasaEnv.step() — packs action dict → flat vector
 
 scripts/explore_vla_pipeline.py   # Single-process VLA explorer (model-only, no env needed)
+scripts/grpo/                     # Online GRPO fine-tuning of the DiT via LoRA (the active
+                                  # work in this repo). train_grpo.py is the trainer +
+                                  # inference server; collect_episodes.py is the sim-side
+                                  # collector it spawns in the robocasa venv.
+                                  # scripts/grpo/README.md is the detailed reference —
+                                  # read it before changing anything under scripts/grpo/.
 ```
 
 ## Model Architecture
@@ -100,6 +114,14 @@ Model outputs are **EEF deltas** (Operational Space Control), NOT joint angles o
 - Model predicts 16 future timesteps (for Panda; varies per embodiment via `delta_indices`)
 - `--n_action_steps 8` means `MultiStepWrapper.step()` executes steps 0-7, discards 8-15
 - After executing 8 sub-steps, new observation collected and fresh chunk predicted
+- **Only ONE frame per chunk is ever consumed** (`video_delta_indices=[0]` → `_get_obs`
+  returns `self.obs[-1]`). GRPO collection exploits this via
+  `skip_intermediate_render` (default ON, `MultiStepWrapper`): camera observables stay
+  disabled for the whole chunk and the kept frame comes from a forced render after the
+  last substep. Eval keeps it OFF (video recording needs every substep). Touching this
+  requires understanding robosuite's `Observable` sampling timer — `set_enabled()` resets
+  the timer but NOT `_sampled`, and the phase makes robosuite sample on the LAST physics
+  substep of a control step. See `scripts/grpo/README.md` before changing it.
 
 ## Architecture: Server-Client Evaluation
 Two terminals, two separate venvs (robocasa not in main venv):

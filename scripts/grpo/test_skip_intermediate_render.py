@@ -174,6 +174,11 @@ class FakeSimEnv(gym.Env):
         self.success_at_substep = success_at_substep
 
         self.tick = 0            # physics steps elapsed
+        # Stands in for fixture visuals that Kitchen._post_action ->
+        # update_state() writes into sim.model AFTER the physics loop but BEFORE
+        # step() returns (coffee-liquid / burner-flame / sink-water site_rgba).
+        # A frame rendered after step() returns sees this one increment ahead.
+        self.visual_state = 0
         self.substep = 0         # control steps elapsed
         self.render_count = 0
         self.render_ticks = []
@@ -207,6 +212,7 @@ class FakeSimEnv(gym.Env):
         frame = np.zeros((FRAME_HW, FRAME_HW, 3), dtype=np.uint8)
         frame[0, 0, :] = REAL_FRAME_SENTINEL
         frame[1, 1, :] = self.tick
+        frame[2, 2, :] = self.visual_state % 250
         return frame
 
     # --- robosuite-side plumbing ------------------------------------------
@@ -229,6 +235,15 @@ class FakeSimEnv(gym.Env):
             o = self._observables[f"cam_{i}_image"]
             if o.is_enabled() != enabled:
                 o.set_enabled(enabled)
+
+    def prime_camera_obs(self):
+        """Mirror RoboCasaEnv.prime_camera_obs: restore the never-disabled
+        phase so the sample is taken inside step(), before _post_action."""
+        for i in range(N_CAMS):
+            o = self._observables[f"cam_{i}_image"]
+            o._enabled = True
+            o._sampled = True
+            o._time_since_last_sample = MODEL_DT
 
     def recompute_observation(self):
         self.set_camera_obs_enabled(True)
@@ -270,6 +285,9 @@ class FakeSimEnv(gym.Env):
         for _ in range(N_PHYSICS_SUBSTEPS):
             self.tick += 1
             self._update_observables()
+        # _post_action equivalent: runs after the physics loop, before the
+        # observation is read.
+        self.visual_state += 1
         terminated = self.substep == self.terminate_at_substep
         success = self.substep == self.success_at_substep
         return (
@@ -347,6 +365,16 @@ def _assert_real_frames(obs, context=""):
         ), f"{key} is not a rendered frame{where}"
 
 
+def _frame_visual(obs):
+    """Fixture-visual counter the kept frame was rendered at (see _render)."""
+    vals = {
+        int(np.asarray(obs[k]).reshape(-1, FRAME_HW, FRAME_HW, 3)[0, 2, 2, 0])
+        for k in CAM_KEYS
+    }
+    assert len(vals) == 1, f"cameras disagree on visual state: {vals}"
+    return vals.pop()
+
+
 def _frame_tick(obs):
     """Physics tick the kept frame was rendered at (see FakeSimEnv._render)."""
     ticks = {
@@ -371,6 +399,7 @@ def _chunk_report(skip, n_chunks=4, n_action_steps=8, **kwargs):
         out.append(
             {
                 "frame_tick": _frame_tick(obs) if has_frames else None,
+                "frame_visual": _frame_visual(obs) if has_frames else None,
                 "frame_dtype": _frames_of(obs).dtype,
                 "state_tick": int(np.asarray(obs["state.pos"]).max()),
                 "renders": env.render_count - before,
@@ -456,6 +485,11 @@ def test_frame_provenance_and_dtype_match_baseline():
             f"baseline used {b['frame_tick']}"
         )
         assert s["state_tick"] == b["state_tick"], f"chunk {i}: state drifted"
+        assert s["frame_visual"] == b["frame_visual"], (
+            f"chunk {i}: frame shows fixture-visual state {s['frame_visual']}, "
+            f"baseline shows {b['frame_visual']} — the frame was rendered on "
+            f"the wrong side of _post_action (Kitchen.update_state)"
+        )
         # The frame and the state in one observation must describe one instant.
         assert s["frame_tick"] == s["state_tick"], (
             f"chunk {i}: frame tick {s['frame_tick']} != state tick "
@@ -722,6 +756,10 @@ def test_outer_gate_wins_over_base_env():
         def recompute_observation(self):
             return self.env.recompute_observation()
 
+        def prime_camera_obs(self):
+            self.calls.append("prime")
+            self.env.prime_camera_obs()
+
     base = FakeSimEnv()
     gate = GatingWrapper(base)
     wrapper = MultiStepWrapper(
@@ -832,9 +870,21 @@ def test_parity_with_baseline():
     ):
         base = _chunk_report(skip=False, **kwargs)
         skipped = _chunk_report(skip=True, **kwargs)
-        strip = lambda rows: [   # noqa: E731
-            {k: v for k, v in r.items() if k != "renders"} for r in rows
-        ]
+        # frame_visual is dropped on the TERMINAL chunk only: that chunk falls
+        # back to recompute_observation(), which renders after _post_action, so
+        # its fixture visuals are one update_state() ahead. Harmless because the
+        # collector discards the terminal observation of a chunk that ended — it
+        # records the PRE-step obs (collect_episodes.py:1404) and only refreshes
+        # envs it will step again (:1439-1443). Non-terminal chunks must still
+        # match exactly, which is what catches a wrongly-timed normal render.
+        def strip(rows):
+            out = []
+            for r in rows:
+                r = {k: v for k, v in r.items() if k != "renders"}
+                if r.get("done"):
+                    r.pop("frame_visual", None)
+                out.append(r)
+            return out
         assert strip(base) == strip(skipped), (
             f"parity broken for {kwargs}:\n  base={base}\n  skip={skipped}"
         )
@@ -928,6 +978,25 @@ def test_rejects_multi_frame_state_horizon():
     raise AssertionError("expected ValueError for state_horizon > 1")
 
 
+def test_terminal_chunk_frame_is_discarded_by_the_collector():
+    """The early-termination fallback renders after _post_action, so its
+    fixture visuals are one step ahead. That is only acceptable because the
+    collector never reads a terminated env's post-step observation — this test
+    pins the assumption so it fails if the fallback is ever used elsewhere.
+    """
+    src = (
+        Path(__file__).parent / "collect_episodes.py"
+    ).read_text()
+    assert "obs = observations_per_env[env_idx]" in src, (
+        "collector no longer records the PRE-step observation; the terminal "
+        "frame from recompute_observation() could now reach training data"
+    )
+    assert "if not done_flags[env_idx]:" in src, (
+        "collector no longer filters done envs when refreshing observations"
+    )
+    print("  [PASS] collector still discards terminated envs' post-step obs")
+
+
 TESTS = [
     test_embedded_observable_matches_robosuite,
     test_baseline_renders_every_substep,
@@ -954,6 +1023,7 @@ TESTS = [
     test_rejects_env_without_render_gate,
     test_video_recording_wrapper_declares_the_marker,
     test_rejects_substep_frame_consumer,
+    test_terminal_chunk_frame_is_discarded_by_the_collector,
     test_parity_with_baseline,
 ]
 

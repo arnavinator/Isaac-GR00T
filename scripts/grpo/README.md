@@ -367,18 +367,27 @@ every camera on every one of them — but the collector reads observations with
 (3 cameras × 8 substeps) were computed, flipped, resized to 256², and thrown
 away.
 
-With the flag on, `MultiStepWrapper.step` keeps the robosuite camera observables
-disabled for the **whole** chunk and takes the one frame it needs from a forced
-render after the last substep, via `RoboCasaEnv.set_camera_obs_enabled` /
-`recompute_observation`.
+With the flag on, `MultiStepWrapper.step` disables the robosuite camera
+observables for the chunk, then **primes** them back to their natural sampling
+phase immediately before the last substep (`RoboCasaEnv.prime_camera_obs`) so
+robosuite takes that one sample itself, inside `env.step()`.
 
 - **Observationally exact, not an approximation.** robosuite samples a camera
   observable once per control step, on the LAST of its
   `control_timestep / model_timestep` physics substeps (the phase is established
-  by the `force_update` at the end of `MujocoEnv.reset`), so it sees the sim
-  state at the END of the control step — exactly what `recompute_observation()`
-  renders. Verified by simulating the real `robosuite.utils.observables`
-  `Observable` (`test_skip_intermediate_render.py`).
+  by the `force_update` at the end of `MujocoEnv.reset`). Priming reproduces that
+  phase exactly, so the kept frame is taken at the same physics substep as
+  baseline.
+- **Why priming rather than a forced render after the substep** (the earlier
+  design): `MujocoEnv.step` runs `_post_action` *between* the physics loop and
+  the observation read, and `Kitchen._post_action` calls `update_state()`, which
+  writes fixture visuals into `sim.model` — coffee-liquid, burner-flame and
+  sink-water `site_rgba`, cabinet interior sites (`accessories.py:89-94`,
+  `stove.py`, `sink.py`, `cabinets.py`). A frame rendered once `step()` has
+  returned therefore shows fixture state **one control step ahead** of baseline:
+  a silent, systematic distribution shift versus eval and the pretraining data.
+  `recompute_observation()` survives only as the early-termination fallback,
+  where the collector discards the observation anyway.
 - **Why not just re-enable on the last substep** (the obvious approach, which is
   wrong): `Observable.set_enabled()` calls `Observable.reset()`, which zeroes the
   sampling timer but does **not** clear `_sampled`. Every env reset ends with a

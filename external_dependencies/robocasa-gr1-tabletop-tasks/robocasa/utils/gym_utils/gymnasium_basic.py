@@ -270,9 +270,67 @@ class RoboCasaEnv(gym.Env):
             if observable is not None and observable.is_enabled() != enabled:
                 self.env.modify_observable(obs_name, "enabled", enabled)
 
+    def prime_camera_obs(self):
+        """Re-enable the camera observables in the phase a never-disabled one
+        would have at the START of a control step.
+
+        This is what makes skip_intermediate_render observationally EXACT rather
+        than one control step off. robosuite's step() is:
+
+            for i in range(control_timestep/model_timestep):
+                ...physics...; _update_observables()   # baseline samples at i == last
+            reward, done, info = self._post_action(action)   # Kitchen.update_state()
+            observations = self._get_observations()
+
+        `Kitchen._post_action` calls `update_state()`, which writes fixture
+        visuals into `sim.model` (coffee-liquid / burner-flame / sink-water
+        `site_rgba`, cabinet interior sites). A frame rendered AFTER that — e.g.
+        by a forced update once step() has returned — shows fixture state one
+        control step ahead of the frame baseline keeps. Priming the phase
+        instead lets robosuite take the sample itself, at the same physics
+        substep and therefore the same visual state, as if nothing was toggled.
+
+        The healthy fingerprint is `_sampled=True` with the timer at one
+        model_timestep — exactly what a reset() + force_update leaves behind
+        (MujocoEnv.reset ends with one). From there the timer wraps on the
+        second-to-last substep and the sample lands on the last.
+        """
+        if not self.enable_render:
+            return
+        model_timestep = self.env.model_timestep
+        for name in self.camera_names:
+            observable = self.env._observables.get(f"{name}_image")
+            if observable is None:
+                continue
+            missing = [
+                attr
+                for attr in ("_enabled", "_sampled", "_time_since_last_sample")
+                if not hasattr(observable, attr)
+            ]
+            if missing:
+                # robosuite is installed from git master (setup_RoboCasa.sh), so
+                # its internals can move. Fail loudly rather than silently
+                # falling back to a render that is one update_state() late.
+                raise AttributeError(
+                    f"Observable {name}_image is missing {missing}; "
+                    f"skip_intermediate_render cannot restore its sampling "
+                    f"phase. Run with skip_intermediate_render=False."
+                )
+            observable._enabled = True
+            observable._sampled = True
+            observable._time_since_last_sample = model_timestep
+
     def recompute_observation(self):
         """Rebuild a full observation from the CURRENT sim state, forcing a
         camera render. No physics advances.
+
+        Used ONLY when a chunk ends before its last substep, where no primed
+        sample could have been taken. Note this renders after `_post_action`, so
+        fixture visuals are one update_state() ahead of what the in-step sample
+        would show — acceptable because the collector discards the terminal
+        observation of a chunk that ended (it records the PRE-step obs and only
+        refreshes envs it will step again). Do NOT use it on the normal path;
+        see prime_camera_obs.
 
         `force_update=True` cannot revive a DISABLED observable (robosuite's
         Observable.update returns early on `not self._enabled`, before it checks

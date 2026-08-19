@@ -246,6 +246,17 @@ def main():
         else:
             info("skipping the byte-exact frame comparison (env not reproducible)")
 
+        # --- 2b. the specific way this can be one control step off -----------
+        # A frame rendered after step() returns sees Kitchen._post_action ->
+        # update_state(), which writes fixture visuals (coffee-liquid /
+        # burner-flame / sink-water site_rgba). Byte-equality above covers this,
+        # but call it out so a failure is diagnosable rather than mysterious.
+        if reproducible and not _failures:
+            info(
+                "byte-equality also rules out the _post_action offset "
+                "(fixture visuals rendered one control step late)"
+            )
+
         # --- 3. no blank frames ---------------------------------------------
         blanks = [
             f"chunk {i} {k}"

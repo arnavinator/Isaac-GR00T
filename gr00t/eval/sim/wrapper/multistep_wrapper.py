@@ -210,8 +210,9 @@ class MultiStepWrapper(gym.Wrapper):
             if self._render_gate is None:
                 raise AttributeError(
                     "skip_intermediate_render requires an env in the wrapper "
-                    "chain implementing set_camera_obs_enabled() and "
-                    "recompute_observation() (see RoboCasaEnv in "
+                    "chain implementing set_camera_obs_enabled(), "
+                    "recompute_observation() and prime_camera_obs() (see "
+                    "RoboCasaEnv in "
                     "robocasa/utils/gym_utils/gymnasium_basic.py). Innermost "
                     f"env: {type(env.unwrapped).__name__}."
                 )
@@ -278,8 +279,13 @@ class MultiStepWrapper(gym.Wrapper):
         Returns None when nothing in the chain supports it.
         """
         for target in cls._walk_chain(env):
-            if cls._declares(target, "set_camera_obs_enabled") and cls._declares(
-                target, "recompute_observation"
+            if all(
+                cls._declares(target, name)
+                for name in (
+                    "set_camera_obs_enabled",
+                    "recompute_observation",
+                    "prime_camera_obs",
+                )
             ):
                 return target
         return None
@@ -400,17 +406,17 @@ class MultiStepWrapper(gym.Wrapper):
         # inside env.step() are pure waste (for RoboCasa, 3 x sim.render at full
         # camera resolution plus a flip/copy and a resize, every substep).
         #
-        # Strategy: camera observables stay off for the WHOLE chunk, and the one
-        # frame we keep comes from a forced render after the last substep, NOT
-        # from the sampling inside env.step(). That is observationally exact:
-        # robosuite samples a camera observable once per control step, on the
-        # LAST of its control_timestep/model_timestep physics substeps (the phase
-        # is established by the force_update at the end of MujocoEnv.reset), so
-        # it sees the sim state at the END of the control step — exactly the
-        # state recompute_observation() renders.
+        # Strategy: camera observables are disabled for the chunk, then PRIMED
+        # back to their natural phase immediately before the last substep, so
+        # robosuite takes that sample itself inside env.step(). Observationally
+        # exact: the frame is captured at the same physics substep as baseline
+        # AND before _post_action runs — Kitchen.update_state() writes fixture
+        # visuals there (coffee-liquid / burner-flame / sink-water site_rgba,
+        # cabinet interior sites), which a render issued after step() returns
+        # would show one control step ahead of baseline.
         #
-        # Re-enabling on the last substep instead does NOT work, which is why
-        # this looks roundabout: Observable.set_enabled() calls reset(), which
+        # Plain set_enabled(True) on the last substep does NOT work, which is
+        # why priming exists: Observable.set_enabled() calls reset(), which
         # zeroes the sampling timer but leaves _sampled set. After any
         # force_update (every env reset ends with one) _sampled is True, so a
         # re-enabled observable cannot sample for a full control step — the first
@@ -435,6 +441,13 @@ class MultiStepWrapper(gym.Wrapper):
                 if len(self.done) > 0 and self.done[-1]:
                     # termination
                     break
+                if skip_render and step == last_step:
+                    # Hand the camera observables back the sampling phase they
+                    # would have had if never disabled, so robosuite takes the
+                    # sample itself INSIDE this step() — at the same physics
+                    # substep, and crucially BEFORE _post_action mutates fixture
+                    # visuals. See RoboCasaEnv.prime_camera_obs.
+                    self._render_gate.prime_camera_obs()
                 observation, reward, done, truncated, info = super().step(act)
                 # TODO: assign meaningful values
                 env_state = {"states": [], "model": []}
@@ -458,13 +471,13 @@ class MultiStepWrapper(gym.Wrapper):
                 # must not end up different lengths (the next step would then
                 # mis-bill its truncation budget).
                 self.done.append(done)
-                if skip_render and (done or step == last_step):
-                    # Last substep of the chunk, either because we ran them all
-                    # or because this one ended the episode (the loop breaks at
-                    # the top of the next iteration). Render the state we just
-                    # reached; no physics advances. Costs one extra resample of
-                    # the non-camera observables, which returns the same values
-                    # they already hold for this state.
+                if skip_render and done and step != last_step:
+                    # The chunk ended early, so no primed sample was taken this
+                    # substep. Fall back to a forced render. Its frame reflects
+                    # fixture state one _post_action ahead of an in-step sample
+                    # (see recompute_observation), which is harmless here: the
+                    # collector discards the terminal observation of a chunk
+                    # that ended.
                     observation = self._render_gate.recompute_observation()
                 self.obs.append(observation)
                 self._add_info(info)

@@ -779,13 +779,33 @@ class GRPOConfig:
         # while still treating the cache flag as enabled, leading to a
         # fresh-weight model trained on iter_0001/'s cached episodes.
         if self.resume_from_collected_data:
-            if not self.resume_from or not self.resume_from.strip():
+            # resume_from=None is ALLOWED and means "fresh model, reuse
+            # episode_dir/iter_0001/". That case is on-policy by construction:
+            # iteration 1 collects BEFORE any optimizer.step(), so its episodes
+            # were produced by the freshly-initialized policy — and setup()
+            # seeds torch.manual_seed(config.seed) before LoRA injection, so a
+            # fresh run with the same seed reproduces that policy bit-for-bit.
+            # Typical use: a run whose UPDATE config was wrong (bad lr, bad
+            # gradient_accumulation_steps) but whose collection was fine —
+            # restart clean without paying the ~25 min collection again.
+            #
+            # The reuse is only sound if seed, model_path, and the LoRA
+            # geometry (rank/alpha/target_modules) match the run that wrote
+            # the cache; none of those are checked by
+            # _validate_collected_data_cache, which verifies the
+            # COLLECTION-side invariants (env_name, group counts, group sizes,
+            # FM keys) instead.
+            #
+            # An empty/whitespace string is still rejected: unlike None it
+            # can only arrive from an explicit `--resume-from ""`, which is a
+            # quoting typo rather than a deliberate fresh start.
+            if self.resume_from is not None and not self.resume_from.strip():
                 raise ValueError(
-                    "resume_from_collected_data=True requires resume_from "
-                    "to be a non-empty path. The flag tells the trainer to "
-                    "reuse episodes that were collected by the policy at "
-                    "resume_from's checkpoint; without a checkpoint, the "
-                    "cached episodes have no on-policy guarantee."
+                    "resume_from_collected_data=True with an empty/whitespace "
+                    "resume_from. Pass a real iter_NNNN/ checkpoint path to "
+                    "resume a trained policy, or OMIT --resume-from entirely "
+                    "to start from a fresh model while reusing the cached "
+                    "episodes at episode_dir/iter_0001/."
                 )
 
         # Resolve episode_dir to an absolute path so a CWD change between

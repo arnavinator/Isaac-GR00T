@@ -1261,14 +1261,36 @@ class GRPOTrainer:
         a glance which iter is being skipped and what the cache looked like.
         """
         if not self.config.resume_from:
-            # Belt-and-suspenders: __post_init__ already enforces this. The
-            # double-check makes the caller's contract explicit and protects
-            # against direct setup() invocation that bypassed the dataclass
-            # validation (e.g., a future refactor that mutates config fields
-            # post-construction).
-            raise ValueError(
-                "_validate_collected_data_cache called without resume_from set "
-                "(should have been rejected by GRPOConfig.__post_init__)."
+            # resume_from=None is a SUPPORTED mode, not an error: "fresh model,
+            # reuse iter_0001's episodes". _parse_resume_iteration returns 1 in
+            # that case, so iter_num is 1 here, and setup() skips both
+            # load_lora_checkpoint and the optimizer restore — the policy is
+            # freshly initialized. Iteration 1 collects BEFORE any
+            # optimizer.step(), so its cached episodes are on-policy for that
+            # fresh policy by construction (see GRPOConfig.__post_init__).
+            #
+            # Guard the one combination that would be silently wrong: reusing
+            # some LATER iteration's cache with no checkpoint. Those episodes
+            # were produced by a TRAINED policy, so consuming them with fresh
+            # weights would train on genuinely off-policy data.
+            if iter_num != 1:
+                raise ValueError(
+                    f"resume_from_collected_data=True without resume_from "
+                    f"reuses episode_dir/iter_0001/ against a fresh model, "
+                    f"but the resolved start iteration is {iter_num}. Those "
+                    f"episodes were collected by a TRAINED policy and are "
+                    f"off-policy for fresh weights. Either pass the matching "
+                    f"--resume-from iter_NNNN/ checkpoint, or point "
+                    f"--episode-dir at a cache whose iter_0001/ is the one "
+                    f"you want to reuse."
+                )
+            print(
+                "  resume_from_collected_data without resume_from: starting "
+                "from a FRESH model and reusing iter_0001's episodes "
+                "(on-policy — collected before any gradient step). Ensure "
+                "seed / model_path / lora_rank / lora_alpha / "
+                "lora_target_modules match the run that wrote the cache; "
+                "those are not validated below."
             )
 
         cache_dir = Path(self.config.episode_dir) / f"iter_{iter_num:04d}"

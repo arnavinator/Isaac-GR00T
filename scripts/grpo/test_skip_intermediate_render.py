@@ -997,6 +997,56 @@ def test_terminal_chunk_frame_is_discarded_by_the_collector():
     print("  [PASS] collector still discards terminated envs' post-step obs")
 
 
+def test_render_cache_keeps_the_last_real_frame():
+    """render() must not return a placeholder mid-chunk.
+
+    The fake mirrors RoboCasaEnv.get_basic_observation: render_cache is updated
+    only from a genuinely rendered frame, never from a backfilled blank.
+    """
+    env, wrapper = _make(n_action_steps=8, skip=True)
+    caches = []
+    real_to_groot = FakeSimEnv._to_groot
+
+    def spy(self, raw):
+        out = real_to_groot(self, raw)
+        # Mirror the env's rule: only a real frame refreshes the cache.
+        if "cam_0_image" in raw:
+            self.render_cache = np.asarray(raw["cam_0_image"])
+        caches.append(getattr(self, "render_cache", None))
+        return out
+
+    FakeSimEnv._to_groot = spy
+    try:
+        # Reset first, WITH the spy installed: reset renders normally, so it
+        # seeds render_cache exactly as RoboCasaEnv.reset does in production.
+        wrapper.reset(seed=0)
+        wrapper.step(_action(8))
+    finally:
+        FakeSimEnv._to_groot = real_to_groot
+    assert len(caches) > 8, f"expected reset + 8 substeps, got {len(caches)}"
+    for i, c in enumerate(caches):
+        assert c is not None, f"render_cache unset at obs {i}"
+        assert c.reshape(-1, FRAME_HW, FRAME_HW, 3)[0, 0, 0, 0] == (
+            REAL_FRAME_SENTINEL
+        ), f"render_cache holds a placeholder at obs {i}"
+    # The fake mirrors the contract; the real modules import robosuite/cv2 and
+    # cannot be imported here, so also assert the guard literally exists in both
+    # robocasa copies. Weak, but it turns silent deletion into a failure.
+    root = Path(__file__).parent.parent.parent / "external_dependencies"
+    for copy in ("robocasa", "robocasa-gr1-tabletop-tasks"):
+        src = (
+            root / copy / "robocasa/utils/gym_utils/gymnasium_basic.py"
+        ).read_text()
+        assert "if self.render_obs_key not in backfilled:" in src, (
+            f"{copy}: render_cache no longer guards against placeholders"
+        )
+        assert "backfilled.add(key)" in src, (
+            f"{copy}: the blank-frame backfill loop is gone — skipped substeps "
+            f"would drop video keys and kill the vector-env workers"
+        )
+    print("  [PASS] render_cache only ever holds a real frame (both copies)")
+
+
 TESTS = [
     test_embedded_observable_matches_robosuite,
     test_baseline_renders_every_substep,
@@ -1023,6 +1073,7 @@ TESTS = [
     test_rejects_env_without_render_gate,
     test_video_recording_wrapper_declares_the_marker,
     test_rejects_substep_frame_consumer,
+    test_render_cache_keeps_the_last_real_frame,
     test_terminal_chunk_frame_is_discarded_by_the_collector,
     test_parity_with_baseline,
 ]

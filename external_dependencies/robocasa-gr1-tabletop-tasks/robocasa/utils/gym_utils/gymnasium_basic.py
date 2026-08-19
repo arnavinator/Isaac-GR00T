@@ -335,6 +335,11 @@ class RoboCasaEnv(gym.Env):
         `force_update=True` cannot revive a DISABLED observable (robosuite's
         Observable.update returns early on `not self._enabled`, before it checks
         `force`), so re-enable first.
+
+        CONTRACT: any subclass that reshapes observations (as GrootRoboCasaEnv
+        does) MUST override this to return its own format — MultiStepWrapper
+        appends the result straight into its obs deque alongside step()'s
+        output, so a format mismatch surfaces as a KeyError in _get_obs.
         """
         self.set_camera_obs_enabled(True)
         raw_obs = (
@@ -356,9 +361,11 @@ class RoboCasaEnv(gym.Env):
         # step, so it alone would not have caught it. Every downstream
         # derivation (process_img, res512_*, ego_view_*) then just works. A copy
         # per substep keeps the shared buffers immutable.
+        backfilled = set()
         for key, blank in self._blank_camera_frames.items():
             if key not in raw_obs:
                 raw_obs[key] = blank.copy()
+                backfilled.add(key)
 
         raw_obs.update(gather_robot_observations(self.env))
 
@@ -381,7 +388,10 @@ class RoboCasaEnv(gym.Env):
                     (self.camera_heights, self.camera_widths, 3), dtype=np.uint8
                 )
 
-        self.render_cache = raw_obs[self.render_obs_key]
+        # Keep the last REAL frame: a backfilled placeholder here would make
+        # render() return black for any call landing mid-chunk.
+        if self.render_obs_key not in backfilled:
+            self.render_cache = raw_obs[self.render_obs_key]
         raw_obs["language"] = self.env.get_ep_meta().get("lang", "")
 
         return raw_obs

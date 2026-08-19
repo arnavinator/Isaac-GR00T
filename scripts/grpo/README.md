@@ -393,11 +393,13 @@ render after the last substep, via `RoboCasaEnv.set_camera_obs_enabled` /
   changes.** `RoboCasaEnv.get_basic_observation` backfills a blank frame for any
   `*_image` key robosuite omitted, before any processing, so every derived key
   (`res512_*`, `ego_view_*`) is produced normally. This is mandatory, not
-  cosmetic: `gym.make()` inserts gymnasium's `PassiveEnvChecker` between
-  `MultiStepWrapper` and the base env, and it asserts
-  observation-keys == observation-space-keys on EVERY step
-  (`gymnasium/utils/passive_env_checker.py`, `check_obs`). Dropping the video
-  keys on skipped substeps kills every AsyncVectorEnv worker on the first step.
+  cosmetic: the vector-env observation concatenate indexes EVERY space key on
+  EVERY step (`gymnasium/vector/utils/space_utils.py` on 1.x,
+  `numpy_utils.py` on 0.29.1), so a missing key raises `KeyError` inside the
+  worker. `gym.make`'s `PassiveEnvChecker` asserts the same equality but only on
+  the FIRST step (it latches on `checked_step`), so it is a backstop, not the
+  enforcer. Dropping the video keys on skipped substeps killed every
+  AsyncVectorEnv worker in production.
   The placeholders are never read — `_get_obs` returns `self.obs[-1]`, which is
   always the forced end-of-chunk render.
 - **Attribute probing must not use `hasattr` on the chain.** gymnasium 0.29.1

@@ -149,10 +149,10 @@ class RoboCasaEnv(gym.Env):
 
         # Placeholder frames substituted for skipped renders
         # (skip_intermediate_render). They MUST be present: gymnasium's
-        # PassiveEnvChecker — inserted by gym.make() between MultiStepWrapper and
-        # this env — asserts exact observation-key/observation-space equality on
-        # EVERY step (gymnasium/utils/passive_env_checker.py check_obs), so an
-        # omitted video key kills the worker. Feeding them through the normal
+        # vector-env observation concatenate indexes every space key on every
+        # step, so an omitted video key raises KeyError inside the worker (and
+        # gym.make's PassiveEnvChecker catches it on step 1 only). Feeding them
+        # through the normal
         # processing path also means every derived key (res512_*, ego_view_*)
         # is produced automatically. Sized per camera because the base robocasa
         # copy allows per-camera dimensions.
@@ -298,10 +298,15 @@ class RoboCasaEnv(gym.Env):
     def get_basic_observation(self, raw_obs):
         # Camera observables disabled for this substep (skip_intermediate_render)
         # → robosuite omitted the *_image keys. Fill them in BEFORE any
-        # processing so the observation keeps its exact shape: gymnasium's
-        # PassiveEnvChecker asserts key-set equality on every step, and every
-        # downstream derivation (process_img, res512_*, ego_view_*) then just
-        # works. A copy per substep keeps the shared buffers immutable.
+        # processing so the observation keeps its exact shape: the vector-env
+        # observation concatenate indexes EVERY space key on EVERY step
+        # (gymnasium vector/utils/space_utils.py on 1.x, numpy_utils.py on
+        # 0.29.1), so a missing key raises KeyError inside the worker — this is
+        # what killed all four workers in production. gym.make's
+        # PassiveEnvChecker also asserts key-set equality, but only on the FIRST
+        # step, so it alone would not have caught it. Every downstream
+        # derivation (process_img, res512_*, ego_view_*) then just works. A copy
+        # per substep keeps the shared buffers immutable.
         for key, blank in self._blank_camera_frames.items():
             if key not in raw_obs:
                 raw_obs[key] = blank.copy()

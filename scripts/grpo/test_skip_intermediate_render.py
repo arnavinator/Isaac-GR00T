@@ -844,6 +844,90 @@ def test_parity_with_baseline():
     print("  [PASS] outcomes and frame provenance identical to baseline")
 
 
+def test_no_op_step_on_done_env_does_not_toggle():
+    """A no-op step renders nothing, so it must not touch the observables.
+
+    Toggling anyway runs Observable.set_enabled -> reset(), which replaces the
+    observable's value with float64 zeros and clears its timer while leaving
+    _sampled set. The collector sends zero actions to done envs while siblings
+    finish (collect_episodes.py), so this path runs constantly.
+    """
+    env, wrapper = _make(n_action_steps=8, skip=True, terminate_at_substep=2)
+    wrapper.reset(seed=0)
+    wrapper.step(_action(8))                     # terminates
+    cam = env._observables["cam_0_image"]
+    before = (cam._current_observed_value.dtype, cam._time_since_last_sample)
+    toggles = []
+    real = FakeSimEnv.set_camera_obs_enabled
+    FakeSimEnv.set_camera_obs_enabled = (
+        lambda self, enabled: (toggles.append(enabled), real(self, enabled))[1]
+    )
+    try:
+        wrapper.step(_action(8))                 # no-op on the done env
+    finally:
+        FakeSimEnv.set_camera_obs_enabled = real
+    after = (cam._current_observed_value.dtype, cam._time_since_last_sample)
+    assert toggles == [], f"no-op step toggled the observables: {toggles}"
+    assert before == after, f"observable state changed on a no-op step: {before} -> {after}"
+    print("  [PASS] no-op step on a done env leaves observables untouched")
+
+
+def test_declares_survives_dictless_chain_element():
+    """_walk_chain follows `.env` untyped; vars() would raise TypeError."""
+
+    class Odd(gym.Wrapper):
+        def __init__(self, env):
+            super().__init__(env)
+            self.env = env
+
+    base = FakeSimEnv()
+    w = Odd(base)
+    w.__dict__["env"] = base
+    # A chain element with no instance __dict__ must not crash the probe.
+    assert MultiStepWrapper._declares(object(), "anything") is False
+    assert MultiStepWrapper._declares(42, "anything") is False
+    assert MultiStepWrapper._find_substep_obs_consumer(base) is None
+    print("  [PASS] _declares tolerates chain elements without __dict__")
+
+
+def test_reward_and_done_stay_in_sync_if_recompute_raises():
+    """A failing forced render must not desync self.reward from self.done."""
+    env, wrapper = _make(n_action_steps=8, skip=True)
+    wrapper.reset(seed=0)
+
+    def boom():
+        raise RuntimeError("EGL render failure")
+
+    wrapper._render_gate.recompute_observation = boom
+    try:
+        wrapper.step(_action(8))
+    except RuntimeError:
+        pass
+    assert len(wrapper.reward) == len(wrapper.done), (
+        f"desynced: reward={len(wrapper.reward)} done={len(wrapper.done)}"
+    )
+    print("  [PASS] reward/done stay in sync when the forced render raises")
+
+
+def test_rejects_multi_frame_state_horizon():
+    """state_horizon > 1 reads obs[-2], whose low-dim phase the forced render
+    perturbs — must be refused, same as video_horizon > 1."""
+    env = FakeSimEnv()
+    try:
+        MultiStepWrapper(
+            env,
+            video_delta_indices=np.array([0]),
+            state_delta_indices=np.array([-1, 0]),
+            n_action_steps=8,
+            skip_intermediate_render=True,
+        )
+    except ValueError as e:
+        assert "state_horizon == 1" in str(e), e
+        print("  [PASS] state_horizon > 1 rejected at construction")
+        return
+    raise AssertionError("expected ValueError for state_horizon > 1")
+
+
 TESTS = [
     test_embedded_observable_matches_robosuite,
     test_baseline_renders_every_substep,
@@ -863,6 +947,10 @@ TESTS = [
     test_outer_gate_wins_over_base_env,
     test_single_action_step_never_disables,
     test_rejects_multi_frame_video_horizon,
+    test_rejects_multi_frame_state_horizon,
+    test_no_op_step_on_done_env_does_not_toggle,
+    test_declares_survives_dictless_chain_element,
+    test_reward_and_done_stay_in_sync_if_recompute_raises,
     test_rejects_env_without_render_gate,
     test_video_recording_wrapper_declares_the_marker,
     test_rejects_substep_frame_consumer,

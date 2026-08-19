@@ -99,7 +99,7 @@ class GrootRoboCasaEnv(RoboCasaEnv):
         for mapped_name, camera_name in zip(mapped_names, camera_names):
             # Always present: RoboCasaEnv.get_basic_observation backfills a blank
             # frame when the renders were skipped for this substep, so the key
-            # set stays constant for gymnasium's PassiveEnvChecker.
+            # set stays constant for the vector-env observation concatenate.
             obs[mapped_name] = GrootRoboCasaEnv.process_img(
                 raw_obs[camera_name + "_image"]
             )

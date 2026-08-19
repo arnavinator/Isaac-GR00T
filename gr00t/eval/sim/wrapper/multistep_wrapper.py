@@ -193,6 +193,19 @@ class MultiStepWrapper(gym.Wrapper):
                     "video horizon, _get_obs reads intermediate substeps whose "
                     "frames would be placeholders."
                 )
+            if self.state_horizon is not None and self.state_horizon != 1:
+                # recompute_observation() force-updates EVERY observable, not
+                # just the cameras. Cameras are phase-protected (set_enabled
+                # resets their timer first); low-dim observables are not, so an
+                # extra sample per chunk walks their phase backwards. obs[-1]
+                # stays correct, but a longer state horizon reads obs[-2], which
+                # drifts from baseline.
+                raise ValueError(
+                    "skip_intermediate_render requires state_horizon == 1 "
+                    f"(state_delta_indices={state_delta_indices}); a longer "
+                    "state horizon reads intermediate substeps whose low-dim "
+                    "sampling phase the forced render perturbs."
+                )
             self._render_gate = self._find_render_gate(env)
             if self._render_gate is None:
                 raise AttributeError(
@@ -230,13 +243,19 @@ class MultiStepWrapper(gym.Wrapper):
 
         `hasattr` is wrong here across gymnasium versions: 0.29.1 (what the
         robocasa collector venv pins) forwards unknown attributes down the
-        wrapper chain and emits a deprecation warning for each lookup, so a
-        plain hasattr on the outermost wrapper both returns True for attributes
-        it does not own AND spams one warning per attribute per env. 1.x dropped
-        forwarding entirely. Checking __dict__/type() is version-independent and
+        wrapper chain, so a plain hasattr on the outermost wrapper returns True
+        for attributes it does not own — _find_render_gate would then return the
+        wrapper instead of the env implementing them. It also emits a
+        UserWarning per distinct attribute name. 1.x dropped forwarding
+        entirely. Checking __dict__/type() is version-independent and
         silent.
         """
-        return name in vars(target) or hasattr(type(target), name)
+        # getattr(..., "__dict__", {}) not vars(): _walk_chain follows `.env`
+        # without a type guard, and vars() raises TypeError on any object
+        # without an instance dict.
+        return name in getattr(target, "__dict__", {}) or hasattr(
+            type(target), name
+        )
 
     @classmethod
     def _find_render_gate(cls, env):
@@ -400,8 +419,14 @@ class MultiStepWrapper(gym.Wrapper):
         # Verified by simulating the real robosuite Observable.
         skip_render = self.skip_intermediate_render and self.n_action_steps > 1
         last_step = self.n_action_steps - 1
+        # Nothing to gate if the env is already done: step() is a no-op that
+        # breaks immediately. Toggling anyway would still hit
+        # Observable.set_enabled -> reset(), which zeroes the observable's value
+        # to float64 and its timer while leaving _sampled set — pointless churn
+        # on a path that renders nothing.
+        already_done = bool(self.done) and self.done[-1]
         try:
-            if skip_render:
+            if skip_render and not already_done:
                 self._render_gate.set_camera_obs_enabled(False)
             for step in range(self.n_action_steps):
                 act = {}
@@ -428,6 +453,11 @@ class MultiStepWrapper(gym.Wrapper):
                 ):
                     # truncation
                     done = True
+                # Append to self.done BEFORE the fallible forced render below:
+                # if recompute_observation() raises, self.reward and self.done
+                # must not end up different lengths (the next step would then
+                # mis-bill its truncation budget).
+                self.done.append(done)
                 if skip_render and (done or step == last_step):
                     # Last substep of the chunk, either because we ran them all
                     # or because this one ended the episode (the loop breaks at
@@ -437,10 +467,9 @@ class MultiStepWrapper(gym.Wrapper):
                     # they already hold for this state.
                     observation = self._render_gate.recompute_observation()
                 self.obs.append(observation)
-                self.done.append(done)
                 self._add_info(info)
         finally:
-            if skip_render:
+            if skip_render and not already_done:
                 # Leave the env renderable. reset() and the scene save/restore
                 # RPCs build observations outside this loop and need real
                 # frames; the finally covers the early-break and exception

@@ -25,6 +25,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
+| `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 
 ---
@@ -431,6 +432,43 @@ robosuite takes that one sample itself, inside `env.step()`.
   and dtype against a `skip=False` baseline driven through the real `Observable`
   state machine, early-exit re-render, restore-on-exit, `SyncVectorEnv`
   round-trip. Runs without MuJoCo.
+
+### Dropping unused video keys (`dropped_video_keys`)
+
+RoboCasa's `GrootRoboCasaEnv` emits full-resolution passthrough copies next to
+the keys the model consumes: the base copy adds `video.res512_image_*` beside
+every `video.res256_image_*`, and the GR1 path adds
+`video.ego_view_res1280x800_freq20`. **Nothing reads them** — the processor
+indexes `images[view]` only for the embodiment's configured modality keys
+(`processing_gr00t_n1d6.py:403-412`), which for PandaOmron are the three
+`res256_*` frames — but they are ~80% of the per-chunk video bytes:
+
+| per chunk (PandaOmron) | bytes |
+|---|---|
+| 3 × `res256` (256²×3) | 0.59 MB |
+| 3 × `res512` (512²×3) | 2.36 MB |
+
+The collector drops them (substring match) at the only two points where
+observations leave it: `_batch_per_env_obs` (everything sent to the policy
+server) and `_extract_video_single` (everything written to an `.npz`). The env's
+declared observation space is untouched, so the vector-env key-set contract is
+unaffected.
+
+That shortens four things at once: the npz write, the trainer-side read-back
+(~30 s/iter on a 48-episode buffer), the ZMQ round trip on every outer step
+(3 × 512²×3 × num_envs per query), and the trainer's resident heap — the last
+being what pushes MuJoCo workers into swap and, per
+`_release_memory_to_os`, makes collection "2-3x slower than its non-swapping
+baseline".
+
+- Behavior-preserving: extra keys were always ignored by the processor. If a
+  future checkpoint does consume one, the policy server raises on the missing
+  modality key — loud, not silent.
+- Old cached episodes still load: `EpisodeBuffer.load_episodes` discovers camera
+  names from the npz keys (`episode_buffer.py:247-253`), so a mix of 6-key and
+  3-key episodes is fine.
+- Set `dropped_video_keys=[]` (or pass `--dropped-video-keys` with no values) to
+  restore the previous behavior.
 
 ### Fast-Forward Branching
 

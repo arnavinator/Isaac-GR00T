@@ -154,6 +154,25 @@ class GRPOConfig:
     # out a rendering-related regression).
     skip_intermediate_render: bool = True
 
+    # Video observation keys (substring match) dropped before an observation
+    # reaches the policy server or an episode .npz. RoboCasa emits
+    # full-resolution passthrough copies next to the keys the model consumes —
+    # `res512_image_*` beside every `res256_image_*` for PandaOmron, and
+    # `ego_view_res1280x800_freq20` for GR1. Nothing in scripts/grpo,
+    # gr00t/eval or gr00t/data reads them (the processor selects the
+    # embodiment's configured modality keys), yet they are ~80% of the
+    # per-chunk video bytes: 2.36 MB of 512x512 copies against 0.59 MB of the
+    # 256x256 frames actually used.
+    #
+    # Dropping them shortens the npz write, the trainer read-back, the ZMQ
+    # round trip per outer step, and the trainer's resident heap — the last of
+    # which is what pushes MuJoCo workers into swap (see _release_memory_to_os).
+    # Set to [] to keep every key. If a checkpoint ever consumes one of these,
+    # the policy server raises on the missing modality key — loud, not silent.
+    dropped_video_keys: list[str] = field(
+        default_factory=lambda: ["res512", "ego_view_res1280x800"]
+    )
+
     # ─── Fast-Forward Branching ──────────────────────────────────────────────
     # Skip the early approach phase by fast-forwarding a single env, then
     # branching all group_size envs from that intermediate state. This focuses

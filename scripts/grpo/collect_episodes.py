@@ -580,6 +580,45 @@ class GroupAlignmentWrapper(MultiStepWrapper):
         return np.array(self.env.unwrapped.env.sim.get_state().flatten())
 
 
+# Video observation keys dropped before the obs is sent to the policy server or
+# written to an episode .npz. RoboCasa's GrootRoboCasaEnv emits full-resolution
+# passthrough copies alongside the keys the model actually consumes: the base
+# copy adds `video.res512_image_*` next to every `video.res256_image_*`, and the
+# GR1 path adds `video.ego_view_res1280x800_freq20`. Neither is referenced
+# anywhere in scripts/grpo, gr00t/eval or gr00t/data — the processor selects the
+# embodiment's configured modality keys (res256_* for PandaOmron) and ignores the
+# rest — but they dominate the payload: for PandaOmron the three 512x512 copies
+# are 2.36 MB/chunk against 0.59 MB for the three 256x256 frames the model reads.
+#
+# Dropping them cuts ~80% of the per-chunk video bytes, which shortens the npz
+# write, the trainer-side read-back, the ZMQ round trip on every outer step, and
+# the trainer's resident heap (heap pressure is what pushes MuJoCo workers into
+# swap — see _release_memory_to_os in train_grpo.py).
+#
+# Substring match, so it is embodiment-agnostic. If a future checkpoint actually
+# consumes one of these, the failure is loud and immediate: the policy server
+# raises on the missing modality key.
+DEFAULT_DROPPED_VIDEO_KEYS = ("res512", "ego_view_res1280x800")
+
+
+def _drop_unused_video_keys(obs: dict, dropped: tuple) -> dict:
+    """Return `obs` without the video keys matching any `dropped` substring.
+
+    Returns the SAME dict when nothing matches, so the common path allocates
+    nothing.
+    """
+    if not dropped:
+        return obs
+    unwanted = [
+        k
+        for k in obs
+        if ("image" in k or "video" in k) and any(d in k for d in dropped)
+    ]
+    if not unwanted:
+        return obs
+    return {k: v for k, v in obs.items() if k not in unwanted}
+
+
 # ---------------------------------------------------------------------------
 # Env factory (used by AsyncVectorEnv subprocess workers)
 # ---------------------------------------------------------------------------
@@ -676,6 +715,16 @@ def parse_args():
         help="Save verification images after each branch point to --output-dir/debug_ff/.",
     )
     parser.add_argument(
+        "--dropped-video-keys", nargs="*", default=list(DEFAULT_DROPPED_VIDEO_KEYS),
+        metavar="SUBSTR",
+        help="Video obs keys containing any of these substrings are dropped "
+             "before the obs reaches the policy server or an episode .npz. "
+             "Default drops RoboCasa's full-resolution passthrough copies "
+             "(res512_*, ego_view_res1280x800), which no code in this repo "
+             "reads and which are ~80%% of the per-chunk video bytes. Pass the "
+             "flag with no values to keep every key.",
+    )
+    parser.add_argument(
         "--no-skip-intermediate-render", dest="skip_intermediate_render",
         action="store_false",
         help="Render camera frames on EVERY substep instead of only the last "
@@ -742,6 +791,7 @@ class EpisodeCollector:
         output_dir: str = "/tmp/grpo_episodes",
         num_async_vector_env: int | None = None,
         skip_intermediate_render: bool = True,
+        dropped_video_keys: tuple = DEFAULT_DROPPED_VIDEO_KEYS,
     ):
         self.env_name = env_name
         self.group_size = group_size            # LOGICAL rollouts per group
@@ -767,6 +817,7 @@ class EpisodeCollector:
         self.debug_fast_forward = debug_fast_forward
         self.output_dir = Path(output_dir)
         self.skip_intermediate_render = skip_intermediate_render
+        self.dropped_video_keys = tuple(dropped_video_keys or ())
 
         env_fns = [
             partial(
@@ -842,6 +893,10 @@ class EpisodeCollector:
         )
         print(f"  Vector env: {'AsyncVectorEnv' if self._uses_async else 'SyncVectorEnv'}")
         print(f"  Server: {server_host}:{server_port}")
+        print(
+            f"  Dropped video keys: "
+            f"{list(self.dropped_video_keys) or '(none — keeping every key)'}"
+        )
 
     # ─── Outer driver ─────────────────────────────────────────────────────
 
@@ -1606,6 +1661,12 @@ class EpisodeCollector:
         """
         if not obs_list:
             return {}
+        # Filter here rather than at the source: this is the single path by
+        # which observations reach the policy server, and it leaves the env's
+        # declared observation space untouched.
+        obs_list = [
+            _drop_unused_video_keys(o, self.dropped_video_keys) for o in obs_list
+        ]
         batched = {}
         for key in obs_list[0]:
             vals = [obs[key] for obs in obs_list]
@@ -1691,6 +1752,7 @@ class EpisodeCollector:
         """
         frames = {}
         if isinstance(obs, dict):
+            obs = _drop_unused_video_keys(obs, self.dropped_video_keys)
             for key, value in obs.items():
                 if "image" in key or "video" in key:
                     clean_key = key.removeprefix("video.")
@@ -1828,6 +1890,7 @@ def main():
         output_dir=args.output_dir,
         num_async_vector_env=args.num_async_vector_env,
         skip_intermediate_render=args.skip_intermediate_render,
+        dropped_video_keys=tuple(args.dropped_video_keys),
     )
 
     try:

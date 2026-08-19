@@ -1192,6 +1192,12 @@ class GRPOTrainer:
         if not self.config.skip_intermediate_render:
             cmd.append("--no-skip-intermediate-render")
 
+        # Always pass the list explicitly (nargs="*", so an empty list becomes a
+        # bare flag) — the collector's default and the config default must not be
+        # able to drift apart silently.
+        cmd.append("--dropped-video-keys")
+        cmd.extend(self.config.dropped_video_keys)
+
         # Stream collector output line-by-line so the user sees progress
         # instead of waiting for the whole subprocess to finish. Mirror the
         # collector's stdout/stderr to the trainer log with a "[collector]"

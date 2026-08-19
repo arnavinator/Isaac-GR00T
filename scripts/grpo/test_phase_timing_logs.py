@@ -32,6 +32,10 @@ STATS = {"success_rate": 0.1, "mean_reward": 0.1, "std_reward": 0.3}
 
 # Sleeps long enough to dominate scheduler noise, short enough to keep the suite
 # fast. Asserted against half their value so the tests aren't flaky.
+# Stale value pre-seeded into the timer fields by the fixtures, so a test
+# asserting NaN/freshness fails if production forgets to set them.
+STALE_SENTINEL = 999.0
+
 ROLLOUT_SLEEP = 0.30
 LOAD_SLEEP = 0.15
 
@@ -104,8 +108,10 @@ def _bare_trainer(load_sleep=0.0, **config_kwargs):
     trainer.buffer = FakeBuffer(load_sleep=load_sleep)
     trainer._consecutive_collect_failures = 0
     trainer._max_consecutive_collect_failures = 3
-    trainer._collect_rollout_time = float("nan")
-    trainer._collect_load_time = float("nan")
+    # Seed a stale FINITE sentinel, never NaN: assertions that a timer "is NaN"
+    # would otherwise pass whether or not production actually reset it.
+    trainer._collect_rollout_time = STALE_SENTINEL
+    trainer._collect_load_time = STALE_SENTINEL
     return trainer
 
 
@@ -281,6 +287,9 @@ def test_failed_collection_leaves_load_time_nan():
         assert math.isfinite(trainer._collect_rollout_time), (
             "the subprocess did run, so its time should be recorded"
         )
+        assert trainer._collect_load_time != STALE_SENTINEL, (
+            "load timer was never touched — the stale pre-seeded value survived"
+        )
         assert math.isnan(trainer._collect_load_time), (
             "no load ran; expected the NaN sentinel"
         )
@@ -294,6 +303,9 @@ def test_cached_load_marks_rollout_nan():
         trainer = _bare_trainer(episode_dir=tmp, load_sleep=LOAD_SLEEP)
         trainer._load_cached_episodes()
 
+        assert trainer._collect_rollout_time != STALE_SENTINEL, (
+            "rollout timer was never touched — the stale pre-seeded value survived"
+        )
         assert math.isnan(trainer._collect_rollout_time), (
             "no rollouts ran; expected the NaN sentinel"
         )
@@ -331,6 +343,85 @@ def test_timers_not_carried_across_iterations_by_a_subclass():
     print("  [PASS] stale sub-phase timers can't leak into a later iteration")
 
 
+def test_collector_cli_flag_only_appended_when_disabled():
+    """The opt-out must cross the CLI boundary in the right direction.
+
+    Inverting this condition would silently run every collection in the opposite
+    render mode from what the config says, with no other symptom.
+    """
+    import inspect
+
+    from collect_episodes import parse_args
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for flag_value in (True, False):
+            trainer = _bare_trainer(
+                episode_dir=tmp, skip_intermediate_render=flag_value
+            )
+            trainer.iteration = 1
+            captured = {}
+
+            def fake_popen(cmd, **kwargs):
+                captured["cmd"] = cmd
+                raise RuntimeError("stop here — we only want the argv")
+
+            import subprocess as _sp
+
+            real_popen = _sp.Popen
+            _sp.Popen = fake_popen
+            try:
+                trainer._collect_via_subprocess(
+                    "robocasa_panda_omron/Fake_Env", Path(tmp), 480, 0
+                )
+            except RuntimeError:
+                pass
+            finally:
+                _sp.Popen = real_popen
+
+            cmd = captured["cmd"]
+            present = "--no-skip-intermediate-render" in cmd
+            assert present == (not flag_value), (
+                f"config skip_intermediate_render={flag_value} produced "
+                f"--no-skip-intermediate-render present={present}"
+            )
+
+    # And the collector must parse that flag to the matching value.
+    sig = inspect.signature(parse_args)
+    assert sig is not None
+    import sys as _sys
+
+    argv = _sys.argv
+    base = ["collect_episodes.py", "--env-name", "e", "--output-dir", "/tmp/x"]
+    try:
+        _sys.argv = base
+        assert parse_args().skip_intermediate_render is True
+        _sys.argv = base + ["--no-skip-intermediate-render"]
+        assert parse_args().skip_intermediate_render is False
+    finally:
+        _sys.argv = argv
+    print("  [PASS] --no-skip-intermediate-render wiring is direction-correct")
+
+
+def test_no_signal_skip_path_logs_collect_subphases():
+    """The early-skip log site is a separate call site from the normal one and
+    must carry the same Phase 1 sub-phases."""
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = _stub_trainer_for_train_loop(tmp)
+        # std_reward == 0 routes through the "no gradient signal" continue.
+        trainer.buffer.stats = lambda: {
+            "success_rate": 0.0, "mean_reward": 0.0, "std_reward": 0.0
+        }
+        trainer.train()
+        tags = _time_tags(trainer)
+        assert "time/collect_rollout_seconds" in tags, tags
+        assert "time/collect_load_seconds" in tags, tags
+        assert "time/collect_seconds" in tags, tags
+        # The phases that never ran must not appear.
+        assert "time/ref_logprob_seconds" not in tags, tags
+        assert "time/update_seconds" not in tags, tags
+    print("  [PASS] no-signal skip path logs the Phase 1 sub-phases")
+
+
 TESTS = [
     test_train_loop_emits_every_phase_curve,
     test_train_loop_cached_iter_gaps_rollout_only,
@@ -339,6 +430,8 @@ TESTS = [
     test_failed_collection_leaves_load_time_nan,
     test_cached_load_marks_rollout_nan,
     test_timers_not_carried_across_iterations_by_a_subclass,
+    test_collector_cli_flag_only_appended_when_disabled,
+    test_no_signal_skip_path_logs_collect_subphases,
 ]
 
 

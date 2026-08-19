@@ -88,10 +88,15 @@ def fixed_actions(wrapper, n_chunks, seed=0):
     return chunks
 
 
-def instrument_renders(base_env):
-    """Count real sim.render() calls. Returns a dict with a 'n' counter."""
+def instrument_renders(base_env, counter):
+    """Patch the CURRENT sim's render() to count calls; returns a restore fn.
+
+    Must be re-applied after every reset: robocasa envs are built with
+    hard_reset=True (kitchen.py / tabletop.py), so MujocoEnv.reset destroys and
+    rebuilds self.sim, and a patch installed on the previous sim object counts
+    nothing afterwards.
+    """
     sim = base_env.env.sim
-    counter = {"n": 0}
     original = sim.render
 
     def counting_render(*args, **kwargs):
@@ -99,14 +104,15 @@ def instrument_renders(base_env):
         return original(*args, **kwargs)
 
     sim.render = counting_render
-    counter["restore"] = lambda: setattr(sim, "render", original)
-    return counter
+    return lambda: setattr(sim, "render", original)
 
 
 def rollout(wrapper, base_env, counter, actions, skip, seed):
     """Replay `actions` with the flag forced to `skip`; return per-chunk frames."""
     wrapper.skip_intermediate_render = skip
     obs, _ = wrapper.reset(seed=seed)
+    # Instrument AFTER the reset — see instrument_renders.
+    restore = instrument_renders(base_env, counter)
     counter["n"] = 0
     t0 = time.perf_counter()
     per_chunk = []
@@ -116,6 +122,7 @@ def rollout(wrapper, base_env, counter, actions, skip, seed):
         if terminated or truncated:
             break
     elapsed = time.perf_counter() - t0
+    restore()
     return {
         "frames": per_chunk,
         "renders": counter["n"],
@@ -159,7 +166,12 @@ def main():
     print(f"  {INFO}  gate class: {type(gate).__name__} "
           f"from {type(gate).__module__}")
 
-    counter = instrument_renders(gate)
+    counter = {"n": 0}
+    # Physical cameras, NOT observation keys: the base robocasa copy emits a
+    # res512_* companion for every res256_* key, so counting video keys would
+    # double the expected render count.
+    n_cams = len(gate.camera_names)
+    print(f"  {INFO}  physical cameras: {n_cams} ({list(gate.camera_names)})")
     try:
         actions = fixed_actions(wrapper, args.n_chunks, seed=0)
 
@@ -187,7 +199,6 @@ def main():
             f"{base['n_chunks']} vs {skipped['n_chunks']}",
         )
 
-        n_cams = len(base["frames"][0]) if base["frames"] else 0
         info(
             f"renders: baseline={base['renders']} "
             f"skipped={skipped['renders']} "
@@ -229,7 +240,8 @@ def main():
                 not mismatches,
                 "kept frames are byte-identical to the unskipped path",
                 "; ".join(mismatches[:4]) if mismatches else
-                f"{base['n_chunks']} chunks x {n_cams} cameras",
+                f"{base['n_chunks']} chunks x {n_cams} cameras "
+                f"({len(base['frames'][0])} video keys)",
             )
         else:
             info("skipping the byte-exact frame comparison (env not reproducible)")
@@ -260,7 +272,6 @@ def main():
                 "substep cost; check MUJOCO_GL/EGL and camera resolution"
             )
     finally:
-        counter["restore"]()
         wrapper.close()
 
     print()

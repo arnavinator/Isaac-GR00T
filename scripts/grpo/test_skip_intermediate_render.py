@@ -557,13 +557,46 @@ def test_gym_make_chain_with_passive_env_checker():
     print(f"  [PASS] survives the real gym.make chain ({' -> '.join(chain)})")
 
 
-def test_gate_lookup_emits_no_warnings():
+def test_declares_ignores_wrapper_forwarding():
     """Attribute probing must not rely on wrapper forwarding.
 
     gymnasium 0.29.1 (pinned by the robocasa collector venv) forwards unknown
-    attributes down the chain and warns on every lookup; 1.x dropped forwarding.
-    Probing type()/__dict__ instead is silent and correct on both.
+    attributes down the chain — so `hasattr(outer, "set_camera_obs_enabled")` is
+    True for a wrapper that does NOT implement it, and `_find_render_gate` would
+    return the wrapper instead of the env that owns the method. 1.x dropped
+    forwarding, which is why this cannot be observed by running the local suite:
+    the check below simulates a 0.29.1-style forwarding wrapper explicitly so it
+    is meaningful on BOTH versions.
     """
+
+    class ForwardingWrapper(gym.Wrapper):
+        """Mimics gymnasium 0.29.1's Wrapper.__getattr__."""
+
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return getattr(self.env, name)
+
+    base = FakeSimEnv()
+    fwd = ForwardingWrapper(base)
+
+    assert hasattr(fwd, "set_camera_obs_enabled"), (
+        "fixture is wrong: this wrapper is supposed to forward"
+    )
+    assert not MultiStepWrapper._declares(fwd, "set_camera_obs_enabled"), (
+        "_declares must not credit a wrapper for a forwarded attribute"
+    )
+    assert MultiStepWrapper._declares(base, "set_camera_obs_enabled")
+    gate = MultiStepWrapper._find_render_gate(fwd)
+    assert gate is base, (
+        f"gate resolved to {type(gate).__name__}; forwarding fooled the walk"
+    )
+    print("  [PASS] _declares sees through wrapper attribute forwarding")
+
+
+def test_gate_lookup_emits_no_warnings():
+    """Companion to the above: the probe must also be silent (0.29.1 warns per
+    forwarded lookup, which produced pages of log spam in production)."""
     import warnings
 
     env_id = "test/SkipRenderFake-v0"
@@ -709,10 +742,21 @@ def test_single_action_step_never_disables():
     env, wrapper = _make(n_action_steps=1, skip=True)
     wrapper.reset()
     env.render_count = 0
-    obs, _, _, _, _ = wrapper.step(_action(1))
+    toggles = []
+    real_toggle = FakeSimEnv.set_camera_obs_enabled
+    FakeSimEnv.set_camera_obs_enabled = (
+        lambda self, enabled: (toggles.append(enabled), real_toggle(self, enabled))[1]
+    )
+    try:
+        obs, _, _, _, _ = wrapper.step(_action(1))
+    finally:
+        FakeSimEnv.set_camera_obs_enabled = real_toggle
     assert env.render_count == N_CAMS, env.render_count
     _assert_real_frames(obs, "n_action_steps=1")
-    print("  [PASS] n_action_steps=1 keeps the plain path")
+    # The point of the n_action_steps > 1 guard: with a single substep there is
+    # nothing to skip, so the gating machinery must not engage at all.
+    assert toggles == [], f"gating engaged for a single-substep chunk: {toggles}"
+    print("  [PASS] n_action_steps=1 keeps the plain path (no gating)")
 
 
 def test_rejects_multi_frame_video_horizon():
@@ -749,6 +793,20 @@ def test_rejects_env_without_render_gate():
         print("  [PASS] env without the render-gate interface rejected")
         return
     raise AssertionError("expected AttributeError for an env without the gate")
+
+
+def test_video_recording_wrapper_declares_the_marker():
+    """The guard is only useful if the real VideoRecordingWrapper carries the
+    marker — the test below uses a local fixture, which would stay green if the
+    production attribute were dropped."""
+    from gr00t.eval.sim.wrapper.video_recording_wrapper import VideoRecordingWrapper
+
+    assert getattr(VideoRecordingWrapper, "consumes_every_substep_obs", False) is True, (
+        "VideoRecordingWrapper must declare consumes_every_substep_obs; "
+        "create_eval_env puts it between MultiStepWrapper and the base env and "
+        "it reads every substep's video.* keys"
+    )
+    print("  [PASS] production VideoRecordingWrapper declares the marker")
 
 
 def test_rejects_substep_frame_consumer():
@@ -795,6 +853,7 @@ TESTS = [
     test_first_chunk_after_forced_update_is_real,
     test_every_substep_keeps_the_full_key_set,
     test_gym_make_chain_with_passive_env_checker,
+    test_declares_ignores_wrapper_forwarding,
     test_gate_lookup_emits_no_warnings,
     test_sync_vector_env_roundtrip,
     test_early_termination_still_returns_real_frames,
@@ -805,6 +864,7 @@ TESTS = [
     test_single_action_step_never_disables,
     test_rejects_multi_frame_video_horizon,
     test_rejects_env_without_render_gate,
+    test_video_recording_wrapper_declares_the_marker,
     test_rejects_substep_frame_consumer,
     test_parity_with_baseline,
 ]

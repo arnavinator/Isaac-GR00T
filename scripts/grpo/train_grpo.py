@@ -72,6 +72,57 @@ _POS_SCALE_PRIOR = 0.05  # within-iter seed from last iter's EMA (~a few % of an
 _POS_SCALE_EPS = 1e-8
 
 
+def clip_killed_gradient(
+    ratio: torch.Tensor,
+    surr1: torch.Tensor,
+    surr2: torch.Tensor,
+    clip_eps_low: float,
+    clip_eps_high: float,
+) -> torch.Tensor:
+    """Which rows had their CLIP-TERM gradient zeroed by the clamp.
+
+    Module-level (not inlined in _grpo_update_inner) so tests exercise the real
+    predicate instead of re-deriving it — a re-derived copy would keep passing
+    if this expression were changed.
+
+    `torch.min(surr1, surr2)` returns the clamped bound iff `surr2 <= surr1`;
+    that bound is a CONSTANT in `ratio` only when the clamp actually moved the
+    ratio. Hence the conjunction. Verified against all four cases:
+
+        A>0, rho < 1-lo : surr1 = A*rho < A*(1-lo) = surr2  -> min picks surr1, ALIVE
+        A>0, rho > 1+hi : surr1 = A*rho > A*(1+hi) = surr2  -> min picks surr2, DEAD
+        A<0, rho < 1-lo : surr1 = A*rho > A*(1-lo) = surr2  -> min picks surr2, DEAD
+        A<0, rho > 1+hi : surr1 = A*rho < A*(1+hi) = surr2  -> min picks surr1, ALIVE
+
+    i.e. positive-advantage rows can only ever die on the UPPER bound and
+    negative ones only on the LOWER bound. That asymmetry is what the
+    sign-agnostic `clipfrac` hides, and it is why a large `jitter_pos` — which
+    pushes every positive row's ratio BELOW `1-clip_eps_low` — inflates
+    `clipfrac` to ~1.0 while killing nothing.
+
+    NAMING CAVEAT: this is the gradient of the CLIP TERM only. With
+    kl_coef_last_iter / kl_coef_base_model > 0 (both default 0.2) a "dead" row
+    still passes gradient through its KL terms, which depend on
+    current_log_probs regardless of the clamp. So this is not "the row
+    contributed no gradient", it is "the surrogate contributed no gradient".
+
+    ZERO-ADVANTAGE ROWS. `A == 0` gives `surr1 == surr2`, so the `surr2 <= surr1`
+    half is satisfied — but the conjunction still requires `clamp_moved`. So a
+    zero-advantage row is reported DEAD only if its ratio is outside the band and
+    ALIVE if inside, even though it has no gradient either way. That is the right
+    call for a metric named after the clip (the clip is not what killed it), but
+    it under-reports in one reachable case: under per-minibatch renorm a
+    minibatch whose rows all share a single advantage value z-scores to exactly
+    0.0 on every row (the `+1e-8` epsilon case documented in _grpo_update_inner),
+    and those rows then land in the `_neg` bucket — `post_renorm_pos_mask` is
+    all-False — diluting `clipfrac_effective_neg` toward the clamp-moved fraction
+    instead of the 1.0 that "no gradient" would suggest. Watch
+    `n_pos_flipped_by_renorm` and the `_neg` denominator if that curve looks odd.
+    """
+    clamp_moved = (ratio < 1 - clip_eps_low) | (ratio > 1 + clip_eps_high)
+    return clamp_moved & (surr2 <= surr1)
+
+
 class GRPOTrainer:
     """GRPO training loop for GR00T N1.6 DiT with LoRA.
 
@@ -150,6 +201,19 @@ class GRPOTrainer:
         # rather than a 0 data point.
         self._collect_rollout_time = float("nan")
         self._collect_load_time = float("nan")
+
+        # Reference-MSE diagnostics, refreshed per iteration by
+        # _compute_ref_log_probs and emitted as ref_mse/* (see _log_metrics).
+        # MSE_ref = -ref_log_prob is the reference policy's own FM loss on the
+        # action IT sampled, and it is the HARD CEILING on the importance ratio:
+        #     log rho = MSE_ref - MSE_theta,  MSE_theta >= 0  =>  rho <= e^MSE_ref
+        # so it is the total reinforcement headroom available on a chunk. It
+        # costs nothing to log (the values are already on the chunks) and it is
+        # the only direct read on positive-branch saturation: MSE_ref falling
+        # toward 0 on positive-advantage chunks means the surrogate has nothing
+        # left to gain there, no matter how the advantage is weighted.
+        # None = the ref pass has not run this iteration (skipped iter).
+        self._ref_mse_stats: dict | None = None
 
     def setup(self):
         """Load the model + LoRA, configure optimizer, validate the resume
@@ -474,6 +538,12 @@ class GRPOTrainer:
             frac = max(frac, 0.1)  # Don't decay below 10% of initial LR
             lr = frac * self.config.learning_rate
             self.optimizer.param_groups[0]["lr"] = lr
+
+            # Clear last iteration's MSE_ref summary so an iteration that never
+            # reaches the ref pass (collection failure, all-dead buffer) leaves a
+            # gap in the ref_mse/* curves instead of silently re-emitting the
+            # previous iteration's numbers at this step.
+            self._ref_mse_stats = None
 
             # --- Select task for this iteration (round-robin across env_names) ---
             # Each iteration focuses on ONE task and collects all num_groups for it.
@@ -1970,6 +2040,123 @@ class GRPOTrainer:
         else:
             print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
 
+        self._ref_mse_stats = self._summarize_ref_mse(chunks, compute_base)
+
+    def _summarize_ref_mse(self, chunks: list, compute_base: bool) -> dict | None:
+        """Summarize MSE_ref (= -ref_log_prob) over this iteration's live chunks.
+
+        Why this is worth a TB curve. The FM surrogate's importance ratio is
+
+            log rho = MSE_ref(a) - MSE_theta(a),     MSE_theta >= 0
+
+        so `rho <= exp(MSE_ref)` is a HARD upper bound, and MSE_ref is therefore
+        the entire reinforcement headroom on a chunk: no amount of advantage
+        weighting (PAWS / tratio / balanced sampling) can move a positive row's
+        surrogate further than that. Two things follow that nothing else in the
+        metric set surfaces:
+
+        1. `ratio_ceiling_mean = mean(exp(MSE_ref))` says whether clip_eps_high
+           is even reachable. If it reads ~1.01 while clip_eps_high=0.2, the
+           upper clip is inert by construction, not by tuning.
+        2. MSE_ref on POSITIVE-advantage chunks is the direct measure of
+           positive-branch saturation. The FM loss is least-squares, so the
+           gradient is proportional to the residual; as the DiT fits a
+           successful chunk, MSE_ref -> 0 and the reinforcement gradient
+           vanishes. A `ref_mse/pos_mean` curve decaying toward zero while
+           success rate plateaus IS that saturation, and it is the signal to
+           reach for a non-saturating term (e.g. a larger jitter_pos, whose
+           Jacobian penalty does not vanish as MSE_ref does) rather than a
+           larger positive weight.
+
+        Split by the chunk's group-relative advantage sign — the same
+        classification used for the per-sign clipfrac buckets and for jitter's
+        per-row lambda — because the two signs answer different questions
+        (headroom to reinforce vs. distance already travelled from a good fit).
+
+        When the base-model anchor is active we also emit MSE_base - MSE_ref
+        = log(base_ratio), the CUMULATIVE drift of the current field from the
+        pretrained one, in the same units. Free: base_log_prob is already on the
+        chunks. Unlike kl_loss_base_model this is not scaled by a coefficient,
+        so it is readable as a distance rather than as a loss contribution.
+
+        Returns None when there is nothing to summarize, which keeps the curves
+        absent (a gap) rather than emitting a misleading 0 — same convention as
+        the per-branch jitter metrics.
+        """
+        if not chunks:
+            return None
+
+        # MSE_ref = -ref_log_prob (compute_fm_log_prob returns negative masked
+        # MSE averaged over the K tau samples). Chunks whose ref pass was
+        # skipped (_prepare_batch returned None for their batch) have
+        # ref_log_prob still None and are excluded rather than treated as 0.
+        mse = np.array(
+            [-c.ref_log_prob for c in chunks if c.ref_log_prob is not None],
+            dtype=np.float64,
+        )
+        if mse.size == 0:
+            return None
+        pos = np.array(
+            [
+                -c.ref_log_prob
+                for c in chunks
+                if c.ref_log_prob is not None and c.advantage > 0
+            ],
+            dtype=np.float64,
+        )
+        neg = np.array(
+            [
+                -c.ref_log_prob
+                for c in chunks
+                if c.ref_log_prob is not None and c.advantage <= 0
+            ],
+            dtype=np.float64,
+        )
+
+        stats = {
+            "mean": float(mse.mean()),
+            "p10": float(np.percentile(mse, 10)),
+            "p50": float(np.percentile(mse, 50)),
+            "p90": float(np.percentile(mse, 90)),
+            "max": float(mse.max()),
+            # exp() of the per-chunk bound, averaged — i.e. the mean attainable
+            # ratio ceiling. Averaging after exp (not exp of the mean) keeps it
+            # comparable to train/ratio_max, which is also a per-row extreme.
+            "ratio_ceiling_mean": float(np.exp(mse).mean()),
+            "ratio_ceiling_max": float(np.exp(mse.max())),
+        }
+        if pos.size:
+            stats["pos_mean"] = float(pos.mean())
+        if neg.size:
+            stats["neg_mean"] = float(neg.mean())
+
+        if compute_base:
+            drift = np.array(
+                [
+                    c.ref_log_prob - c.base_log_prob
+                    for c in chunks
+                    if c.ref_log_prob is not None and c.base_log_prob is not None
+                ],
+                dtype=np.float64,
+            )
+            # ref_log_prob - base_log_prob = MSE_base - MSE_ref = log(base_ratio).
+            # POSITIVE => the adapted field fits the sampled action BETTER than
+            # the pretrained one; negative => it has been eroded past base.
+            if drift.size:
+                stats["log_base_ratio_mean"] = float(drift.mean())
+                stats["log_base_ratio_p10"] = float(np.percentile(drift, 10))
+                stats["log_base_ratio_min"] = float(drift.min())
+
+        print(
+            f"  MSE_ref: mean={stats['mean']:.5f} "
+            f"p10={stats['p10']:.5f} p90={stats['p90']:.5f} "
+            f"→ ratio ceiling e^MSE_ref: mean={stats['ratio_ceiling_mean']:.4f} "
+            f"max={stats['ratio_ceiling_max']:.4f} "
+            f"(clip_eps_high={self.config.clip_eps_high} → "
+            f"{'REACHABLE' if stats['ratio_ceiling_max'] > 1 + self.config.clip_eps_high else 'UNREACHABLE'})"
+        )
+        return stats
+
     def _cache_encoded_features(self, valid_batch, batch_data):
         """Store per-chunk slices of the batched backbone/state output onto
         each chunk, so _prepare_batch can rebuild batches without re-running
@@ -2210,6 +2397,48 @@ class GRPOTrainer:
         n_rows_fixed_neg = 0
         n_rows_jitter_pos = 0
         n_rows_jitter_neg = 0
+        # Sign-split ratio accumulators. The existing mean_ratio_{fixed,jitter}
+        # pool both advantage signs, and because the jitter gap scales as
+        # lambda^2 the two signs sit at very different ratios (at
+        # jitter_pos=0.25 / jitter_neg=0.05 the biases are ~-0.058 vs ~-0.002),
+        # so the pooled curve is dominated by the positive rows and NEITHER
+        # branch is legible. Split by sign and each becomes a real signal:
+        #   *_pos starts each iteration at e^-gap_pos and its movement away from
+        #         that value IS headroom being consumed — the only direct
+        #         "is the positive branch learning?" readout that exists.
+        #   *_neg starts at ~1.0 and moves down; that is erosion.
+        # Reuses the n_rows_{branch}_{sign} counters above as divisors.
+        ratio_sum_fixed_pos = 0.0
+        ratio_sum_fixed_neg = 0.0
+        ratio_sum_jitter_pos = 0.0
+        ratio_sum_jitter_neg = 0.0
+        log_ratio_abs_sum_fixed_pos = 0.0
+        log_ratio_abs_sum_fixed_neg = 0.0
+        log_ratio_abs_sum_jitter_pos = 0.0
+        log_ratio_abs_sum_jitter_neg = 0.0
+        # EFFECTIVE clipfrac: rows whose CLIP-TERM gradient the clamp zeroed.
+        # This is not what `clipfrac` measures. `clipfrac` is the sign-agnostic
+        # test `(ratio < 1-lo) | (ratio > 1+hi)`, which for a positive-advantage
+        # row is a false positive: with A>0 and rho < 1-lo,
+        # min(A*rho, A*(1-lo)) = A*rho — the unclamped branch wins and the clip
+        # term is fully alive. That distinction is cosmetic today
+        # (rho_max_observed ~ 1.05) but becomes load-bearing the moment
+        # jitter_pos rises past ~0.30, where gap_pos exceeds |log(1-lo)| and
+        # EVERY positive row reports as "clipped" while training normally.
+        # Predicate lives in the module-level clip_killed_gradient() so tests
+        # exercise it directly; see there for the four-case derivation and for
+        # why "clip-term gradient" is the accurate phrasing (KL terms still flow).
+        clipfrac_eff_sum_pos = 0
+        clipfrac_eff_sum_neg = 0
+        # Dedicated row counters for the effective clipfrac. Deliberately NOT
+        # the n_rows_{branch}_{sign} counters above: those only accumulate when
+        # jitter is active, and the effective clipfrac is meaningful for vanilla
+        # GRPO too.
+        n_rows_pos_total = 0
+        n_rows_neg_total = 0
+        # Once-per-iteration jitter gap measurement (None until it runs; stays
+        # None when jitter is off, which leaves the jitter/* curves absent).
+        jitter_diag: dict | None = None
 
         # ── Balanced training: dynamic epoch count ───────────────────────────
         # When dynamic_epoch_training=True, scale update_epochs using a tent function
@@ -2605,6 +2834,68 @@ class GRPOTrainer:
                         * ready_noise[jitter_mask_dev].unsqueeze(0)
                         + lam_j[None, :, None, None] * xi[:, jitter_mask_dev]
                     ).to(ready_noise.dtype)
+
+                    # ── Once-per-iteration jitter gap measurement ────────────
+                    # Must be taken at theta == theta_ref, i.e. before any
+                    # optimizer.step(), or the "gap" picks up policy drift and
+                    # stops being a pure input-perturbation effect.
+                    #
+                    # `n_updates == 0` is exactly that condition: it is
+                    # incremented only immediately after optimizer.step() in
+                    # _apply_accumulated_grads, and the non-finite-gradient path
+                    # there returns before BOTH the step and the increment. So
+                    # n_updates == 0 <=> the weights are still the reference
+                    # weights. Deliberately NOT `accum_count == 0` as well:
+                    # accumulating a micro-batch does not move weights, so under
+                    # gradient_accumulation_steps > 1 this correctly gets up to k
+                    # chances to land the measurement before the first step.
+                    #
+                    # Why a retry loop matters at all: this whole block is
+                    # conditional on the minibatch CONTAINING jitter rows, and
+                    # under jitter_paired=True the entry pool is 50% "fixed", so
+                    # an all-fixed first minibatch is possible (~0.4% at
+                    # mini_batch_size=8). Without the n_updates guard that case
+                    # would silently defer the measurement to a POST-step
+                    # minibatch and report drift as gap. With it, we either
+                    # measure pre-step or emit nothing (curve gap).
+                    if jitter_diag is None and n_updates == 0:
+                        # Pure instrumentation: a failure here must cost the
+                        # metric, not the iteration. An iteration carries ~13
+                        # minutes of collected simulation by the time it reaches
+                        # this point, so a diagnostic-only exception (shape
+                        # surprise on an odd minibatch, OOM on the extra
+                        # forwards) must not discard it. Warn loudly and set a
+                        # non-None sentinel so we don't retry every minibatch.
+                        try:
+                            jitter_diag = self._jitter_gap_diagnostics(
+                                ready_backbone=ready_backbone,
+                                ready_state_features=ready_state_features,
+                                ready_embodiment_id=ready_embodiment_id,
+                                ready_actions=ready_actions,
+                                ready_masks=ready_masks,
+                                ready_noise=ready_noise,
+                                timesteps=timesteps,
+                                noise_for_input=noise_for_input,
+                                lam_row=lam_row,
+                                pos_adv_mask=ready_advantages > 0,
+                                fixed_row_mask=~jitter_mask_dev,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"  WARNING: jitter gap diagnostics failed "
+                                f"({type(exc).__name__}: {exc}) — skipping the "
+                                f"jitter/* metrics for this iteration. Training "
+                                f"is unaffected."
+                            )
+                            # If the failure was an OOM on the two extra
+                            # forwards, hand the freed blocks back before the
+                            # real minibatch runs — otherwise the diagnostic
+                            # could turn a survivable iteration into a training
+                            # OOM, which is the one way this instrumentation
+                            # could still cost you a run.
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            jitter_diag = {}
                 else:
                     noise_for_input = None
 
@@ -2916,6 +3207,40 @@ class GRPOTrainer:
                         (pre_renorm_pos_adv_mask & (ready_advantages <= 0)).sum().item()
                     )
 
+                    # --- EFFECTIVE clipfrac (clip-term gradient zeroed) -------
+                    # See the accumulator declarations for why this is not the
+                    # same as `clipfrac`, and clip_killed_gradient() for the
+                    # four-case derivation and the KL-term caveat.
+                    #
+                    # Bucketed by the POST-renorm advantage sign, unlike the
+                    # sibling clipfrac_{branch}_{sign} metrics which use the
+                    # pre-renorm (group-relative) sign. That is deliberate:
+                    # which BOUND a row can die on is decided by the sign of the
+                    # advantage the LOSS saw, i.e. post-renorm. Under the default
+                    # per-minibatch renorm a group-good row can z-score negative
+                    # (counted as n_pos_flipped_by_renorm); bucketing such a row
+                    # as "pos" would put a lower-bound death into
+                    # clipfrac_effective_pos and break the one property that
+                    # makes this metric useful — that _pos stays at 0 unless the
+                    # ratio genuinely exceeded 1+clip_eps_high.
+                    grad_dead = clip_killed_gradient(
+                        ratio, surr1, surr2,
+                        self.config.clip_eps_low, self.config.clip_eps_high,
+                    )
+                    post_renorm_pos_mask = ready_advantages > 0
+                    n_p = int(post_renorm_pos_mask.sum().item())
+                    n_n = int(ready_advantages.numel()) - n_p
+                    if n_p > 0:
+                        clipfrac_eff_sum_pos += int(
+                            grad_dead[post_renorm_pos_mask].sum().item()
+                        )
+                        n_rows_pos_total += n_p
+                    if n_n > 0:
+                        clipfrac_eff_sum_neg += int(
+                            grad_dead[~post_renorm_pos_mask].sum().item()
+                        )
+                        n_rows_neg_total += n_n
+
                     # --- Per-branch row-level accumulation (Jitter-GRPO) ---
                     # Only runs when jitter is enabled. Gating on jitter-active
                     # makes the jitter-off path bit-identical at the metrics
@@ -2980,15 +3305,23 @@ class GRPOTrainer:
                         n_jn = int(jit_neg_mask.sum().item())
                         if n_fp > 0:
                             clipfrac_sum_fixed_pos += int(over_clip[fixed_pos_mask].sum().item())
+                            ratio_sum_fixed_pos += ratio[fixed_pos_mask].sum().item()
+                            log_ratio_abs_sum_fixed_pos += log_ratio_abs[fixed_pos_mask].sum().item()
                             n_rows_fixed_pos += n_fp
                         if n_fn > 0:
                             clipfrac_sum_fixed_neg += int(over_clip[fixed_neg_mask].sum().item())
+                            ratio_sum_fixed_neg += ratio[fixed_neg_mask].sum().item()
+                            log_ratio_abs_sum_fixed_neg += log_ratio_abs[fixed_neg_mask].sum().item()
                             n_rows_fixed_neg += n_fn
                         if n_jp > 0:
                             clipfrac_sum_jitter_pos += int(over_clip[jit_pos_mask].sum().item())
+                            ratio_sum_jitter_pos += ratio[jit_pos_mask].sum().item()
+                            log_ratio_abs_sum_jitter_pos += log_ratio_abs[jit_pos_mask].sum().item()
                             n_rows_jitter_pos += n_jp
                         if n_jn > 0:
                             clipfrac_sum_jitter_neg += int(over_clip[jit_neg_mask].sum().item())
+                            ratio_sum_jitter_neg += ratio[jit_neg_mask].sum().item()
+                            log_ratio_abs_sum_jitter_neg += log_ratio_abs[jit_neg_mask].sum().item()
                             n_rows_jitter_neg += n_jn
 
             # ── Epoch boundary: flush a partial accumulation window ──────────
@@ -3045,6 +3378,29 @@ class GRPOTrainer:
                 early["actual_epochs"] = actual_num_epochs
                 if success_frac is not None:
                     early["success_fraction"] = success_frac
+            # Diagnostics that are still VALID on a no-step iteration, and are
+            # most valuable exactly here:
+            #   - the jitter gap was measured at theta == theta_ref, before any
+            #     step could have fired, so discarding it because the update was
+            #     later thrown away loses a reading that is still correct. It is
+            #     also the most likely EXPLANATION for landing in this branch: a
+            #     large gap means a large |log_ratio|, and bf16 `ratio =
+            #     log_ratio.exp()` overflowing is precisely what trips the
+            #     non-finite-loss guard.
+            #   - the effective clipfracs come from micro-batches that actually
+            #     trained, so they are populated in the dropped-gradient case
+            #     (n_micro_batches > 0) and simply absent in the all-non-finite
+            #     case, which is the right behaviour in both.
+            if jitter_diag:
+                early["_jitter_diag"] = jitter_diag
+            if n_rows_pos_total > 0:
+                early["clipfrac_effective_pos"] = (
+                    clipfrac_eff_sum_pos / n_rows_pos_total
+                )
+            if n_rows_neg_total > 0:
+                early["clipfrac_effective_neg"] = (
+                    clipfrac_eff_sum_neg / n_rows_neg_total
+                )
             return early
 
         if n_skipped_nonfinite > 0:
@@ -3181,13 +3537,233 @@ class GRPOTrainer:
         # curve has a gap), rather than emitting a misleading 0.
         if n_rows_fixed_pos > 0:
             result["clipfrac_fixed_pos"] = clipfrac_sum_fixed_pos / n_rows_fixed_pos
+            result["mean_ratio_fixed_pos"] = ratio_sum_fixed_pos / n_rows_fixed_pos
+            result["mean_log_ratio_abs_fixed_pos"] = (
+                log_ratio_abs_sum_fixed_pos / n_rows_fixed_pos
+            )
         if n_rows_fixed_neg > 0:
             result["clipfrac_fixed_neg"] = clipfrac_sum_fixed_neg / n_rows_fixed_neg
+            result["mean_ratio_fixed_neg"] = ratio_sum_fixed_neg / n_rows_fixed_neg
+            result["mean_log_ratio_abs_fixed_neg"] = (
+                log_ratio_abs_sum_fixed_neg / n_rows_fixed_neg
+            )
         if n_rows_jitter_pos > 0:
             result["clipfrac_jitter_pos"] = clipfrac_sum_jitter_pos / n_rows_jitter_pos
+            result["mean_ratio_jitter_pos"] = ratio_sum_jitter_pos / n_rows_jitter_pos
+            result["mean_log_ratio_abs_jitter_pos"] = (
+                log_ratio_abs_sum_jitter_pos / n_rows_jitter_pos
+            )
         if n_rows_jitter_neg > 0:
             result["clipfrac_jitter_neg"] = clipfrac_sum_jitter_neg / n_rows_jitter_neg
+            result["mean_ratio_jitter_neg"] = ratio_sum_jitter_neg / n_rows_jitter_neg
+            result["mean_log_ratio_abs_jitter_neg"] = (
+                log_ratio_abs_sum_jitter_neg / n_rows_jitter_neg
+            )
+        # Effective clipfrac — emitted for EVERY run (jitter on or off), unlike
+        # the branch-split metrics above. This is the honest "how much gradient
+        # did the clip actually kill" number; see the accumulator comments.
+        if n_rows_pos_total > 0:
+            result["clipfrac_effective_pos"] = clipfrac_eff_sum_pos / n_rows_pos_total
+        if n_rows_neg_total > 0:
+            result["clipfrac_effective_neg"] = clipfrac_eff_sum_neg / n_rows_neg_total
+        # Once-per-iteration jitter gap measurement. Keys are namespaced under
+        # `jitter/` by _log_metrics rather than `train/`, since they are a
+        # single-minibatch snapshot at theta == theta_ref, not a per-mb mean
+        # over the iteration like everything else in `result`.
+        if jitter_diag:
+            result["_jitter_diag"] = jitter_diag
         return result
+
+    def _jitter_gap_diagnostics(
+        self,
+        *,
+        ready_backbone,
+        ready_state_features,
+        ready_embodiment_id,
+        ready_actions,
+        ready_masks,
+        ready_noise,
+        timesteps,
+        noise_for_input,
+        lam_row,
+        pos_adv_mask,
+        fixed_row_mask,
+    ) -> dict:
+        """Measure the fixed-vs-jitter FM-loss gap directly, once per iteration.
+
+        WHY THIS EXISTS. The gap
+
+            gap = E[ MSE_theta(eps') - MSE_theta(eps) ]  ~=  (1-tau)^2 * lam^2 * ||grad_x v_theta||_F^2
+
+        is the single quantity Jitter-GRPO turns on, and it is readable two ways:
+          - as the Jacobian penalty (the derivation's framing), and
+          - as the EXTRA RATIO HEADROOM on a positive-advantage row: without
+            jitter, `log rho <= MSE_ref` caps reinforcement at ~0.01-0.05; with
+            jitter the row starts at `rho = e^-gap` and has `MSE_ref + gap` of
+            usable room. A positive row cannot be clipped by clip_eps_LOW no
+            matter how far its ratio falls (min() picks the unclamped branch —
+            see clip_killed_gradient), and the only bound that CAN kill it,
+            clip_eps_high, is unreachable at these ratios. So the added room is
+            usable in full.
+
+        WHAT `jacobian_fro_sq` ACTUALLY IS. Two caveats on the name:
+          - The MSE is a mean over VALID action dims, so this is
+            `‖∇_x v_θ‖²_F / D_valid`, not the raw Frobenius norm. It is a proxy
+            for trend and for cross-lambda comparison, not an absolute quantity.
+          - It divides by `lambda²`, but the actual per-element perturbation
+            variance of `eps' - eps` is `(sqrt(1-lambda²) - 1)² + lambda²`. So
+            the estimate is biased HIGH by `1 + ((sqrt(1-lam²)-1)/lam)²`:
+            +1.6% at lambda=0.25, +7% at lambda=0.50. Small enough that the
+            metric stays comparable across the lambda ladder, but it is a bias,
+            not exact invariance.
+          - `timesteps` arrives as bf16 (built that way in _grpo_update_inner
+            from the fp32 `tau_samples` on the chunks), so the `(1-tau)²`
+            prefactor divided out here — and the reported `tau{k}_value` — carry
+            ~0.4% relative quantization versus the taus the ref pass actually
+            used. Third-order against the two biases above; noted so the
+            enumeration is complete.
+
+        Until now it was only observable by DIFFING two TB curves
+        (`mean_log_ratio_abs_fixed` vs `_jitter`), which requires
+        `jitter_paired=True` — so it was unmeasurable in every `nojitterpair`
+        run. This measures it directly instead, in any mode.
+
+        WHY IT IS TRUSTWORTHY. Both forwards run here, back to back, on the SAME
+        minibatch with the SAME cached backbone features and the SAME tau
+        samples, differing ONLY in `noise_for_input`. So unlike the
+        curve-differencing approach it carries none of the ~5e-4 bf16/batching
+        noise floor between the ref pass (batch = 2*mini_batch_size, fresh
+        `_prepare_batch`) and the update pass (batch = mini_batch_size, rebuilt
+        from cache), and it does not depend on `ref_log_prob` at all.
+
+        COST AND SAFETY. Two extra no_grad forwards on ONE minibatch per
+        iteration: ~12 DiT passes against the ~780+ a normal iteration runs, so
+        ~1.5% overhead, and no activations are retained so peak VRAM is strictly
+        below a training minibatch. Critically it consumes NO RNG: with both
+        `timesteps` and `noise` supplied, compute_fm_log_prob's sampling
+        branches are skipped, and the DiT is in eval mode with lora_dropout
+        inert — so inserting this does not shift the global torch RNG stream and
+        runs stay comparable to ones recorded before it existed.
+
+        Args:
+            lam_row: [B] per-row jitter lambda (jitter_pos / jitter_neg by
+                pre-renorm advantage sign) — the same tensor used to build
+                `noise_for_input`, so the lambda^2 divided out below is exactly
+                the one applied.
+            pos_adv_mask: [B] bool, PRE-renormalization advantage sign. Matches
+                the convention of the clipfrac_{branch}_{pos,neg} buckets.
+            fixed_row_mask: [B] bool, True for `jitter_paired=True` "fixed"
+                rows. Those rows have noise_for_input == eps, so their gap must
+                come out ~0 — a built-in correctness check on this whole
+                measurement. Empty in `nojitterpair` mode.
+
+        Returns:
+            dict of scalars, TB-prefixed `jitter/` by _log_metrics. Empty when
+            there is nothing meaningful to report (no positive-advantage rows in
+            this minibatch), which leaves a curve gap rather than a fake 0.
+        """
+        K = timesteps.shape[0]
+        common = dict(
+            action_head=self.model.action_head,
+            backbone_output=ready_backbone,
+            state_features=ready_state_features,
+            embodiment_id=ready_embodiment_id,
+            actions=ready_actions,
+            action_mask=ready_masks,
+            timesteps=timesteps,
+            noise=ready_noise,
+            n_samples=K,
+        )
+        with torch.no_grad():
+            # noise_for_input=None => DiT input is the original eps for EVERY
+            # row, including rows tagged "jitter". This is the clean reference
+            # leg and it is what makes the gap a pure input-perturbation effect.
+            _, lp_clean = compute_fm_log_prob(
+                **common, noise_for_input=None, return_per_tau=True
+            )  # [K, B]
+            _, lp_jit = compute_fm_log_prob(
+                **common, noise_for_input=noise_for_input, return_per_tau=True
+            )  # [K, B]
+
+        # log_prob = -MSE, so (clean - jittered) = MSE_jittered - MSE_clean = gap.
+        # Non-negative in expectation; individual rows can go slightly negative
+        # from the finite-xi sample, which is why we report means.
+        gap_per_tau = (lp_clean - lp_jit).float()          # [K, B]
+        gap_row = gap_per_tau.mean(dim=0)                  # [B]
+
+        # Divide out the analytic prefactor to recover the Jacobian norm itself,
+        # using the ACTUAL jittered taus (tau_centers +/- N(0, 0.02)) rather than
+        # the nominal centers. Per-row division, then mean — dividing the means
+        # would bias the estimate when lam_row is mixed.
+        w_row = ((1.0 - timesteps.float()) ** 2).mean(dim=0)   # [B]
+        denom = w_row * (lam_row.float() ** 2)                 # [B]
+        jac_row = torch.where(
+            denom > 1e-12, gap_row / denom.clamp_min(1e-12), torch.zeros_like(gap_row)
+        )
+
+        out: dict = {}
+        neg_adv_mask = ~pos_adv_mask
+        # Restrict every headline number to JITTER rows: a paired-mode "fixed"
+        # row has noise_for_input == eps by construction, so including it would
+        # dilute the gap toward zero by the fixed/jitter row ratio.
+        jit_mask = ~fixed_row_mask
+        jp = jit_mask & pos_adv_mask
+        jn = jit_mask & neg_adv_mask
+        n_jp = int(jp.sum().item())
+        n_jn = int(jn.sum().item())
+
+        if n_jp > 0:
+            gap_pos = float(gap_row[jp].mean().item())
+            out["gap_pos"] = gap_pos
+            out["jacobian_fro_sq"] = float(jac_row[jp].mean().item())
+            out["n_rows_pos"] = n_jp
+            # Per-tau profile, POSITIVE rows only: gap scales as lam^2, and
+            # lam_pos is typically ~5x lam_neg (25x in the gap), so pooling the
+            # signs would make the profile a mixture of two very different
+            # curves. Index k maps to config.tau_centers[k].
+            for k in range(K):
+                out[f"gap_at_tau{k}"] = float(gap_per_tau[k][jp].mean().item())
+                out[f"tau{k}_value"] = float(timesteps[k][jp].float().mean().item())
+            # THE jitter metric: how many times more usable log-ratio room a
+            # positive row has with jitter than without.
+            #
+            # SCOPE MISMATCH, stated so it is not mistaken for an identity:
+            # `ref_pos` is a chunk-level mean over ALL positive-advantage live
+            # chunks of the iteration, while `gap_pos` is a row-level mean over
+            # THIS ONE minibatch. Fine for the intended use (an order-of-
+            # magnitude read on "is jitter buying gradient room"), but the two
+            # terms are not drawn from the same sample.
+            #
+            # getattr, not attribute access: this is an OPTIONAL upstream stat
+            # (absent if the ref pass produced nothing, and absent entirely on
+            # any trainer built via __new__ without __init__, as the CPU tests
+            # do). A missing diagnostic input must degrade to "no curve", never
+            # to an AttributeError hours into a run.
+            ref_pos = (getattr(self, "_ref_mse_stats", None) or {}).get("pos_mean")
+            if ref_pos is not None and ref_pos > 1e-9:
+                out["headroom_multiplier"] = (ref_pos + gap_pos) / ref_pos
+                out["headroom_ref_only"] = ref_pos
+                out["headroom_with_jitter"] = ref_pos + gap_pos
+        if n_jn > 0:
+            out["gap_neg"] = float(gap_row[jn].mean().item())
+            out["n_rows_neg"] = n_jn
+            # Fraction of the erosion clip budget |log(1-clip_eps_low)| that the
+            # negative rows' gap consumes BEFORE any policy drift. At
+            # jitter_neg=0.05 this is a few percent (harmless); as it approaches
+            # 1.0 every negative row is born outside the clip and contributes no
+            # gradient at all. This is the hard ceiling on jitter_neg, and it is
+            # the only place clip_eps_low interacts with jitter — it cannot clip
+            # a POSITIVE row (min() always picks the unclamped branch there).
+            lo_budget = -math.log(max(1.0 - self.config.clip_eps_low, 1e-12))
+            out["neg_clip_budget_used"] = out["gap_neg"] / lo_budget
+        if int(fixed_row_mask.sum().item()) > 0:
+            # Self-check, paired mode only: must read ~0 (bounded by bf16 noise,
+            # order 1e-4). A non-trivial value means the fixed rows are NOT
+            # being fed the original eps and the jitter bookkeeping is wrong.
+            out["gap_fixed_rows_selfcheck"] = float(
+                gap_row[fixed_row_mask].mean().item()
+            )
+        return out
 
     def _iter_stratified_minibatches(
         self,
@@ -4082,6 +4658,129 @@ class GRPOTrainer:
                         f"train/{key}", update_stats[key], iteration
                     )
 
+        # Reference-MSE diagnostics. Deliberately OUTSIDE the n_updates > 0
+        # gate below: MSE_ref is a property of (collected data x reference
+        # policy) measured before any optimizer step, so it is still valid — and
+        # still worth seeing — on an iteration whose update was skipped. It is
+        # None only when the ref pass itself did not run (no live chunks), which
+        # leaves a gap rather than a fake 0. See _summarize_ref_mse for why
+        # these curves matter: ref_mse/ratio_ceiling_max vs clip_eps_high tells
+        # you whether the upper clip is reachable at all, and ref_mse/pos_mean
+        # decaying toward 0 is positive-branch saturation.
+        # getattr for the same reason as in _jitter_gap_diagnostics: a trainer
+        # built without __init__ (CPU tests) must still be able to log.
+        #
+        # NON-FINITE FILTER on all three blocks below. Every other numeric TB
+        # path in this file filters (ratio_maxes/ratio_mins, grad_norms,
+        # phase_times) for the reason phase_times documents: one nan/inf poisons
+        # wandb's chart autoscale for the REST OF THE RUN. These metrics derive
+        # from ref_log_prob (never isfinite-checked upstream) and from two
+        # diagnostic forwards, and np.exp(MSE_ref) overflows above MSE_ref ~709,
+        # so inf/nan is reachable in principle. Drop the offending scalar, keep
+        # the rest, and say so once.
+        # NON-FINITE FILTER for the metrics added alongside this helper.
+        #
+        # SCOPE, stated precisely because an earlier version of this comment
+        # over-claimed: exactly four pre-existing sites filter non-finite values
+        # (ratio_maxes/ratio_mins, grad_norms, phase_times). `train/loss`,
+        # `train/clipfrac`, `train/mean_ratio` and `train/mean_log_ratio_abs` do
+        # NOT — that is pre-existing behaviour this change deliberately leaves
+        # alone. Everything routed through _emit below IS filtered.
+        #
+        # Why it matters: phase_times documents the reason — one nan/inf poisons
+        # wandb's chart autoscale for the REST OF THE RUN. And it is reachable
+        # for the sign-split ratio metrics specifically: the comment on
+        # ratio_maxes notes that bf16 `ratio = log_ratio.exp()` can overflow to
+        # +inf while the clipped loss stays FINITE (for A>0,
+        # min(A*inf, A*(1+hi)) is the finite bound), so an inf ratio survives the
+        # torch.isfinite(loss) guard and lands in ratio_sum_*. ref_log_prob is
+        # likewise never isfinite-checked upstream, and np.exp(MSE_ref) overflows
+        # above MSE_ref ~709.
+        def _emit(prefix: str, d: dict) -> None:
+            # Non-numeric values are skipped rather than raising: math.isfinite
+            # throws TypeError on a str/None, and the TB half of _log_metrics has
+            # no try/except (unlike the _jitter_gap_diagnostics callsite). An
+            # iteration carries ~13 minutes of collected simulation by the time it
+            # gets here, so a malformed diagnostic entry must cost that entry, not
+            # the iteration.
+            bad = []
+            for key, val in d.items():
+                try:
+                    ok = math.isfinite(val)
+                except TypeError:
+                    ok = False
+                if ok:
+                    self.writer.add_scalar(f"{prefix}/{key}", val, iteration)
+                else:
+                    bad.append(key)
+            if bad:
+                print(
+                    f"  WARNING: dropped non-finite/non-numeric {prefix}/* "
+                    f"scalar(s) {bad} at iteration {iteration} rather than "
+                    f"poisoning the charts."
+                )
+
+        _ref_mse = getattr(self, "_ref_mse_stats", None)
+        if _ref_mse:
+            _emit("ref_mse", _ref_mse)
+
+        # Jitter gap measurement. Under its own `jitter/` prefix because it is a
+        # single-minibatch snapshot taken at theta == theta_ref, not a per-mb
+        # mean over the iteration like every `train/` scalar. Absent when jitter
+        # is off or when the first minibatch drew no positive-advantage rows,
+        # which leaves a curve gap rather than a fake 0.
+        #
+        # Reading guide:
+        #   jitter/headroom_multiplier  = (MSE_ref_pos + gap_pos) / MSE_ref_pos.
+        #       How many times more usable log-ratio room a positive row has WITH
+        #       jitter than without. ~1.0 means jitter_pos is doing nothing.
+        #   jitter/jacobian_fro_sq      = the field's noise-sensitivity with the
+        #       (1-tau)^2 * lambda^2 prefactor divided out, so it is comparable
+        #       ACROSS different jitter_pos settings.
+        #   jitter/gap_at_tau{k}        = per-tau profile (positive rows), k
+        #       indexing config.tau_centers. Shows WHERE along the denoising
+        #       path the field is noise-sensitive.
+        #   jitter/neg_clip_budget_used = fraction of the erosion clip budget the
+        #       negative rows' gap eats before any drift. -> 1.0 means every
+        #       negative row is born clipped; that is the ceiling on jitter_neg.
+        #   jitter/n_rows_{pos,neg}     = row counts backing the two gaps. A
+        #       ONE-MINIBATCH count, not an iteration total — the whole jitter/*
+        #       block is a single-minibatch snapshot.
+        #   jitter/gap_fixed_rows_selfcheck = must be ~0 (paired mode only).
+        if update_stats and update_stats.get("_jitter_diag"):
+            _emit("jitter", update_stats["_jitter_diag"])
+
+        # Effective clipfrac. Ungated on n_updates for the same reason as the two
+        # blocks above: it is populated by micro-batches that TRAINED, which
+        # includes the iteration where every gradient window was then dropped —
+        # exactly the iteration whose diagnosis this metric helps with.
+        #
+        # Expect clipfrac_effective_pos == 0 at any sane jitter_pos: a
+        # post-renorm-positive row can only die on the UPPER bound, which needs
+        # ratio > 1+clip_eps_high (~1.2) against the analytic ceiling
+        # e^MSE_ref ~= 1.01-1.05. If _pos goes non-zero, either the ratio really
+        # did exceed the upper bound or clip_eps_high was lowered below reach.
+        # THAT is the property this metric exists for, and it holds exactly.
+        #
+        # Do NOT read clipfrac_effective_neg as a drop-in for clipfrac_*_neg:
+        # under the default per-minibatch renorm the two have different
+        # DENOMINATORS. This one buckets by post-renorm sign, which z-scoring
+        # puts near half the rows below zero for, regardless of success rate;
+        # clipfrac_{fixed,jitter}_neg uses the true group-relative negative
+        # count. Worse, a group-good row carrying lam = jitter_pos (hence a large
+        # gap, hence a ratio well under 1-clip_eps_low) that renorm then flipped
+        # negative is a genuine lower-bound death booked HERE — so a large
+        # jitter_pos inflates _neg. Cross-reference n_pos_flipped_by_renorm
+        # before attributing a rise in _neg to real erosion clipping.
+        if update_stats:
+            _eff = {
+                k: update_stats[k]
+                for k in ("clipfrac_effective_pos", "clipfrac_effective_neg")
+                if k in update_stats
+            }
+            if _eff:
+                _emit("train", _eff)
+
         # Loss / ratio / grad scalars are only meaningful when at least one
         # optimizer.step() actually fired. `_grpo_update_inner` returns
         # `{"n_skipped_nonfinite": N}` when every minibatch got skipped for
@@ -4164,12 +4863,33 @@ class GRPOTrainer:
                 # `clipfrac_sum_fixed_pos` etc. in _grpo_update_inner.
                 # Gated independently of the other branch metrics: a bucket
                 # with zero rows this iter is just absent from update_stats.
-                for sign in ("pos", "neg"):
-                    key = f"clipfrac_{branch}_{sign}"
-                    if key in update_stats:
-                        self.writer.add_scalar(
-                            f"train/{key}", update_stats[key], iteration
-                        )
+                # mean_ratio / mean_log_ratio_abs are split the same way: the
+                # pooled versions above are dominated by the positive rows'
+                # jitter bias, so the sign-split pair is what makes each branch
+                # legible (mean_ratio_jitter_pos starting at e^-gap_pos and
+                # moving up = positive-branch headroom being consumed).
+                #
+                # Routed through _emit (unlike the un-split versions above) so
+                # the sign-split ratio metrics get the non-finite filter: a bf16
+                # `ratio = exp(log_ratio)` overflow reaches ratio_sum_* while the
+                # clipped loss stays finite, so +inf here is reachable in a way
+                # it is not for the pre-existing curves.
+                _split = {
+                    f"{metric}_{branch}_{sign}": update_stats[
+                        f"{metric}_{branch}_{sign}"
+                    ]
+                    for sign in ("pos", "neg")
+                    for metric in ("clipfrac", "mean_ratio", "mean_log_ratio_abs")
+                    if f"{metric}_{branch}_{sign}" in update_stats
+                }
+                if _split:
+                    _emit("train", _split)
+
+            # Effective clipfrac moved OUT of this block — see below. It is
+            # populated by any micro-batch that trained, which includes
+            # iterations where every gradient window was later dropped
+            # (n_updates == 0, n_micro_batches > 0), so gating it on
+            # n_updates > 0 would have made the early-return copy dead code.
 
             # Dynamic positive-advantage weight (pos_adv_*: present only when
             # positive_advantage_weight_scaling ran this iter) and the sign-flip
@@ -4224,6 +4944,20 @@ class GRPOTrainer:
                 log_dict = {"iteration": iteration}
                 if stats:
                     log_dict.update(stats)
+                # Mirror the TB-side ref_mse/* block, which is deliberately
+                # ungated on n_updates (see the comment there). getattr, not
+                # attribute access: on a trainer built without __init__ a bare
+                # read raises AttributeError, and the `except Exception: pass`
+                # around this whole block would then silently drop the ENTIRE
+                # iteration's wandb payload rather than just this one metric.
+                # Non-finite values are filtered for the same
+                # chart-autoscale-poisoning reason as the TB side.
+                _ref_mse_w = getattr(self, "_ref_mse_stats", None)
+                if _ref_mse_w:
+                    log_dict.update({
+                        f"ref_mse/{k}": v for k, v in _ref_mse_w.items()
+                        if math.isfinite(v)
+                    })
                 if update_stats is not None:
                     # Counters always; loss/ratio/grad only when n_updates>0
                     # (matching the TB-side gating). n_micro_batches is a
@@ -4252,8 +4986,40 @@ class GRPOTrainer:
                                 # runs and a double-log (train/ + balanced/) on
                                 # dynamic-epoch runs.
                                 "actual_epochs", "success_fraction",
+                                # Nested dict, not a scalar — mirrored under the
+                                # jitter/ prefix just below, same as the TB side.
+                                "_jitter_diag",
+                                # Excluded so the finite-filtered copies added
+                                # below are the ONLY source of these keys.
+                                # Without this exclusion the unfiltered value
+                                # would already be in log_dict and the filtered
+                                # block could not remove it — dict.update cannot
+                                # un-set a key — so wandb would receive a
+                                # non-finite scalar on every n_updates > 0
+                                # iteration while the TB side printed
+                                # "dropped ... rather than poisoning the charts".
+                                "clipfrac_effective_pos",
+                                "clipfrac_effective_neg",
                             )
                         })
+                    # Mirror the TB-side jitter/* block. Ungated on n_updates for
+                    # the same reason ref_mse/* is: the measurement happens at
+                    # theta == theta_ref, before any step could have fired.
+                    if update_stats.get("_jitter_diag"):
+                        log_dict.update({
+                            f"jitter/{k}": v
+                            for k, v in update_stats["_jitter_diag"].items()
+                            if math.isfinite(v)
+                        })
+                    # Effective clipfrac, also ungated (populated by any
+                    # micro-batch that trained, including on a dropped-window
+                    # iteration).
+                    log_dict.update({
+                        f"train/{k}": update_stats[k]
+                        for k in ("clipfrac_effective_pos",
+                                  "clipfrac_effective_neg")
+                        if k in update_stats and math.isfinite(update_stats[k])
+                    })
                 if lr is not None:
                     log_dict["train/lr"] = lr
                 if phase_times is not None:

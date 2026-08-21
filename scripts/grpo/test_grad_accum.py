@@ -418,6 +418,18 @@ def run_update(
         lp = delta + (wterm - (f @ w.detach()))
         if records and records[-1]["nonfinite"]:
             lp = lp + float("inf")
+        if kw.get("return_per_tau"):
+            # Honour the real compute_fm_log_prob contract: (mean, [K, B]).
+            # Called by GRPOTrainer._jitter_gap_diagnostics on the first
+            # minibatch of a jitter-enabled iteration. This surrogate is
+            # value-pinned (no tau or noise_for_input dependence), so the honest
+            # per-tau breakdown is the mean replicated K times — which satisfies
+            # per_tau.mean(0) == lp exactly and makes the measured gap 0. That is
+            # the correct answer FOR THIS FAKE, and it keeps this file's tests a
+            # crash/plumbing check; the arithmetic is verified against a
+            # tau- and noise-sensitive stand-in in test_jitter_metrics.py.
+            K = int(kw["n_samples"])
+            return lp, lp.detach().unsqueeze(0).expand(K, -1)
         return lp
 
     real_fm = train_grpo.compute_fm_log_prob

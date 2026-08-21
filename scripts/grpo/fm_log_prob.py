@@ -47,7 +47,8 @@ def compute_fm_log_prob(
     noise_beta_beta: float = 1.0,
     noise_s: float = 1.0,
     noise_for_input: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_per_tau: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Compute FM log-probability surrogate for a batch of action chunks.
 
     This mirrors the forward() method of Gr00tN1d6ActionHead (gr00t_n1d6.py:149-257)
@@ -85,9 +86,26 @@ def compute_fm_log_prob(
             None = use `noise` for both target and input (current behavior,
             bit-identical when jitter is disabled). The 4-D shape with leading
             K is required so each τ can use an independent ξ-jitter.
+        return_per_tau: When True, ALSO return the un-averaged [K, B] per-τ
+            log-probs alongside the [B] mean. Intended for the once-per-iteration
+            jitter diagnostic in train_grpo._jitter_gap_diagnostics, which needs
+            the per-τ breakdown to fit
+                gap(τ) ≈ (1-τ)² · λ² · ‖∇_x v_θ‖²_F
+            i.e. to see WHERE along the denoising path the velocity field is
+            noise-sensitive — a single K-averaged number cannot show that.
+            Default False keeps the return type and the arithmetic
+            bit-identical for every existing caller: the flag adds one Python
+            `None` assignment on that path and nothing else. When True it does
+            cost one extra elementwise negation per tau (`-per_sample_mse` is
+            evaluated a second time rather than reusing the in-place `+=`
+            operand) — negligible, and the only callsite is a no_grad
+            diagnostic.
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
+        (log_probs, per_tau_log_probs): when return_per_tau=True, with
+            per_tau_log_probs of shape [K, B] (fp32), ordered to match
+            `timesteps`/`tau_centers`.
     """
     B = actions.shape[0]
     device = actions.device
@@ -146,6 +164,8 @@ def compute_fm_log_prob(
 
     # Accumulate log-probs across K timestep samples for variance reduction
     log_probs_accumulated = torch.zeros(B, device=device, dtype=torch.float32)
+    # Per-τ terms, kept only when the caller asks.
+    per_tau_log_probs: list[torch.Tensor] | None = [] if return_per_tau else None
 
     for k in range(n_samples):
         # --- Sample or use pre-specified timestep ---
@@ -235,9 +255,14 @@ def compute_fm_log_prob(
         per_sample_mse = masked_mse.sum(dim=(1, 2)) / valid_elements_per_sample.float()
 
         log_probs_accumulated += -per_sample_mse  # already fp32
+        if per_tau_log_probs is not None:
+            per_tau_log_probs.append(-per_sample_mse)
 
     # Average across K timestep samples
     log_probs = log_probs_accumulated / n_samples
+
+    if per_tau_log_probs is not None:
+        return log_probs, torch.stack(per_tau_log_probs, dim=0)  # [K, B]
 
     return log_probs
 

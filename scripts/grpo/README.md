@@ -23,7 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
-| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. |
+| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
@@ -1549,6 +1549,102 @@ jitter branches' `mean_log_ratio_abs` (and analogous `clipfrac`):
   has grown beyond the clip threshold — λ is likely too aggressive for the
   current model state, or the model is genuinely sensitive in a way the
   regularizer is fighting.
+
+### Measuring the gap directly (`jitter/*`, `ref_mse/*`)
+
+Differencing two TB curves only works with `jitter_paired=True`, so the gap
+was unobservable in `jitter_paired=False` runs — which is most of them. It also
+inherits the ~5e-4 bf16/batching noise floor between the ref pass (batch
+`2·mini_batch_size`, fresh `_prepare_batch`) and the update pass (batch
+`mini_batch_size`, rebuilt from cache).
+
+`GRPOTrainer._jitter_gap_diagnostics` measures it directly instead: **two
+matched `no_grad` forwards** on the first minibatch of the iteration — clean ε
+and jittered ε′, same cached features, same τ, differing only in
+`noise_for_input`. Gated on `n_updates == 0` so it is always taken at
+θ ≡ θ_ref (no optimizer step has fired, so the gap carries zero policy-drift
+contamination); if the first minibatch happens to hold no jitter rows the
+measurement is **skipped** rather than deferred to a post-step one. Wrapped in
+`try/except` — a diagnostic failure costs the metric, not the iteration.
+
+Cost: ~12 extra DiT passes against the ~780+ a normal iteration runs (~1.5%),
+no activations retained, and **no RNG consumed** (with `timesteps` and `noise`
+both supplied, `compute_fm_log_prob` takes no sampling branch), so the global
+torch RNG stream is unchanged versus runs recorded before this existed.
+
+| Scalar | Meaning |
+|---|---|
+| `jitter/gap_pos`, `gap_neg` | `E[MSE_θ(ε′) − MSE_θ(ε)]` on jitter rows, split by **pre**-renorm advantage sign (matching how `lam_row` picks `jitter_pos` vs `jitter_neg`) |
+| `jitter/jacobian_fro_sq` | the gap with the `E_k[(1−τ)²]·λ²` prefactor divided out, so it is comparable **across** `jitter_pos` settings. Two documented biases: it is `‖J‖²_F / D_valid` (the MSE is a per-valid-dim mean), and it reads high by `1 + ((√(1−λ²)−1)/λ)²` (+1.6% at λ=0.25, +7% at λ=0.50) because the true per-element perturbation variance is `(√(1−λ²)−1)² + λ²`. A comparable proxy, not an exact invariant. |
+| `jitter/gap_at_tau{k}`, `tau{k}_value` | per-τ profile over positive rows, `k` indexing `tau_centers`. Shows **where** along the denoising path the field is noise-sensitive; should fall as τ rises. `tau{k}_value` is the mean of the actual jittered τ, read back from the bf16 `timesteps` tensor, so it carries ~0.4% relative quantization versus the fp32 `tau_samples` on the chunks. |
+| `jitter/headroom_multiplier` | `(ref_mse/pos_mean + gap_pos) / ref_mse/pos_mean`. The second reading of the gap: without jitter `log ρ ≤ MSE_ref` caps reinforcement at ~0.01–0.05; with jitter the row starts at `ρ = e^-gap` with `MSE_ref + gap` of usable room, all of it usable because `clip_eps_low` cannot clip a positive row. ~1.0 means `jitter_pos` is doing nothing. Note the two terms differ in scope — `pos_mean` is an iteration-wide chunk mean, `gap_pos` a one-minibatch row mean. |
+| `jitter/neg_clip_budget_used` | `gap_neg / |log(1−clip_eps_low)|`. The hard ceiling on `jitter_neg`: → 1.0 means every negative row is born outside the clip and contributes no gradient. ~0.028 at `jitter_neg=0.05`; the wall is ≈0.30. This is the **only** place `clip_eps_low` interacts with jitter — it cannot clip a positive row. |
+| `jitter/gap_fixed_rows_selfcheck` | gap on paired-mode "fixed" rows. **Must read ~0** (≤1e-4); anything else means the fixed rows are not being fed the original ε. Absent in `jitter_paired=False`. |
+| `jitter/n_rows_pos`, `n_rows_neg` | row counts backing the two gaps — a **one-minibatch** count, not an iteration total. |
+| `ref_mse/{mean,p10,p50,p90,max}` | distribution of `MSE_ref = −ref_log_prob` over live chunks. Free (the values are already on the chunks). |
+| `ref_mse/pos_mean`, `neg_mean` | split by advantage sign. `pos_mean` is the reinforcement headroom on successful chunks; it decaying toward 0 while success rate plateaus **is** positive-branch saturation, since the FM loss is least-squares so the gradient is `∝ residual`. |
+| `ref_mse/ratio_ceiling_{mean,max}` | `exp(MSE_ref)` — the analytic ceiling on the importance ratio, since `log ρ = MSE_ref − MSE_θ` and `MSE_θ ≥ 0`. Compare against `1 + clip_eps_high`: the per-iteration console line prints REACHABLE / UNREACHABLE. |
+| `ref_mse/log_base_ratio_{mean,p10,min}` | `ref_log_prob − base_log_prob` = cumulative drift of the adapted field from the pretrained one, in MSE units and unscaled by any coefficient (unlike `kl_loss_base_model`). Positive = fits the sampled action better than base. Emitted only when `kl_coef_base_model > 0`. |
+
+`ref_mse/*` and `jitter/*` are emitted **outside** the `n_updates > 0` gate:
+both are measured before any optimizer step, so they stay valid on an iteration
+whose update was discarded — and a blown-up gap is a likely *cause* of landing
+there (large `|log_ratio|` → bf16 `exp` overflow → non-finite loss).
+
+### Advantage-sign-split ratio metrics and the *effective* clipfrac
+
+`mean_ratio_{fixed,jitter}` pool both advantage signs, and because the gap
+scales as `λ²` the two signs sit at very different ratios (at
+`jitter_pos=0.25` / `jitter_neg=0.05` the biases are ≈−0.058 vs ≈−0.002), so
+the pooled curve is dominated by the positive rows and neither branch is
+legible. `train/{mean_ratio,mean_log_ratio_abs}_{fixed,jitter}_{pos,neg}` split
+them:
+
+- `mean_ratio_jitter_pos` starts each iteration at `e^-gap_pos` and its
+  movement **up** within the iteration is headroom being consumed — the direct
+  "is the positive branch learning?" readout.
+- `mean_ratio_jitter_neg` starts at ≈1.0 and moves down; that is erosion.
+
+`train/clipfrac_effective_{pos,neg}` counts rows whose **clip-term** gradient
+the clamp actually zeroed, which is *not* what `clipfrac` measures. `clipfrac`
+is the sign-agnostic test `(ratio < 1−lo) | (ratio > 1+hi)`, and for a
+positive-advantage row that is a false positive: with `A>0` and `ρ < 1−lo`,
+`min(A·ρ, A·(1−lo)) = A·ρ` — the unclamped branch wins and the gradient is
+fully alive. Predicate: `clip_killed_gradient()` (module-level in
+`train_grpo.py`, so tests exercise the real expression), which is
+`clamp_moved & (surr2 <= surr1)`; positives can only die on the **upper** bound
+and negatives only on the **lower** one.
+
+That distinction is cosmetic at today's `jitter_pos` (observed `ratio_max` ≈
+1.05) but becomes load-bearing above `jitter_pos ≈ 0.30`, where `gap_pos`
+exceeds `|log(1−clip_eps_low)|` and **every** positive row reports as
+"clipped" while training normally. Two caveats:
+
+- Buckets by the **post**-renorm advantage sign (unlike the sibling
+  `clipfrac_{branch}_{sign}` metrics, which use pre-renorm), because which
+  bound a row can die on is decided by the sign the loss saw. Expect
+  `_pos` ≡ 0 at any sane `jitter_pos`.
+- Do **not** read `_neg` as a drop-in for `clipfrac_*_neg`: under
+  per-minibatch renorm the two have different denominators, and a group-good
+  row carrying `λ = jitter_pos` that renorm flipped negative is a genuine
+  lower-bound death booked here — so a large `jitter_pos` inflates `_neg`.
+  Cross-reference `n_pos_flipped_by_renorm`.
+
+Values routed through `_log_metrics._emit` are filtered for non-finite (and
+non-numeric) entries before reaching TB/wandb, because a bf16
+`ratio = log_ratio.exp()` overflow reaches `ratio_sum_*` while the clipped loss
+stays finite, and one `nan`/`inf` poisons wandb's chart autoscale for the rest
+of the run. Note the **pre-existing** `train/loss`, `train/clipfrac`,
+`train/mean_ratio` and `train/mean_log_ratio_abs` are deliberately left
+unfiltered.
+
+`test_jitter_metrics.py` covers all of the above on CPU: the gap / Jacobian /
+headroom arithmetic against a closed-form stand-in whose FM residual vanishes
+at `ε_in = ε` (so the Taylor expansion the estimator inverts applies), the
+`clip_killed_gradient` truth table cross-checked against autograd on the real
+loss, the `clipfrac_effective_*` aggregation **values** (forced dead-patterns
+pin each bucket's denominator), and the θ ≡ θ_ref property functionally via
+AdamW's lazily-populated `optimizer.state`.
 
 ### Bit-identical guarantee with jitter off (both sides `0`)
 

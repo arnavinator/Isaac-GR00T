@@ -1231,6 +1231,194 @@ def test_diagnostic_runs_strictly_before_any_step():
           "_jitter_diag" in r_nofinite.result, str(sorted(r_nofinite.result)))
 
 
+# ───────────── 7. per-chunk gap survey (Stage 0 + Stage 1) ───────────────
+
+class _SurveyChunk:
+    def __init__(self, ep, idx, succ, ref_lp, adv, H, D):
+        self.episode_idx, self.chunk_idx, self.episode_success = ep, idx, succ
+        self.ref_log_prob, self.advantage = ref_lp, adv
+        self.tau_samples = np.linspace(0.0, 0.75, 6).astype(np.float32)
+        self.initial_noise = np.zeros((H, D), dtype=np.float32)
+
+
+def _survey_trainer(size, n_eps=8, chunks_succ=6, chunks_fail=10, H=4, D=8,
+                    gap_of=None):
+    """Trainer whose _prepare_batch is stubbed and whose fm_log_prob returns a
+    log-prob chosen so that gap_i == gap_of(chunk) exactly."""
+    t = GRPOTrainer.__new__(GRPOTrainer)
+    t.config = SimpleNamespace(
+        jitter_pos=0.25, jitter_neg=0.05, clip_eps_low=0.08, clip_eps_high=0.2,
+        tau_centers=[0.0, 0.25, 0.35, 0.5, 0.6, 0.75], mini_batch_size=8,
+        seed=67, per_chunk_gap_survey_size=size,
+    )
+    t.device = torch.device("cpu")
+    t.iteration = 3
+    import threading
+    t._model_lock = threading.RLock()
+    t.model = SimpleNamespace(action_head=None)
+
+    chunks = []
+    for ep in range(n_eps):
+        succ = ep % 2 == 0
+        n = chunks_succ if succ else chunks_fail
+        for i in range(n):
+            chunks.append(_SurveyChunk(ep, i, succ, -0.004, +1.0 if succ else -1.0, H, D))
+
+    def _prep(entries):
+        cs = [c for c, _ in entries]
+        B = len(cs)
+        return ({"initial_noise": torch.zeros(B, H, D),
+                 "backbone_output": {"backbone_features": torch.zeros(B, 1, D)},
+                 "state_features": torch.zeros(B, 2, D),
+                 "embodiment_id": torch.zeros(B, dtype=torch.long),
+                 "actions": torch.zeros(B, H, D),
+                 "action_masks": torch.ones(B, H, D)}, cs)
+    t._prepare_batch = _prep
+
+    def _fake(**kw):
+        cs = _fake.current
+        # lp_jit = ref_log_prob - gap  =>  gap_i = ref_log_prob_i - lp_jit_i
+        return torch.tensor([c.ref_log_prob - gap_of(c) for c in cs],
+                            dtype=torch.float32)
+    _fake.current = None
+    orig_prep = t._prepare_batch
+
+    def _prep_track(entries):
+        bd, cs = orig_prep(entries); _fake.current = cs; return bd, cs
+    t._prepare_batch = _prep_track
+    return t, chunks, _fake
+
+
+def test_per_chunk_gap_survey():
+    print("\n[chunk_gap] Stage 1: per-chunk gap survey")
+    real = train_grpo.compute_fm_log_prob
+
+    # (a) disabled by default -> exactly None, zero cost
+    t, chunks, fake = _survey_trainer(0, gap_of=lambda c: 0.05)
+    check("size=0 (default) -> returns None, no work done",
+          t._per_chunk_gap_survey(chunks) is None)
+
+    # (b) gap arithmetic + CV + planted correlations
+    #     plant: successes have SMALLER gap (wider basins), and gap RISES with
+    #     position within the episode.
+    def planted(c):
+        base = 0.040 if c.episode_success else 0.060
+        n = 5 if c.episode_success else 9
+        return base + 0.020 * (c.chunk_idx / n)
+    t, chunks, fake = _survey_trainer(200, gap_of=planted)
+    train_grpo.compute_fm_log_prob = fake
+    torch.manual_seed(99); before = torch.get_rng_state().clone()
+    try:
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = t._per_chunk_gap_survey(chunks)
+    finally:
+        train_grpo.compute_fm_log_prob = real
+    check("returns a dict when enabled", isinstance(out, dict), str(type(out)))
+    check("consumes NO global RNG (uses its own generator)",
+          torch.equal(before, torch.get_rng_state()))
+    exp = [planted(c) for c in chunks]
+    check("mean gap matches the planted values",
+          close(out["mean"], float(np.mean(exp)), 0.05),
+          f"{out['mean']:.5f} vs ~{np.mean(exp):.5f}")
+    check("cv is reported (THE decision statistic)", "cv" in out, str(sorted(out)))
+    check("cv is positive and finite",
+          out["cv"] > 0 and math.isfinite(out["cv"]), str(out.get("cv")))
+    check("probe_lambda == jitter_pos (single probe, not the per-sign split)",
+          close(out["probe_lambda"], 0.25))
+    check("successes have the smaller mean gap, as planted",
+          out["mean_succ"] < out["mean_fail"],
+          f"succ={out['mean_succ']:.5f} fail={out['mean_fail']:.5f}")
+    check("r_outcome is NEGATIVE (success <-> wider basin), as planted",
+          out["r_outcome"] < -0.3, f"{out.get('r_outcome')}")
+    check("r_position is POSITIVE (gap rises with position), as planted",
+          out["r_position"] > 0.2, f"{out.get('r_position')}")
+    check("both outcome classes were sampled (stratification works)",
+          "mean_succ" in out and "mean_fail" in out, str(sorted(out)))
+    check("percentiles ordered p10 <= p50 <= p90 <= max",
+          out["p10"] <= out["p50"] <= out["p90"] <= out["max"],
+          str({k: out[k] for k in ("p10", "p50", "p90", "max")}))
+    check("every emitted value is finite",
+          all(math.isfinite(v) for v in out.values()),
+          str({k: v for k, v in out.items() if not math.isfinite(v)}))
+
+    # (c) a FLAT gap must produce CV ~ 0 -> the kill signal
+    t, chunks, fake = _survey_trainer(200, gap_of=lambda c: 0.05)
+    train_grpo.compute_fm_log_prob = fake
+    try:
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            flat = t._per_chunk_gap_survey(chunks)
+    finally:
+        train_grpo.compute_fm_log_prob = real
+    check("constant gap -> cv ~ 0 (the 'per-chunk is dead' signal)",
+          flat["cv"] < 1e-6, f"{flat['cv']:.3e}")
+    check("constant gap -> r_outcome absent or ~0 (no spurious correlation)",
+          abs(flat.get("r_outcome", 0.0)) < 1e-6, str(flat.get("r_outcome")))
+
+    # (d) degenerate inputs
+    t, chunks, fake = _survey_trainer(200, gap_of=lambda c: 0.05)
+    check("too few usable chunks -> None", t._per_chunk_gap_survey(chunks[:8]) is None)
+    for c in chunks:
+        c.ref_log_prob = None
+    check("all ref_log_prob None -> None", t._per_chunk_gap_survey(chunks) is None)
+
+
+def test_stage0_cv_and_chunk_gap_logging():
+    print("\n[chunk_gap] Stage 0 CV + TB emission")
+    from grpo_config import GRPOConfig
+    # Stage 0: gap_pos_cv comes out of the existing minibatch diagnostic
+    inp = _make_inputs(B=8, K=3, seed=13)
+    head = _MinAtEpsHead(inp["actions"], inp["eps"], inp["timesteps"], c=0.7)
+    t = _probe_trainer(0.25, 0.05, ref_pos=0.004)
+    t.model = SimpleNamespace(action_head=head)
+    pos = torch.zeros(8, dtype=torch.bool); pos[:6] = True
+    lam = torch.where(pos, torch.full((8,), 0.25), torch.full((8,), 0.05))
+    g = torch.Generator().manual_seed(5)
+    xi = torch.randn(inp["K"], *inp["eps"].shape, generator=g)
+    nfi = ((1 - lam * lam).sqrt()[None, :, None, None] * inp["eps"].unsqueeze(0)
+           + lam[None, :, None, None] * xi)
+    out = t._jitter_gap_diagnostics(
+        ready_backbone=inp["backbone"], ready_state_features=inp["state_features"],
+        ready_embodiment_id=inp["embodiment_id"], ready_actions=inp["actions"],
+        ready_masks=inp["mask"], ready_noise=inp["eps"], timesteps=inp["timesteps"],
+        noise_for_input=nfi, lam_row=lam, pos_adv_mask=pos,
+        fixed_row_mask=torch.zeros(8, dtype=torch.bool))
+    for k in ("gap_pos_cv", "gap_pos_min", "gap_pos_max"):
+        check(f"Stage 0 emits {k}", k in out, str(sorted(out)))
+    check("gap_pos_min <= gap_pos <= gap_pos_max",
+          out["gap_pos_min"] <= out["gap_pos"] <= out["gap_pos_max"],
+          f"{out['gap_pos_min']:.5f} {out['gap_pos']:.5f} {out['gap_pos_max']:.5f}")
+    check("gap_pos_cv is finite and non-negative",
+          math.isfinite(out["gap_pos_cv"]) and out["gap_pos_cv"] >= 0,
+          str(out["gap_pos_cv"]))
+
+    # chunk_gap/* must reach TB, ungated on n_updates, filtered for non-finite
+    for label, nupd in (("n_updates>0", 3), ("n_updates==0", 0)):
+        tr = GRPOTrainer.__new__(GRPOTrainer)
+        tr.config = GRPOConfig(device="cpu", use_wandb=False)
+        tr.writer = _RecordingWriter()
+        tr._ref_mse_stats = None
+        tr._chunk_gap_stats = {"n": 256, "mean": 0.05, "cv": 0.11,
+                              "r_outcome": -0.21, "bad": float("inf")}
+        tr._log_metrics(4, {"success_rate": 0.5}, {"n_updates": nupd},
+                        lr=1e-5, iter_time=1.0, phase_times=None, lora_delta_norm=0.1)
+        tags = [t_ for t_, _, _ in tr.writer.calls]
+        check(f"{label}: chunk_gap/* emitted", "chunk_gap/cv" in tags,
+              str(sorted(x for x in tags if "chunk_gap" in x)))
+        check(f"{label}: non-finite chunk_gap entry dropped",
+              "chunk_gap/bad" not in tags, str(tags))
+    tr2 = GRPOTrainer.__new__(GRPOTrainer)
+    tr2.config = GRPOConfig(device="cpu", use_wandb=False)
+    tr2.writer = _RecordingWriter(); tr2._ref_mse_stats = None
+    tr2._log_metrics(4, {"success_rate": 0.5}, {"n_updates": 3},
+                     lr=1e-5, iter_time=1.0, phase_times=None, lora_delta_norm=0.1)
+    check("survey disabled / attr absent -> no chunk_gap/* curves",
+          not [x for x, _, _ in tr2.writer.calls if x.startswith("chunk_gap/")])
+    check("config default keeps the survey OFF (zero cost)",
+          GRPOConfig(device="cpu").per_chunk_gap_survey_size == 0)
+
+
 # ───────────────────────────── run ───────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1245,6 +1433,8 @@ if __name__ == "__main__":
     test_wandb_path_excludes_nested_dict()
     test_diagnostic_runs_strictly_before_any_step()
     test_diagnostic_failure_is_isolated()
+    test_per_chunk_gap_survey()
+    test_stage0_cv_and_chunk_gap_logging()
     print()
     if FAILURES:
         print(f"{RED}{len(FAILURES)} test(s) FAILED:{RESET}")

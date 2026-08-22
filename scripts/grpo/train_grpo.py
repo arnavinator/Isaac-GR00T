@@ -215,6 +215,12 @@ class GRPOTrainer:
         # None = the ref pass has not run this iteration (skipped iter).
         self._ref_mse_stats: dict | None = None
 
+        # Per-chunk jitter-gap survey, refreshed per iteration by
+        # _per_chunk_gap_survey and emitted as chunk_gap/*. None when
+        # per_chunk_gap_survey_size == 0 (the default) or when the ref pass
+        # produced too little usable data.
+        self._chunk_gap_stats: dict | None = None
+
     def setup(self):
         """Load the model + LoRA, configure optimizer, validate the resume
         cache (when ``resume_from_collected_data=True``), and start the
@@ -544,6 +550,7 @@ class GRPOTrainer:
             # gap in the ref_mse/* curves instead of silently re-emitting the
             # previous iteration's numbers at this step.
             self._ref_mse_stats = None
+            self._chunk_gap_stats = None
 
             # --- Select task for this iteration (round-robin across env_names) ---
             # Each iteration focuses on ONE task and collects all num_groups for it.
@@ -2041,6 +2048,22 @@ class GRPOTrainer:
             print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
 
         self._ref_mse_stats = self._summarize_ref_mse(chunks, compute_base)
+        # Per-chunk gap survey (Stage 1). Runs HERE because it needs ref_log_prob,
+        # tau_samples and the cached encoded features all in place — which is
+        # exactly the state at the end of this pass — and because measuring at
+        # theta == theta_ref keeps the gap free of policy-drift contamination, same
+        # as _jitter_gap_diagnostics. Off by default; see the config docstring.
+        try:
+            self._chunk_gap_stats = self._per_chunk_gap_survey(chunks)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  WARNING: per-chunk gap survey failed "
+                f"({type(exc).__name__}: {exc}) — skipping chunk_gap/* this "
+                f"iteration. Training is unaffected."
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._chunk_gap_stats = None
 
     def _summarize_ref_mse(self, chunks: list, compute_base: bool) -> dict | None:
         """Summarize MSE_ref (= -ref_log_prob) over this iteration's live chunks.
@@ -3574,6 +3597,196 @@ class GRPOTrainer:
             result["_jitter_diag"] = jitter_diag
         return result
 
+    def _per_chunk_gap_survey(self, chunks: list) -> dict | None:
+        """Measure the jitter gap PER CHUNK on a stratified sample (Stage 1).
+
+        WHY. `_jitter_gap_diagnostics` reports the gap averaged over ~4 positive
+        rows of one minibatch. This measures it for individual chunks, which turns
+        it into a per-chunk BASIN WIDTH: small gap = the velocity field is locally
+        flat, so neighbouring noise vectors produce nearly the same action (robust
+        basin); large gap = a small eps perturbation moves the action a lot
+        (fragile basin).
+
+        That matters because this problem's defining constraint is ONE BIT of
+        reward per ~40 chunks. A continuous per-chunk quantity is the only kind of
+        signal that can break that, and this one is nearly free to obtain. The
+        three correlations below are the point of the exercise:
+          gap vs episode outcome  -> is success "landing in robust basins"? If so
+              the gap is usable as an advantage shaper, which is a far better use
+              than modulating lambda (see the lambda note at the bottom).
+          gap vs normalised position in the episode -> does fragility live early or
+              late? This is the measurement that settles the recency-weighting
+              direction, which the objective itself does not determine.
+          gap vs the chunk's own MSE_ref -> are fragile chunks also poorly-fit
+              ones? Bears on the MSE_ref growth seen across iterations.
+
+        COST. The clean leg is FREE: MSE_theta(eps) == -chunk.ref_log_prob, already
+        stored by the ref pass. Only the jittered leg needs a forward, so a sample
+        of N chunks costs N*K DiT forwards against the ref pass's n_chunks*2K.
+        At N=256 that is ~5% of the ref pass's DiT work, ~12 s on a ~1700 s
+        iteration (<1%). Sampling ALL chunks would be ~6%, which is why this is
+        deliberately a subsample -- 256 resolves |r| > 0.12 at 2 sigma and pins the
+        CV to +/-4.4% relative, which is all these questions need.
+
+        A SINGLE PROBE LAMBDA is used for every sampled chunk, NOT the per-sign
+        jitter_pos/jitter_neg. gap scales as lambda^2, so the production 0.25/0.05
+        split would make gap differ 25x by advantage sign and the outcome
+        correlation would just be measuring that split. A uniform probe keeps
+        gap_i comparable across chunks.
+
+        RNG: uses a dedicated seeded torch.Generator, so it consumes no global RNG
+        and leaves runs bit-comparable to ones recorded before this existed
+        (`_jitter_gap_diagnostics` achieves the same by consuming none at all).
+
+        ON LAMBDA MODULATION: this survey deliberately does NOT feed a per-chunk
+        lambda. With lambda constant, gap_i is ALREADY proportional to ||J_i||^2,
+        so sharp-basin chunks already receive proportionally more flattening
+        pressure. "Equalising the gap" (lambda_i ~ 1/||J_i||) would REMOVE that
+        scaling; amplifying it drives the sharpest chunks to the mode-collapse
+        bound first. Measure first; only add modulation if the numbers below
+        suggest a specific policy.
+
+        Returns a dict logged under `chunk_gap/`, or None when disabled or when
+        there is not enough usable data.
+        """
+        N = int(getattr(self.config, "per_chunk_gap_survey_size", 0) or 0)
+        if N <= 0:
+            return None
+        usable = [
+            c for c in chunks
+            if c.ref_log_prob is not None and c.initial_noise is not None
+            and c.tau_samples is not None
+        ]
+        if len(usable) < 16:
+            return None
+
+        # Normalised position within the parent episode. Computed over ALL chunks
+        # (not the sample) so it is a true fraction: episodes have different
+        # lengths, and successes terminate early, so raw chunk_idx would conflate
+        # "late in the episode" with "came from a failure".
+        last = {}
+        for c in chunks:
+            last[c.episode_idx] = max(last.get(c.episode_idx, 0), c.chunk_idx)
+        pos = {id(c): (c.chunk_idx / last[c.episode_idx]) if last[c.episode_idx] else 0.0
+               for c in usable}
+
+        # Stratify over 10 position bins x {success, failure}. Without this the
+        # gap-vs-position estimate is confounded: failures run to the 50-chunk
+        # truncation while successes stop at ~36, so late positions would be
+        # drawn disproportionately from failures and the outcome effect would
+        # masquerade as a position effect.
+        rng = np.random.default_rng(self.config.seed + self.iteration * 7919)
+        cells: dict = {}
+        for c in usable:
+            cells.setdefault((min(int(pos[id(c)] * 10), 9), bool(c.episode_success)), []).append(c)
+        per_cell = max(1, N // max(len(cells), 1))
+        sample = []
+        for key in sorted(cells, key=lambda k: (k[1], k[0])):
+            pool = cells[key]
+            take = min(per_cell, len(pool))
+            idx = rng.choice(len(pool), size=take, replace=False)
+            sample.extend(pool[i] for i in idx)
+        if len(sample) < 16:
+            return None
+
+        probe_lam = float(self.config.jitter_pos) or 0.25
+        K = len(self.config.tau_centers)
+        gaps: list[float] = []
+        meta: list[tuple] = []
+        gen = torch.Generator(device="cpu").manual_seed(
+            self.config.seed + self.iteration * 104729
+        )
+        bs = max(1, self.config.mini_batch_size * 2)
+        with self._model_lock, torch.no_grad():
+            for start in range(0, len(sample), bs):
+                batch = sample[start:start + bs]
+                result = self._prepare_batch([(c, "fixed") for c in batch])
+                if result is None:
+                    continue
+                bd, valid = result
+                eps = bd["initial_noise"]
+                if eps is None:
+                    continue
+                B, H, D = eps.shape
+                tau = torch.from_numpy(
+                    np.stack([c.tau_samples for c in valid], axis=1)
+                ).to(device=self.device, dtype=torch.bfloat16)
+                xi = torch.randn(K, B, H, D, generator=gen).to(
+                    device=self.device, dtype=eps.dtype
+                )
+                nfi = (
+                    math.sqrt(1.0 - probe_lam * probe_lam) * eps.unsqueeze(0)
+                    + probe_lam * xi
+                ).to(eps.dtype)
+                lp_jit = compute_fm_log_prob(
+                    action_head=self.model.action_head,
+                    backbone_output=bd["backbone_output"],
+                    state_features=bd["state_features"],
+                    embodiment_id=bd["embodiment_id"],
+                    actions=bd["actions"],
+                    action_mask=bd["action_masks"],
+                    timesteps=tau,
+                    noise=eps,
+                    n_samples=K,
+                    noise_for_input=nfi,
+                )
+                for i, c in enumerate(valid):
+                    # gap = MSE(eps') - MSE(eps) = (-lp_jit) - (-ref_log_prob)
+                    gp = float(c.ref_log_prob) - float(lp_jit[i].item())
+                    if not math.isfinite(gp):
+                        continue
+                    gaps.append(gp)
+                    meta.append((
+                        1.0 if c.episode_success else 0.0,
+                        pos[id(c)],
+                        -float(c.ref_log_prob),        # this chunk's MSE_ref
+                        1.0 if c.advantage > 0 else 0.0,
+                    ))
+        if len(gaps) < 16:
+            return None
+
+        gv = np.asarray(gaps, dtype=np.float64)
+        succ, position, mse_ref, posadv = (np.asarray(x, dtype=np.float64)
+                                           for x in zip(*meta))
+
+        def corr(a, b):
+            if a.std() < 1e-12 or b.std() < 1e-12:
+                return None
+            return float(np.corrcoef(a, b)[0, 1])
+
+        out = {
+            "n": int(gv.size),
+            "probe_lambda": probe_lam,
+            "mean": float(gv.mean()),
+            "p10": float(np.percentile(gv, 10)),
+            "p50": float(np.percentile(gv, 50)),
+            "p90": float(np.percentile(gv, 90)),
+            "max": float(gv.max()),
+        }
+        if abs(gv.mean()) > 1e-12:
+            # THE decision statistic. Compare against the ~4-8% intrinsic
+            # xi-sampling floor: at or below it, per-chunk treatment is dead.
+            out["cv"] = float(gv.std() / abs(gv.mean()))
+        for lbl, mask in (("succ", succ > 0.5), ("fail", succ <= 0.5)):
+            if mask.sum() >= 4:
+                out[f"mean_{lbl}"] = float(gv[mask].mean())
+        for lbl, mask in (("posadv", posadv > 0.5), ("negadv", posadv <= 0.5)):
+            if mask.sum() >= 4:
+                out[f"mean_{lbl}"] = float(gv[mask].mean())
+        for lbl, other in (("r_outcome", succ), ("r_position", position),
+                           ("r_ref_mse", mse_ref)):
+            c = corr(gv, other)
+            if c is not None:
+                out[lbl] = c
+        print(
+            f"  chunk-gap survey: n={out['n']} lam={probe_lam:.2f} "
+            f"mean={out['mean']:.5f} CV={out.get('cv', float('nan')):.3f} "
+            f"r(outcome)={out.get('r_outcome', float('nan')):+.3f} "
+            f"r(position)={out.get('r_position', float('nan')):+.3f} "
+            f"r(MSE_ref)={out.get('r_ref_mse', float('nan')):+.3f}"
+        )
+        return out
+
     def _jitter_gap_diagnostics(
         self,
         *,
@@ -3717,6 +3930,23 @@ class GRPOTrainer:
             out["gap_pos"] = gap_pos
             out["jacobian_fro_sq"] = float(jac_row[jp].mean().item())
             out["n_rows_pos"] = n_jp
+            # STAGE-0 per-chunk spread. gap_row is already PER CHUNK; everything
+            # else here collapses it to a mean. The coefficient of variation across
+            # the rows of this one minibatch is the cheapest possible test of
+            # whether a per-chunk gap carries information at all:
+            #   a single chunk's gap has ~4-8% intrinsic noise from the xi draw
+            #   (rel. sd ~ sqrt(2/r_eff)/sqrt(K), r_eff = 50..192 output dims),
+            # so CV <~ 8% means the between-chunk spread is all sampling noise and
+            # a per-chunk treatment cannot help; CV >~ 15% means real structure.
+            # Only ~4 positive rows per iteration, so read this pooled over many
+            # iterations, not per-iteration. Free: no extra forward.
+            if n_jp > 1:
+                gp_rows = gap_row[jp]
+                m = float(gp_rows.mean().item())
+                if abs(m) > 1e-12:
+                    out["gap_pos_cv"] = float(gp_rows.std().item()) / abs(m)
+            out["gap_pos_min"] = float(gap_row[jp].min().item())
+            out["gap_pos_max"] = float(gap_row[jp].max().item())
             # Per-tau profile, POSITIVE rows only: gap scales as lam^2, and
             # lam_pos is typically ~5x lam_neg (25x in the gap), so pooling the
             # signs would make the profile a mixture of two very different
@@ -4724,6 +4954,14 @@ class GRPOTrainer:
         if _ref_mse:
             _emit("ref_mse", _ref_mse)
 
+        # Per-chunk gap survey. Ungated on n_updates for the same reason as
+        # ref_mse/*: measured at theta == theta_ref, before any step. The headline
+        # is chunk_gap/cv -- compare it against the ~4-8% intrinsic xi-sampling
+        # floor to decide whether any per-chunk treatment is worth building.
+        _cg = getattr(self, "_chunk_gap_stats", None)
+        if _cg:
+            _emit("chunk_gap", _cg)
+
         # Jitter gap measurement. Under its own `jitter/` prefix because it is a
         # single-minibatch snapshot taken at theta == theta_ref, not a per-mb
         # mean over the iteration like every `train/` scalar. Absent when jitter
@@ -4956,6 +5194,12 @@ class GRPOTrainer:
                 if _ref_mse_w:
                     log_dict.update({
                         f"ref_mse/{k}": v for k, v in _ref_mse_w.items()
+                        if math.isfinite(v)
+                    })
+                _cg_w = getattr(self, "_chunk_gap_stats", None)
+                if _cg_w:
+                    log_dict.update({
+                        f"chunk_gap/{k}": v for k, v in _cg_w.items()
                         if math.isfinite(v)
                     })
                 if update_stats is not None:

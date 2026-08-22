@@ -494,6 +494,39 @@ class GRPOConfig:
     #         jittered input noise.
     jitter_paired: bool = True
 
+    # PER-CHUNK jitter-gap survey (measurement only; changes no training math).
+    #
+    # 0 = off (default, zero cost). N > 0 measures the jitter gap for N individual
+    # chunks per iteration, stratified over 10 normalised-position bins x
+    # {success, failure}, and logs the distribution plus three correlations under
+    # `chunk_gap/`. See GRPOTrainer._per_chunk_gap_survey for the full rationale.
+    #
+    # What it buys: the per-chunk gap is a BASIN WIDTH measurement — how much the
+    # FM loss rises when that chunk's noise is perturbed. Small = neighbouring
+    # noise lands on the same action (robust); large = fragile. This problem gives
+    # ONE BIT of reward per ~40 chunks, so a continuous per-chunk quantity is the
+    # only kind of signal that can break that bottleneck, and the clean leg of the
+    # measurement is already computed (MSE_ref = -chunk.ref_log_prob).
+    #
+    # Cost: N*K extra DiT forwards against the ref pass's n_chunks*2K. At N=256
+    # that is ~5% of the ref pass's DiT work, ~12 s on a ~1700 s iteration (<1%).
+    # Sampling every chunk would be ~6% of the iteration, which is why this is a
+    # subsample: N=256 resolves |r| > 0.12 at 2 sigma and pins the CV to +/-4.4%
+    # relative, which is all the three questions need. Values much above ~512 buy
+    # precision nothing depends on.
+    #
+    # Reading the result: `chunk_gap/cv` is the decision statistic. A single
+    # chunk's gap carries ~4-8% intrinsic noise from the xi draw, so CV at or below
+    # ~8% means the between-chunk spread is pure sampling noise and no per-chunk
+    # treatment can help; CV above ~15% means real structure.
+    #
+    # Requires jitter to be meaningful but not enabled: the survey uses a single
+    # probe lambda = jitter_pos (falling back to 0.25 when jitter_pos == 0) for
+    # every sampled chunk, because gap ~ lambda^2 and the production 0.25/0.05
+    # sign split would otherwise make the outcome correlation measure the split
+    # rather than basin width.
+    per_chunk_gap_survey_size: int = 0
+
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
     # K = len(tau_centers) determines how many points along the noise→action interpolation

@@ -245,6 +245,7 @@ def test_jitter_gap_arithmetic():
         ready_masks=inp["mask"], ready_noise=inp["eps"],
         timesteps=inp["timesteps"], noise_for_input=nfi, lam_row=lam_row,
         pos_adv_mask=pos_mask, fixed_row_mask=fixed_mask,
+        jitter_row_mask=~fixed_mask,
     )
 
     # Independent expectation from the closed form.
@@ -386,6 +387,7 @@ def test_jacobian_estimator_is_lambda_invariant():
             ready_masks=inp["mask"], ready_noise=inp["eps"],
             timesteps=inp["timesteps"], noise_for_input=nfi, lam_row=lam_row,
             pos_adv_mask=pos_mask, fixed_row_mask=fixed_mask,
+            jitter_row_mask=~fixed_mask,
         )
 
     gaps = [results[l]["gap_pos"] for l in (0.10, 0.25, 0.50)]
@@ -447,6 +449,7 @@ def test_jitter_gap_edge_cases():
         noise_for_input=nfi, lam_row=torch.full((4,), 0.05),
         pos_adv_mask=torch.zeros(4, dtype=torch.bool),
         fixed_row_mask=torch.zeros(4, dtype=torch.bool),
+        jitter_row_mask=torch.ones(4, dtype=torch.bool),
     )
     check("all-negative minibatch: no gap_pos / headroom keys",
           "gap_pos" not in out and "headroom_multiplier" not in out, str(sorted(out)))
@@ -464,6 +467,7 @@ def test_jitter_gap_edge_cases():
         noise_for_input=nfi, lam_row=torch.full((4,), 0.25),
         pos_adv_mask=torch.ones(4, dtype=torch.bool),
         fixed_row_mask=torch.zeros(4, dtype=torch.bool),
+        jitter_row_mask=torch.ones(4, dtype=torch.bool),
     )
     check("absent _ref_mse_stats: no raise, gap still reported",
           "gap_pos" in out2 and "headroom_multiplier" not in out2)
@@ -478,6 +482,7 @@ def test_jitter_gap_edge_cases():
         noise_for_input=nfi, lam_row=torch.zeros(4),
         pos_adv_mask=torch.ones(4, dtype=torch.bool),
         fixed_row_mask=torch.zeros(4, dtype=torch.bool),
+        jitter_row_mask=torch.ones(4, dtype=torch.bool),
     )
     check("lam == 0: jacobian_fro_sq is finite (guarded division)",
           math.isfinite(out3["jacobian_fro_sq"]), f"{out3['jacobian_fro_sq']}")
@@ -495,6 +500,7 @@ def test_jitter_gap_edge_cases():
         noise_for_input=nfi, lam_row=torch.full((4,), 0.25),
         pos_adv_mask=torch.ones(4, dtype=torch.bool),
         fixed_row_mask=torch.zeros(4, dtype=torch.bool),
+        jitter_row_mask=torch.ones(4, dtype=torch.bool),
     )
     check("diagnostic consumes NO global RNG",
           torch.equal(before, torch.get_rng_state()))
@@ -512,6 +518,7 @@ def test_jitter_gap_edge_cases():
         noise_for_input=nfi, lam_row=torch.full((4,), 0.25),
         pos_adv_mask=torch.ones(4, dtype=torch.bool),
         fixed_row_mask=torch.zeros(4, dtype=torch.bool),
+        jitter_row_mask=torch.ones(4, dtype=torch.bool),
     )
     check("diagnostic leaves no gradient on params (no_grad honoured)",
           head_g.w.grad is None)
@@ -1383,7 +1390,8 @@ def test_stage0_cv_and_chunk_gap_logging():
         ready_embodiment_id=inp["embodiment_id"], ready_actions=inp["actions"],
         ready_masks=inp["mask"], ready_noise=inp["eps"], timesteps=inp["timesteps"],
         noise_for_input=nfi, lam_row=lam, pos_adv_mask=pos,
-        fixed_row_mask=torch.zeros(8, dtype=torch.bool))
+        fixed_row_mask=torch.zeros(8, dtype=torch.bool),
+        jitter_row_mask=torch.ones(8, dtype=torch.bool))
     for k in ("gap_pos_cv", "gap_pos_min", "gap_pos_max"):
         check(f"Stage 0 emits {k}", k in out, str(sorted(out)))
     check("gap_pos_min <= gap_pos <= gap_pos_max",

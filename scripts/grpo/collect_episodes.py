@@ -1055,14 +1055,22 @@ class EpisodeCollector:
 
             group_successes = sum(e["success"] for e in group_episodes)
             # "Alive group" = mixed: at least one rollout succeeded AND at
-            # least one failed. This matches the trainer's gradient-signal
-            # criterion exactly: under the sparse binary reward (time-scaling
+            # least one failed. This matches the trainer's IMPROVEMENT-signal
+            # criterion: under the sparse binary reward (time-scaling
             # disabled; see episode_buffer.py for the ablation rationale),
             # per-group reward std > 0 iff the rewards span both 0 and 1 —
             # i.e., 0 < group_successes < group_size. Pure all-success groups
             # (group_successes == group_size) and pure all-fail groups
-            # (group_successes == 0) both have std=0 and get advantage-zeroed
-            # by compute_advantages, so neither contributes gradient signal.
+            # (group_successes == 0) both have std=0, so neither carries a
+            # within-group contrast.
+            #
+            # Deliberately unchanged by the trainer's include_anchor_groups: an
+            # all-success group DOES train there (as an anchor: retention, not
+            # improvement), but it still offers nothing to compare against, so
+            # it must not satisfy the "keep collecting until N groups carry
+            # gradient signal" gate. Otherwise dynamic collection would stop
+            # early at high success — exactly when mixed groups are scarcest and
+            # extending toward max_groups matters most.
             if 0 < group_successes < self.group_size:
                 alive_groups += 1
 

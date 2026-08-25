@@ -17,6 +17,10 @@ Key difference from grpo_cont.py:
   broadcast to each chunk in _build_chunks (mirroring grpo_cont.py:368-369).
   The division preserves the group-zero-sum invariant at the chunk level so
   every trajectory contributes equal gradient weight regardless of length.
+- ANCHOR groups (all-success) are the one exception to the group-relative
+  formula: their group-mean baseline gives exactly 0, so they optionally take a
+  constant positive advantage instead. See compute_advantages and README
+  "Anchor groups".
 """
 
 from dataclasses import dataclass, field
@@ -73,6 +77,16 @@ class ActionChunk:
     # minibatch can span all live groups. Defaults to 0 to keep the
     # dataclass constructor backward-compatible.
     group_id: int = 0
+
+    # True when the parent episode belongs to an ANCHOR group (all-success;
+    # see compute_advantages). Anchor rows carry a small constant positive
+    # advantage (or 0 for KL-only anchoring) instead of a group-relative
+    # z-score, so every downstream mechanism that is DEFINED by advantage sign
+    # — the balanced sampler's pos/neg pools, the dynamic-epoch success
+    # fraction, PAWS' alive-mass split, the pos/neg clipfrac buckets — must
+    # exclude them. They are also never renormalized against minibatch-local
+    # statistics; see _grpo_update_inner.
+    is_anchor: bool = False
 
     # Pre-computed reference log-prob (set after collection, before GRPO update)
     ref_log_prob: float | None = None
@@ -135,6 +149,7 @@ class GRPOEpisode:
     num_steps: int                               # Total env steps taken
     group_id: int = 0                            # Which group this episode belongs to
     env_seed: int = 0                            # Env reset seed (same within a group)
+    is_anchor: bool = False                      # Set by compute_advantages for all-success groups
 
     @property
     def num_chunks(self) -> int:
@@ -161,6 +176,12 @@ class EpisodeBuffer:
         # can see how much signal each iteration actually carried.
         self._n_groups: int = 0
         self._n_dead_groups: int = 0
+        # Anchor-group bookkeeping (all-success groups admitted by
+        # include_anchor_groups). Kept separate from _n_dead_groups so the
+        # existing dead/live curves keep their meaning.
+        self._n_anchor_groups: int = 0
+        self._n_anchor_episodes: int = 0
+        self._n_anchor_episodes_dropped: int = 0
 
     def clear(self):
         """Clear buffer for next iteration.
@@ -184,6 +205,9 @@ class EpisodeBuffer:
         self._chunks = None
         self._n_groups = 0
         self._n_dead_groups = 0
+        self._n_anchor_groups = 0
+        self._n_anchor_episodes = 0
+        self._n_anchor_episodes_dropped = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -304,7 +328,13 @@ class EpisodeBuffer:
             env_seed=env_seed,
         )
 
-    def compute_advantages(self, max_episode_steps: int = 520) -> np.ndarray:
+    def compute_advantages(
+        self,
+        max_episode_steps: int = 520,
+        anchor_advantage: float = 0.0,
+        include_anchor_groups: bool = False,
+        anchor_max_row_frac: float = 1.0,
+    ) -> np.ndarray:
         """Compute group-relative advantages for all episodes (one per episode).
 
         This is the CORE GRPO computation, mirroring grpo_cont.py lines 362-364:
@@ -320,20 +350,47 @@ class EpisodeBuffer:
         time-scaling step below (faster solutions get higher reward) is
         currently DISABLED; see the block comment for the ablation rationale.
 
+        Groups are classified three ways (see README "Anchor groups"):
+          - SIGNAL (0 < k < G): group-relative z-score, formula untouched.
+          - ANCHOR (k == G): all-success. `std_r == 0` makes the group-mean
+            baseline give exactly 0, so with include_anchor_groups these get a
+            constant `anchor_advantage` instead and are marked `is_anchor`.
+          - DEAD (k == 0, or a singleton group): advantage 0, filtered before
+            any forward pass.
+        With include_anchor_groups=False, anchor groups fall through to DEAD and
+        every value returned here is bit-identical to the pre-anchor behavior.
+
         Note: this returns ONE advantage per episode. The per-chunk division
         (A_episode / num_chunks, matching grpo_cont.py:368-369) happens later in
         _build_chunks when episodes are flattened into ActionChunks.
 
         Args:
             max_episode_steps: Maximum episode steps (used for time-scaling normalization).
+            anchor_advantage: Per-episode advantage for anchor groups. 0.0 keeps
+                anchor rows in the batch for the KL terms only.
+            include_anchor_groups: Whether all-success groups become anchors at
+                all. False = they stay dead (default, pre-anchor behavior).
+            anchor_max_row_frac: Cap on anchor chunks as a multiple of the
+                signal chunk count. Ignored when there are no signal chunks.
 
         Returns:
-            advantages: [num_episodes] array of group-relative normalized per-episode advantages.
+            advantages: [num_episodes] array of per-episode advantages (signal
+            groups group-relative normalized, anchor groups constant).
         """
+        # Any previously-built chunk list is now stale: it carries the old
+        # advantages and is_anchor flags. Drop the memo so _build_chunks rebuilds
+        # from the values computed here. Without this, a second call with a
+        # different config returns chunks whose stale NON-ZERO advantage passes
+        # the update's live filter even though the gate is now off — the flag
+        # being gated does not help, because it is the advantage that admits them.
+        self._chunks = None
         if not self.episodes:
             self.advantages = np.array([])
             self._n_groups = 0
             self._n_dead_groups = 0
+            self._n_anchor_groups = 0
+            self._n_anchor_episodes = 0
+            self._n_anchor_episodes_dropped = 0
             return self.advantages
 
         # Step 1: Sparse binary reward per episode (1.0 on success, else 0.0).
@@ -381,6 +438,10 @@ class EpisodeBuffer:
         unique_groups = np.unique(group_ids)
 
         n_dead = 0
+        # Anchor groups are resolved in a second pass: the row budget is a
+        # multiple of the SIGNAL chunk count, which isn't known until every
+        # group has been classified.
+        anchor_gids: list[int] = []
         for gid in unique_groups:
             mask = group_ids == gid
             group_rewards = rewards[mask]
@@ -399,17 +460,124 @@ class EpisodeBuffer:
                 # binary rewards (1.0 / num_steps * max_steps in [~1, ~5]),
                 # any group_std < 1e-4 means the group is effectively
                 # all-same-reward and provides no useful gradient signal.
+                #
+                # Under the binary reward this is never a close call: the
+                # per-group std is either exactly 0 (all G outcomes identical)
+                # or at least 1/sqrt(G) — 3500x the threshold at G=8 — so the
+                # branch below is an exact "were all outcomes the same?" test.
                 if std_r < 1e-4:
-                    # No meaningful signal within group
-                    self.advantages[mask] = 0.0
-                    n_dead += 1
+                    if include_anchor_groups and group_rewards.min() >= 1.0 - 1e-9:
+                        # ANCHOR: all-success. Resolved after the loop.
+                        anchor_gids.append(int(gid))
+                    else:
+                        # DEAD: all-fail. Deliberately NOT given the anchor
+                        # treatment — a shrunk baseline would hand every
+                        # episode a negative advantage, which is uniform
+                        # suppression with no target to move toward.
+                        self.advantages[mask] = 0.0
+                        n_dead += 1
                 else:
                     self.advantages[mask] = (group_rewards - mean_r) / std_r
 
         self._n_groups = int(len(unique_groups))
+        self._resolve_anchor_groups(
+            group_ids, anchor_gids, anchor_advantage, anchor_max_row_frac
+        )
+        # An anchor group that lost every episode to the row budget contributes
+        # nothing, so it counts as dead for the live/dead accounting.
+        n_dead += len(anchor_gids) - self._n_anchor_groups
         self._n_dead_groups = int(n_dead)
 
         return self.advantages
+
+    def _resolve_anchor_groups(
+        self,
+        group_ids: np.ndarray,
+        anchor_gids: list[int],
+        anchor_advantage: float,
+        anchor_max_row_frac: float,
+    ) -> None:
+        """Assign anchor advantages, honoring the anchor row budget.
+
+        Anchor episodes are walked in index order and admitted FIRST-FIT (an
+        episode that doesn't fit is skipped, and a later shorter one may still be
+        admitted) until the budget (`anchor_max_row_frac` x signal chunks) is
+        exhausted; the rest revert to advantage 0 and are filtered as dead
+        downstream. Because anchor advantages are constant rather than zero-sum
+        within the group, dropping individual episodes distorts nothing — unlike
+        a signal group, where it would break the Sum(A_ep) == 0 invariant that
+        _build_chunks relies on.
+
+        The budget has an implicit floor of ONE WHOLE EPISODE: the first anchor
+        episode is admitted unconditionally so a small `anchor_max_row_frac`
+        shrinks the anchor share rather than silently deleting the feature. At
+        ~30-65 chunks per episode that can overshoot a small budget several-fold,
+        so the realized chunk count is logged whenever anything is dropped.
+        """
+        self._n_anchor_groups = 0
+        self._n_anchor_episodes = 0
+        self._n_anchor_episodes_dropped = 0
+        for ep in self.episodes:
+            ep.is_anchor = False
+        if not anchor_gids:
+            return
+
+        anchor_set = set(anchor_gids)
+        is_anchor_ep = np.array(
+            [int(gid) in anchor_set for gid in group_ids], dtype=bool
+        )
+        # Signal chunks = chunks of non-anchor episodes with a non-zero
+        # advantage. Dead episodes contribute 0 to both sides.
+        n_signal_chunks = sum(
+            ep.num_chunks
+            for i, ep in enumerate(self.episodes)
+            if not is_anchor_ep[i] and self.advantages[i] != 0.0
+        )
+        # No SIGNAL chunks at all: there is no denominator to measure the budget
+        # against, so it does not apply. Note this is not only the all-success
+        # case — an all-fail + all-success mix also has zero signal chunks while
+        # carrying a non-zero std_reward, so the trainer's outer skip does not
+        # fire either. Logged, because it means anchor_max_row_frac (documented as
+        # the compute knob) is not bounding anything this iteration.
+        if n_signal_chunks == 0:
+            budget = float("inf")
+            n_anchor_chunks = sum(
+                ep.num_chunks for i, ep in enumerate(self.episodes) if is_anchor_ep[i]
+            )
+            print(
+                f"  Anchor row budget WAIVED: no signal (mixed-group) chunks this "
+                f"iteration, so anchor_max_row_frac={anchor_max_row_frac:g} has no "
+                f"denominator — admitting all {n_anchor_chunks} anchor chunk(s)."
+            )
+        else:
+            budget = anchor_max_row_frac * n_signal_chunks
+
+        used = 0
+        kept_gids: set[int] = set()
+        for i, ep in enumerate(self.episodes):
+            if not is_anchor_ep[i]:
+                continue
+            # `not kept_gids` keeps the first anchor episode unconditionally: a
+            # budget too small for even one episode should shrink the anchor's
+            # share, not silently delete the feature.
+            if used + ep.num_chunks <= budget or not kept_gids:
+                ep.is_anchor = True
+                self.advantages[i] = anchor_advantage
+                used += ep.num_chunks
+                kept_gids.add(ep.group_id)
+                self._n_anchor_episodes += 1
+            else:
+                self.advantages[i] = 0.0
+                self._n_anchor_episodes_dropped += 1
+
+        self._n_anchor_groups = len(kept_gids)
+        if self._n_anchor_episodes_dropped:
+            print(
+                f"  Anchor row budget ({anchor_max_row_frac:g} x "
+                f"{n_signal_chunks} signal chunks): kept "
+                f"{self._n_anchor_episodes} anchor episode(s) / {used} chunks, "
+                f"dropped {self._n_anchor_episodes_dropped} to dead."
+            )
 
     def _build_chunks(self) -> list[ActionChunk]:
         """Flatten episodes into individual action chunks for mini-batching.
@@ -452,6 +620,7 @@ class EpisodeBuffer:
                     episode_reward=episode.shaped_reward,
                     episode_success=episode.success,
                     group_id=episode.group_id,
+                    is_anchor=episode.is_anchor,
                 )
                 chunks.append(chunk)
 
@@ -520,6 +689,23 @@ class EpisodeBuffer:
         rewards = [ep.shaped_reward for ep in self.episodes]
         num_steps_list = [ep.num_steps for ep in self.episodes]
 
+        # Advantage summaries are computed over SIGNAL episodes only (anchor
+        # episodes carry a constant positive advantage, not a group-relative
+        # z-score, so pooling them would push pct_positive_advantage toward 1
+        # and make the curve mean something different from one run to the next).
+        # With anchors off this selects every episode, so the values are
+        # bit-identical to the pre-anchor behavior.
+        adv = self.advantages
+        if adv is not None and len(adv) == len(self.episodes):
+            signal_adv = np.array(
+                [a for a, ep in zip(adv, self.episodes) if not ep.is_anchor],
+                dtype=np.float64,
+            )
+        elif adv is not None:
+            signal_adv = np.asarray(adv, dtype=np.float64)
+        else:
+            signal_adv = None
+
         # Per-group success rate distribution. Each group's rate is
         # (n_successes_in_group / n_episodes_in_group); aggregated to
         # min / median / max so TB shows the spread without histograms.
@@ -540,15 +726,39 @@ class EpisodeBuffer:
             "success_rate": self.success_rate,
             "mean_reward": float(np.mean(rewards)),
             "std_reward": float(np.std(rewards)),
-            "mean_advantage": float(self.advantages.mean()) if self.advantages is not None else 0,
-            "std_advantage": float(self.advantages.std()) if self.advantages is not None else 0,
-            "pct_positive_advantage": float((self.advantages > 0).mean()) if self.advantages is not None else 0,
+            "mean_advantage": float(signal_adv.mean()) if signal_adv is not None and signal_adv.size else 0,
+            "std_advantage": float(signal_adv.std()) if signal_adv is not None and signal_adv.size else 0,
+            "pct_positive_advantage": float((signal_adv > 0).mean()) if signal_adv is not None and signal_adv.size else 0,
             # Group quality (populated by compute_advantages); diagnoses how
             # much of the iter's signal got filtered out by the dead-group
             # threshold downstream.
             "n_groups": self._n_groups,
             "n_dead_groups": self._n_dead_groups,
-            "n_live_groups": max(0, self._n_groups - self._n_dead_groups),
+            # SIGNAL (mixed) groups only — anchor groups are neither dead nor a
+            # source of improvement gradient, so they get their own counters and
+            # this keeps its original meaning across the feature flag.
+            "n_live_groups": max(
+                0, self._n_groups - self._n_dead_groups - self._n_anchor_groups
+            ),
+            # Anchor groups (all-success, admitted by include_anchor_groups).
+            # n_anchor_episodes_dropped > 0 means anchor_max_row_frac bit.
+            "n_anchor_groups": self._n_anchor_groups,
+            "n_anchor_episodes": self._n_anchor_episodes,
+            "n_anchor_episodes_dropped": self._n_anchor_episodes_dropped,
+            # Trainable CHUNK counts, which is what the trainer's skip decision
+            # actually depends on. Group and episode counts are not substitutes:
+            # an anchor group can survive classification and still contribute
+            # zero chunks (every episode budget-dropped, or zero-chunk
+            # episodes), and a buffer can have zero signal chunks while
+            # std_reward is non-zero (an all-fail + all-success mix).
+            "n_signal_chunks": sum(
+                ep.num_chunks for i, ep in enumerate(self.episodes)
+                if not ep.is_anchor and adv is not None and i < len(adv)
+                and adv[i] != 0.0
+            ),
+            "n_anchor_chunks": sum(
+                ep.num_chunks for ep in self.episodes if ep.is_anchor
+            ),
             # Per-group success rate spread (min/median/max across groups).
             # Reveals when the iter average masks a bimodal "some seeds at
             # 100%, others at 0%" pattern.
@@ -640,5 +850,81 @@ if __name__ == "__main__":
     print(f"  {len(chunks)} batches, {total_chunks} total chunks")
     assert total_chunks == buffer.num_chunks
     print("  PASS")
+
+    # Test 4: Anchor groups (all-success) vs dead groups (all-fail)
+    print("\nTest 4: Anchor classification")
+
+    def _mk_buffer(outcomes: list[list[bool]], n_chunks: int = 2) -> EpisodeBuffer:
+        """One group per sub-list, one episode per bool."""
+        b = EpisodeBuffer()
+        for gid, group in enumerate(outcomes):
+            for succ in group:
+                b.episodes.append(GRPOEpisode(
+                    video_frames=[{}] * n_chunks, states=[{}] * n_chunks,
+                    language="t", actions=[np.zeros((16, 12))] * n_chunks,
+                    raw_actions=[np.zeros((50, 128))] * n_chunks,
+                    action_masks=[np.ones((50, 128))] * n_chunks,
+                    initial_noises=[np.zeros((50, 128))] * n_chunks,
+                    success=succ, shaped_reward=0.0, env_name="t",
+                    episode_idx=len(b.episodes), num_steps=100,
+                    group_id=gid, env_seed=gid,
+                ))
+        return b
+
+    # Group 0 all-success (anchor), group 1 all-fail (dead), group 2 mixed (signal).
+    outcomes = [[True] * 4, [False] * 4, [True, True, False, False]]
+
+    # 4a: feature OFF reproduces the pre-anchor behavior exactly.
+    off = _mk_buffer(outcomes)
+    adv_off = off.compute_advantages().copy()
+    assert np.all(adv_off[:8] == 0.0), "all-success + all-fail must be dead when off"
+    assert off.stats()["n_dead_groups"] == 2
+    assert off.stats()["n_anchor_groups"] == 0
+    assert not any(ep.is_anchor for ep in off.episodes)
+
+    # 4b: feature ON with a positive advantage.
+    on = _mk_buffer(outcomes)
+    adv_on = on.compute_advantages(anchor_advantage=0.2, include_anchor_groups=True)
+    assert np.allclose(adv_on[:4], 0.2), f"anchor group should be +0.2, got {adv_on[:4]}"
+    assert np.all(adv_on[4:8] == 0.0), "all-fail must STAY dead"
+    assert np.allclose(adv_on[8:], adv_off[8:]), "mixed group must be untouched"
+    s = on.stats()
+    assert s["n_anchor_groups"] == 1 and s["n_anchor_episodes"] == 4
+    assert s["n_dead_groups"] == 1 and s["n_live_groups"] == 1
+    # Advantage summaries stay signal-only, so the mixed group's zero-sum holds.
+    assert abs(s["mean_advantage"]) < 1e-9, s["mean_advantage"]
+    assert s["pct_positive_advantage"] == 0.25, s["pct_positive_advantage"]
+    assert all(c.is_anchor for c in on._build_chunks() if c.episode_idx < 4)
+    print("  PASS: anchor=+0.2, all-fail dead, mixed unchanged")
+
+    # 4c: Layer 1 (anchor_advantage=0) still marks anchors, for the KL terms.
+    l1 = _mk_buffer(outcomes)
+    adv_l1 = l1.compute_advantages(anchor_advantage=0.0, include_anchor_groups=True)
+    assert np.all(adv_l1[:4] == 0.0)
+    assert sum(ep.is_anchor for ep in l1.episodes) == 4, "anchors must still be flagged"
+    assert l1.stats()["n_anchor_groups"] == 1
+    print("  PASS: KL-only anchors flagged with zero advantage")
+
+    # 4d: row budget. Group 2 (mixed) has 4 eps x 2 chunks = 8 signal chunks;
+    # frac=0.25 -> budget 2 chunks -> only the first anchor episode fits.
+    bud = _mk_buffer(outcomes)
+    bud.compute_advantages(
+        anchor_advantage=0.2, include_anchor_groups=True, anchor_max_row_frac=0.25,
+    )
+    assert bud.stats()["n_anchor_episodes"] == 1, bud.stats()["n_anchor_episodes"]
+    assert bud.stats()["n_anchor_episodes_dropped"] == 3
+    assert sum(1 for c in bud._build_chunks() if c.is_anchor) == 2
+    print("  PASS: row budget caps anchor episodes")
+
+    # 4e: all-success iteration — no signal chunks, so the budget is waived.
+    allsucc = _mk_buffer([[True] * 4, [True] * 4])
+    allsucc.compute_advantages(
+        anchor_advantage=0.2, include_anchor_groups=True, anchor_max_row_frac=0.1,
+    )
+    s = allsucc.stats()
+    assert s["n_anchor_episodes"] == 8 and s["n_anchor_episodes_dropped"] == 0
+    assert s["n_anchor_groups"] == 2 and s["n_dead_groups"] == 0
+    assert s["std_reward"] < 1e-8, "the trainer's skip-check must be anchor-aware here"
+    print("  PASS: all-success iteration keeps every anchor row")
 
     print("\nAll tests PASSED.")

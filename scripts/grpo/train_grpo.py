@@ -72,6 +72,20 @@ _POS_SCALE_PRIOR = 0.05  # within-iter seed from last iter's EMA (~a few % of an
 _POS_SCALE_EPS = 1e-8
 
 
+def is_anchor_row(chunk, include_anchor_groups: bool) -> bool:
+    """Whether a chunk gets ANCHOR treatment this iteration.
+
+    Reads the config gate rather than `chunk.is_anchor` alone, so a buffer
+    flagged by an earlier `compute_advantages` call (or a resumed run whose
+    config changed) can never admit anchor rows that the rest of the update
+    would then treat as ordinary zero-advantage chunks. Shared by
+    `_compute_ref_log_probs` and `_grpo_update_inner` so their row filters are
+    the same expression by construction — if they diverged, a row could reach
+    the update without a precomputed ref log-prob.
+    """
+    return include_anchor_groups and chunk.is_anchor
+
+
 def clip_killed_gradient(
     ratio: torch.Tensor,
     surr1: torch.Tensor,
@@ -524,6 +538,45 @@ class GRPOTrainer:
                     f"matches vanilla at the same update_epochs; no `_fixed` "
                     f"branch metrics)"
                 )
+        if self.config.include_anchor_groups:
+            # Anchor groups reclassify all-success groups from dead to trainable.
+            # Print the pairing advice: the per-minibatch z-score is what makes
+            # a fixed anchor magnitude drift batch to batch, so per-iteration
+            # norm is the intended companion.
+            print(
+                f"  Anchor groups: ON "
+                f"(advantage={self.config.anchor_advantage:g}"
+                f"{' — KL-only' if self.config.anchor_advantage == 0.0 else ''}, "
+                f"row budget={self.config.anchor_max_row_frac:g}× signal rows)"
+            )
+            # Anchor rows occupy minibatch slots, so the signal rows spread over
+            # MORE minibatches — i.e. more optimizer steps per iteration at the
+            # same LR. Same caveat as jitter_paired's 2× warning below; worth
+            # stating because it is a confound when comparing an anchors-on run
+            # against an anchors-off baseline.
+            _bound = (
+                f"~2×" if self.config.anchor_max_row_frac <= 1.0
+                else f"up to {self.config.mini_batch_size}×"
+            )
+            print(
+                f"    NOTE: anchor rows take minibatch slots, so the per-iter "
+                f"optimizer step count RISES ({_bound} at "
+                f"anchor_max_row_frac={self.config.anchor_max_row_frac:g}), and "
+                f"under active max_grad_norm clipping their added KL mass "
+                f"rescales the signal gradient too. Lower update_epochs or "
+                f"anchor_max_row_frac to match an anchors-off baseline."
+            )
+            if (
+                self.config.anchor_advantage > 0.0
+                and not self.config.per_iteration_advantage_norm
+            ):
+                print(
+                    "    NOTE: per_iteration_advantage_norm=False — signal rows "
+                    "renorm per minibatch while anchor rows use the buffer-wide "
+                    "std, so the anchor:signal weight ratio wobbles with batch "
+                    "composition. --per-iteration-advantage-norm is the intended "
+                    "pairing."
+                )
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
 
         for iteration in range(self._start_iteration, self.config.num_iterations + 1):
@@ -599,13 +652,57 @@ class GRPOTrainer:
             phase2_start = time.time()
             self.buffer.compute_advantages(
                 max_episode_steps=max_steps,
+                anchor_advantage=self.config.anchor_advantage,
+                include_anchor_groups=self.config.include_anchor_groups,
+                anchor_max_row_frac=self.config.anchor_max_row_frac,
             )
             stats = self.buffer.stats()
             phase2_time = time.time() - phase2_start
 
-            # Skip update if no gradient signal (all same outcome)
-            if stats.get("std_reward", 0) < 1e-8:
-                print(f"  Skipping update: all episodes have same reward (no gradient signal)")
+            # Skip update if no gradient signal (all same outcome). Anchor groups
+            # are the exception: an all-success iteration has std_reward == 0 yet
+            # every group is an anchor, and those rows are exactly the ones the
+            # feature exists to train on. All-FAIL iterations still land here
+            # (no anchors), as do all-success iterations with the feature off.
+            # Keyed on the trainable CHUNK counts, not on std_reward. Those are
+            # different questions: an all-fail + all-success mix has
+            # std_reward = 0.5 yet zero signal chunks, so a std_reward test never
+            # fires for it. `n_signal_chunks == 0` is strictly stronger — a mixed
+            # group spans both reward values, so std_reward < 1e-8 implies no
+            # mixed group — and it also catches the mix.
+            #
+            # Anchor chunks (not groups) rescue the iteration — counting CHUNKS
+            # covers an anchor group that survived classification but contributes
+            # no rows — provided the iteration can actually learn something from
+            # them. Two ways it can:
+            #   - anchor_advantage > 0: a real reinforcement gradient.
+            #   - kl_coef_base_model > 0: KL(base || current) is NOT degenerate at
+            #     theta == theta_ref once LoRA has moved, so it pulls the policy
+            #     back toward the pretrained model ON THE SOLVED STATES. That is
+            #     exactly the "trust region never covers the solved states" gap
+            #     Layer 1 exists to close, and the coefficient defaults to 0.2, so
+            #     skipping here would defeat the documented Layer-1 recipe.
+            # KL(ref || current) alone does NOT qualify: its gradient is zero at
+            # the start of the update and only re-anchors drift this same update
+            # introduced, so a step would apply little but weight decay and
+            # carried momentum while consuming an iteration the pre-anchor code
+            # preserved for a retry.
+            if (
+                stats.get("n_signal_chunks", 0) == 0
+                and not (
+                    stats.get("n_anchor_chunks", 0) > 0
+                    and (
+                        self.config.anchor_advantage > 0.0
+                        or self.config.kl_coef_base_model > 0.0
+                    )
+                )
+            ):
+                print(
+                    f"  Skipping update: no trainable chunks "
+                    f"(signal={stats.get('n_signal_chunks', 0)}, "
+                    f"anchor={stats.get('n_anchor_chunks', 0)}, "
+                    f"anchor_advantage={self.config.anchor_advantage:g})"
+                )
                 # Pass lr and iter_time so train/learning_rate and
                 # time/iteration_seconds aren't dropped on the early-skip
                 # path — TB curves with gaps are harder to read than
@@ -681,15 +778,10 @@ class GRPOTrainer:
             self._log_vram(vram)
 
             # Treat an iter as "updated" only if at least one optimizer.step()
-            # actually fired. Three paths lead to n_updates=0 here that the
-            # outer std_reward<1e-8 skip-check above does NOT catch:
+            # actually fired. Two paths lead to n_updates=0 here that the outer
+            # chunk-keyed skip-check above does NOT catch:
             #   1. Every minibatch had non-finite loss (bf16 ratio overflow).
-            #   2. Every group's per-group std<1e-4 (so the dead-chunk filter
-            #      in _grpo_update_inner left zero live chunks), but the
-            #      GLOBAL std_reward exceeded 1e-8 — e.g., a mix of all-fail
-            #      groups (rewards=0) and all-succeed-with-identical-num_steps
-            #      groups (rewards=constant).
-            #   3. Every accumulation window was dropped because its ACCUMULATED
+            #   2. Every accumulation window was dropped because its ACCUMULATED
             #      gradient was non-finite (see _apply_accumulated_grads). Unlike
             #      1 and 2 this one CAN coincide with n_micro_batches > 0 —
             #      minibatches trained, but no step was allowed to reach the
@@ -872,9 +964,11 @@ class GRPOTrainer:
         episode LENGTH, since chunks/episode = num_steps / n_action_steps).
 
         `n_cached_chunks` varies iter to iter (dead groups shrink it, dynamic
-        group collection up to max_groups grows it), so size the budget against
-        the worst case — max_groups × group_size × chunks-per-episode — not
-        against whatever the first iteration happens to report.
+        group collection up to max_groups grows it, and include_anchor_groups
+        keeps all-success groups that would otherwise have been dropped — capped
+        by anchor_max_row_frac), so size the budget against the worst case —
+        max_groups × group_size × chunks-per-episode — not against whatever the
+        first iteration happens to report.
 
         Note `per_row` also absorbs the len(tau_centers) multiplier: the K-loop
         in compute_fm_log_prob accumulates into one loss, so autograd retains
@@ -890,7 +984,7 @@ class GRPOTrainer:
         peak = torch.cuda.max_memory_allocated(self.device) / 1e9
         base = vram["base"]
         mb = self.config.mini_batch_size
-        # Cheap: _build_chunks memoizes (episode_buffer.py:429), so this returns
+        # Cheap: _build_chunks memoizes, so this returns
         # the same objects _compute_ref_log_probs hung the feature cache on.
         n_cached = sum(
             1
@@ -1639,12 +1733,14 @@ class GRPOTrainer:
         n_groups_observed = len(group_to_successes)
         # "Alive" group = mixed (0 < group_successes < group_size). Matches
         # the collector's exit criterion (collect_episodes.py:_collect) and
-        # the trainer's gradient-signal filter (advantage=0 for std<1e-4
-        # groups → dropped by the dead-group filter in
-        # _grpo_update_inner). Compare against `len(s)` rather than
-        # config.group_size so partial groups (worker crashes losing some
-        # rollouts) are evaluated by what's actually in the cache — which
-        # is what compute_advantages will see. For full groups
+        # the trainer's IMPROVEMENT-signal filter. Deliberately still
+        # mixed-only under include_anchor_groups: anchor (all-success) groups
+        # train, but they carry no within-group contrast, so they cannot
+        # substitute for a mixed group when deciding whether a cache has enough
+        # gradient signal to be worth resuming from. Compare against `len(s)`
+        # rather than config.group_size so partial groups (worker crashes
+        # losing some rollouts) are evaluated by what's actually in the cache —
+        # which is what compute_advantages will see. For full groups
         # (`len(s) == group_size`) the two are equivalent.
         n_alive_groups = sum(
             1 for s in group_to_successes.values()
@@ -1926,22 +2022,37 @@ class GRPOTrainer:
         # computing their ref log-probs here would be pure waste — and they
         # also wouldn't get encoded-feature cache entries that nothing
         # downstream would use. The advantage is set to literal `0.0` upstream
-        # (episode_buffer.py:367), so `== 0.0` would also work; `abs(x) > 1e-12`
+        # (episode_buffer.py, compute_advantages), so `== 0.0` would also work;
+        # `abs(x) > 1e-12`
         # is defense-in-depth against any future change that introduces float
         # noise in the per-group normalization path.
+        #
+        # ANCHOR chunks are kept regardless of advantage: at anchor_advantage=0
+        # they train on the KL terms alone, which still needs ref (and base)
+        # log-probs. The same predicate is used in _grpo_update_inner, so the
+        # two passes always agree on the row set. Both read the config gate
+        # rather than trusting `is_anchor` alone, so a buffer flagged by an
+        # earlier call (or a resumed run whose config changed) can never admit
+        # anchor rows that the update would then treat as ordinary zero-advantage
+        # chunks.
         n_total = len(chunks)
-        chunks = [c for c in chunks if abs(c.advantage) > 1e-12]
+        use_anchors = self.config.include_anchor_groups
+        chunks = [
+            c for c in chunks
+            if abs(c.advantage) > 1e-12 or is_anchor_row(c, use_anchors)
+        ]
         n_live = len(chunks)
         if n_live < n_total:
+            n_anchor = sum(1 for c in chunks if c.is_anchor)
+            anchor_note = f" ({n_anchor} anchor chunk(s) kept)" if n_anchor else ""
             print(
                 f"  Skipping ref log-prob pass for {n_total - n_live}/"
-                f"{n_total} dead-group chunks (advantage == 0)."
+                f"{n_total} dead-group chunks (advantage == 0){anchor_note}."
             )
         if not chunks:
-            # Should have been caught by std_reward < 1e-8 in train(), but
-            # guard against the edge case of a non-zero global std but every
-            # group still dead (mathematically possible with a single
-            # success-vs-failure split across groups).
+            # Unreachable: train()'s chunk-keyed skip returns before this pass
+            # whenever there are no trainable chunks. Kept as a cheap guard in
+            # case a future caller reaches the ref pass directly.
             return
 
         batch_size = self.config.mini_batch_size * 2  # Larger batches OK (no grad)
@@ -2047,14 +2158,17 @@ class GRPOTrainer:
         else:
             print(f"  Pre-computed ref_log_probs for {n_computed} chunks")
 
-        self._ref_mse_stats = self._summarize_ref_mse(chunks, compute_base)
+        # Both diagnostics split by advantage SIGN, so they see signal chunks
+        # only — an anchor row is neither "good" nor "bad" relative to its group.
+        signal_chunks = [c for c in chunks if not is_anchor_row(c, use_anchors)]
+        self._ref_mse_stats = self._summarize_ref_mse(signal_chunks, compute_base)
         # Per-chunk gap survey (Stage 1). Runs HERE because it needs ref_log_prob,
         # tau_samples and the cached encoded features all in place — which is
         # exactly the state at the end of this pass — and because measuring at
         # theta == theta_ref keeps the gap free of policy-drift contamination, same
         # as _jitter_gap_diagnostics. Off by default; see the config docstring.
         try:
-            self._chunk_gap_stats = self._per_chunk_gap_survey(chunks)
+            self._chunk_gap_stats = self._per_chunk_gap_survey(signal_chunks)
         except Exception as exc:  # noqa: BLE001
             print(
                 f"  WARNING: per-chunk gap survey failed "
@@ -2277,35 +2391,97 @@ class GRPOTrainer:
         #      tiny gradient at a different scale than other minibatches.
         # Filtering at the buffer level (here) keeps every minibatch
         # uniformly-sized live-only.
+        #
+        # Live chunks split two ways (same predicate as _compute_ref_log_probs):
+        #   - SIGNAL: mixed-group chunks with a group-relative advantage. These
+        #     drive every existing mechanism (sampler pools, renorm statistics,
+        #     dynamic epochs, PAWS mass, pos/neg metrics) exactly as before.
+        #   - ANCHOR: all-success chunks (config.include_anchor_groups). Held
+        #     separate so none of those mechanisms sees them; they enter each
+        #     minibatch through a fixed quota instead. With anchors off,
+        #     anchor_chunks is empty and everything below is bit-identical.
         all_chunks = self.buffer._build_chunks()
-        live_chunks = [c for c in all_chunks if abs(c.advantage) > 1e-12]
+        use_anchors = self.config.include_anchor_groups
+        # Module-level `is_anchor_row` (gated on the config) is the single anchor
+        # predicate; every consumer below goes through it rather than reading
+        # `c.is_anchor` directly, and _compute_ref_log_probs uses the same
+        # expression so the two row filters cannot diverge.
+        def _is_anchor(c) -> bool:
+            return is_anchor_row(c, use_anchors)
+
+        live_chunks = [
+            c for c in all_chunks
+            if abs(c.advantage) > 1e-12 or is_anchor_row(c, use_anchors)
+        ]
+        signal_chunks = [c for c in live_chunks if not _is_anchor(c)]
+        anchor_chunks = [c for c in live_chunks if _is_anchor(c)]
         n_total_chunks = len(all_chunks)
         n_live_chunks = len(live_chunks)
+        n_signal_chunks = len(signal_chunks)
+        n_anchor_chunks = len(anchor_chunks)
         if n_live_chunks < n_total_chunks:
             print(
                 f"  Filtering {n_total_chunks - n_live_chunks}/"
                 f"{n_total_chunks} chunks with zero advantage (dead groups). "
                 f"Remaining live chunks: {n_live_chunks}."
             )
+        if n_anchor_chunks:
+            print(
+                f"  Anchor rows: {n_anchor_chunks} chunk(s) from "
+                f"{len({c.group_id for c in anchor_chunks})} all-success "
+                f"group(s) at advantage {self.config.anchor_advantage:g}"
+                f"{' (KL-only)' if self.config.anchor_advantage == 0.0 else ''}."
+            )
         if n_live_chunks == 0:
             return {}
 
         # Buffer-wide advantage stats for per-iteration normalization
-        # (config.per_iteration_advantage_norm). Computed ONCE over the live
+        # (config.per_iteration_advantage_norm). Computed ONCE over the SIGNAL
         # chunks' per-chunk advantages (A_ep / num_chunks). The buffer mean is
         # ≈0 by group-relative construction (Σ A_ep = 0 within each group), so
         # dividing by the buffer std preserves each chunk's good/bad sign — see
         # grpo_config.per_iteration_advantage_norm. ddof=1 matches torch.std()
         # (used by the per-minibatch path) and episode_buffer.compute_advantages.
-        # buffer_adv_std == 0.0 (from the <2-live-chunk fallback) disables the
-        # renorm below, mirroring the per-mb numel()>1 guard.
-        if self.config.per_iteration_advantage_norm and n_live_chunks > 1:
-            _adv_arr = np.array([c.advantage for c in live_chunks], dtype=np.float64)
+        # buffer_adv_std == 0.0 (from the <2-signal-chunk fallback) disables the
+        # renorm below, mirroring the per-mb numel()>1 guard. Anchor chunks are
+        # excluded from the statistic (their constant positive advantage would
+        # lift the mean off zero and reintroduce sign flips) but DO consume it as
+        # a scale — see anchor_scale.
+        need_buffer_stats = (
+            self.config.per_iteration_advantage_norm or bool(anchor_chunks)
+        )
+        if need_buffer_stats and n_signal_chunks > 1:
+            _adv_arr = np.array([c.advantage for c in signal_chunks], dtype=np.float64)
             buffer_adv_mean = float(_adv_arr.mean())
             buffer_adv_std = float(_adv_arr.std(ddof=1))
         else:
             buffer_adv_mean = 0.0
             buffer_adv_std = 0.0
+
+        # Scale applied to anchor rows' raw per-chunk advantage. Anchor rows
+        # never see minibatch-local statistics: an anchor-only minibatch has no
+        # variance except `anchor_advantage / num_chunks`, so a z-score there
+        # would amplify pure EPISODE LENGTH to ±1 and reproduce the time-scaling
+        # gradient that collapsed v2. Two regimes:
+        #   - Signal rows present: divide by the same buffer-wide std they use,
+        #     so the documented ratio (an anchor row is anchor_advantage/|A_sig|
+        #     of a signal row) holds regardless of batch composition.
+        #   - No signal rows at all (all-success iteration): normalize by the
+        #     mean anchor magnitude so rows land at ~anchor_advantage, close to
+        #     where the first regime puts them. No mean subtraction either way,
+        #     so length variation stays a proportional ~2x spread instead of a
+        #     z-scored ±1.
+        if not anchor_chunks:
+            anchor_scale = 0.0
+        elif buffer_adv_std > 1e-8:
+            anchor_scale = 1.0 / (buffer_adv_std + 1e-8)
+        else:
+            _mean_abs = float(
+                np.mean([abs(c.advantage) for c in anchor_chunks])
+            )
+            anchor_scale = (
+                self.config.anchor_advantage / _mean_abs if _mean_abs > 0.0 else 0.0
+            )
 
         # Jitter-GRPO scheduling. When jitter is active (jitter_pos or
         # jitter_neg > 0), each chunk's jitter entry uses DiT input noise
@@ -2324,13 +2500,115 @@ class GRPOTrainer:
         if self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0:
             if self.config.jitter_paired:
                 entries = (
-                    [(c, "fixed") for c in live_chunks]
-                    + [(c, "jitter") for c in live_chunks]
+                    [(c, "fixed") for c in signal_chunks]
+                    + [(c, "jitter") for c in signal_chunks]
                 )
             else:
-                entries = [(c, "jitter") for c in live_chunks]
+                entries = [(c, "jitter") for c in signal_chunks]
         else:
-            entries = [(c, "fixed") for c in live_chunks]
+            entries = [(c, "fixed") for c in signal_chunks]
+
+        # Anchor entries are ALWAYS "fixed" (never jittered): the Jacobian
+        # regularizer is defined per advantage sign and anchor rows are a third
+        # class, so jittering them would feed rows with no λ into the per-branch
+        # accounting for no benefit.
+        anchor_entries = [(c, "fixed") for c in anchor_chunks]
+
+        # Per-minibatch anchor quota, subtracted from mini_batch_size rather than
+        # added on top — total rows per minibatch stay at mini_batch_size so the
+        # documented per-row VRAM budget is unchanged.
+        #
+        # `anchor_slots` is the integer per-batch reservation; it sizes the signal
+        # batches (`signal_mb_size = mb_size - anchor_slots`) and caps how many
+        # anchor rows a batch may receive. The per-batch TARGET is not computed
+        # here — _with_anchor_rows derives it from the batch count the sampler
+        # actually produced (see there). A target floored at 1 would make a small
+        # anchor pool ride along in EVERY minibatch — 1 anchor chunk against 100
+        # signal chunks would train ~15x per epoch while each signal row trains
+        # once, the over-sharpening risk the anchor magnitude is kept small to
+        # avoid — which is why the target is fractional.
+        mb_size = self.config.mini_batch_size
+        anchor_slots = 0
+        signal_mb_size = mb_size
+        # True whenever anchor rows participate in this iteration at all. Gates
+        # the loss divisor below — NOT `has_anchor_rows` (whether a particular
+        # minibatch happens to hold one). Because the quota is fractional, the
+        # credit accumulator leaves some batches anchor-free; gating per batch
+        # would send those through `.mean()` and reintroduce exactly the
+        # composition-dependent row weight the constant divisor exists to
+        # prevent (a 1-signal-row trailing batch would weight its row at 1.0
+        # instead of 1/signal_mb_size).
+        if anchor_entries and entries:
+            # Reserve at least 1 signal slot (so the signal batch is never
+            # empty) and at least 1 anchor slot (so a sub-1.0 target can still
+            # land). At mini_batch_size=1 there is no room for both: skip the
+            # interleave and say so rather than silently exceeding mb_size.
+            #
+            # CEIL, not round: the slot count is the per-batch CAP in
+            # _with_anchor_rows, so rounding down would pin every batch at the
+            # cap, let `credit` grow without bound, and under-deliver the target
+            # by up to a third (target 3.4 -> cap 3 -> realized 3.0). Ceil keeps
+            # the cap >= the target so the accumulator can average to it.
+            # Reserve enough slots that the epoch can actually DELIVER the pool:
+            # capacity is slots x n_batches, and n_batches depends on the reduced
+            # signal batch size, so solve for the smallest slots that fits.
+            # `ceil(mb_size * frac)` alone assumed the STRATIFIED batch count;
+            # _iter_balanced_minibatches (the default) terminates early when its
+            # majority pool drains, so the realized count is smaller, the target
+            # exceeds the cap, and every batch gets pinned — measured 0.83-0.91x
+            # delivery in the band where the ceil lands on 1.
+            # _min_expected_batches is a LOWER bound on the batch count, so it can
+            # only over-reserve (an extra optimizer step) and never under-reserve
+            # (dropped rows); the wrapper measures the real count and warns if
+            # capacity still fell short.
+            anchor_slots = 1
+            while anchor_slots < mb_size - 1:
+                if (anchor_slots * self._min_expected_batches(
+                        entries, mb_size - anchor_slots) >= len(anchor_entries)):
+                    break
+                anchor_slots += 1
+            anchor_slots = min(anchor_slots, mb_size - 1)
+            if anchor_slots < 1:
+                print(
+                    f"  WARNING: mini_batch_size={mb_size} leaves no room for an "
+                    f"anchor row alongside a signal row — {len(anchor_entries)} "
+                    f"anchor row(s) will NOT be trained this iter. Raise "
+                    f"mini_batch_size to >= 2."
+                )
+                anchor_slots = 0
+            else:
+                # max() is redundant given the `mb_size - 1` clamp above, but it
+                # keeps this invariant local: signal_mb_size == 0 would make the
+                # inner samplers fall back to config.mini_batch_size (via
+                # `mb_size or self.config.mini_batch_size`, where 0 is falsy) and
+                # overfill every minibatch.
+                signal_mb_size = max(1, mb_size - anchor_slots)
+                # The per-batch anchor target is computed inside
+                # _with_anchor_rows from the batch count the sampler ACTUALLY
+                # produces. It must not be estimated here: ceil(len(entries) /
+                # signal_mb_size) is the STRATIFIED count, and
+                # _iter_balanced_minibatches — the default — terminates early
+                # when its majority pool drains, so the estimate overshoots and
+                # the pool under-delivers (a 1-chunk pool trained ZERO rows).
+                print(
+                    f"  Anchor schedule: {len(anchor_entries)} anchor row(s) "
+                    f"spread over the epoch, <= {anchor_slots}/minibatch, "
+                    f"alongside {signal_mb_size} signal row(s). Target row ratio "
+                    f"{len(anchor_entries) / len(entries):.2f} anchor:signal; each "
+                    f"anchor row's ADVANTAGE is ~anchor_advantage/|A_signal| of a "
+                    f"signal row's, so the gradient share is smaller than the "
+                    f"row share."
+                )
+
+        # True only when anchor rows will actually appear in minibatches. NOT
+        # `bool(anchor_chunks)`: at mini_batch_size=1 the reservation clamps to 0
+        # slots and the rows are skipped with a warning, and treating that
+        # iteration as anchors-in-play would still divert every signal row into
+        # the anchor-aware renorm branch (whose <2-signal-row fallback replaces
+        # the plain path's numel()>1 renorm skip), silently changing their scale
+        # for no anchor training at all. `not entries` is the anchor-only path,
+        # where the rows go through the stratified sampler at full mb_size.
+        anchors_in_play = bool(anchor_chunks) and (anchor_slots > 0 or not entries)
 
         total_loss = 0.0
         total_clip_loss = 0.0
@@ -2380,6 +2658,10 @@ class GRPOTrainer:
         # window's weights update was dropped to avoid writing NaN into the
         # LoRA params — see _apply_accumulated_grads. Expected to stay 0.
         n_nonfinite_grad_steps = 0
+        # Optimizer steps skipped because the accumulated gradient was exactly
+        # zero — no learning signal, so the window is dropped rather than spending
+        # an iteration on it. See _apply_accumulated_grads.
+        n_zero_grad_steps = 0
         # Sign-flip diagnostic: count of group-good chunks (pre-renorm adv > 0)
         # that advantage renorm pushed to a non-positive z-scored value. >0 under
         # per-minibatch norm (the artifact); exactly 0 under per-iteration norm.
@@ -2459,6 +2741,14 @@ class GRPOTrainer:
         # GRPO too.
         n_rows_pos_total = 0
         n_rows_neg_total = 0
+        # Anchor-row accumulators. Row-weighted (sum / n_rows), like the
+        # per-branch jitter metrics — anchor rows are excluded from every
+        # sign-keyed metric, so these are the only readout of what they did.
+        n_rows_anchor = 0          # trained anchor rows (the reported count)
+        n_rows_anchor_finite = 0   # divisor for the ratio/KL means (finite rows)
+        ratio_sum_anchor = 0.0
+        kl_per_row_sum_anchor = 0.0
+
         # Once-per-iteration jitter gap measurement (None until it runs; stays
         # None when jitter is off, which leaves the jitter/* curves absent).
         jitter_diag: dict | None = None
@@ -2493,7 +2783,10 @@ class GRPOTrainer:
         # non-zero-advantage chunk in live_chunks). Dead groups — all-success
         # or all-fail with std<1e-4 — produce no gradient signal, so including
         # their episodes would inflate success_frac and keep actual_num_epochs
-        # near update_epochs even when real training signal is sparse.
+        # near update_epochs even when real training signal is sparse. ANCHOR
+        # groups are excluded for the same reason: every one of their episodes
+        # succeeded, so counting them would drive success_frac toward 1 and
+        # collapse the tent to 1 epoch exactly when anchors were added.
         #
         # We use episode-level advantage sign (self.buffer.advantages[i] > 0)
         # rather than ep.success, for consistency with _iter_balanced_minibatches
@@ -2502,10 +2795,13 @@ class GRPOTrainer:
         # positive advantage, failures negative), so this is equivalent to
         # counting ep.success while keeping the two mechanisms aligned.
         if self.config.dynamic_epoch_training:
-            live_group_ids = {c.group_id for c in live_chunks}
+            live_group_ids = {c.group_id for c in signal_chunks}
             live_ep_indices = [
                 i for i, ep in enumerate(self.buffer.episodes)
-                if ep.group_id in live_group_ids
+                # `not ep.is_anchor` is belt-and-braces: an anchor group is
+                # all-success, so none of its episodes ever contributes a signal
+                # chunk and the group_id test already excludes them.
+                if ep.group_id in live_group_ids and not ep.is_anchor
             ]
             successful_eps = sum(
                 1 for i in live_ep_indices
@@ -2516,19 +2812,41 @@ class GRPOTrainer:
             # Exact integer tent: (4·m·E + n) // (2·n) where m = min(k, n-k).
             # Avoids the ULP cancellation that can corrupt math.floor(float + 0.5)
             # at specific integer counts when update_epochs >= 6.
+            if not live_ep_indices:
+                # No signal episodes at all (an anchor-only iteration). The tent
+                # is a function of the pos/neg BALANCE among signal episodes, and
+                # there is none to measure: the empty-list fallback
+                # (total=max(0,1)=1, successful=0) would collapse it to 1 epoch
+                # and report success_fraction=0.0 on an iteration where every
+                # episode succeeded. Anchor rows carry a fixed small magnitude
+                # rather than an asymmetric advantage distribution, so the
+                # mechanism has nothing to correct — run the configured epochs
+                # and emit no success_fraction rather than a fabricated one.
+                actual_num_epochs = self.config.update_epochs
+                success_frac = None
+                print(
+                    f"  Dynamic epochs: no signal episodes (anchor-only iter) — "
+                    f"tent not applicable, running "
+                    f"{actual_num_epochs}/{self.config.update_epochs} epochs"
+                )
+                _tent_applied = False
+            else:
+                _tent_applied = True
             m = min(successful_eps, total_eps_collected - successful_eps)
             E = self.config.update_epochs
             n = total_eps_collected
-            actual_num_epochs = max(1, (4 * m * E + n) // (2 * n))
-            update_scale = 2.0 * m / n  # float tent scale, for the print only
-            # Always print: silence looks like dynamic epoch scaling is off when
-            # it's actually running at full capacity (epochs == update_epochs near peak).
-            print(
-                f"  Dynamic epochs: {successful_eps}/{total_eps_collected} "
-                f"positive-advantage live-group episodes "
-                f"(tent scale={update_scale:.2f}) "
-                f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
-            )
+            if _tent_applied:
+                actual_num_epochs = max(1, (4 * m * E + n) // (2 * n))
+            if _tent_applied:
+                update_scale = 2.0 * m / n  # float tent scale, for the print only
+                # Always print: silence looks like dynamic epoch scaling is off when
+                # it's actually running at full capacity (epochs == update_epochs near peak).
+                print(
+                    f"  Dynamic epochs: {successful_eps}/{total_eps_collected} "
+                    f"positive-advantage live-group episodes "
+                    f"(tent scale={update_scale:.2f}) "
+                    f"→ {actual_num_epochs}/{self.config.update_epochs} epochs"
+                )
         else:
             actual_num_epochs = self.config.update_epochs
             success_frac = None  # Not computed; omit from stats
@@ -2609,6 +2927,7 @@ class GRPOTrainer:
             always counts steps that actually reached the weights.
             """
             nonlocal accum_count, n_updates, n_nonfinite_grad_steps
+            nonlocal n_zero_grad_steps
 
             # Gradient clipping. clip_grad_norm_ returns the TOTAL norm
             # of the gradient vector BEFORE clipping — capture it for
@@ -2655,6 +2974,24 @@ class GRPOTrainer:
             # existing skip path treats the iteration as not-updated (model
             # unchanged, checkpoint written under the prior iter's name) — which
             # is exactly right, because the model IS unchanged.
+            # A step whose gradient is EXACTLY zero carries no learning signal.
+            # Reachable and not hypothetical: at LoRA init PEFT sets lora_B = 0, so
+            # base == ref == current and on an anchor-only Layer-1 iteration
+            # (anchor_advantage = 0) the clip term is 0 by construction and BOTH KL
+            # anchors are KL(p||p) = 0 — every loss term vanishes. Counting such a
+            # step as an update sets did_update=True, which burns the iteration
+            # from num_iterations, writes a checkpoint named after it, advances the
+            # LR schedule, and defeats the retry the skip path exists to preserve.
+            # Same handling as a non-finite gradient: drop the window, don't step.
+            # (AdamW's decoupled weight decay would still shrink the weights a
+            # little, which is exactly what we do NOT want to spend an iteration
+            # on.)
+            if gnorm == 0.0:
+                n_zero_grad_steps += 1
+                self.optimizer.zero_grad()
+                accum_count = 0
+                return
+
             if not math.isfinite(gnorm):
                 n_nonfinite_grad_steps += 1
                 print(
@@ -2700,10 +3037,22 @@ class GRPOTrainer:
                 self.config.seed + self.iteration * 100 + epoch
             )
 
-            if self.config.balanced_minibatch_training:
-                batch_iter = self._iter_balanced_minibatches(entries, rng)
+            if not entries:
+                # Anchor-only iteration (every group came back all-success).
+                # Stratify the anchor rows themselves at full mini_batch_size:
+                # the balanced sampler has no sign classes to balance here, and
+                # the stratified path still yields each row exactly once/epoch.
+                batch_iter = self._iter_stratified_minibatches(anchor_entries, rng)
+            elif self.config.balanced_minibatch_training:
+                batch_iter = self._with_anchor_rows(
+                    self._iter_balanced_minibatches(entries, rng, signal_mb_size),
+                    anchor_entries, anchor_slots, rng,
+                )
             else:
-                batch_iter = self._iter_stratified_minibatches(entries, rng)
+                batch_iter = self._with_anchor_rows(
+                    self._iter_stratified_minibatches(entries, rng, signal_mb_size),
+                    anchor_entries, anchor_slots, rng,
+                )
 
             for batch in batch_iter:
                 # --- Prepare batch tensors ---
@@ -2741,6 +3090,39 @@ class GRPOTrainer:
                     continue
                 ready_batch = [valid_batch[i] for i in ready_indices]
                 ready_modes = [modes[i] for i in ready_indices]
+                # Anchor rows in this minibatch. Built once here and reused by
+                # every sign-keyed mask below, all of which must treat anchors
+                # as a third class rather than as positives.
+                anchor_row_mask = torch.tensor(
+                    [_is_anchor(c) for c in ready_batch],
+                    device=self.device, dtype=torch.bool,
+                )
+                has_anchor_rows = bool(anchor_row_mask.any())
+                signal_row_mask = ~anchor_row_mask
+                n_signal_rows = int(signal_row_mask.sum())
+                # Row divisor for clip_loss and both KL terms when anchor rows
+                # are present: the INTENDED signal-row count (`signal_mb_size`),
+                # held CONSTANT across the epoch.
+                #
+                # Why not the realized count. Dividing by the rows actually
+                # present spikes any batch the sampler under-fills: a trailing
+                # batch with 1 signal + 3 anchor rows would weight every row at
+                # 1.0 instead of 1/signal_mb_size, making a 4-row batch the
+                # largest step of the epoch (and, at max_grad_norm=0.5, the only
+                # clipped one). A constant divisor makes a row's weight
+                # independent of batch composition — an under-filled batch simply
+                # contributes proportionally less, which is what it should do.
+                #
+                # Why the signal count and not the total. It keeps anchor rows
+                # ADDITIVE: a signal row's weight is 1/signal_mb_size either way,
+                # exactly what it would be in an anchor-free minibatch of that
+                # size, so turning anchors on doesn't rescale the rows that drive
+                # improvement — and the anchor KL genuinely ADDS a constraint
+                # rather than reallocating the existing KL budget across more
+                # rows. In the anchor-only path signal_mb_size == mini_batch_size,
+                # so a full batch reduces to a plain mean. With no anchor rows
+                # the expression below IS row_loss.mean().
+                loss_divisor = float(max(signal_mb_size, 1))
 
                 # If all chunks are ready, use tensors as-is (common case)
                 if len(ready_batch) == len(valid_batch):
@@ -2900,8 +3282,9 @@ class GRPOTrainer:
                                 timesteps=timesteps,
                                 noise_for_input=noise_for_input,
                                 lam_row=lam_row,
-                                pos_adv_mask=ready_advantages > 0,
-                                fixed_row_mask=~jitter_mask_dev,
+                                pos_adv_mask=(ready_advantages > 0) & ~anchor_row_mask,
+                                fixed_row_mask=(~jitter_mask_dev) & ~anchor_row_mask,
+                                jitter_row_mask=jitter_mask_dev & ~anchor_row_mask,
                             )
                         except Exception as exc:  # noqa: BLE001
                             print(
@@ -2980,26 +3363,90 @@ class GRPOTrainer:
                 # "above/below mb mean" rather than "good/bad chunk". The
                 # pre-renorm sign matches the buffer's group-relative GRPO
                 # classification, which is what the diagnostic should
-                # surface.
-                pre_renorm_pos_adv_mask = ready_advantages > 0
+                # surface. Anchor rows are excluded: their advantage is a
+                # constant, not a group-relative comparison, so they are
+                # neither "good" nor "bad" in this sense.
+                pre_renorm_pos_adv_mask = (ready_advantages > 0) & ~anchor_row_mask
 
-                if self.config.per_iteration_advantage_norm:
-                    # Buffer-wide (per-iteration) z-score: subtract the iteration
-                    # mean (≈0 by group-relative construction) and divide by the
-                    # iteration std computed ONCE over all live chunks. Because
-                    # buffer_adv_mean ≈ 0, sign is preserved → no good chunk flips
-                    # to a negative z-scored advantage, and the effective clip
-                    # threshold / gradient scale no longer depend on minibatch
-                    # composition. buffer_adv_std == 0.0 (< 2 live chunks) skips it.
-                    if buffer_adv_std > 1e-8:
+                # Gated on anchors being enabled for the ITERATION, for the
+                # same reason as loss_divisor: a batch the fractional quota left
+                # anchor-free must still get the anchor-aware treatment, whose
+                # <2-signal-row fallback is what keeps a lone row from entering
+                # the surrogate at raw A_ep/num_chunks scale. When the batch has
+                # no anchor rows the torch.where below is a no-op, so the branch
+                # reduces to the plain path for a FULL batch; an under-filled one
+                # is deliberately scaled down by the constant divisor.
+                #
+                # The two gatings differ only for a batch that is anchor-free AND
+                # has <2 signal rows (plain leaves it raw; this path falls back to
+                # the buffer-wide scale). That composition is COMMON, not a
+                # defensive edge. The credit accumulator lands the final anchor
+                # unit on the last batch, but does nothing about the interior
+                # batches it leaves anchor-free, and _iter_stratified_minibatches
+                # under-fills MID-epoch whenever its global filler order is
+                # exhausted while a large group still has queued entries — the
+                # skewed group sizes that dynamic collection produces. Measured
+                # with groups (40,1,1,1) at mb_size=5: 35 of 40 minibatches are
+                # anchor-free with one signal row. Gating per batch instead would
+                # leave every one of those rows at raw A_ep/num_chunks scale.
+                if not anchors_in_play:
+                    if self.config.per_iteration_advantage_norm:
+                        # Buffer-wide (per-iteration) z-score: subtract the iteration
+                        # mean (≈0 by group-relative construction) and divide by the
+                        # iteration std computed ONCE over all live chunks. Because
+                        # buffer_adv_mean ≈ 0, sign is preserved → no good chunk flips
+                        # to a negative z-scored advantage, and the effective clip
+                        # threshold / gradient scale no longer depend on minibatch
+                        # composition. buffer_adv_std == 0.0 (< 2 live chunks) skips it.
+                        if buffer_adv_std > 1e-8:
+                            ready_advantages = (
+                                (ready_advantages - buffer_adv_mean)
+                                / (buffer_adv_std + 1e-8)
+                            )
+                    elif ready_advantages.numel() > 1:
                         ready_advantages = (
+                            (ready_advantages - ready_advantages.mean())
+                            / (ready_advantages.std() + 1e-8)
+                        )
+                else:
+                    # Mixed minibatch: renorm the signal rows exactly as above
+                    # (statistics over signal rows ONLY — an anchor row's
+                    # constant positive advantage would lift the mean and flip
+                    # weak positives), and put anchor rows on the buffer-wide
+                    # scale instead. See anchor_scale for why anchors must never
+                    # touch minibatch-local statistics.
+                    signal_row_mask = ~anchor_row_mask
+                    scaled_anchor = ready_advantages * anchor_scale
+                    if self.config.per_iteration_advantage_norm:
+                        if buffer_adv_std > 1e-8:
+                            signal_vals = (
+                                (ready_advantages - buffer_adv_mean)
+                                / (buffer_adv_std + 1e-8)
+                            )
+                        else:
+                            signal_vals = ready_advantages
+                    elif n_signal_rows > 1:
+                        _sig = ready_advantages[signal_row_mask]
+                        signal_vals = (
+                            (ready_advantages - _sig.mean()) / (_sig.std() + 1e-8)
+                        )
+                    elif buffer_adv_std > 1e-8:
+                        # Too few signal rows for a per-minibatch z-score. Fall
+                        # back to the buffer-wide one — available whenever the BUFFER
+                        # holds >= 2 signal chunks; with exactly one, buffer_adv_std
+                        # is 0 and the row stays raw, there being no scale to borrow
+                        # — instead of leaving the row RAW: a raw per-chunk
+                        # advantage is ~1/num_chunks of a normalized one, so the
+                        # row would enter the surrogate at a wildly different
+                        # scale from every other minibatch's.
+                        signal_vals = (
                             (ready_advantages - buffer_adv_mean)
                             / (buffer_adv_std + 1e-8)
                         )
-                elif ready_advantages.numel() > 1:
-                    ready_advantages = (
-                        (ready_advantages - ready_advantages.mean())
-                        / (ready_advantages.std() + 1e-8)
+                    else:
+                        signal_vals = ready_advantages
+                    ready_advantages = torch.where(
+                        anchor_row_mask, scaled_anchor, signal_vals
                     )
 
                 # --- Clipped surrogate loss ---
@@ -3038,11 +3485,17 @@ class GRPOTrainer:
                     #       dead winner never inflates D). Keying D on pos_amp_mask
                     #       (not all pre-renorm positives) keeps the denominator
                     #       equal to the mass k actually scales.
+                    # Anchor rows are in NEITHER mass: they are not an erosion
+                    # term and not a group-relative reinforcement term, so
+                    # letting them inflate D would drive k toward 1 and silently
+                    # disable the mechanism at high success.
                     with torch.no_grad():
                         r_det = ratio.detach()
                         rl_abs = row_loss.detach().abs()
-                        alive_neg_mask = (~pre_renorm_pos_adv_mask) & (
-                            r_det >= 1 - self.config.clip_eps_low
+                        alive_neg_mask = (
+                            (~pre_renorm_pos_adv_mask)
+                            & (~anchor_row_mask)
+                            & (r_det >= 1 - self.config.clip_eps_low)
                         )
                         amp_alive_mask = pos_amp_mask & (
                             r_det <= 1 + self.config.clip_eps_high
@@ -3073,7 +3526,10 @@ class GRPOTrainer:
                     row_weight = 1.0 + (k - 1.0) * pos_amp_mask.to(row_loss.dtype)
                     row_loss = row_weight * row_loss
 
-                clip_loss = row_loss.mean()
+                clip_loss = (
+                    row_loss.mean() if not anchors_in_play
+                    else row_loss.sum() / loss_divisor
+                )
 
                 # --- KL divergence penalties (Schulman k3 estimator) ---
                 # KL(p || q) ≈ E[exp(p_lp - q_lp) - (p_lp - q_lp) - 1] with the
@@ -3095,11 +3551,13 @@ class GRPOTrainer:
                 #     Bounds CUMULATIVE drift from the pretrained policy.
                 # Per-row tensors are kept around (not just the mean) so the
                 # per-branch fixed/jitter accumulator below can split each
-                # term separately.
+                # term separately. Both terms use loss_divisor for the same
+                # additive-anchor reason as clip_loss above.
                 inv_log_ratio = ref_log_probs - current_log_probs  # = -log_ratio
                 kl_per_row_last_iter = inv_log_ratio.exp() - inv_log_ratio - 1.0
-                kl_loss_last_iter = (
-                    self.config.kl_coef_last_iter * kl_per_row_last_iter.mean()
+                kl_loss_last_iter = self.config.kl_coef_last_iter * (
+                    kl_per_row_last_iter.mean() if not anchors_in_play
+                    else kl_per_row_last_iter.sum() / loss_divisor
                 )
 
                 if compute_base:
@@ -3107,9 +3565,9 @@ class GRPOTrainer:
                     kl_per_row_base_model = (
                         inv_log_ratio_base.exp() - inv_log_ratio_base - 1.0
                     )
-                    kl_loss_base_model = (
-                        self.config.kl_coef_base_model
-                        * kl_per_row_base_model.mean()
+                    kl_loss_base_model = self.config.kl_coef_base_model * (
+                        kl_per_row_base_model.mean() if not anchors_in_play
+                        else kl_per_row_base_model.sum() / loss_divisor
                     )
                 else:
                     kl_per_row_base_model = None
@@ -3189,6 +3647,13 @@ class GRPOTrainer:
                     # Fraction of rows the clamp actually moved. With asymmetric
                     # bounds this is the OR of the two one-sided clips rather than
                     # a single |ratio - 1| > eps threshold.
+                    #
+                    # This and the mean_ratio / mean_log_ratio_abs accumulators
+                    # below cover ALL trained rows, anchor rows included — they
+                    # describe the batch the optimizer saw, and anchor rows are
+                    # part of it. For the signal-only view use
+                    # clipfrac_effective_{pos,neg} (sign-bucketed, anchors
+                    # excluded) and mean_ratio_anchor for the anchor split.
                     clipfrac = (
                         (ratio < 1 - self.config.clip_eps_low)
                         | (ratio > 1 + self.config.clip_eps_high)
@@ -3250,9 +3715,13 @@ class GRPOTrainer:
                         ratio, surr1, surr2,
                         self.config.clip_eps_low, self.config.clip_eps_high,
                     )
-                    post_renorm_pos_mask = ready_advantages > 0
+                    # Anchor rows sit in neither bucket — they have no
+                    # group-relative sign, and pooling them into _pos would make
+                    # the curve a mix of two different row classes.
+                    post_renorm_pos_mask = (ready_advantages > 0) & ~anchor_row_mask
+                    post_renorm_neg_mask = (ready_advantages <= 0) & ~anchor_row_mask
                     n_p = int(post_renorm_pos_mask.sum().item())
-                    n_n = int(ready_advantages.numel()) - n_p
+                    n_n = int(post_renorm_neg_mask.sum().item())
                     if n_p > 0:
                         clipfrac_eff_sum_pos += int(
                             grad_dead[post_renorm_pos_mask].sum().item()
@@ -3260,9 +3729,33 @@ class GRPOTrainer:
                         n_rows_pos_total += n_p
                     if n_n > 0:
                         clipfrac_eff_sum_neg += int(
-                            grad_dead[~post_renorm_pos_mask].sum().item()
+                            grad_dead[post_renorm_neg_mask].sum().item()
                         )
                         n_rows_neg_total += n_n
+
+                    # --- Anchor-row accumulation ---
+                    # Row-weighted, and the only place anchor rows are measured.
+                    # mean_ratio_anchor is the readout that matters: it starts at
+                    # 1.0 and rises toward 1 + clip_eps_high as the anchor term
+                    # pulls; it saturating there means the clip is capping the
+                    # per-iteration retention move, which is the intended bound.
+                    if has_anchor_rows:
+                        n_a = int(anchor_row_mask.sum().item())
+                        n_rows_anchor += n_a
+                        # Ratio/KL sums accumulate over FINITE rows only, with
+                        # their own divisor: `ratio = log_ratio.exp()` can
+                        # overflow to +inf while the clipped loss stays finite,
+                        # and a single inf in a running sum poisons the curve for
+                        # the whole run. Same policy as ratio_maxes/ratio_mins
+                        # above and the sign-split mean_ratio_* metrics.
+                        _r_a = ratio[anchor_row_mask]
+                        _k_a = kl_per_row_last_iter[anchor_row_mask]
+                        _fin = torch.isfinite(_r_a) & torch.isfinite(_k_a)
+                        n_finite_a = int(_fin.sum().item())
+                        if n_finite_a > 0:
+                            n_rows_anchor_finite += n_finite_a
+                            ratio_sum_anchor += _r_a[_fin].sum().item()
+                            kl_per_row_sum_anchor += _k_a[_fin].sum().item()
 
                     # --- Per-branch row-level accumulation (Jitter-GRPO) ---
                     # Only runs when jitter is enabled. Gating on jitter-active
@@ -3287,14 +3780,17 @@ class GRPOTrainer:
                             | (ratio > 1 + self.config.clip_eps_high)
                         ).float()
                         log_ratio_abs = log_ratio.abs()
+                        # Anchor rows are always tagged "fixed" but belong to
+                        # neither branch — strip them so mean_ratio_fixed stays a
+                        # pure signal-row curve.
                         fixed_mask = torch.tensor(
                             [m == "fixed" for m in ready_modes],
                             device=self.device, dtype=torch.bool,
-                        )
-                        jit_mask = ~fixed_mask
+                        ) & ~anchor_row_mask
+                        jit_mask = (~fixed_mask) & ~anchor_row_mask
                         # Pre-renorm sign masks for the 4-way clipfrac split.
                         # See pre_renorm_pos_adv_mask capture above.
-                        neg_adv_mask = ~pre_renorm_pos_adv_mask
+                        neg_adv_mask = (~pre_renorm_pos_adv_mask) & ~anchor_row_mask
                         fixed_pos_mask = fixed_mask & pre_renorm_pos_adv_mask
                         fixed_neg_mask = fixed_mask & neg_adv_mask
                         jit_pos_mask = jit_mask & pre_renorm_pos_adv_mask
@@ -3388,6 +3884,18 @@ class GRPOTrainer:
             early: dict = {}
             if n_skipped_nonfinite:
                 early["n_skipped_nonfinite"] = n_skipped_nonfinite
+            if n_zero_grad_steps:
+                # Reported HERE above all: a zero-gradient window is the reason
+                # this iteration has n_updates == 0, so the counter is most
+                # needed on exactly this path.
+                early["n_zero_grad_steps"] = n_zero_grad_steps
+                early["n_micro_batches"] = n_micro_batches
+                print(
+                    f"  No optimizer step survived this iter: "
+                    f"{n_zero_grad_steps} window(s) had an exactly-zero gradient "
+                    f"(no learning signal) over {n_micro_batches} trained "
+                    f"minibatch(es). Model unchanged; iteration preserved."
+                )
             if n_nonfinite_grad_steps:
                 early["n_nonfinite_grad_steps"] = n_nonfinite_grad_steps
                 early["n_micro_batches"] = n_micro_batches
@@ -3463,6 +3971,7 @@ class GRPOTrainer:
             # TB curve is a flat zero line you can glance at, rather than a
             # missing series you'd have to know to look for.
             "n_nonfinite_grad_steps": n_nonfinite_grad_steps,
+            "n_zero_grad_steps": n_zero_grad_steps,
             "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
             "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
@@ -3487,6 +3996,24 @@ class GRPOTrainer:
         # ran with entries present). With the dynamic flag it tracks success.
         if eff_pos_ratio is not None:
             result["balanced_pos_ratio"] = eff_pos_ratio
+        # Anchor-row metrics. Emitted only when anchor rows actually trained, so
+        # runs with include_anchor_groups=False keep exactly their prior key set.
+        if n_rows_anchor > 0:
+            result["n_anchor_rows_trained"] = n_rows_anchor
+            # Emitted only when at least one anchor row had a finite ratio, and
+            # only if the resulting mean is itself finite — a non-finite value is
+            # DROPPED (leaving a curve gap) rather than written, matching the
+            # policy for every other ratio-derived metric here. Note this is a
+            # per-anchor-row mean, whereas kl_loss_last_iter in the LOSS divides
+            # by signal_mb_size; the two are not comparable side by side.
+            if n_rows_anchor_finite > 0:
+                _mr = ratio_sum_anchor / n_rows_anchor_finite
+                _kl = (self.config.kl_coef_last_iter
+                       * kl_per_row_sum_anchor / n_rows_anchor_finite)
+                if math.isfinite(_mr):
+                    result["mean_ratio_anchor"] = _mr
+                if math.isfinite(_kl):
+                    result["kl_loss_anchor"] = _kl
         # --- Dynamic positive-advantage weighting: fold this iter's pooled
         # masses into the cross-iteration EMA and surface k. Reached only on the
         # success path (n_updates > 0 is guaranteed by the early return above),
@@ -3499,16 +4026,31 @@ class GRPOTrainer:
         # under dynamic_epoch_training the count varies, which only shifts how
         # much the seed anchors — k is a RATIO, so this is a second-order
         # smoothing effect, not a bias in k.
+        #
+        # An ANCHOR-ONLY iteration reaches here with n_updates > 0 but pools
+        # zero mass in both terms (anchor rows are in neither N nor D). Folding
+        # that in would decay the EMA scale toward zero for no information, and
+        # on a first-ever update would set D_ema = 0 — which reads as "not warmed
+        # up" and pins k=1 until a signal iteration arrives. Skip the fold
+        # instead and leave the prior EMA untouched.
         if scaling:
-            if not have_prior:
-                self._pos_scale_N_ema, self._pos_scale_D_ema = N_iter, D_iter
-            else:
-                self._pos_scale_N_ema = (
-                    _POS_SCALE_BETA * self._pos_scale_N_ema + (1 - _POS_SCALE_BETA) * N_iter
-                )
-                self._pos_scale_D_ema = (
-                    _POS_SCALE_BETA * self._pos_scale_D_ema + (1 - _POS_SCALE_BETA) * D_iter
-                )
+            # Skip the fold ONLY on an iteration with no SIGNAL rows at all
+            # (`not entries`): anchor rows are in neither N nor D, so folding
+            # zeros would decay the EMA scale for no information, and on a
+            # first-ever update would leave D_ema == 0 and pin k=1. Keyed on
+            # `entries` rather than `anchors_in_play` so an iteration that HAS
+            # signal rows but pooled zero mass (every row clip-dead) still folds,
+            # exactly as the pre-anchor code did.
+            if (N_iter > 0.0 or D_iter > 0.0) or entries:
+                if not have_prior:
+                    self._pos_scale_N_ema, self._pos_scale_D_ema = N_iter, D_iter
+                else:
+                    self._pos_scale_N_ema = (
+                        _POS_SCALE_BETA * self._pos_scale_N_ema + (1 - _POS_SCALE_BETA) * N_iter
+                    )
+                    self._pos_scale_D_ema = (
+                        _POS_SCALE_BETA * self._pos_scale_D_ema + (1 - _POS_SCALE_BETA) * D_iter
+                    )
             result["pos_adv_weight_k"] = k_last
             result["pos_adv_alive_neg_mass"] = N_iter
             result["pos_adv_pos_mass"] = D_iter
@@ -3801,6 +4343,7 @@ class GRPOTrainer:
         lam_row,
         pos_adv_mask,
         fixed_row_mask,
+        jitter_row_mask,
     ) -> dict:
         """Measure the fixed-vs-jitter FM-loss gap directly, once per iteration.
 
@@ -3919,7 +4462,14 @@ class GRPOTrainer:
         # Restrict every headline number to JITTER rows: a paired-mode "fixed"
         # row has noise_for_input == eps by construction, so including it would
         # dilute the gap toward zero by the fixed/jitter row ratio.
-        jit_mask = ~fixed_row_mask
+        #
+        # Taken as an EXPLICIT mask, never as ~fixed_row_mask. Anchor rows are
+        # excluded from BOTH masks by the caller, so complementing one would
+        # sweep every anchor row into the other — and since anchors are never
+        # jittered their gap is structurally 0, which would drag gap_neg (and
+        # hence neg_clip_budget_used, documented as the ceiling on jitter_neg)
+        # toward zero by the anchor row fraction.
+        jit_mask = jitter_row_mask
         jp = jit_mask & pos_adv_mask
         jn = jit_mask & neg_adv_mask
         n_jp = int(jp.sum().item())
@@ -3995,10 +4545,150 @@ class GRPOTrainer:
             )
         return out
 
+    def _min_expected_batches(
+        self, entries: list[tuple[ActionChunk, str]], signal_mb_size: int
+    ) -> int:
+        """LOWER BOUND on the minibatches an epoch yields at `signal_mb_size`.
+
+        Used only to size the anchor slot reservation — `_with_anchor_rows`
+        measures the real count and distributes against that.
+
+        A bound, not an exact count, and the direction is the whole point.
+        Reserved capacity is `slots x n_batches`, so UNDER-estimating the batch
+        count over-reserves slots (costing extra optimizer steps — see the gap
+        note below — but never dropping rows), while OVER-estimating
+        under-reserves and silently drops anchor rows. Since dropped rows are the
+        unrecoverable failure, every term below is conservative:
+
+        - `ceil(n / mb)` is itself a lower bound for the stratified sampler,
+          which under-fills mid-epoch when a group's queue drains early and so
+          can yield MORE batches than the row count implies. The gap is small for
+          near-uniform group sizes but LARGE for skewed ones: measured max
+          real - est of 99 over 30k randomized shapes, e.g. groups (109, 1x11) at
+          mb=12 yields 109 batches against a bound of 10. Since the reservation
+          loop stops at the first sufficient slot count, a loose bound
+          over-reserves slots and can multiply the per-iteration step count
+          several-fold — not merely "an occasional extra step".
+        - `_iter_balanced_minibatches` yields at most that, terminating early
+          once its majority pool drains after
+          `ceil(len(majority) / n_majority_per_batch)` batches. Mirrors that
+          sampler's arithmetic including both of its fallbacks to stratified.
+
+        `test_min_expected_batches_never_overshoots` pins the direction.
+        """
+        n = len(entries)
+        if n == 0 or signal_mb_size <= 0:
+            return 1
+        n_stratified = math.ceil(n / signal_mb_size)
+        if not self.config.balanced_minibatch_training:
+            return n_stratified
+        n_pos = sum(1 for c, _m in entries if c.advantage > 0)
+        n_neg = n - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return n_stratified                      # sampler falls back
+        natural = n_pos / n
+        ratio = self._effective_pos_ratio(natural)
+        n_pos_per_batch = max(1, round(ratio * signal_mb_size))
+        n_neg_per_batch = signal_mb_size - n_pos_per_batch
+        if n_neg_per_batch <= 0:
+            return n_stratified                      # sampler falls back
+        if natural < ratio:
+            majority, per_batch = n_neg, n_neg_per_batch
+        else:
+            majority, per_batch = n_pos, n_pos_per_batch
+        return max(1, min(n_stratified, math.ceil(majority / per_batch)))
+
+    def _with_anchor_rows(
+        self,
+        batch_iter: Iterator[list[tuple[ActionChunk, str]]],
+        anchor_entries: list[tuple[ActionChunk, str]],
+        max_per_batch: int,
+        rng: np.random.Generator,
+    ) -> Iterator[list[tuple[ActionChunk, str]]]:
+        """Append an anchor-row quota to minibatches from `batch_iter`.
+
+        Anchor rows are added here rather than inside the samplers so both
+        sampler paths stay signal-only: their pos/neg pools, stratification, and
+        epoch-length anchors are unchanged, and with no anchor entries this is a
+        transparent pass-through. The inner sampler is driven at
+        `mini_batch_size - max_per_batch` so total rows per minibatch — and hence
+        peak VRAM — stay at `mini_batch_size`.
+
+        The epoch's batches are MATERIALIZED first so the per-batch target is
+        `pool / n_batches` against the real count. Estimating it instead is what
+        made a small pool under-deliver: `ceil(len(entries) / signal_mb_size)` is
+        the stratified count, while `_iter_balanced_minibatches` (the default)
+        stops early once its majority pool drains, and both fallbacks inside it
+        change the count again. At a 1-chunk pool the estimate produced ZERO
+        trained anchor rows. Materializing costs only a list of references —
+        the samplers do index arithmetic, no tensor work — and consumes the
+        epoch's RNG up front, which changes nothing about determinism.
+
+        The target may be fractional, so a running credit accumulator emits
+        `floor(credit)` rows per batch and carries the remainder; `+1e-9` before
+        truncating because an epoch's credits sum to a whole number only up to
+        float error (1/6 * 6 == 0.9999999999999999). Emission is capped at
+        `max_per_batch` (the reserved slot count).
+
+        The pool is drawn without replacement. `used` additionally prevents the
+        same chunk landing twice in ONE batch if the permutation were exhausted
+        mid-batch — unreachable as written, since the target is `pool /
+        n_batches` so an epoch's emissions never exceed the pool and the
+        permutation never wraps; kept as defense in case the target derivation
+        changes. `test_fixed_branch_metrics_exclude_anchors` checks the invariant
+        that makes it unreachable, but only on three enumerated (pool, n_batches)
+        pairs — it would not catch a target-derivation change that broke the
+        invariant at some other shape.
+        """
+        if not anchor_entries or max_per_batch <= 0:
+            yield from batch_iter
+            return
+
+        batches = list(batch_iter)
+        if not batches:
+            return
+        capacity = max_per_batch * len(batches)
+        if capacity < len(anchor_entries):
+            # The reservation was sized from an ESTIMATE of the batch count; if
+            # the sampler produced fewer batches than that, the epoch physically
+            # cannot place every anchor row without exceeding mini_batch_size.
+            # Say so rather than dropping rows silently.
+            print(
+                f"  WARNING: anchor row capacity {capacity} "
+                f"({max_per_batch}/minibatch x {len(batches)} minibatches) is "
+                f"below the {len(anchor_entries)}-row pool — "
+                f"{len(anchor_entries) - capacity} row(s) will not train this "
+                f"epoch. Lower anchor_max_row_frac or raise mini_batch_size."
+            )
+        rows_per_batch = min(
+            len(anchor_entries) / len(batches), float(max_per_batch)
+        )
+
+        order = list(rng.permutation(len(anchor_entries)).astype(int))
+        ptr = 0
+        credit = 0.0
+        for batch in batches:
+            credit += rows_per_batch
+            n_take = min(int(credit + 1e-9), max_per_batch)
+            credit -= n_take
+            used: set[int] = set()
+            while len(used) < n_take:
+                if ptr >= len(order):
+                    order = list(rng.permutation(len(anchor_entries)).astype(int))
+                    ptr = 0
+                idx = int(order[ptr])
+                ptr += 1
+                if idx in used:
+                    continue
+                used.add(idx)
+                batch.append(anchor_entries[idx])
+            yield batch
+
     def _iter_stratified_minibatches(
         self,
         entries: list[tuple[ActionChunk, str]],
         rng: np.random.Generator,
+        mb_size: int | None = None,
     ) -> Iterator[list[tuple[ActionChunk, str]]]:
         """Yield minibatches with best-effort per-group stratification.
 
@@ -4045,6 +4735,11 @@ class GRPOTrainer:
             divide evenly.
 
         Each entry is yielded exactly once per epoch.
+
+        Args:
+            mb_size: Rows per minibatch. Defaults to config.mini_batch_size;
+                _grpo_update_inner passes a reduced size when an anchor-row
+                quota is appended afterwards (see _with_anchor_rows).
         """
         n_entries = len(entries)
         if n_entries == 0:
@@ -4077,7 +4772,7 @@ class GRPOTrainer:
         used = np.zeros(n_entries, dtype=bool)
 
         n_live_groups = len(group_to_queue)
-        mb_size = self.config.mini_batch_size
+        mb_size = mb_size or self.config.mini_batch_size
         base_per_group = mb_size // n_live_groups
         n_filler = mb_size - base_per_group * n_live_groups
 
@@ -4149,6 +4844,7 @@ class GRPOTrainer:
         self,
         entries: list[tuple[ActionChunk, str]],
         rng: np.random.Generator,
+        mb_size: int | None = None,
     ) -> Iterator[list[tuple[ActionChunk, str]]]:
         """Yield mini-batches with balanced positive/negative advantage sampling.
 
@@ -4179,6 +4875,9 @@ class GRPOTrainer:
         Args:
             entries: List of (ActionChunk, mode) tuples from _grpo_update_inner.
             rng:     Per-epoch numpy Generator (caller provides reproducible seed).
+            mb_size: Rows per minibatch. Defaults to config.mini_batch_size;
+                     reduced by the caller when an anchor-row quota is appended
+                     afterwards (see _with_anchor_rows).
 
         Yields:
             Lists of (ActionChunk, mode) tuples, length <= mini_batch_size.
@@ -4188,14 +4887,17 @@ class GRPOTrainer:
 
         # Split entries by advantage sign. The per-chunk advantage inherits its
         # sign directly from the episode-level group-relative normalization;
-        # live_chunks already filtered out zero-advantage (dead group) entries.
+        # live_chunks already filtered out zero-advantage (dead group) entries,
+        # and anchor entries are held out by the caller — their constant positive
+        # advantage would swamp the positive pool at high success and crowd out
+        # the genuine mixed-group successes this sampler exists to preserve.
         pos_indices = [i for i, (c, _) in enumerate(entries) if c.advantage > 0]
         neg_indices = [i for i, (c, _) in enumerate(entries) if c.advantage <= 0]
 
         # Fall back to stratified when one sign class is absent — we can't
         # form a balanced batch without both positive and negative entries.
         if not pos_indices or not neg_indices:
-            yield from self._iter_stratified_minibatches(entries, rng)
+            yield from self._iter_stratified_minibatches(entries, rng, mb_size)
             return
 
         natural_pos_frac = len(pos_indices) / len(entries)
@@ -4203,14 +4905,33 @@ class GRPOTrainer:
         # natural fraction clamped to [base, max]. See _effective_pos_ratio.
         pos_ratio = self._effective_pos_ratio(natural_pos_frac)
 
-        mb_size = self.config.mini_batch_size
+        mb_size = mb_size or self.config.mini_batch_size
         n_pos_per_batch = max(1, round(pos_ratio * mb_size))
         n_neg_per_batch = mb_size - n_pos_per_batch
 
         # Guard: if rounding left no room for one sign class (e.g. pos_ratio=0.9375
         # with mb_size=8 causes round(7.5)=8 → n_neg=0), fall back.
+        #
+        # Logged, not silent: an anchor-row quota SHRINKS mb_size here, so a
+        # large anchor pool can turn balanced sampling off. `pos_ratio` is NOT the
+        # natural positive fraction — _effective_pos_ratio returns the configured
+        # constant unless the dynamic flag is set, then clamps to ..._ratio_max —
+        # so at the default 0.5 this needs signal_mb_size == 1, i.e. anchor_slots
+        # == mini_batch_size - 1. The pool ratio that implies SCALES with
+        # mini_batch_size — measured first fallback at 1.05:1 (mb=4), 3.05:1
+        # (mb=8), 5.05:1 (mb=12), 7.05:1 (mb=16) — and is reachable at the default
+        # anchor_max_row_frac=1.0, because the budget's one-whole-episode floor
+        # can admit an anchor episode far larger than the cap.
+        # train/balanced_pos_ratio (computed separately) still reports the target
+        # as though it had applied, hence the warning.
         if n_neg_per_batch <= 0:
-            yield from self._iter_stratified_minibatches(entries, rng)
+            print(
+                f"  WARNING: balanced sampling disabled this epoch — "
+                f"pos_ratio={pos_ratio:.3f} at {mb_size} row(s)/minibatch "
+                f"leaves no negative slot. Falling back to stratified sampling. "
+                f"Lower anchor_max_row_frac or raise mini_batch_size."
+            )
+            yield from self._iter_stratified_minibatches(entries, rng, mb_size)
             return
 
         # Determine minority vs majority pool based on which sign class is
@@ -4812,6 +5533,35 @@ class GRPOTrainer:
             self.writer.add_scalar("episode/group_success_median", stats.get("group_success_median", 0), iteration)
             self.writer.add_scalar("episode/group_success_max", stats.get("group_success_max", 0), iteration)
 
+            # Anchor groups (all-success). Only emitted when the feature is on,
+            # so prior runs keep exactly their existing episode/* key set.
+            # n_anchor_groups rising while n_live_groups falls is the expected
+            # shape at high success — it is the buffer that used to vanish.
+            if self.config.include_anchor_groups:
+                self.writer.add_scalar(
+                    "episode/n_anchor_groups", stats.get("n_anchor_groups", 0), iteration
+                )
+                self.writer.add_scalar(
+                    "episode/n_anchor_episodes",
+                    stats.get("n_anchor_episodes", 0),
+                    iteration,
+                )
+                self.writer.add_scalar(
+                    "episode/n_anchor_episodes_dropped",
+                    stats.get("n_anchor_episodes_dropped", 0),
+                    iteration,
+                )
+                # The two counts the skip decision is keyed on. Without them a
+                # TB-only operator cannot tell WHY an iteration was skipped.
+                self.writer.add_scalar(
+                    "episode/n_signal_chunks", stats.get("n_signal_chunks", 0),
+                    iteration,
+                )
+                self.writer.add_scalar(
+                    "episode/n_anchor_chunks", stats.get("n_anchor_chunks", 0),
+                    iteration,
+                )
+
             # Advantage signal availability (already in buffer.stats() but
             # previously not surfaced to TB). pct_positive_advantage near 0.5 is
             # healthy; far off means the group-relative normalization is failing.
@@ -5141,6 +5891,13 @@ class GRPOTrainer:
                 "pos_adv_pos_mass",
                 "n_pos_flipped_by_renorm",
                 "balanced_pos_ratio",
+                # Anchor rows (present only when anchor rows trained this iter).
+                # mean_ratio_anchor is the one to watch: it starts at 1.0 and
+                # saturating at 1 + clip_eps_high means the clip is bounding the
+                # retention move, which is the designed cap.
+                "n_anchor_rows_trained",
+                "mean_ratio_anchor",
+                "kl_loss_anchor",
             ):
                 if key in update_stats:
                     self.writer.add_scalar(f"train/{key}", update_stats[key], iteration)
@@ -5182,6 +5939,18 @@ class GRPOTrainer:
                 log_dict = {"iteration": iteration}
                 if stats:
                     log_dict.update(stats)
+                    if not self.config.include_anchor_groups:
+                        # buffer.stats() reports the anchor counters
+                        # unconditionally, but the TB side gates them on the
+                        # flag — drop them here too so an anchors-off run's key
+                        # set is exactly what it was before the feature existed.
+                        # Must list EVERY anchor-related key stats() adds
+                        # unconditionally — it grew from three to five when the
+                        # chunk counts were added for the skip decision.
+                        for _k in ("n_anchor_groups", "n_anchor_episodes",
+                                   "n_anchor_episodes_dropped",
+                                   "n_signal_chunks", "n_anchor_chunks"):
+                            log_dict.pop(_k, None)
                 # Mirror the TB-side ref_mse/* block, which is deliberately
                 # ungated on n_updates (see the comment there). getattr, not
                 # attribute access: on a trainer built without __init__ a bare

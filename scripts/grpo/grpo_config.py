@@ -365,6 +365,76 @@ class GRPOConfig:
     # be >= balanced_minibatch_positive_adv_ratio.
     balanced_minibatch_positive_adv_ratio_max: float = 0.75
 
+    # ─── Anchor groups (all-success groups) ──────────────────────────────────
+    # An ALL-SUCCESS group (k == group_size) has per-group reward std == 0, so
+    # the group-mean baseline gives every episode advantage exactly 0 and the
+    # whole group is dropped as dead. That is correct policy-gradient behavior
+    # (nothing to improve), but it also means the trust region never sees the
+    # states the policy already solves, and at high success rates most of the
+    # buffer disappears while the surviving mixed groups are dominated by rare
+    # large-negative failures.
+    #
+    # These two knobs reclassify all-success groups as ANCHOR groups. ALL-FAIL
+    # and singleton groups stay dead — pushing DOWN on every rollout from a
+    # state gives no direction to move toward and is the documented cause of the
+    # v2 avoidance-gradient collapse. See README "Anchor groups".
+    #
+    # include_anchor_groups admits all-success chunks into the ref pass and the
+    # update. With anchor_advantage == 0 their clip term is identically 0, so the
+    # only thing they add to the LOSS is the KL anchors (kl_coef_last_iter /
+    # kl_coef_base_model) — a retention constraint with no reward signal of its
+    # own. Not a literal no-op, though: the rows occupy minibatch slots, so they
+    # change each batch's renorm sample and raise the per-iteration optimizer
+    # step count (see README "Anchor groups").
+    include_anchor_groups: bool = False
+
+    # Positive advantage assigned to each episode of an anchor group, in the
+    # same units as the group-relative z-scores of mixed groups. 0.0 = KL-only
+    # (see above). Requires include_anchor_groups=True.
+    #
+    # Choosing the value — pseudo-count (Beta-Bernoulli) baseline. k == G is not
+    # proof that p == 1: at G=8 a state with true p=0.85 returns 8/8 about 27% of
+    # the time, so the MLE baseline 1.0 over-estimates and each success really did
+    # earn positive advantage. Replace the group mean with the posterior mean
+    # under κ pseudo-counts at prior success rate p̄, and divide by a FIXED scale
+    # (the group's own std is 0):
+    #
+    #   b_g      = (Σ r_i + κ·p̄) / (G + κ)
+    #   A_anchor = (1 − b_g) / σ_fixed  =  κ(1 − p̄) / ((G + κ)·σ_fixed)
+    #
+    # With κ=2, p̄=0.5 (Laplace's rule of succession) and σ_fixed=0.5 (the max
+    # Bernoulli std, ≈ the std of a balanced G/2 group): A_anchor = 2/(G+2), i.e.
+    # 0.200 at group_size=8 and 0.143 at group_size=12. Today's behavior is the
+    # κ=0 case. The value is a CONSTANT (κ, p̄, σ_fixed are only identifiable as
+    # this one combination), so it is configured directly rather than derived at
+    # runtime; recompute it if you change group_size. For scale: at G=12 a
+    # balanced 6/12 group's successes sit at ±0.96 and the weakest signal row
+    # that exists at all is ±0.29.
+    #
+    # Deliberately NOT tied to the running success rate: the estimator wants the
+    # anchor to fade as success climbs, while the negative-mass asymmetry wants
+    # it strongest exactly then. Keeping it fixed makes the effect readable and
+    # leaves the asymmetry to the balanced-sampler mechanisms above.
+    anchor_advantage: float = 0.0
+
+    # Anchor row budget, as a multiple of the SIGNAL (mixed-group) chunk count.
+    # Anchor episodes are kept in index order until the budget is met; the rest
+    # are dropped back to dead (logged, never silent). Anchor advantages are not
+    # zero-sum within a group, so dropping individual anchor episodes distorts
+    # nothing — unlike signal groups, where it would break Σ A_ep = 0.
+    # 1.0 = anchor rows may be at most as numerous as signal rows. WAIVED (and
+    # logged) whenever there are no signal chunks at all — not just an
+    # all-success iteration, but any iteration with no mixed group, e.g. an
+    # all-fail + all-success mix, which carries a non-zero std_reward and so does
+    # not hit the trainer's outer skip either. Above ~7 the per-batch cap stops
+    # an epoch from covering the pool (see README "Row budget and cost"). Each anchor row costs the same
+    # len(tau_centers) DiT forwards as a signal row in both the ref pass and
+    # every update epoch, so this is the compute knob as well as the strength
+    # knob — halving it halves both the cost and the anchor's share of the
+    # gradient (the per-minibatch quota is proportional and may be fractional,
+    # so this holds for pools smaller than one row per minibatch too).
+    anchor_max_row_frac: float = 1.0
+
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
     # Smaller = more updates per epoch but noisier gradients
@@ -760,6 +830,41 @@ class GRPOConfig:
                 f"would invert the anchor's gradient direction if the gate "
                 f"were ever loosened."
             )
+        # Anchor groups (all-success). anchor_advantage is a POSITIVE advantage
+        # applied to rows we only ever want to nudge upward; a negative value
+        # would turn the retention term into active suppression of behavior that
+        # demonstrably works. It is also inert unless the rows are admitted at
+        # all, so require the gate explicitly rather than silently ignoring it.
+        if self.anchor_advantage < 0.0:
+            raise ValueError(
+                f"anchor_advantage must be >= 0, got {self.anchor_advantage}. "
+                f"Use 0.0 for KL-only anchoring; a negative value would "
+                f"suppress trajectories that succeeded."
+            )
+        if self.anchor_advantage > 0.0 and not self.include_anchor_groups:
+            raise ValueError(
+                f"anchor_advantage={self.anchor_advantage} requires "
+                f"include_anchor_groups=True — with the gate off, all-success "
+                f"groups stay dead and the value is never read."
+            )
+        if self.anchor_max_row_frac <= 0.0:
+            raise ValueError(
+                f"anchor_max_row_frac must be > 0, got "
+                f"{self.anchor_max_row_frac}. It caps anchor rows at this "
+                f"multiple of the signal-chunk count; use "
+                f"include_anchor_groups=False to disable anchors entirely."
+            )
+        if (
+            self.anchor_max_row_frac != 1.0
+            and not self.include_anchor_groups
+        ):
+            raise ValueError(
+                f"anchor_max_row_frac={self.anchor_max_row_frac} requires "
+                f"include_anchor_groups=True — with the gate off there are no "
+                f"anchor rows to budget and the value is never read. (Mirrors "
+                f"the same check on anchor_advantage.)"
+            )
+
         # The clipped surrogate clamps the importance ratio to
         # [1 - clip_eps_low, 1 + clip_eps_high]. Each epsilon must lie in the
         # open interval (0, 1); there is NO ordering constraint between them

@@ -28,7 +28,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from grpo_config import GRPOConfig  # noqa: E402
 from train_grpo import GRPOTrainer  # noqa: E402
 
-STATS = {"success_rate": 0.1, "mean_reward": 0.1, "std_reward": 0.3}
+# n_signal_chunks is what train()'s skip decision reads (std_reward is not a
+# substitute: an all-fail + all-success mix has std_reward > 0 and zero signal
+# chunks). Non-zero here so these fixtures reach the ref-logprob and update
+# phases whose timing curves they assert on.
+STATS = {"success_rate": 0.1, "mean_reward": 0.1, "std_reward": 0.3,
+         "n_signal_chunks": 24, "n_anchor_chunks": 0}
 
 # Sleeps long enough to dominate scheduler noise, short enough to keep the suite
 # fast. Asserted against half their value so the tests aren't flaky.
@@ -91,7 +96,7 @@ class FakeBuffer:
         self.num_chunks = self.n_loaded * self.chunks_per_episode
         return self.n_loaded
 
-    def compute_advantages(self, max_episode_steps=None):
+    def compute_advantages(self, max_episode_steps=None, **kwargs):
         pass
 
     def stats(self):

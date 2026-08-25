@@ -76,6 +76,7 @@ class _Chunk:
     advantage: float
     feat: float                      # drives the stub's per-row f / delta
     group_id: int = 0
+    is_anchor: bool = False
     ref_log_prob: Optional[float] = 0.0
     base_log_prob: Optional[float] = None
     tau_samples: Optional[np.ndarray] = None

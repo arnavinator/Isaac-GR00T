@@ -23,7 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
-| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. |
+| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
@@ -575,6 +575,8 @@ Interactions with other knobs:
   can produce dead groups early (every rollout fails identically → std=0 →
   zero advantage → no learning). Pick a branch point the policy already
   solves at least intermittently, or the iteration yields no gradient signal.
+  Note `include_anchor_groups` does not help here: it rescues the all-SUCCESS
+  end of the distribution, not the all-fail end.
 
 #### Budget accounting (`consumed_substeps`)
 
@@ -670,7 +672,7 @@ group at a time** until either:
    disabled), or
 2. `group_idx >= max_groups` (hard cap, logs a WARNING).
 
-The "alive" predicate matches the trainer's gradient-signal filter
+The "alive" predicate matches the trainer's **improvement**-signal filter
 exactly: `compute_advantages` zeros the advantage of any group with
 std < 1e-4, and the GRPO update drops zero-advantage chunks before
 backward (`abs(c.advantage) < 1e-12`). All-success groups
@@ -681,6 +683,13 @@ gradient — neither is "alive". An earlier version of this loop used
 as satisfying the gate; that has been replaced by the exact mixed
 criterion. In the early/low-success regime (no group fully solved
 yet) the two criteria are equivalent.
+
+**`include_anchor_groups` does not change this gate.** All-success groups do
+train under that flag (as anchors — see "Anchor groups"), but they carry no
+within-group contrast, so counting them as alive would stop dynamic collection
+early at high success, exactly when mixed groups are scarcest and extending
+toward `max_groups` matters most. "Alive" stays mixed-only in both
+`collect_episodes.py` and `_validate_collected_data_cache`.
 
 To disable dynamic collection entirely, set `min_alive_groups = 0` —
 the collector then always stops at exactly `num_groups`.
@@ -710,7 +719,7 @@ for iteration in range(start, num_iterations + 1):
     _collect_episodes(env_name)                            # via collect_episodes.py subprocess
 
     # Phase 2: compute advantages
-    buffer.compute_advantages(max_steps)                   # per-group z-score
+    buffer.compute_advantages(max_steps, anchor_advantage, ...)  # per-group z-score
 
     # Phase 2b: pre-compute reference log-probs (current model == ref before update)
     _compute_ref_log_probs()                               # caches backbone features
@@ -767,11 +776,311 @@ A_chunk = A_episode / num_chunks_in_episode
   zero-sum invariant at the chunk level, so every trajectory contributes
   equal **total** gradient weight regardless of length.
 
-A group with reward std < 1e-4 is **dead**: its chunks get advantage
-exactly 0 and are filtered out before any forward pass (see "Minibatch
-construction"). Under the binary reward this happens for all-success groups
-(every rollout succeeds) and all-fail groups (every rollout fails) — only
-**mixed** groups produce a gradient.
+A group with reward std < 1e-4 is **degenerate**: the group-mean baseline gives
+every episode an advantage of exactly 0. Under the binary reward this happens
+for all-success groups (every rollout succeeded) and all-fail groups (every
+rollout failed) — only **mixed** groups produce an improvement gradient. This is
+not a threshold artifact: the per-group std is either exactly 0 (all G outcomes
+identical) or at least `1/sqrt(G)`, which is 3500× the threshold at G=8, so the
+`std_r < 1e-4` test is an exact "were all outcomes the same?" check.
+
+By default degenerate groups are **dead**: their chunks are filtered out before
+any forward pass (see "Minibatch construction"). `include_anchor_groups`
+reclassifies the all-success half as **anchor** groups instead — see the next
+section.
+
+### Anchor groups
+
+An all-success group being zero-advantage is correct policy-gradient behavior:
+the group mean *is* the Monte-Carlo value estimate, and no rollout beat it, so
+there is nothing to improve. But dropping those groups has two costs:
+
+1. **The trust region never covers the solved states.** `kl_coef_last_iter` and
+   `kl_coef_base_model` are evaluated only over live chunks, so the constraint
+   binds where the policy is uncertain and is blind to where it succeeds.
+   Because group seeds are fresh every iteration
+   (`seed + iter*100_000 + group_idx*1000`), the anchor states are *different
+   scenes* from the live ones, so admitting them genuinely widens the
+   constraint's support.
+2. **At high success most of the buffer disappears**, and what survives is
+   dominated by rare failures: in a 7/8 group the single failure carries
+   −2.47 against successes at +0.35. `balanced_minibatch_training` and the
+   tent-shaped epoch decay both exist to damp that asymmetry by reweighting
+   scarce data; anchor rows instead restore positive mass that is *real*.
+
+Three-way classification in `compute_advantages` (k = successes, G = group size):
+
+| | condition | advantage | role |
+|---|---|---|---|
+| **signal** | `0 < k < G` | `(r − mean) / std_r` — formula untouched | improvement |
+| **anchor** | `k == G` | `anchor_advantage` (constant) | retention |
+| **dead** | `k == 0`, or `G == 1` | 0, filtered | — |
+
+**All-fail groups stay dead, deliberately.** Pushing down on every rollout from
+a state gives no target to move toward, and it is the avoidance gradient the v2
+ablation identified as the collapse mechanism. Run the pseudo-count baseline
+below on a `k == 0` group and it hands every episode a *negative* advantage, so
+the asymmetry falls out of the math too — it lives in one `if`.
+
+#### Choosing `anchor_advantage`
+
+`k == G` is not proof that `p == 1`: at G=8 a state with true p=0.85 returns 8/8
+about 27% of the time (0.85⁸), so the MLE baseline 1.0 over-estimates and each
+success really did earn positive advantage. Replace the group mean with the
+Beta-Bernoulli posterior mean under κ pseudo-counts at prior success rate p̄,
+and divide by a fixed scale (the group's own std is 0):
+
+```
+b_g      = (Σ r_i + κ·p̄) / (G + κ)
+A_anchor = (1 − b_g) / σ_fixed  =  κ(1 − p̄) / ((G + κ)·σ_fixed)
+```
+
+κ is "how many imaginary rollouts my prior is worth"; p̄ is "what success rate
+they had". With κ=2, p̄=0.5 (Laplace's rule of succession) and σ_fixed=0.5 (the
+max Bernoulli std, ≈ the std of a balanced G/2 group) this is `2/(G+2)`:
+
+| group_size | `anchor_advantage` (κ=2) | balanced-group success, for scale | weakest signal row |
+|---|---|---|---|
+| 8 | **0.200** | ±0.935 | ±0.354 |
+| 12 | **0.143** | ±0.957 | ±0.289 |
+| 16 | 0.111 | ±0.968 | ±0.250 |
+
+Those comparisons are at the **episode** level (`A_episode`), which is where the
+value is set. What a row contributes also passes through `÷ num_chunks` and the
+iteration-wide scale, so the realized row-level ratio varies with group
+composition and episode length — larger against a lopsided group whose
+advantages are small, smaller against a balanced one. That is the intended
+behavior for a fixed absolute magnitude.
+
+Today's dead-group behavior is the κ=0 case. The correction shrinks as G grows —
+more real evidence, less prior — which is what makes it a finite-sample
+correction rather than a bonus. Since κ, p̄ and σ_fixed are only identifiable as
+this one combination, the value is configured directly; recompute it if you
+change `group_size` (κ=3 at G=12 reproduces the G=8, κ=2 magnitude if you want
+to hold gradient scale fixed across a group-size change).
+
+It is deliberately **not** tied to the running success rate: the estimator wants
+the anchor to fade as success climbs, while the negative-mass asymmetry wants it
+strongest exactly then. A fixed value keeps the effect readable and leaves the
+asymmetry to the balanced-sampler mechanisms.
+
+`anchor_advantage = 0` with `include_anchor_groups = True` is the KL-only
+setting — the rows join the batch and the trust region, but their clip term is
+identically 0, so they carry no reward signal of their own. Not a literal no-op,
+though: the rows occupy minibatch slots, which changes each batch's renorm sample
+and raises the per-iteration step count.
+
+#### Bound
+
+With A > 0 the surrogate is `min(A·ρ, A·(1+clip_eps_high))`, so an anchor row's
+gradient dies once ρ exceeds 1.2 — the FM surrogate can improve by at most
+log(1.2) ≈ 0.18 nats on that path per iteration, regardless of the constant.
+`train/mean_ratio_anchor` saturating near `1 + clip_eps_high` means the clip is
+bounding the retention move, which is the designed cap.
+
+#### What anchor rows are excluded from
+
+Anchor rows are a third class, so every mechanism *defined by advantage sign*
+skips them. Getting any of these wrong silently defeats the feature:
+
+| mechanism | why anchors are excluded |
+|---|---|
+| per-minibatch z-score | An anchor-only minibatch has no variance except `anchor_advantage / num_chunks` — i.e. **episode length**. A z-score there amplifies length to ±1 and reproduces the time-scaling gradient that collapsed v2. In a mixed batch, all-positive anchor rows also lift the mean and can flip weak real positives negative. |
+| `buffer_adv_mean` / `buffer_adv_std` | Computed over signal rows only, so the mean stays ≈0 and `per_iteration_advantage_norm` keeps its sign-preservation property. |
+| balanced sampler pos/neg pools | At high success anchors would *dominate* the positive pool and crowd out the genuine mixed-group successes the sampler exists to preserve, while inflating `natural_pos_frac`. |
+| dynamic-epoch `success_frac` | Every anchor episode succeeded, so counting them drives the tent toward 1 epoch exactly when anchors were added. |
+| PAWS `N`/`D` alive mass | Inflating D drives k → 1 and silently disables the mechanism. |
+| pos/neg clipfrac buckets, `n_pos_flipped_by_renorm`, `mean_ratio_fixed/jitter` | All keyed on group-relative sign. Anchors get their own `*_anchor` curves instead. |
+| `ref_mse/*`, `chunk_gap/*` | Split by advantage sign; anchor rows are simply dropped from these diagnostics (no `*_anchor` counterpart). |
+| jitter (`jitter_pos`/`jitter_neg`) | Anchor entries are always tagged `"fixed"` — λ is selected by advantage sign. `_jitter_gap_diagnostics` takes the jitter set as an explicit mask rather than `~fixed_row_mask`, since excluding anchors from one mask would otherwise sweep them into the other. |
+| balanced-sampler viability | The anchor reservation shrinks the sampler's batch size, which can round the minority slot count to 0 and make `_iter_balanced_minibatches` fall back to stratified. At the default `balanced_minibatch_positive_adv_ratio=0.5` this needs `signal_mb_size == 1`, i.e. `anchor_slots == mini_batch_size − 1`. The pool ratio that implies **scales with `mini_batch_size`** — measured first fallback at 1.05:1 (mb=4), 3.05:1 (mb=8), 5.05:1 (mb=12), 7.05:1 (mb=16) — so it is roughly `(mini_batch_size − 1):1`, not a constant. It IS reachable at the default `anchor_max_row_frac=1.0`: that budget caps *chunks*, but the one-whole-episode floor below can admit an anchor episode several times larger than the cap, so a small mixed group plus one 65-chunk anchor episode reaches 6.5:1. Do not confuse this with the ~7:1 *coverage* limit below; they are different thresholds. The fallback logs a WARNING either way. |
+
+The headline `clipfrac` / `mean_ratio` / `mean_log_ratio_abs` curves are the
+deliberate exception: they cover **all** trained rows, anchors included, because
+they describe the batch the optimizer saw. Use `clipfrac_effective_{pos,neg}`
+for the signal-only view and `train/mean_ratio_anchor` for the anchor split.
+
+Anchor rows instead get their **scale** from the buffer-wide signal std
+(`anchor_scale`), so an anchor row's weight does not depend on which rows happen
+to share its minibatch. It does still depend on the iteration's signal spread
+(`buffer_adv_std` is per-iteration): the anchor is a fixed *absolute* magnitude,
+so its weight relative to the signal rows grows as the signal advantages shrink
+— which is what happens at high success, and is the direction you want. Anchor
+rows also never get the mean subtracted, only the scale divided.
+`per_iteration_advantage_norm=True` is the intended pairing: under per-minibatch
+norm the signal rows rescale per batch while anchors don't, so the ratio wobbles
+with batch composition (the startup banner warns about this).
+
+#### Row budget and cost
+
+Each anchor row costs the same `len(tau_centers)` DiT forwards as a signal row
+in the ref pass (×2 with the base-model KL) and in every update epoch. At high
+success they can be a large fraction of the buffer, so `anchor_max_row_frac`
+caps anchor chunks at that multiple of the signal chunk count — one knob for
+both compute and the anchor's share of the gradient. Anchor episodes are kept in
+index order — first-fit, so an episode that doesn't fit is skipped and a later
+shorter one may still be admitted — until the budget is met, and the rest revert
+to dead, logged rather than silently dropped. The budget has an implicit floor of
+one whole episode: the first anchor episode is always admitted so a small value
+shrinks the anchor share instead of deleting the feature, which at ~30–65
+chunks/episode can overshoot a small budget several-fold. Because anchor advantages are constant rather than
+zero-sum within a group, dropping individual anchor episodes distorts nothing —
+unlike a signal group, where it would break `Σ A_ep = 0`.
+
+The budget is **waived when there are no signal chunks at all**: there is no
+denominator to measure it against. That is not only the all-success case — an
+all-fail *plus* all-success mix also has zero signal chunks while carrying a
+non-zero `std_reward`, so the outer skip doesn't fire either. The waiver is
+logged, because it means `anchor_max_row_frac` is bounding nothing that
+iteration.
+
+Two more bounds worth knowing:
+
+- Above roughly `anchor_max_row_frac ≈ 7` the per-batch cap (`anchor_slots ≤
+  mini_batch_size − 1`) stops the epoch from covering the pool: measured coverage
+  is 1.00× up to a 5:1 anchor:signal ratio, then 0.70× at 10:1 and 0.35× at 20:1.
+  Far outside the default of 1.0, but the excess rows are simply never trained.
+- The budget admits episodes in index order, so a small value systematically
+  favours the lowest `group_id`s — the earliest-collected groups. Deterministic
+  across runs; group seeds rotate per iteration, so it doesn't compound.
+- **`anchor_max_row_frac` is therefore not a hard cap.** The one-episode floor
+  admits the first anchor episode whatever its size, so the realized ratio can
+  exceed the configured budget several-fold (measured 3.25× with a 10-chunk
+  episode against an 8-chunk signal pool at `frac=0.5`). Reason about it as a
+  target, not a bound — and note the interaction with first-fit: the overshoot is
+  worst when a long episode sorts first, and the shorter episodes that would have
+  fit are then dropped.
+
+The iteration skip is keyed on `n_signal_chunks` / `n_anchor_chunks` rather than
+`std_reward` — see "Skip semantics". An iteration with no signal chunks trains on
+its anchor rows when `anchor_advantage > 0` **or** `kl_coef_base_model > 0`; with
+both at 0 it has no gradient at all (clip term identically 0, `KL(ref ‖ current)`
+zero at `θ == θ_ref`) and stays skipped rather than firing steps that would apply
+only weight decay and carried momentum while consuming an iteration.
+
+#### Additive, not diluting
+
+`clip_loss` and both KL terms divide by `signal_mb_size` — the **intended**
+signal-row count, held constant across the epoch — when anchor rows are present,
+rather than by the total row count. Two consequences:
+
+- A signal row's weight is `1/signal_mb_size`, exactly what it would be in an
+  anchor-free minibatch of that size, so turning anchors on doesn't rescale the
+  rows that drive improvement, and the anchor KL genuinely *adds* a constraint
+  rather than reallocating the existing KL budget across more rows.
+- Using the **realized** signal count instead would spike any batch the sampler
+  under-fills: a trailing batch with 1 signal + 3 anchor rows would weight every
+  row at 1.0 instead of `1/signal_mb_size`, making a 4-row batch the largest step
+  of the epoch and — at `max_grad_norm=0.5` — the only clipped one. A constant
+  divisor makes a row's weight independent of batch composition; an under-filled
+  batch simply contributes proportionally less.
+
+A minibatch left with fewer than 2 signal rows also can't support a
+per-minibatch z-score, so its signal rows fall back to the buffer-wide one
+rather than entering the surrogate at raw `A_ep / num_chunks` scale.
+
+The divisor is gated on **anchors being enabled this iteration**, not on "this
+minibatch happens to hold an anchor row". Because the quota is fractional, the
+credit accumulator leaves some batches anchor-free; gating per batch would send
+those through `.mean()` and put the composition-dependent weight straight back —
+a 1-signal-row trailing batch would weight its row at 1.0 instead of
+`1/signal_mb_size`, and whether it did would be decided by the credit counter.
+
+Two caveats on "additive". The loss *weights* are additive as described, but each
+anchor row still carries full `1/signal_mb_size` KL weight, so a batch's pre-clip
+gradient norm rises by roughly `1 + n_anchor/signal_mb_size`. At the default
+`max_grad_norm=0.5` that can put a batch into active clipping, and the rescale
+then applies to the signal gradient too. And anchor rows occupy slots, so the
+per-iteration optimizer step count rises (see above).
+
+With no anchor rows in the iteration the expression is `row_loss.mean()`,
+bit-identical to the pre-anchor path.
+
+#### Metrics
+
+`episode/n_anchor_groups`, `episode/n_anchor_episodes`,
+`episode/n_anchor_episodes_dropped` (only with the flag on — `buffer.stats()`
+reports the counters unconditionally, so the wandb bulk-dump strips them too);
+`train/n_anchor_rows_trained`, `train/mean_ratio_anchor`, `train/kl_loss_anchor`
+(only when anchor rows actually trained, and dropped rather than written if
+non-finite). `episode/n_live_groups` still counts **signal** groups only, and
+`mean_advantage` / `std_advantage` / `pct_positive_advantage` are still computed
+over signal episodes only.
+
+Caveats on cross-run comparability, since not every pre-existing curve is
+untouched:
+
+- `clipfrac`, `mean_ratio` and `mean_log_ratio_abs` cover anchor rows too (the
+  deliberate exception noted above).
+- `train/loss`, `train/clip_loss`, `train/kl_loss_last_iter` **and
+  `train/kl_loss_base_model`** switch from `.mean()` to
+  `.sum() / signal_mb_size` whenever anchors are in play, so their magnitudes are
+  not directly comparable to an anchors-off run.
+- `episode/n_dead_groups` falls (an anchor group is no longer dead — inherent to
+  the feature), and `episode/pct_positive_advantage` / `episode/std_advantage`
+  shift because their denominator is the non-anchor episodes: anchor episodes
+  leave the sample entirely rather than contributing zeros as they did when they
+  were dead. Only `episode/n_live_groups` and `episode/mean_advantage` are
+  numerically preserved.
+- `train/kl_loss_anchor` covers the `kl_coef_last_iter` term only; the anchor
+  rows' base-model KL contribution is not surfaced separately.
+- `train/ratio_max`, `train/ratio_min` and `train/grad_norm_*` also shift, since
+  anchor rows enter the ratio extremes and the rescaled loss.
+- Budget-DROPPED anchor episodes revert to `is_anchor=False` with advantage 0, so
+  they still contribute zeros to `pct_positive_advantage` / `std_advantage`. Only
+  admitted anchor episodes leave that sample.
+- `train/kl_loss_anchor` is a per-anchor-row mean, whereas the `kl_loss_last_iter`
+  term inside the loss divides by `signal_mb_size`. Similar names, different
+  normalizations — don't read them side by side as one quantity.
+
+#### Suggested ablation
+
+`init_state_npz_path` single-scene mode is the right harness — it is where
+v2/v3 ran, where all-success groups are pure "G/G noise draws succeeded", and
+where the buffer actually goes empty at high success. Ladder:
+`anchor_advantage` ∈ {0 (KL-only), 0.10, 0.143, 0.25} at `group_size=12`,
+against the v3 baseline that held at 0.83. Watch whether success *holds above*
+the prior plateau rather than merely reaching it; watch
+`train/mean_ratio_anchor` for clip saturation; and watch
+`episode/group_success_{min,median,max}` spread for the one genuinely uncertain
+risk — reinforcing the model's own (ε → a) mappings is reflow-style
+self-distillation, and since all exploration here comes from denoising noise
+through a shared DiT, over-sharpening on solved states could shrink within-group
+variance everywhere.
+
+#### What not to do instead
+
+Do not create within-group variance among the successes to make the group
+non-degenerate. That includes the capped speed multiplier suggested in
+`compute_advantages`' block comment: capping the reward at
+`min(1.5, max_steps/num_steps)` bounds the reward *spread*, but the advantage
+divides by the group's own std, which rescales whatever spread survives back to
+±1. An all-success group with rewards in [1.0, 1.5] and std 0.15 yields
+advantages of ±1.7 — the same magnitude as real succeed-vs-fail signal, so "be
+20% faster" gets weighted like "succeed instead of failing". That is the v2
+mechanism exactly, cap or no cap. A speed term would need a fixed-scale
+denominator, not the per-group std.
+
+#### CLI usage
+
+```bash
+# Layer 1 — retention constraint only. Anchor rows join the batch and the KL
+# terms; their clip term is identically 0, so they cannot move the policy.
+uv run python scripts/grpo/train_grpo.py --include-anchor-groups
+
+# Layer 2 — add the positive pull. 0.143 is the kappa=2 value at group_size=12.
+uv run python scripts/grpo/train_grpo.py \
+    --include-anchor-groups \
+    --anchor-advantage 0.143 \
+    --per-iteration-advantage-norm \
+    --group-size 12 \
+    --anchor-max-row-frac 0.5
+```
+
+`--anchor-advantage` without `--include-anchor-groups` is a hard config error
+rather than a silent no-op. The startup banner prints
+`Anchor groups: ON (advantage=…, row budget=…× signal rows)`, plus a NOTE when
+a positive advantage is combined with per-minibatch renorm.
 
 ### FM log-prob surrogate
 
@@ -855,11 +1164,11 @@ log-prob estimate but linearly increases per-minibatch compute.
 `_grpo_update_inner` does NOT use `EpisodeBuffer.iter_minibatches` (a flat
 shuffle). It uses `_iter_stratified_minibatches` instead:
 
-1. **Dead-group filter**: drop every chunk with `|advantage| < 1e-12`
-   (advantage was set to literal 0 by `compute_advantages` for groups with
-   std < 1e-4). Filtering here keeps every minibatch uniformly live-only
-   and avoids a `(0 - mean) / std` term polluting the per-minibatch
-   advantage renorm.
+1. **Dead-group filter**: drop every chunk with `|advantage| < 1e-12` (advantage
+   was set to literal 0 by `compute_advantages` for groups with std < 1e-4),
+   keeping anchor chunks when `include_anchor_groups` is on. Filtering here
+   keeps every minibatch uniformly live-only and avoids a `(0 - mean) / std`
+   term polluting the per-minibatch advantage renorm.
 
 2. **Bin live chunks by `group_id`** and shuffle within each bin.
 
@@ -884,6 +1193,68 @@ Why uniform-over-CHUNKS for the filler (vs uniform-over-GROUPS): it
 self-balances. Fuller groups contribute filler proportionally more often,
 so all groups drain in lockstep and the "≥1 per group" guarantee holds
 for essentially the whole epoch.
+
+**Anchor rows** (see "Anchor groups") are appended by `_with_anchor_rows`
+*around* whichever sampler ran, not inside it — so both sampler paths stay
+signal-only and are a transparent pass-through when no anchors exist. The inner
+sampler is driven at `mini_batch_size - anchor_slots` (both samplers take an
+optional `mb_size` override), so total rows per minibatch — and hence peak VRAM —
+stay at `mini_batch_size`. At least one signal slot is always reserved: at
+`anchor_max_row_frac` large enough for the anchor pool to dwarf the signal pool,
+the proportional quota would otherwise reach `mini_batch_size`, leaving the inner
+sampler a batch size of 0 — which its `mb_size or config.mini_batch_size` default
+silently turns back into `mini_batch_size`, overfilling every minibatch. At
+`mini_batch_size = 1` there is no room for both, so the anchor rows are skipped
+with a WARNING rather than exceeding the budget.
+
+The quota may be FRACTIONAL: `_with_anchor_rows` carries a credit accumulator
+and emits `floor(credit)` rows per batch, so one epoch consumes the anchor pool
+about once. Flooring it at one row per batch instead would ride a small pool
+along in every minibatch — 1 anchor chunk against 100 signal chunks would train
+~15× per epoch while every signal row trains once. Within a batch the pool is
+drawn without replacement even across a reshuffle, so a chunk is never served
+twice into the same minibatch.
+
+Two details make the realized share match the pool share rather than merely
+approximating it:
+
+- The reserved slot count is chosen by solving for **delivery capacity**: the
+  smallest `slots` whose `slots × n_batches` covers the pool, where `n_batches`
+  comes from `_min_expected_batches` (which models both samplers, including the
+  balanced one's early termination and both of its fallbacks). `ceil(target)`
+  alone is not enough — it implicitly assumes the *stratified* batch count, and
+  on the balanced sampler the smaller realized count makes the target exceed the
+  cap, pinning every batch. Measured 0.83–0.91× delivery in the band where the
+  ceil lands on 1. The reservation is only an estimate; `_with_anchor_rows`
+  measures the real count and WARNS if capacity still fell short.
+- The target is `pool / n_batches` against the batch count the sampler
+  **actually produced** — `_with_anchor_rows` materializes the epoch's batches
+  before distributing. Estimating it does not work: `ceil(len(entries) /
+  signal_mb_size)` is the *stratified* count, while `_iter_balanced_minibatches`
+  (the default) stops early once its majority pool drains, and its fallbacks
+  change the count again. Under that estimate a 1-chunk pool trained **zero**
+  rows on the balanced path. Measured exposure is now 1.00× on both samplers for
+  every pool up to the coverage limit below (~7:1 anchor:signal); above that the
+  per-batch cap binds and delivery falls off as documented, with a WARNING naming
+  the shortfall.
+
+Under `jitter_paired=True` the anchor share is computed against an entry pool
+that jitter has doubled, so the realized anchor:signal **mass** ratio is about
+half what the same `anchor_max_row_frac` gives with jitter off. Preserving both
+that ratio and 1× exposure per epoch is not possible — pairing doubles signal
+mass without doubling anchor mass — so exposure is preserved and the ratio moves.
+Raise `anchor_max_row_frac` (or `anchor_advantage`) if you want the same anchor
+pressure under paired jitter.
+
+When there are no signal rows at all, the anchor entries go through the
+stratified sampler directly at full `mini_batch_size`.
+
+**Anchor rows raise the per-iteration optimizer step count.** They occupy
+minibatch slots, so the signal rows spread over more batches — up to ~2× the
+steps at the same LR when the anchor pool matches the signal pool. Same caveat as
+`jitter_paired`'s 2× warning; the startup banner states it. Lower
+`update_epochs` or `anchor_max_row_frac` to match an anchors-off baseline's step
+budget.
 
 ### Balanced Training
 
@@ -912,7 +1283,9 @@ epoch ends.
 - `natural_pos_frac ≥ X`: too few negatives → cycle negatives, drain positives
 
 Falls back to `_iter_stratified_minibatches` only when one sign class is
-entirely absent (all episodes fail or all succeed within live groups).
+entirely absent (all episodes fail or all succeed within live groups). Anchor
+rows are not in either pool — the caller holds them out and appends them as a
+separate quota (see "Anchor groups").
 
 **Why bidirectional matters.** At high success rates (e.g. 70% positive), the
 few negative-advantage chunks (failures) receive a very large magnitude from
@@ -975,7 +1348,9 @@ implementations at specific episode counts when `update_epochs ≥ 6`.
   signal. Dead all-success or all-fail groups are excluded from both
   numerator and denominator to prevent their inflating `success_frac` and
   keeping `actual_num_epochs` near `update_epochs` when real signal is
-  sparse.
+  sparse. Anchor groups are excluded for the same reason — every one of their
+  episodes succeeded, so counting them would drive `success_frac` toward 1 and
+  collapse the tent to 1 epoch exactly when anchors were added.
 - `successful_eps` counts live-group episodes with **positive advantage**
   (`self.buffer.advantages[i] > 0`), not `ep.success`. Under the sparse
   binary reward these coincide for live (mixed) groups — a group's successes
@@ -1024,6 +1399,16 @@ one optimizer step in that iteration).
 | `train_grpo.py` | `_grpo_update_inner` computes `actual_num_epochs` via the integer tent formula when `dynamic_epoch_training` is on (else `update_epochs`), and dispatches to `_iter_balanced_minibatches` when `balanced_minibatch_training` is on (else `_iter_stratified_minibatches`). `_iter_balanced_minibatches` applies the target ratio bidirectionally — cycles the minority sign class with replacement, drains the majority without replacement. `_log_metrics` emits `balanced/actual_epochs` and `balanced/success_fraction` (gated on `dynamic_epoch_training` and `n_updates > 0`). |
 | `test_balanced_fixes.py` | Unit tests for both mechanisms plus their independence (all four on/off combinations): per-batch ratio in both directions, epoch-length anchor, minority cycling, fallback paths, tent formula correctness including integer ULP cases. |
 
+#### Files touched (anchor groups)
+
+| File | Change |
+|------|--------|
+| `grpo_config.py` | Adds `include_anchor_groups: bool = False`, `anchor_advantage: float = 0.0`, `anchor_max_row_frac: float = 1.0` with `__post_init__` validation (non-negative advantage; advantage > 0 requires the gate; positive row budget). |
+| `episode_buffer.py` | `compute_advantages` takes the three knobs and classifies signal / anchor / dead; `_resolve_anchor_groups` applies the row budget at episode granularity. `GRPOEpisode.is_anchor` / `ActionChunk.is_anchor` carry the flag; `_build_chunks` propagates it. `stats()` adds `n_anchor_{groups,episodes,episodes_dropped}`, keeps `n_live_groups` and the advantage summaries signal-only. `__main__` self-test covers the classification. |
+| `train_grpo.py` | `train()` passes the knobs through and makes the `std_reward < 1e-8` skip anchor-aware. `_compute_ref_log_probs` admits anchor chunks (gated on config) and passes signal-only chunks to `_summarize_ref_mse` / `_per_chunk_gap_survey`. `_grpo_update_inner` splits live chunks into signal/anchor, computes `anchor_scale`, excludes anchors from the renorm statistics / sign masks / PAWS mass / sign-keyed metrics, divides the loss by the signal row count, and appends the anchor quota via `_with_anchor_rows`. Both samplers take an optional `mb_size`. `_log_metrics` emits `episode/n_anchor_*` and `train/{n_anchor_rows_trained,mean_ratio_anchor,kl_loss_anchor}`. |
+| `collect_episodes.py` | Comment only — the `min_alive_groups` "alive" predicate stays mixed-only. |
+| `test_anchor_groups.py` | Buffer classification, row budget, config validation, and the real `_grpo_update_inner` on CPU: bit-identity with no anchor rows, renorm isolation, the anchor-only iteration, additive KL, and the PAWS / balanced-sampler / dynamic-epoch exclusions. |
+
 ---
 
 ### Clipped surrogate + KL
@@ -1048,6 +1433,11 @@ kl_loss_base_model = kl_coef_base_model * (inv_base.exp() - inv_base - 1).mean()
 
 loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
 ```
+
+When anchor rows are present in the minibatch, all three `.mean()`s become
+`.sum() / signal_mb_size` (a constant, not the realized row count) — see
+"Anchor groups → Additive, not diluting". With no anchor rows the expression is
+exactly the `.mean()` above.
 
 NaN/Inf guard: a minibatch with non-finite loss (typically bf16 ratio
 overflow when `|log_ratio|` is large) is **skipped**, the
@@ -1846,10 +2236,22 @@ Phase 1 here), `advantage`, `ref_logprob`, `update`, and overall
 An iteration is "skipped" if no `optimizer.step()` actually fired. Two
 paths produce this:
 
-1. Outer skip: global `std_reward < 1e-8` → entire buffer pruned, no
-   update.
+1. Outer skip: **no trainable chunks** — `n_signal_chunks == 0` and not
+   (`n_anchor_chunks > 0` and `anchor_advantage > 0`). Keyed on chunk counts, not
+   on `std_reward`: an all-fail **plus** all-success iteration has
+   `std_reward = 0.5` yet zero signal chunks, so a `std_reward` test never fires
+   for it. `n_signal_chunks == 0` is strictly stronger (a mixed group spans both
+   reward values, so `std_reward < 1e-8` implies no mixed group) and also catches
+   the mix. Anchor **chunks**, not groups, rescue the iteration — an anchor group
+   can survive classification and still contribute no rows — provided the
+   iteration can learn from them: either `anchor_advantage > 0`, or
+   `kl_coef_base_model > 0` (default 0.2), since `KL(base ‖ current)` is not
+   degenerate at `θ == θ_ref` and pulls the policy back toward the pretrained
+   model on the solved states — the very gap Layer 1 exists to close.
+   `kl_coef_last_iter` alone does not qualify: its gradient is zero at the start
+   of the update.
 2. Inner skip: per-iter `n_updates == 0` (every minibatch non-finite, OR
-   every group dead with global std still > 1e-8).
+   every group dead).
 
 In both cases the checkpoint (if scheduled this iter) is written under
 the **last successfully-updated** iter's name — not the current loop
@@ -1946,6 +2348,17 @@ uv run python scripts/grpo/train_grpo.py \
   of positive-advantage chunks per mini-batch. Must be strictly in `(0, 1)`.
   Only active when `balanced_minibatch_training=True`. Raise above 0.5 (e.g.
   0.7) to bias more gradient steps toward success examples.
+- `include_anchor_groups` (default `False`) — admit all-success groups into the
+  ref pass and the update instead of dropping them as dead. See "Anchor
+  groups". All-fail and singleton groups stay dead either way.
+- `anchor_advantage` (default `0.0`) — constant advantage per anchor episode, in
+  the same units as mixed-group z-scores. `0.0` = KL-only (retention constraint,
+  no pull). Requires `include_anchor_groups=True`. Recommended starting value is
+  the κ=2 pseudo-count figure `2/(G+2)`: **0.143 at `group_size=12`**, 0.200 at
+  `group_size=8`. Pairs with `per_iteration_advantage_norm=True`.
+- `anchor_max_row_frac` (default `1.0`) — cap on anchor chunks as a multiple of
+  the signal chunk count; the compute knob and the strength knob at once. Waived
+  when there are no signal chunks (an all-success iteration).
 
 **Optimizer**
 - `learning_rate` (default 3e-5; ~3× lower than supervised FT because RL

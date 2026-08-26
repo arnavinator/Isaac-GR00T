@@ -540,43 +540,15 @@ class GRPOTrainer:
                 )
         if self.config.include_anchor_groups:
             # Anchor groups reclassify all-success groups from dead to trainable.
-            # Print the pairing advice: the per-minibatch z-score is what makes
-            # a fixed anchor magnitude drift batch to batch, so per-iteration
-            # norm is the intended companion.
+            # The per-iteration consequences (a higher optimizer step count, and
+            # the anchor:signal weight ratio under per-minibatch renorm) are
+            # documented in README "Anchor groups" rather than printed here.
             print(
                 f"  Anchor groups: ON "
                 f"(advantage={self.config.anchor_advantage:g}"
                 f"{' — KL-only' if self.config.anchor_advantage == 0.0 else ''}, "
                 f"row budget={self.config.anchor_max_row_frac:g}× signal rows)"
             )
-            # Anchor rows occupy minibatch slots, so the signal rows spread over
-            # MORE minibatches — i.e. more optimizer steps per iteration at the
-            # same LR. Same caveat as jitter_paired's 2× warning below; worth
-            # stating because it is a confound when comparing an anchors-on run
-            # against an anchors-off baseline.
-            _bound = (
-                f"~2×" if self.config.anchor_max_row_frac <= 1.0
-                else f"up to {self.config.mini_batch_size}×"
-            )
-            print(
-                f"    NOTE: anchor rows take minibatch slots, so the per-iter "
-                f"optimizer step count RISES ({_bound} at "
-                f"anchor_max_row_frac={self.config.anchor_max_row_frac:g}), and "
-                f"under active max_grad_norm clipping their added KL mass "
-                f"rescales the signal gradient too. Lower update_epochs or "
-                f"anchor_max_row_frac to match an anchors-off baseline."
-            )
-            if (
-                self.config.anchor_advantage > 0.0
-                and not self.config.per_iteration_advantage_norm
-            ):
-                print(
-                    "    NOTE: per_iteration_advantage_norm=False — signal rows "
-                    "renorm per minibatch while anchor rows use the buffer-wide "
-                    "std, so the anchor:signal weight ratio wobbles with batch "
-                    "composition. --per-iteration-advantage-norm is the intended "
-                    "pairing."
-                )
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
 
         for iteration in range(self._start_iteration, self.config.num_iterations + 1):

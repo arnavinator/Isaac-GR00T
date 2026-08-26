@@ -23,7 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
-| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
+| `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
@@ -1411,6 +1411,85 @@ one optimizer step in that iteration).
 
 ---
 
+### PAWS: dynamic positive-advantage weighting
+
+`positive_advantage_weight_scaling` scales the per-row clip loss on group-good
+rows by a live factor `k`, chosen so that reinforcement mass is
+`positive_advantage_weight_target_ratio` times erosion mass:
+
+```
+N = alive erosion       = sum |row_loss| over negative-advantage rows still
+                          passing gradient (dead iff ratio < 1 - clip_eps_low)
+D = alive reinforcement = sum |row_loss| over amplified positive rows still
+                          passing gradient (dead iff ratio > 1 + clip_eps_high)
+k = clamp(target_ratio * N / D, 1.0, positive_advantage_weight_max)
+```
+
+Mass is measured on the **unweighted** row loss, so the estimate never feeds
+back on `k`. Anchor rows are in neither term. Both terms pool per **trained**
+micro-batch across the whole iteration.
+
+**Read `pos_adv_realized_ratio`, not `pos_adv_weight_k`** — but read it as a
+coarse "which side is this iteration pushing on", not as a precise estimator of
+`target_ratio`. It is `Σ kᵢ·Dᵢ / Σ Nᵢ`, pooled per micro-batch at the `k` that
+micro-batch was actually weighted by:
+
+- `≈ 1.0` → the two sides are balanced, i.e. the mechanism is off in effect.
+  When `target_ratio > 1` this is the reading to worry about: it is what the
+  removed cross-iteration EMA produced on every resume, survivable at 52 %
+  success and fatal (0.67 → ~0.04 in one iteration) at 67 %. **At the config
+  default `target_ratio = 1.0` it is instead the on-target reading** — the two
+  cases are only distinguishable by knowing `target_ratio`.
+- `>> target_ratio` → erosion is largely clip-dead (`N << D`). The raw ratio
+  *diverges* as `N → 0` (measured 12–15 in that regime), so the emitted value is
+  clamped to `positive_advantage_weight_max` to keep the curve readable; the
+  unclamped terms are always available as `pos_adv_pos_mass` /
+  `pos_adv_alive_neg_mass`. Cross-check `clipfrac_effective_neg` and `k_min`.
+
+**Deviation from `target_ratio` does not by itself mean a clamp is binding.**
+Each `kᵢ` is a *prefix* estimate (the pool excluding its own micro-batch), so
+when the running prefix ratio differs from the whole-iteration ratio the pooled
+result drifts off target with no clamp involved — measured +9…+20 % on skewed
+group shapes with `k` comfortably inside `[1, max]`. On the 238-micro-batch
+reference iterations, where the prefix is stable, it read 1.7500–1.7501 against
+a target of 1.75. Use `k_min` / `k_max` to tell a clamp from prefix drift.
+
+`k` itself is a poor headline because it moves for a benign reason: under
+per-minibatch renorm the z-score forces `Σ_{post>0}|A| ≡ Σ_{post≤0}|A|`. `N` and
+`D` are keyed on the **pre**-renorm sign, so that gives `N/D ≡ 1` only absent
+renorm sign flips (a flipped row falls out of *both* masses; one pos→neg flip in
+an 8-row minibatch measures `N/D ≈ 0.88`) — watch
+`n_pos_flipped_by_renorm`, which read 0 on 15 of 16 iterations of the reference
+run. There `N/D` sat at `exp(jitter/gap_pos)`, measured 1.0464 ± 0.0057 over
+every non-clipping iteration and matching `exp(gap_pos)` to within 0.5 %, so
+`k ≈ target_ratio·1.046`. When drift starts clip-killing negatives, `N` falls and
+`k` falls with it — the mechanism correctly tracking a real drop in erosion, not
+the mechanism weakening. In that same run `k` slid 1.83 → 1.49 over the last
+three iterations while the realized ratio never left 1.750.
+
+`pos_adv_weight_k_{min,max}` bracket the **measured** `k`s (the unmeasured prior
+is excluded — it is a config-derived constant, and folding it in would pin
+`k_min` to it and hide the real spread). They are absent on an iteration that
+never measured. Together with `k_last` they separate a clamp from prefix drift,
+and they surface a mid-iteration excursion — e.g. a run of one-sided minibatches
+pinning `k` at the cap — that `k_last` alone would miss.
+
+**No cross-iteration state.** `k` is derived from the current iteration's pool
+alone. Until the pool holds any amplified-positive mass there is nothing to
+measure, so `k` falls back to the analytic prior `k = target_ratio` — the
+fallback **tracks the target** instead of being pinned to `1.0` independently of
+it. (At the config default `target_ratio = 1.0` the prior *is* 1.0 — correct,
+since that config asks for equal masses.) There is no count-based warm-up beyond
+that: the prior is unmeasured and is *not* floored by the measurement, so holding
+it longer over-amplifies in the clip-dead-erosion regime, where the measured `k`
+floors at 1.0 while the prior still says `target_ratio`. Under
+`per_iteration_advantage_norm` the minibatch zero-mean identity does not hold, so
+there is no prior to stand on and the fallback is `1.0`; that combination
+measures much worse overall anyway (see "Gradient accumulation"). See
+"Checkpointing & Resuming → Resume" for the resume bug this design replaced.
+
+---
+
 ### Clipped surrogate + KL
 
 ```
@@ -2168,6 +2247,30 @@ On resume:
    digits like `iter_０` are rejected). Non-canonical names (`best/`,
    `latest/`, `iter_50.bak`) silently fall back to `start_iteration=1`,
    preserving backward compat for unstructured checkpoint names.
+
+**Nothing algorithmic needs to be restored beyond the weights and Adam
+moments.** The LR schedule is recomputed per-iteration from the loop counter,
+and PAWS (`positive_advantage_weight_scaling`) derives its weight `k` from the
+CURRENT iteration's pooled mass only — see `_POS_SCALE_WARMUP_MB`. That is a
+deliberate property, not an accident: `k` used to be gated on a cross-iteration
+EMA of the `(N, D)` alive-mass terms which was **not** in the checkpoint, so the
+first update after every resume (and every fresh run) trained an entire
+iteration at `k = 1.0` regardless of
+`positive_advantage_weight_target_ratio`. That is not a mild warm-up. The
+realized post-weighting ratio is `k·D/N`, and per-minibatch renorm forces
+`N ≈ D` (the z-score makes `Σ_pos|A| ≡ Σ_neg|A|`), so `k = 1.0` takes the net
+update direction `k·D − N` from a positive reinforcement surplus to slightly
+negative — it inverts the sign. Measured consequence when resuming a
+67 %-success run: collapse to ~4 % in one iteration. If you are tempted to
+persist per-iteration trainer state to "improve" resume fidelity, prefer making
+the quantity self-sufficient within the iteration instead.
+
+**One metric does not survive resume:** `lora/weight_delta_norm` measures drift
+since *this run* started (`_lora_init_params` is snapshotted after the
+checkpoint load), so it restarts at ~0 on every resume. For cumulative drift
+from the pretrained field across resumes, read
+`ref_mse/log_base_ratio_mean` instead — it is computed against the base model
+and is resume-proof.
 
 ### Resume + reuse cached collection (`resume_from_collected_data`)
 

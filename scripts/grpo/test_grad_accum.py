@@ -306,7 +306,6 @@ def run_update(
     iteration: int = 1,
     delta_scale: float = 0.05,
     config_overrides: Optional[dict] = None,
-    pos_scale_ema: Optional[tuple] = None,
 ) -> _Run:
     """Drive the real _grpo_update() once and return everything observable.
 
@@ -330,9 +329,6 @@ def run_update(
             invalidating `_reference_grad`.
         config_overrides: extra GRPOConfig kwargs (e.g. jitter_pos,
             positive_advantage_weight_scaling, kl_coef_base_model).
-        pos_scale_ema: (N_ema, D_ema) seed for the PAWS cross-iteration EMA.
-            None leaves both at None, which pins k to 1.0 for the whole
-            iteration (the first-update warm-up path).
     """
     cfg_kwargs = dict(
         device="cpu",
@@ -366,8 +362,6 @@ def run_update(
     trainer.optimizer = _RecordingSGD(model.parameters(), lr=lr, events=events)
     trainer.buffer = types.SimpleNamespace(_build_chunks=lambda: list(chunks))
     trainer.iteration = iteration
-    trainer._pos_scale_N_ema = None if pos_scale_ema is None else pos_scale_ema[0]
-    trainer._pos_scale_D_ema = None if pos_scale_ema is None else pos_scale_ema[1]
     import threading
     trainer._model_lock = threading.RLock()
 
@@ -1102,23 +1096,25 @@ def test_paws_mass_pools_per_trained_microbatch():
 
     The mass commits per micro-batch right after the non-finite guard, so
     window boundaries must be irrelevant: N_iter/D_iter (and therefore
-    pos_adv_weight_k and the cross-iteration EMA fold) are invariant to k, and a
-    skipped micro-batch contributes nothing.
+    pos_adv_weight_k) are invariant to k, and a skipped micro-batch contributes
+    nothing.
     """
     print("\n[PAWS] Pooled mass == trained rows, independent of k")
 
+    # target_ratio > 1 keeps k live (> 1) in both regimes the update passes
+    # through — the pre-warm-up analytic prior (k == target_ratio) and the
+    # measured ratio (k == target_ratio * N/D, and N ~ D here because the
+    # per-minibatch z-score forces sum_pos|A| == sum_neg|A|). Neither the pooled
+    # mass nor its k-invariance depends on the value.
     paws = dict(
         positive_advantage_weight_scaling=True,
         positive_advantage_weight_max=10.0,
-        positive_advantage_weight_target_ratio=1.0,
+        positive_advantage_weight_target_ratio=2.0,
     )
-    # A seeded prior EMA makes have_prior True, so k is a live value in
-    # [1, max] rather than the pinned 1.0 of a first-ever update.
-    ema = (4.0, 1.0)
 
     runs = {
         k: run_update(k, n_chunks=16, mb_size=4, epochs=2,
-                      config_overrides=paws, pos_scale_ema=ema)
+                      config_overrides=paws)
         for k in (1, 2, 4)
     }
     base = runs[1].result
@@ -1149,9 +1145,9 @@ def test_paws_mass_pools_per_trained_microbatch():
 
     # A dropped micro-batch must contribute no mass — under accumulation too.
     clean = run_update(2, n_chunks=16, mb_size=4, epochs=1,
-                       config_overrides=paws, pos_scale_ema=ema)
+                       config_overrides=paws)
     skipped = run_update(2, n_chunks=16, mb_size=4, epochs=1, nonfinite=(1,),
-                         config_overrides=paws, pos_scale_ema=ema)
+                         config_overrides=paws)
     exp_n2 = exp_d2 = 0.0
     for rec in skipped.trained_records:
         n_m, d_m = _reference_masses(skipped.config, rec)
@@ -1168,6 +1164,149 @@ def test_paws_mass_pools_per_trained_microbatch():
         skipped.result["pos_adv_alive_neg_mass"] < clean.result["pos_adv_alive_neg_mass"],
         f"{skipped.result['pos_adv_alive_neg_mass']} vs "
         f"{clean.result['pos_adv_alive_neg_mass']}",
+    )
+
+
+def test_paws_cold_start_uses_target_ratio_not_one():
+    """PAWS must never open an iteration at k = 1.0, and must carry no state.
+
+    The regression this pins: k used to be gated on a cross-iteration EMA of
+    (N, D) that was NOT checkpointed, so the first update of a fresh run AND the
+    first update after --resume-from ran the WHOLE iteration at k = 1.0 whatever
+    positive_advantage_weight_target_ratio said. k = 1.0 is not a mild warm-up:
+    the realized post-weighting ratio is k*D/N, so at N ~ D (which per-minibatch
+    renorm forces, since the z-score makes sum_pos|A| == sum_neg|A|) it drops the
+    net update direction k*D - N from a positive surplus to ~0 and inverts its
+    sign. Observed consequence when resuming a 67%-success run: collapse to
+    ~4% in one iteration.
+
+    Four properties, all of which the old code violated:
+      1. A one-micro-batch iteration — i.e. an iteration that is nothing BUT its
+         cold start — runs at the analytic prior k == target_ratio, not 1.0.
+      2. The realized ratio tracks target_ratio, i.e. the mechanism actually
+         delivers its target over a full iteration.
+      3. k_min/k_max bracket k_last, so a within-iteration excursion is visible.
+      4. Two independent trainers with no shared history produce identical k —
+         there is no cross-iteration state left to lose, so resume is seamless
+         by construction rather than by remembering to persist something.
+    """
+    print("\n[PAWS] Cold start opens at target_ratio, and carries no state")
+
+    tratio = 1.75
+    paws = dict(
+        positive_advantage_weight_scaling=True,
+        positive_advantage_weight_max=10.0,
+        positive_advantage_weight_target_ratio=tratio,
+    )
+
+    # Property 1, measured directly rather than through an aggregate: 4 chunks at
+    # mb_size 4 for 1 epoch trains exactly ONE micro-batch, and the warm-up is at
+    # least 1 micro-batch long, so k_last IS the cold-start k. Asserting on
+    # k_last (not a dedicated "first" metric) keeps this keyed to a value the
+    # weights actually saw.
+    solo = run_update(1, n_chunks=4, mb_size=4, epochs=1, config_overrides=paws)
+    check("the solo run trained exactly one micro-batch",
+          solo.result["n_micro_batches"] == 1,
+          str(solo.result.get("n_micro_batches")))
+    check(
+        "cold-start micro-batch uses k == target_ratio (not 1.0)",
+        math.isclose(solo.result["pos_adv_weight_k"], tratio, rel_tol=1e-9),
+        f"k={solo.result['pos_adv_weight_k']} vs {tratio}",
+    )
+    # k_min/k_max track MEASURED k's only, so an iteration whose single
+    # micro-batch ran at the unmeasured prior must report neither — otherwise
+    # k_min would be pinned to the config-derived prior and hide the real spread.
+    check(
+        "an all-prior iteration reports no k_min/k_max",
+        "pos_adv_weight_k_min" not in solo.result
+        and "pos_adv_weight_k_max" not in solo.result,
+        f"min={solo.result.get('pos_adv_weight_k_min')} "
+        f"max={solo.result.get('pos_adv_weight_k_max')}",
+    )
+
+    # Every trainer here is built fresh via GRPOTrainer.__new__ with no EMA
+    # attributes of any kind, which is exactly the post-resume state.
+    # 64 chunks / mb 4 / 2 epochs = 32 micro-batches, so the 8-micro-batch
+    # warm-up gives way to the measured ratio for the remaining 24.
+    r = run_update(1, n_chunks=64, mb_size=4, epochs=2, config_overrides=paws)
+    res = r.result
+
+    check(
+        "k_last is live (measured from the pool, still > 1)",
+        res["pos_adv_weight_k"] > 1.0,
+        str(res["pos_adv_weight_k"]),
+    )
+    check(
+        "k_min <= k_last <= k_max, and the bracket respects [1, max]",
+        res["pos_adv_weight_k_min"] <= res["pos_adv_weight_k"]
+        <= res["pos_adv_weight_k_max"]
+        and res["pos_adv_weight_k_min"] >= 1.0
+        and res["pos_adv_weight_k_max"] <= 10.0,
+        f"min={res['pos_adv_weight_k_min']} last={res['pos_adv_weight_k']} "
+        f"max={res['pos_adv_weight_k_max']}",
+    )
+    # Realized ratio is pooled per micro-batch at the k that micro-batch was
+    # actually weighted by (Dw_iter), so it is NOT reconstructible from the
+    # aggregate k_last * D / N — assert it differs from that reconstruction, which
+    # is what the earlier version of this metric computed.
+    naive = res["pos_adv_weight_k"] * res["pos_adv_pos_mass"] / res["pos_adv_alive_neg_mass"]
+    check(
+        "realized ratio is the weighted pool, not k_last * D / N",
+        not math.isclose(res["pos_adv_realized_ratio"], naive, rel_tol=1e-9),
+        f"realized={res['pos_adv_realized_ratio']} naive={naive}",
+    )
+    # Not exact: the warm-up micro-batches were weighted at the prior rather than
+    # at the measured ratio, and they are pooled too. What the assertion pins is
+    # that the DELIVERED ratio tracks the target rather than sitting at the 1.0
+    # the old cold-start path produced.
+    check(
+        "realized reinforcement:erosion ratio tracks target_ratio",
+        math.isclose(res["pos_adv_realized_ratio"], tratio, rel_tol=0.05),
+        f"realized={res['pos_adv_realized_ratio']} vs target={tratio}",
+    )
+
+    # Resume-equivalence: a second, independent trainer over the same data must
+    # reproduce k exactly. Under the EMA design this pair differed (one warm,
+    # one cold) — which is precisely what made a resumed iteration untrainable.
+    r2 = run_update(1, n_chunks=64, mb_size=4, epochs=2, config_overrides=paws)
+    for key in ("pos_adv_weight_k", "pos_adv_weight_k_min",
+                "pos_adv_realized_ratio", "pos_adv_alive_neg_mass",
+                "pos_adv_pos_mass"):
+        check(f"fresh-vs-fresh trainer: {key} identical",
+              r2.result[key] == res[key],
+              f"{r2.result[key]} vs {res[key]}")
+
+    # A real __init__ (cheap: no model, no GPU, no server thread) must not
+    # create the EMA slots at all — the state is gone, not merely unused.
+    fresh = GRPOTrainer(GRPOConfig(device="cpu", **paws))
+    check(
+        "no cross-iteration PAWS attribute exists on a real trainer",
+        not any(hasattr(fresh, a) for a in
+                ("_pos_scale_N_ema", "_pos_scale_D_ema")),
+    )
+
+    # target_ratio must reach the weights on the very first iteration, so a
+    # resume that CHANGES it is not silently a no-op.
+    hot = run_update(1, n_chunks=4, mb_size=4, epochs=1,
+                     config_overrides={**paws,
+                                       "positive_advantage_weight_target_ratio": 3.5})
+    check(
+        "changing target_ratio changes the cold-start k",
+        math.isclose(hot.result["pos_adv_weight_k"], 3.5, rel_tol=1e-9),
+        f"{hot.result['pos_adv_weight_k']} vs 3.5 "
+        f"(baseline solo run was {solo.result['pos_adv_weight_k']})",
+    )
+
+    # Under per_iteration_advantage_norm the zero-mean identity does not hold, so
+    # there is no analytic prior and the cold start correctly stays at 1.0 — with
+    # the warm-up held to a single micro-batch to bound the exposure.
+    pin = run_update(1, n_chunks=4, mb_size=4, epochs=1,
+                     config_overrides={**paws,
+                                       "per_iteration_advantage_norm": True})
+    check(
+        "per_iteration_advantage_norm cold start stays at k = 1.0",
+        math.isclose(pin.result["pos_adv_weight_k"], 1.0, rel_tol=1e-9),
+        str(pin.result["pos_adv_weight_k"]),
     )
 
 
@@ -1384,6 +1523,7 @@ if __name__ == "__main__":
     test_balanced_sampler_epoch_boundary()
     test_multi_group_stratified_with_accumulation()
     test_paws_mass_pools_per_trained_microbatch()
+    test_paws_cold_start_uses_target_ratio_not_one()
     test_jitter_branch_metrics_invariant_to_k()
     test_base_model_kl_metric_divisor()
     test_clipped_rows_metrics_invariant_to_k()

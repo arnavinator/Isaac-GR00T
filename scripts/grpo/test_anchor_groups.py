@@ -684,48 +684,37 @@ def test_divisor_is_gated_on_the_iteration_not_the_batch():
           f"norms={[round(n, 3) for n in norms]}")
 
 
-def test_paws_ema_untouched_when_anchors_off():
-    """The EMA-fold guard must not change behavior with anchors disabled.
+def test_paws_degenerate_mass_iterations_are_inert():
+    """A zero-pooled-mass iteration must be inert, not bogus.
 
-    Skipping the fold on a zero-mass iteration is right for an ANCHOR-ONLY
-    iteration (no signal row pooled anything) but must not apply when anchors are
-    off, where a zero-mass iteration is a legitimate all-rows-clip-dead one whose
-    fold is part of the pre-anchor behavior.
+    Replaces the old EMA-fold-guard test. That guard existed because an
+    anchor-only iteration pools zero mass in both N and D (anchor rows are in
+    neither), and folding those zeros into the cross-iteration EMA would decay it
+    toward zero and thereby pin k = 1 on LATER iterations. There is no
+    cross-iteration state any more — k is derived from the current iteration's
+    pool alone — so that failure mode is structurally impossible rather than
+    guarded against. What still needs pinning is that these iterations report
+    something honest instead of a fabricated ratio:
+
+      - k falls back to the cold-start value (nothing was measured), and
+      - pos_adv_realized_ratio is OMITTED rather than dividing by N == 0.
+
+    Both the anchor-only case and the every-row-clip-dead case are exercised,
+    since they reach zero mass by different routes.
     """
-    print("\n[update] PAWS EMA fold is unchanged with anchors off")
-    seen: dict = {}
-    real = h.GRPOTrainer._grpo_update
+    print("\n[update] PAWS zero-mass iterations report honestly")
 
-    def spy(self):
-        out = real(self)
-        seen["N"] = self._pos_scale_N_ema
-        seen["D"] = self._pos_scale_D_ema
-        return out
-
+    # per_iteration_advantage_norm=True keeps each row's group-relative sign, so
+    # aligning delta's sign with the advantage's makes negatives lower-clip-dead
+    # and positives upper-clip-dead simultaneously — the only construction that
+    # empties BOTH masses while signal rows are present. Under that norm there is
+    # no analytic prior for k (the minibatch zero-mean identity does not hold),
+    # so the expected cold-start value is 1.0.
     paws = dict(positive_advantage_weight_scaling=True,
                 per_iteration_advantage_norm=True,
+                positive_advantage_weight_target_ratio=1.75,
                 clip_eps_low=1e-6, clip_eps_high=1e-6)  # every row clip-dead
-    h.GRPOTrainer._grpo_update = spy
-    try:
-        _run(_mixed_chunks(16, 0, 0.2), mb_size=8, epochs=1,
-             config_overrides=paws, pos_scale_ema=(1.0, 1.0))
-        off = (seen["N"], seen["D"])
-        seen.clear()
-        _run(_mixed_chunks(0, 10, 0.2), mb_size=4, epochs=1,
-             config_overrides=dict(**paws, include_anchor_groups=True,
-                                   anchor_advantage=0.2),
-             pos_scale_ema=(1.0, 1.0))
-        anchor_only = (seen["N"], seen["D"])
-    finally:
-        h.GRPOTrainer._grpo_update = real
 
-    check("anchors off: the fold still runs (EMA moves off its seed)",
-          off != (1.0, 1.0), f"EMA stayed at {off}")
-    # The distinguishing case for the guard's predicate: signal rows PRESENT but
-    # zero pooled mass, with anchors also present. Keyed on `entries` the fold
-    # runs (pre-anchor behavior); keyed on `anchors_in_play` it would be skipped.
-    # Buildable by aligning each row's delta sign with its advantage sign so
-    # negatives are lower-clip-dead and positives upper-clip-dead at once.
     aligned = []
     for i in range(8):
         adv = (1.0 + 0.1 * i) * (1.0 if i % 2 == 0 else -1.0)
@@ -740,33 +729,36 @@ def test_paws_ema_untouched_when_anchors_off():
             ref_log_prob=0.0, base_log_prob=0.0,
             tau_samples=np.zeros(6, dtype=np.float32),
             raw_action=np.full((1, 1), 2.5, dtype=np.float32)))
-    seen.clear()
-    h.GRPOTrainer._grpo_update = spy
-    try:
-        rz = _run(aligned, mb_size=8, epochs=1,
-                  config_overrides=dict(positive_advantage_weight_scaling=True,
-                                        per_iteration_advantage_norm=True,
-                                        clip_eps_low=1e-6, clip_eps_high=1e-6,
-                                        include_anchor_groups=True,
-                                        anchor_advantage=0.2),
-                  pos_scale_ema=(1.0, 1.0))
-    finally:
-        h.GRPOTrainer._grpo_update = real
+
+    rz = _run(aligned, mb_size=8, epochs=1,
+              config_overrides=dict(**paws, include_anchor_groups=True,
+                                    anchor_advantage=0.2))
     zero_mass = (rz.result.get("pos_adv_alive_neg_mass", 1.0) == 0.0
                  and rz.result.get("pos_adv_pos_mass", 1.0) == 0.0)
     check("built an iteration with signal rows and zero PAWS mass", zero_mass,
           f"N={rz.result.get('pos_adv_alive_neg_mass')} "
           f"D={rz.result.get('pos_adv_pos_mass')}")
-    if zero_mass:
-        # have_prior is True (seeded 1.0), so folding zero mass blends toward 0
-        # rather than assigning it: 0.5*1.0 + 0.5*0.0 = 0.5. The observable fact
-        # is simply that the EMA MOVED off its seed.
-        check("signal rows present + zero mass: the fold still runs",
-              (seen.get("N"), seen.get("D")) != (1.0, 1.0),
-              f"EMA stayed at {(seen.get('N'), seen.get('D'))}; keying the guard "
-              f"on anchors_in_play would skip the fold here")
-    check("anchor-only: the fold is skipped (EMA left at its seed)",
-          anchor_only == (1.0, 1.0), f"EMA moved to {anchor_only}")
+    check("zero-mass iter reports the cold-start k, not a measured one",
+          rz.result["pos_adv_weight_k"] == 1.0,
+          str(rz.result["pos_adv_weight_k"]))
+    check("zero-mass iter omits pos_adv_realized_ratio (no N to divide by)",
+          "pos_adv_realized_ratio" not in rz.result,
+          str(rz.result.get("pos_adv_realized_ratio")))
+
+    # Same requirement via the anchor-only route: n_updates > 0, but every
+    # trained row is an anchor and therefore in neither mass.
+    ao = _run(_mixed_chunks(n_signal=0, n_anchor=8, anchor_adv=0.2),
+              mb_size=4, epochs=1,
+              config_overrides=dict(**paws, include_anchor_groups=True,
+                                    anchor_advantage=0.2))
+    check("anchor-only iter pools zero PAWS mass",
+          ao.result["pos_adv_pos_mass"] == 0.0
+          and ao.result["pos_adv_alive_neg_mass"] == 0.0,
+          f"N={ao.result['pos_adv_alive_neg_mass']} "
+          f"D={ao.result['pos_adv_pos_mass']}")
+    check("anchor-only iter omits pos_adv_realized_ratio",
+          "pos_adv_realized_ratio" not in ao.result,
+          str(ao.result.get("pos_adv_realized_ratio")))
 
 
 def test_jitter_gap_excludes_anchors_from_both_buckets():
@@ -1210,11 +1202,10 @@ def test_anchors_excluded_from_paws():
     # the wrong difference.
     signal_only = _mixed_chunks(n_signal=12, n_anchor=0, anchor_adv=0.2)
     off = _run(signal_only, mb_size=8, epochs=1,
-               config_overrides=paws, pos_scale_ema=(1.0, 1.0))
+               config_overrides=paws)
     on = _run(chunks, mb_size=8, epochs=1,
               config_overrides=dict(**paws, include_anchor_groups=True,
-                                    anchor_advantage=0.2),
-              pos_scale_ema=(1.0, 1.0))
+                                    anchor_advantage=0.2))
     check("baseline has no anchor rows, test run does",
           off.result.get("n_anchor_rows_trained", 0) == 0
           and on.result.get("n_anchor_rows_trained", 0) > 0)
@@ -1242,8 +1233,7 @@ def test_anchors_excluded_from_paws():
     anchor_only = _mixed_chunks(n_signal=0, n_anchor=8, anchor_adv=0.2)
     ao = _run(anchor_only, mb_size=4, epochs=1,
               config_overrides=dict(**paws, include_anchor_groups=True,
-                                    anchor_advantage=0.2),
-              pos_scale_ema=(1.0, 1.0))
+                                    anchor_advantage=0.2))
     check("anchor-only iter pools zero PAWS mass",
           ao.result["pos_adv_pos_mass"] == 0.0
           and ao.result["pos_adv_alive_neg_mass"] == 0.0)
@@ -1987,7 +1977,7 @@ if __name__ == "__main__":
     test_loss_divisor_is_constant_across_batches()
     test_anchor_exposure_is_proportional()
     test_divisor_is_gated_on_the_iteration_not_the_batch()
-    test_paws_ema_untouched_when_anchors_off()
+    test_paws_degenerate_mass_iterations_are_inert()
     test_jitter_gap_excludes_anchors_from_both_buckets()
     test_delivery_in_the_cap_rounding_band()
     test_min_expected_batches_never_overshoots()

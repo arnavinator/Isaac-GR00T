@@ -66,9 +66,38 @@ ITER_DIR_RE = re.compile(r"iter_([0-9]+)")
 
 # Dynamic positive-advantage weighting (config.positive_advantage_weight_scaling).
 # The tunables (k cap, target ratio) are config fields; these are the fixed
-# smoothing constants. See _grpo_update_inner for the full algorithm.
-_POS_SCALE_BETA = 0.5    # cross-iteration EMA weight on history
-_POS_SCALE_PRIOR = 0.05  # within-iter seed from last iter's EMA (~a few % of an iter's mass)
+# constants. See _grpo_update_inner for the full algorithm.
+#
+# k is estimated from the CURRENT iteration's pooled mass ONLY — there is
+# deliberately no cross-iteration state, which is what makes --resume-from
+# seamless. The previous design carried an EMA of (N, D) across iterations and
+# ran an ENTIRE iteration at k = 1.0 whenever that EMA was absent (fresh run OR
+# resume, since it was never checkpointed). That is not a mild warm-up: k = 1.0
+# with erosion fully alive inverts the SIGN of the net update (see the fallback
+# comment in _grpo_update_inner), and it measured fatal when resuming a
+# high-success run.
+#
+# Dropping the EMA costs nothing measurable, because the quantity it smoothed is
+# near-constant in the regime that matters. Under per-minibatch renorm the
+# z-score forces sum(A) == 0 over the minibatch, hence
+# sum_{post>0}|A| == sum_{post<=0}|A|. Two things then stand between that and
+# N/D == 1: (a) N and D are keyed on the PRE-renorm sign, so a row whose sign
+# FLIPS in renorm is excluded from D by pos_amp_mask AND from N by
+# ~pre_renorm_pos_adv_mask, dropping out of both and skewing the ratio (a single
+# pos->neg flip in an 8-row minibatch measures N/D ~ 0.88 — watch
+# train/n_pos_flipped_by_renorm, which read 0 on 15 of 16 iterations of the
+# reference run); and (b) the masses are sums of |A * rho|, not of |A|, so they
+# also carry the per-row ratio. On the reference run those left N/D at
+# 1.0464 +/- 0.0057 over every iteration with no clipping, tracking
+# exp(jitter/gap_pos) — the jitter offset on the positive branch — to within
+# 0.5%. Re-deriving k from each iteration's own mass reproduced the EMA-seeded k
+# to 3-4 significant figures.
+#
+# What this does NOT survive is the clip-dead-erosion regime: once negatives sit
+# below 1 - clip_eps_low they leave N, N/D collapses, and the measured k floors at
+# 1.0 while the prior would still say target_ratio. That is why the prior is
+# applied to as few micro-batches as possible — see the k selection in
+# _grpo_update_inner.
 _POS_SCALE_EPS = 1e-8
 
 
@@ -176,15 +205,6 @@ class GRPOTrainer:
 
         # Logging
         self.writer = None  # TensorBoard/wandb writer
-
-        # Dynamic positive-advantage weighting: cross-iteration EMA of the
-        # per-iter alive-negative (N) / positive (D) loss mass. None until the
-        # first update folds in its own masses. NOT persisted in checkpoints, so a
-        # resumed run drops pre-resume EMA history and re-warms: the first update
-        # after a fresh start OR a resume runs with k=1 (no weighting) while these
-        # are None, then re-seeds — safe, but not seamless across resume.
-        self._pos_scale_N_ema = None
-        self._pos_scale_D_ema = None
 
         # Re-entrant lock serializing ALL model forward/backward passes
         # between the server thread (serving inference for the collector
@@ -2825,30 +2845,48 @@ class GRPOTrainer:
 
         # --- Dynamic positive-advantage weighting: per-iteration state ---
         # (config.positive_advantage_weight_scaling). N_iter/D_iter pool the
-        # UNWEIGHTED alive-negative / positive loss mass across ALL minibatches
-        # of this iteration; a light seed from last iter's EMA (prior * *_ema)
-        # warm-starts k within the iteration. `scaling` and `have_prior` are
-        # defined unconditionally (both gate the end-of-iter fold below).
-        # have_prior requires the prior EMA to hold a USABLE positive-mass
-        # denominator (D_ema > 0), not merely be non-None: a degenerate prior
-        # iteration with zero alive-positive mass (D_ema == 0) would otherwise
-        # leave D_seed == 0, and — since k now excludes the current minibatch's
-        # own mass — the first positives-bearing minibatch could divide N by only
-        # +eps and spuriously saturate k at the cap. Treating D_ema == 0 as
-        # "not warmed up" runs a safe k=1 iteration that re-seeds the EMA instead.
-        # (D_ema == 0 is unreachable under the intended per_iteration_advantage_norm
-        # pairing — mixed live groups always yield alive positive mass — so this is
-        # purely defensive for the off-label per-minibatch-norm combination.)
+        # UNWEIGHTED alive-negative / positive loss mass across ALL minibatches of
+        # this iteration, and k is derived from that pool alone — no state crosses
+        # an iteration boundary, so a resumed run behaves exactly like a
+        # never-interrupted one from its first micro-batch.
+        #
+        # There is NO count-based warm-up. k switches to the measured ratio as soon
+        # as the pool holds any amplified-positive mass at all (`D_iter > 0.0`),
+        # which in practice is after the first trained micro-batch, so the
+        # unmeasured prior is applied as narrowly as possible. An earlier revision
+        # held the prior for the first 8 micro-batches as a variance guard against a
+        # tiny-D denominator; it was removed because it costs more than it buys:
+        #   - It over-amplifies in the clip-dead-erosion regime. Measured at DEFAULT
+        #     clip_eps with negatives below 1 - clip_eps_low: the measured k floors
+        #     at 1.0 while the prior says target_ratio, so an 8-micro-batch window
+        #     ran positives 75% hot at target_ratio=1.75, bypassing the max(.., 1.0)
+        #     floor that the measured branch has.
+        #   - It does not cure what it was for. Skewed group shapes on the
+        #     STRATIFIED sampler emit long runs of single-row minibatches, which skip
+        #     renorm (the `numel() > 1` guard below leaves the raw A_ep/num_chunks
+        #     value) and so enter the pool un-normalized and one-sided; D can freeze
+        #     tiny while N climbs, walking k to positive_advantage_weight_max.
+        #     Measured on groups (109, 1x11) at mb=12: the cap is reached at an
+        #     8-micro-batch warm-up just as at a 1-batch one. That pathology predates
+        #     the k rework (the old EMA seed damped it the same way and no better),
+        #     its root cause is un-normalized mass in the pool, and the real fix is
+        #     keeping renorm-skipped minibatches out of the pool. Until then the cap
+        #     is the bound and pos_adv_weight_k_max is what surfaces it.
+        #
+        # Dw_iter pools the WEIGHTED positive mass (k_i * d_mass_i, each micro-batch
+        # at the k it was actually weighted by) so pos_adv_realized_ratio reflects
+        # what the loss really did rather than being reconstructed from a single k.
+        # k_min/k_max bracket the MEASURED k's only (the prior is a known constant,
+        # and including it would pin k_min to that constant and hide the real
+        # spread); they are absent on an iteration that never measured.
         scaling = self.config.positive_advantage_weight_scaling
-        have_prior = (
-            self._pos_scale_D_ema is not None and self._pos_scale_D_ema > 0.0
-        )
         if scaling:
-            N_seed = _POS_SCALE_PRIOR * self._pos_scale_N_ema if have_prior else 0.0
-            D_seed = _POS_SCALE_PRIOR * self._pos_scale_D_ema if have_prior else 0.0
             N_iter = 0.0
             D_iter = 0.0
+            Dw_iter = 0.0
             k_last = 1.0
+            k_min = None
+            k_max = None
 
         # Effective balanced-sampler positive ratio this iter, for logging — the
         # same value _iter_balanced_minibatches will use (via _effective_pos_ratio).
@@ -3433,11 +3471,11 @@ class GRPOTrainer:
                 # Dynamic positive-advantage weight (config.positive_advantage_weight_scaling).
                 # Deferred commit: measure the alive loss mass and pick k now (k is
                 # needed to weight THIS minibatch), but fold the mass into the
-                # pooled N_iter/D_iter — and hence the persistent EMA — ONLY after
-                # the minibatch clears the non-finite-loss guard below. So a
-                # minibatch dropped for non-finite loss (incl. a base-model KL
-                # overflow while the ref ratio is finite) contributes no mass,
-                # keeping "pooled mass == trained rows" exactly true.
+                # pooled N_iter/D_iter ONLY after the minibatch clears the
+                # non-finite-loss guard below. So a minibatch dropped for
+                # non-finite loss (incl. a base-model KL overflow while the ref
+                # ratio is finite) contributes no mass, keeping "pooled mass ==
+                # trained rows" exactly true.
                 pending_pos_scale = None
                 if scaling:
                     # Rows we amplify: group-good (pre-renorm adv > 0) AND still
@@ -3476,21 +3514,62 @@ class GRPOTrainer:
                         d_mass = float(rl_abs[amp_alive_mask].sum())
                     # k from the pool as finalized by prior TRAINED minibatches
                     # (this mb's own mass is folded in post-guard, not here), so a
-                    # dropped minibatch never feeds k or the EMA. Mass is pooled per
-                    # trained row — both jitter_paired branches and balanced-sampler
+                    # dropped minibatch never feeds k. Mass is pooled per trained
+                    # row — both jitter_paired branches and balanced-sampler
                     # duplicates count, since each applies a real gradient.
-                    if not have_prior:
-                        k = 1.0  # first update (fresh or post-resume): warm up
-                    else:
+                    #
+                    # Before the pool holds any amplified-positive mass there is
+                    # nothing to measure, so fall back to the ANALYTIC PRIOR rather
+                    # than to a hardcoded 1.0. Under per-minibatch renorm the
+                    # z-score forces sum(A) == 0 over the minibatch, so absent
+                    # renorm sign flips and per-row ratio spread the pre-renorm-keyed
+                    # masses give N/D == 1, and the target is met at
+                    # k == target_ratio (measured N/D on the reference run:
+                    # 1.0464 +/- 0.0057 over every non-clipping iteration).
+                    #
+                    # The point of the prior is that the fallback TRACKS THE
+                    # TARGET instead of being pinned to 1.0 independently of it.
+                    # At N ~ D the realized post-weighting ratio is ~k, so the net
+                    # reinforcement surplus is positive at k == target_ratio > 1 and
+                    # vanishes at k = 1.0. The old cross-iteration-EMA design took
+                    # the latter for a full iteration on every fresh start and every
+                    # resume, whatever target_ratio said. Note this is about
+                    # tracking, not about avoiding the number 1.0: at the config
+                    # default target_ratio == 1.0 the prior IS 1.0, which is correct
+                    # — that config asks for equal masses.
+                    #
+                    # The prior is unmeasured, so it is applied as narrowly as the
+                    # guard allows (see the per-iteration state block for why there
+                    # is no additional count-based warm-up). It is also NOT floored
+                    # by the measurement, which is exactly why it must not be held
+                    # long: in the clip-dead-erosion regime the measured k floors at
+                    # 1.0 while the prior still says target_ratio.
+                    #
+                    # Under per_iteration_advantage_norm the minibatch zero-mean
+                    # identity does not apply (the buffer-wide z-score preserves
+                    # each chunk's group-relative sign instead of centering the
+                    # minibatch), so N/D is unconstrained and there is no prior to
+                    # stand on; 1.0 is the only defensible fallback there.
+                    tratio = self.config.positive_advantage_weight_target_ratio
+                    if D_iter > 0.0:
                         k = min(max(
-                            self.config.positive_advantage_weight_target_ratio
-                            * (N_seed + N_iter) / (D_seed + D_iter + _POS_SCALE_EPS),
+                            tratio * N_iter / (D_iter + _POS_SCALE_EPS),
                             1.0,
                         ), self.config.positive_advantage_weight_max)
+                        k_measured = True
+                    elif not self.config.per_iteration_advantage_norm:
+                        k = min(
+                            max(tratio, 1.0),
+                            self.config.positive_advantage_weight_max,
+                        )
+                        k_measured = False
+                    else:
+                        k = 1.0
+                        k_measured = False
                     # Stage the mass for post-guard commit (only if finite, so a
-                    # ratio overflow can never poison the pool or the EMA).
+                    # ratio overflow can never poison the pool).
                     if math.isfinite(n_mass) and math.isfinite(d_mass):
-                        pending_pos_scale = (k, n_mass, d_mass)
+                        pending_pos_scale = (k, n_mass, d_mass, k_measured)
                     # row_weight is exactly k on amplified rows, 1.0 elsewhere.
                     # (Weighting an upper-clipped positive would be a no-op — its
                     # gradient is already zero — so pos_amp_mask needs no alive
@@ -3574,21 +3653,35 @@ class GRPOTrainer:
 
                 # Minibatch survived the non-finite guard → commit its dynamic-
                 # weight mass and k. Done here (not in the measure block) so a
-                # dropped minibatch never folds its mass into N_iter/D_iter or the
-                # cross-iteration EMA. Unaffected by accumulation: mass pools per
-                # TRAINED micro-batch, which is exactly the set of rows that
-                # reach backward() below, regardless of where window boundaries
-                # land. ONE rare exception: if a window is later dropped for a
-                # non-finite accumulated gradient, its rows' mass is already
-                # pooled even though no gradient reached the weights, so the pool
-                # over-counts by up to k micro-batches. Accepted rather than
-                # staged per window — it only occurs on an anomaly that already
-                # warrants investigation, and k is a RATIO so the effect is
-                # second-order (n_nonfinite_grad_steps surfaces it).
+                # dropped minibatch never folds its mass into N_iter/D_iter.
+                # Unaffected by accumulation: mass pools per TRAINED micro-batch,
+                # which is exactly the set of rows that reach backward() below,
+                # regardless of where window boundaries land. ONE rare exception:
+                # if a window is later dropped for a non-finite accumulated
+                # gradient, its rows' mass is already pooled even though no
+                # gradient reached the weights, so the pool over-counts by up to k
+                # micro-batches. Accepted rather than staged per window — it only
+                # occurs on an anomaly that already warrants investigation, and k
+                # is a RATIO so the effect is second-order
+                # (n_nonfinite_grad_steps surfaces it).
                 if pending_pos_scale is not None:
-                    k_last, _n_mass, _d_mass = pending_pos_scale
+                    k_last, _n_mass, _d_mass, _k_measured = pending_pos_scale
+                    # k_min/k_max track the MEASURED k's only — the prior is a
+                    # config-derived constant, so folding it in would pin k_min to
+                    # that constant and hide the measured spread entirely.
+                    if _k_measured:
+                        k_min = k_last if k_min is None else min(k_min, k_last)
+                        k_max = k_last if k_max is None else max(k_max, k_last)
                     N_iter += _n_mass
                     D_iter += _d_mass
+                    # Weighted positive mass, at the k this micro-batch was
+                    # ACTUALLY weighted by. Pooling it here (rather than
+                    # reconstructing k_last * D_iter at the end) is what keeps
+                    # pos_adv_realized_ratio faithful to the loss: k varies across
+                    # the iteration, and k_last is computed from the pool EXCLUDING
+                    # this micro-batch, so k_last * D_iter / N_iter would mix two
+                    # snapshots and two different weightings.
+                    Dw_iter += k_last * _d_mass
 
                 # --- Backward pass (gradient accumulation window) ---
                 # zero_grad ONLY at the start of a window; otherwise this
@@ -3986,46 +4079,57 @@ class GRPOTrainer:
                     result["mean_ratio_anchor"] = _mr
                 if math.isfinite(_kl):
                     result["kl_loss_anchor"] = _kl
-        # --- Dynamic positive-advantage weighting: fold this iter's pooled
-        # masses into the cross-iteration EMA and surface k. Reached only on the
-        # success path (n_updates > 0 is guaranteed by the early return above),
-        # so a dead iteration never drags the EMA toward zero. have_prior was
-        # snapshotted at iteration start: on the first-ever update it's False, so
-        # the EMA is seeded from this iter's own masses.
-        # Note: N_iter/D_iter pool across all epochs, so their absolute scale
-        # tracks the epoch count. Under a fixed update_epochs (default) the scale
-        # is constant across iters and the seed stays a fixed ~prior fraction;
-        # under dynamic_epoch_training the count varies, which only shifts how
-        # much the seed anchors — k is a RATIO, so this is a second-order
-        # smoothing effect, not a bias in k.
+        # --- Dynamic positive-advantage weighting: surface k and the mass terms.
+        # No cross-iteration state is folded anywhere — there is none.
         #
-        # An ANCHOR-ONLY iteration reaches here with n_updates > 0 but pools
-        # zero mass in both terms (anchor rows are in neither N nor D). Folding
-        # that in would decay the EMA scale toward zero for no information, and
-        # on a first-ever update would set D_ema = 0 — which reads as "not warmed
-        # up" and pins k=1 until a signal iteration arrives. Skip the fold
-        # instead and leave the prior EMA untouched.
+        # pos_adv_realized_ratio = Dw_iter / N_iter, the POST-weighting
+        # reinforcement:erosion loss-mass ratio, pooled per micro-batch at the k
+        # that micro-batch was actually weighted by. Read it as a coarse
+        # "which side is the iteration pushing on", NOT as a precise estimator of
+        # target_ratio:
+        #   ~= 1.0            → the two sides are balanced, i.e. the mechanism is
+        #                       off in effect. When target_ratio > 1 that is the
+        #                       reading to worry about — it is what the removed
+        #                       cross-iteration EMA produced on every resume, and
+        #                       it was survivable at 52% success and fatal
+        #                       (0.67 -> ~0.04 in one iteration) at 67%. At
+        #                       target_ratio == 1.0 (the config DEFAULT) it is
+        #                       instead the on-target reading; the two cases are
+        #                       only distinguishable by knowing target_ratio.
+        #   >> target_ratio   → erosion is largely clip-dead (N << D). The ratio
+        #                       DIVERGES as N -> 0 (measured 12-15 in that regime),
+        #                       so it is clamped to positive_advantage_weight_max
+        #                       before emission to keep the curve readable; the
+        #                       unclamped terms are always available as
+        #                       pos_adv_{pos,alive_neg}_mass. Cross-check
+        #                       clipfrac_effective_neg and k_min (which floors).
+        # Deviation from target_ratio does NOT by itself mean a clamp is binding:
+        # each k_i is a PREFIX estimate (the pool excluding its own micro-batch),
+        # so whenever the running prefix ratio differs from the whole-iteration
+        # ratio the pooled result drifts off target with no clamp involved —
+        # measured +9%..+20% on skewed group shapes with k comfortably inside
+        # [1, max]. It read 1.7500-1.7501 against target 1.75 on the 238-
+        # micro-batch reference iterations, where the prefix is stable. Use k_min /
+        # k_max to tell a clamp from prefix drift.
+        #
+        # Guarded on N_iter > 0 because the ratio is undefined with no alive
+        # erosion mass at all — which is also how an ANCHOR-ONLY iteration
+        # (n_updates > 0 but zero pooled mass in both terms, since anchor rows are
+        # in neither N nor D) reports: no realized ratio rather than a fabricated
+        # one.
         if scaling:
-            # Skip the fold ONLY on an iteration with no SIGNAL rows at all
-            # (`not entries`): anchor rows are in neither N nor D, so folding
-            # zeros would decay the EMA scale for no information, and on a
-            # first-ever update would leave D_ema == 0 and pin k=1. Keyed on
-            # `entries` rather than `anchors_in_play` so an iteration that HAS
-            # signal rows but pooled zero mass (every row clip-dead) still folds,
-            # exactly as the pre-anchor code did.
-            if (N_iter > 0.0 or D_iter > 0.0) or entries:
-                if not have_prior:
-                    self._pos_scale_N_ema, self._pos_scale_D_ema = N_iter, D_iter
-                else:
-                    self._pos_scale_N_ema = (
-                        _POS_SCALE_BETA * self._pos_scale_N_ema + (1 - _POS_SCALE_BETA) * N_iter
-                    )
-                    self._pos_scale_D_ema = (
-                        _POS_SCALE_BETA * self._pos_scale_D_ema + (1 - _POS_SCALE_BETA) * D_iter
-                    )
             result["pos_adv_weight_k"] = k_last
             result["pos_adv_alive_neg_mass"] = N_iter
             result["pos_adv_pos_mass"] = D_iter
+            if k_min is not None:
+                result["pos_adv_weight_k_min"] = k_min
+                result["pos_adv_weight_k_max"] = k_max
+            if N_iter > 0.0:
+                _realized = Dw_iter / N_iter
+                if math.isfinite(_realized):
+                    result["pos_adv_realized_ratio"] = min(
+                        _realized, self.config.positive_advantage_weight_max
+                    )
         # Only emit kl_loss_base_model when the anchor was active this iter.
         # _log_metrics gates on key presence, so vanilla runs see no
         # train/kl_loss_base_model curve at all.
@@ -5854,11 +5958,23 @@ class GRPOTrainer:
             # Dynamic positive-advantage weight (pos_adv_*: present only when
             # positive_advantage_weight_scaling ran this iter) and the sign-flip
             # counter (n_pos_flipped_by_renorm: emitted every successful iter).
-            # pos_adv_weight_k is the headline curve (sits in [1, ..._max]); the
-            # mass terms show what drove it. n_pos_flipped_by_renorm reads 0 under
-            # per-iteration norm and >0 under per-minibatch norm (the artifact).
+            # pos_adv_realized_ratio is the headline curve: the POST-weighting
+            # reinforcement:erosion mass ratio, pooled at the k each micro-batch
+            # was actually weighted by, clamped to positive_advantage_weight_max
+            # for readability. ~= 1.0 means the two sides are balanced — the
+            # reading to worry about when target_ratio > 1, and the on-target
+            # reading when target_ratio == 1.0 (the default). Deviation from
+            # target_ratio does NOT imply a binding clamp; see the reading guide in
+            # _grpo_update_inner. pos_adv_weight_k_{min,max} bracket the MEASURED
+            # k's (absent if the iteration never measured) and are what separate a
+            # clamp from prefix drift. n_pos_flipped_by_renorm reads 0 under
+            # per-iteration norm and >0 under per-minibatch norm (the artifact); a
+            # nonzero value also skews N/D away from the 1.0 the prior assumes.
             for key in (
+                "pos_adv_realized_ratio",
                 "pos_adv_weight_k",
+                "pos_adv_weight_k_min",
+                "pos_adv_weight_k_max",
                 "pos_adv_alive_neg_mass",
                 "pos_adv_pos_mass",
                 "n_pos_flipped_by_renorm",

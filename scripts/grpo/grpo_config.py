@@ -297,7 +297,7 @@ class GRPOConfig:
     # post-mortem inspection. Set to 0 to disable pruning (keep everything).
     # At 25 episodes/iter × 90 chunks × ~250KB/chunk ≈ 0.5 GB/iter, 200 iters
     # is ~100 GB if unpruned; /tmp on most GPU hosts is much smaller.
-    episode_dirs_to_keep: int = 2
+    episode_dirs_to_keep: int = 10
 
     # ─── GRPO Algorithm ──────────────────────────────────────────────────────
     # These directly mirror grpo_cont.py's clipped objective args

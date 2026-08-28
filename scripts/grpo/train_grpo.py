@@ -22,6 +22,7 @@ Hardware: Fits on A10G (24GB) with batch_size=4 and shared backbone.
 
 import sys
 import dataclasses
+import json
 import math
 import os
 import re
@@ -49,7 +50,22 @@ from lora_dit import (
     print_trainable_params,
     disabled_adapters,
 )
-from fm_log_prob import compute_fm_log_prob, _sample_jittered_timesteps
+from fm_log_prob import (
+    compute_fm_log_prob,
+    _sample_jittered_timesteps,
+    TAU_JITTER_STD,
+)
+from smoothness import pooled_hf, SMOOTH_M_EPS
+
+# Filename for the frozen endpoint-roughness reference inside each checkpoint.
+SMOOTH_REF_FILENAME = "smooth_ref.json"
+
+# Minimum rows in a minibatch for the endpoint-roughness hinge to apply. The hinge
+# is evaluated on the minibatch's POOLED HF, and relu convexity means a very small
+# minibatch reinstates the single-row ratio blow-up that pooling removes (a lone
+# near-idle row reads HF ~0.8 against a moving row's ~0.05). 4 is well below any
+# production mini_batch_size and only excludes degenerate trailing batches.
+SMOOTH_MIN_ROWS_PER_MB = 4
 from episode_buffer import EpisodeBuffer, ActionChunk
 
 
@@ -177,6 +193,25 @@ class GRPOTrainer:
     - Policy gradient update (clipped surrogate + KL penalty)
     - Checkpointing
     """
+
+    # ── Endpoint-roughness constraint: OFF-state class defaults ──────────────
+    # Declared at class level, not only in _setup_smoothness(), because several
+    # test harnesses (test_grad_accum, test_anchor_groups, test_jitter_metrics,
+    # test_phase_timing_logs, test_video_key_filter) construct the trainer via
+    # __new__ to skip setup(). Without these, _grpo_update_inner would raise
+    # AttributeError on those paths instead of simply seeing the feature off.
+    smooth_active = False
+    _smooth_dims = None
+    _smooth_dims_list = ()
+    _smooth_kept_keys = ()
+    _smooth_horizon = None
+    _smooth_hf_ref = None
+    _smooth_calib_sum = None
+    _smooth_calib_n = 0
+    _smooth_calib_rows = 0
+    _smooth_calib_iter = None
+    _smooth_ref_source = None            # "config" | "calibrated" | "inherited"
+    _smooth_ref_scale_applied = None     # the scale baked into hf_ref, if any
 
     def __init__(self, config: GRPOConfig):
         """Initialize the GRPO trainer.
@@ -438,6 +473,9 @@ class GRPOTrainer:
 
         print(f"  AdamW: lr={self.config.learning_rate}, wd={self.config.weight_decay}")
         print(f"  Trainable params in optimizer: {sum(p.numel() for p in trainable_params):,}")
+
+        # --- Step 3b: Endpoint-roughness constraint (no-op when smooth_coef==0) ---
+        self._setup_smoothness()
 
         # --- Step 4: Setup logging ---
         print("\n[4/4] Setting up logging...")
@@ -768,6 +806,13 @@ class GRPOTrainer:
                 raise
             phase3_time = time.time() - phase3_start
             self._log_vram(vram)
+
+            # Freeze the endpoint-roughness reference from this iteration's
+            # measurement. On a fresh run iteration 1 is theta == theta_base
+            # (PEFT zero-inits lora_B), so the samples accumulated while
+            # n_updates == 0 are base-policy. No-op on every later iteration and
+            # whenever the reference is already resolved.
+            update_stats.update(self._smooth_finalize_calibration(iteration))
 
             # Treat an iter as "updated" only if at least one optimizer.step()
             # actually fired. Two paths lead to n_updates=0 here that the outer
@@ -2637,6 +2682,33 @@ class GRPOTrainer:
         # comparable across k instead of being inflated k-fold.
         n_updates = 0
         n_micro_batches = 0
+        # --- Endpoint-roughness constraint accumulators (all stay 0 when off) ---
+        smooth_loss_sum = 0.0          # per-minibatch term value, for the mean
+        smooth_r_sum = 0.0             # ΣR over minibatches (energy-weighted HF)
+        smooth_m_sum = 0.0             # ΣM over minibatches
+        smooth_hf_max = 0.0
+        smooth_hf_finite_mbs = 0       # divisor for hf_mean: only finite readings
+        smooth_excess_sum = 0.0
+        smooth_active_mbs = 0          # minibatches above the threshold
+        smooth_rows = 0
+        smooth_nonfinite_loss_mbs = 0   # HF non-finite -> term skipped, iter saved
+        # Minibatches where the hinge was actually EVALUATED (finite HF, enough
+        # rows, hf_ref resolved). The correct divisor for the hinge-describing
+        # metrics -- see _smooth_stats.
+        smooth_hinge_mbs = 0
+        smooth_undersized_mbs = 0       # too few rows to hinge on (see below)
+        smooth_calib_prestep_rows = 0   # subtotal measured at exactly theta_base
+        # Own counter: the HF measurements are accumulated BEFORE the non-finite
+        # guard (they describe the field, which is valid even for a minibatch
+        # whose loss is later discarded), so they must not be divided by
+        # n_micro_batches, which counts only minibatches that trained.
+        smooth_measured_mbs = 0
+        # Calibration samples rejected for non-finite HF (see the guard below).
+        smooth_calib_nonfinite = 0
+        # Samples ADDED to the calibration accumulator by this call. Reported so
+        # the `n_updates == 0` gate is observable from update_stats: with
+        # gradient_accumulation_steps=k this must equal k, not n_micro_batches.
+        smooth_calib_added = 0
         # Minibatches dropped for NaN/Inf loss. The guard fires BEFORE
         # backward(), so a dropped minibatch adds nothing to the gradient
         # buffer and — see the accumulation block below — does not advance the
@@ -3316,7 +3388,14 @@ class GRPOTrainer:
                     noise_for_input = None
 
                 # Only compute current model's log-prob (with gradient)
-                current_log_probs = compute_fm_log_prob(
+                # `smooth_dims`/`smooth_horizon` are None unless the
+                # endpoint-roughness constraint is on, in which case
+                # compute_fm_log_prob ALSO takes one dedicated clean forward at
+                # tau=0 and returns [B, 2] roughness moments (R, M). That forward
+                # is an EXTRA DiT pass (~1/K of the K-loop, ~17% at K=6): it is
+                # not taken from the K-loop, whose velocity is contaminated by the
+                # eps-jitter. See the block after the K-loop in fm_log_prob.py.
+                fm_out = compute_fm_log_prob(
                     action_head=self.model.action_head,
                     backbone_output=ready_backbone,
                     state_features=ready_state_features,
@@ -3327,7 +3406,21 @@ class GRPOTrainer:
                     noise=ready_noise,
                     n_samples=len(self.config.tau_centers),
                     noise_for_input=noise_for_input,
+                    smooth_dims=self._smooth_dims if self.smooth_active else None,
+                    # During calibration the term never enters the loss, so its
+                    # forward needs no autograd graph (~1/K of peak activation).
+                    smooth_no_grad=(
+                        self.smooth_active and self._smooth_hf_ref is None
+                    ),
+                    smooth_horizon=(
+                        self._smooth_horizon if self.smooth_active else None
+                    ),
                 )
+                if self.smooth_active:
+                    current_log_probs, smooth_moments = fm_out
+                else:
+                    current_log_probs = fm_out
+                    smooth_moments = None
 
                 log_ratio = current_log_probs - ref_log_probs
                 ratio = log_ratio.exp()
@@ -3582,6 +3675,141 @@ class GRPOTrainer:
                     else row_loss.sum() / loss_divisor
                 )
 
+                # --- Endpoint-roughness constraint (jerk constraint) ---
+                # L = coef * relu( HF_pooled - hf_ref )
+                #
+                # HF is evaluated on ONE dedicated clean DiT forward at tau = 0
+                # inside compute_fm_log_prob, with the ORIGINAL eps, so it is
+                # immune to the jitter Jacobian response that would otherwise
+                # dominate it (see the comment there). tau = 0 needs no (1-tau)^2
+                # weight, so hf_ref is a scalar.
+                #
+                # POOLED, not a mean of per-row ratios: HF's denominator is a
+                # row's own energy, so a near-idle chunk reports HF(a_hat) ->
+                # HF(r), hundreds of times a moving chunk's value, and an
+                # unweighted mean would be dominated by it. sum(R)/(6 sum(M)) is
+                # energy-weighted by construction and batch-size invariant.
+                #
+                # Because the term is one scalar per minibatch, its magnitude does
+                # not depend on row count, so it needs no anchor loss divisor --
+                # unlike clip_loss/KL, which are per-row means. Anchor rows still
+                # contribute their R and M, which is intended: roughness is not
+                # advantage-keyed and anchors are the retention set.
+                #
+                # While hf_ref is being calibrated (iteration 1 of a fresh run)
+                # the term contributes nothing to the loss -- it only records.
+                # That keeps iteration 1 bit-identical to an unconstrained run,
+                # which is what makes theta == theta_base a valid reference.
+                smooth_loss = None
+                if smooth_moments is not None:
+                    mom_det = smooth_moments.detach()
+                    hf_pooled_det = float(
+                        pooled_hf(mom_det, detach_denominator=False)
+                    )
+                    with torch.no_grad():
+                        n_r = mom_det.shape[0]
+                        smooth_rows += n_r
+                        smooth_measured_mbs += 1
+                        if math.isfinite(hf_pooled_det):
+                            # Pool R and M across minibatches rather than
+                            # averaging their ratios: reporting mean(pooled_mb)
+                            # would reintroduce, one level up, exactly the
+                            # mean-of-ratios bias that pooling exists to remove.
+                            smooth_r_sum += float(mom_det[:, 0].sum())
+                            smooth_m_sum += float(mom_det[:, 1].sum())
+                            smooth_hf_max = max(smooth_hf_max, hf_pooled_det)
+                            smooth_hf_finite_mbs += 1
+
+                    if self._smooth_hf_ref is None:
+                        # Calibration: pool R and M rather than HF, so the
+                        # reference is energy-weighted exactly like the
+                        # measurement it will be compared against.
+                        #
+                        # The finiteness test is not cosmetic: a minibatch whose
+                        # DiT output is non-finite -- the same condition that trips
+                        # the loss guard below -- yields a NaN HF. Unguarded, that
+                        # NaN freezes into hf_ref, tau/relu propagate it, and every
+                        # later minibatch is skipped: the run stalls permanently
+                        # with the weights frozen.
+                        # Accumulate over the WHOLE calibration iteration, not
+                        # only the pre-first-optimizer-step window. That window is
+                        # exactly `gradient_accumulation_steps` micro-batches --
+                        # ONE at the defaults, i.e. mini_batch_size=8 rows. Measured
+                        # on base-like chunks, an 8-row window spreads the pooled
+                        # base HF over 0.64x-1.57x of its large-sample value, and a
+                        # window dominated by low-energy chunks (routine during a
+                        # grasp or an approach pause) reads up to 17x high -- which,
+                        # since hf_ref is frozen and persisted into every
+                        # checkpoint, would silently neuter the feature for the
+                        # whole run lineage. Widening trades that for one
+                        # iteration's worth of drift, which is small: ref_mse moves
+                        # 0.0042 -> 0.0040 over iterations 1-2 in the measured runs.
+                        # `smooth_calib_prestep_rows` records the strict-theta_base
+                        # subtotal so the drift is auditable.
+                        # Stop once the row target is met. Accumulating past it
+                        # buys no statistical precision and maximises how much
+                        # in-iteration drift is baked into a reference that is then
+                        # frozen and persisted for the whole run lineage. At
+                        # production sizes the target is reached ~64 micro-batches
+                        # in, against ~250 per epoch, so this cuts the drift
+                        # exposure ~4x AND keeps the measurement inside the first
+                        # epoch (so update_epochs never double-counts a chunk).
+                        if (
+                            self._smooth_calib_sum is not None
+                            and self._smooth_calib_rows
+                            < int(self.config.smooth_calib_min_rows)
+                        ):
+                            with torch.no_grad():
+                                rm = torch.stack(
+                                    (mom_det[:, 0].sum(), mom_det[:, 1].sum())
+                                )
+                                if bool(torch.isfinite(rm).all()):
+                                    self._smooth_calib_sum += rm
+                                    self._smooth_calib_n += 1
+                                    self._smooth_calib_rows += n_r
+                                    smooth_calib_added += 1
+                                    if n_updates == 0:
+                                        smooth_calib_prestep_rows += n_r
+                                else:
+                                    smooth_calib_nonfinite += 1
+                    else:
+                        hf_pooled = pooled_hf(smooth_moments)
+                        # A non-finite HF must NOT reach the loss. The tau=0 pass
+                        # is the one evaluation on pure noise -- the
+                        # largest-magnitude DiT input of the K+1 forwards -- so it
+                        # is the likeliest to overflow bf16 while every other term
+                        # (log-probs, clip, KL) stays finite and healthy. Letting
+                        # it through would NaN the total loss, the pre-existing
+                        # guard would drop the micro-batch, and with every
+                        # micro-batch affected the whole iteration is discarded --
+                        # attributed by the surviving warning to "bf16 ratio
+                        # overflow", which is the wrong cause. Skipping just this
+                        # term costs one measurement instead of an iteration.
+                        # relu is convex, so hinging per minibatch gives
+                        # mean_mb relu(pooled_mb - ref) >= relu(pooled_all - ref),
+                        # and the gap grows as minibatches shrink: on 7 moving rows
+                        # plus 1 near-idle row, 8 singleton minibatches deliver
+                        # 4.6x the penalty of one 8-row minibatch, because the idle
+                        # row alone reads HF 0.818. That is the idle-row domination
+                        # pooling exists to remove, returning whenever a minibatch
+                        # is nearly a single row. Skip the term there rather than
+                        # let an under-filled trailing batch land an outsized
+                        # high-pass update.
+                        if n_r < SMOOTH_MIN_ROWS_PER_MB:
+                            smooth_undersized_mbs += 1
+                        elif math.isfinite(float(hf_pooled.detach())):
+                            excess = (
+                                hf_pooled - self._smooth_hf_ref
+                            ).clamp(min=0.0)
+                            smooth_loss = self.config.smooth_coef * excess
+                            with torch.no_grad():
+                                ex = float(excess.detach())
+                                smooth_excess_sum += ex
+                                smooth_active_mbs += int(ex > 0.0)
+                                smooth_hinge_mbs += 1
+                        else:
+                            smooth_nonfinite_loss_mbs += 1
+
                 # --- KL divergence penalties (Schulman k3 estimator) ---
                 # KL(p || q) ≈ E[exp(p_lp - q_lp) - (p_lp - q_lp) - 1] with the
                 # log-prob of the ANCHOR target on the left. Identity:
@@ -3628,6 +3856,8 @@ class GRPOTrainer:
 
                 # --- Total loss ---
                 loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
+                if smooth_loss is not None:
+                    loss = loss + smooth_loss
 
                 # NaN/Inf guard: a single bad batch (e.g., bf16 overflow in
                 # ratio = log_ratio.exp() when log_ratio is large, or NaN
@@ -3726,6 +3956,8 @@ class GRPOTrainer:
                     clipfracs.append(clipfrac)
                     total_loss += loss.item()
                     total_clip_loss += clip_loss.item()
+                    if smooth_loss is not None:
+                        smooth_loss_sum += smooth_loss.item()
                     total_kl_last_iter += kl_loss_last_iter.item()
                     if compute_base:
                         total_kl_base_model += kl_loss_base_model.item()
@@ -3945,6 +4177,43 @@ class GRPOTrainer:
         # the two apart instead of seeing a bare empty dict. The divisions below
         # stay safe either way: a step requires at least one backward(), so
         # n_updates > 0 implies n_micro_batches > 0.
+        def _smooth_stats() -> dict:
+            """Endpoint-roughness metrics, or {} when the feature is off.
+
+            Defined here so BOTH the early-return path and the normal result dict
+            report them: the readings are taken before the non-finite loss guard,
+            so they are valid on an iteration whose update was entirely discarded.
+            """
+            if not self.smooth_active or smooth_measured_mbs == 0:
+                return {}
+            out = {
+                "smooth_hf_mean": (
+                    smooth_r_sum / (6.0 * smooth_m_sum)
+                    if smooth_m_sum > 0.0 else float("nan")
+                ),
+                "smooth_hf_max": smooth_hf_max,
+                "smooth_rows": smooth_rows,
+                "smooth_measured_mbs": smooth_measured_mbs,
+                "smooth_nonfinite_mbs": smooth_measured_mbs - smooth_hf_finite_mbs,
+                "smooth_undersized_mbs": smooth_undersized_mbs,
+                "smooth_nonfinite_loss_mbs": smooth_nonfinite_loss_mbs,
+                "smooth_calib_nonfinite": smooth_calib_nonfinite,
+                "smooth_calib_added": smooth_calib_added,
+                "smooth_calib_prestep_rows": smooth_calib_prestep_rows,
+            }
+            # excess/active_frac describe the HINGE, so they divide by the number of
+            # minibatches where the hinge was actually EVALUATED -- not by
+            # smooth_hf_finite_mbs, which also counts undersized minibatches and
+            # every minibatch of the calibration iteration, where the hinge never
+            # ran. Dividing by the latter reported 0.0 on the calibration iteration,
+            # indistinguishable from "the field is already smooth".
+            if smooth_hinge_mbs > 0:
+                out["smooth_loss"] = smooth_loss_sum / smooth_hinge_mbs
+                out["smooth_excess_mean"] = smooth_excess_sum / smooth_hinge_mbs
+                out["smooth_active_frac"] = smooth_active_mbs / smooth_hinge_mbs
+                out["smooth_hinge_mbs"] = smooth_hinge_mbs
+            return out
+
         if n_updates == 0:
             early: dict = {}
             if n_skipped_nonfinite:
@@ -3987,6 +4256,13 @@ class GRPOTrainer:
             #     trained, so they are populated in the dropped-gradient case
             #     (n_micro_batches > 0) and simply absent in the all-non-finite
             #     case, which is the right behaviour in both.
+            # The HF readings are measured BEFORE the non-finite loss guard, so they
+            # exist even when no optimizer step survived -- and that is precisely the
+            # iteration where they matter, since the smooth term is one of the things
+            # that can kill an iteration. They must therefore be carried onto this
+            # path explicitly; unlike ref_mse/* they do not live on an instance
+            # attribute that _log_metrics can read independently.
+            early.update(_smooth_stats())
             if jitter_diag:
                 early["_jitter_diag"] = jitter_diag
             if n_rows_pos_total > 0:
@@ -4036,6 +4312,16 @@ class GRPOTrainer:
             # TB curve is a flat zero line you can glance at, rather than a
             # missing series you'd have to know to look for.
             "n_nonfinite_grad_steps": n_nonfinite_grad_steps,
+            # Endpoint-roughness constraint. Absent when the feature is off. Built by
+            # _smooth_stats() so the early-return path above reports the same keys.
+            # `active_frac` is the fraction of hinge-EVALUATED minibatches whose
+            # pooled HF exceeded the threshold. Per section 7 of jerk-constraint.md
+            # the hinge is expected to be ACTIVE early (the measured HF(a) is 36-87x
+            # base) and to relax as the field smooths, so a low reading is a terminal
+            # property, not an early-training one. There is deliberately no
+            # per-advantage-sign split: the term is one POOLED scalar per minibatch,
+            # so a per-sign split is not definable.
+            **_smooth_stats(),
             "n_zero_grad_steps": n_zero_grad_steps,
             "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
@@ -5780,6 +6066,27 @@ class GRPOTrainer:
         if _ref_mse:
             _emit("ref_mse", _ref_mse)
 
+        # Endpoint-roughness constraint. UNGATED on n_updates, for the same reason
+        # as ref_mse/* and jitter/*: these are measurements of the field taken
+        # before any optimizer step, so they stay valid on an iteration whose
+        # update was discarded -- and an iteration the smooth term itself killed is
+        # exactly the one where these curves are most needed. Routed through _emit
+        # so a non-finite reading is dropped with a warning rather than written.
+        if self.smooth_active:
+            _sm = {
+                k[len("smooth_"):]: v
+                for k, v in (update_stats or {}).items()
+                if k.startswith("smooth_")
+            }
+            # The threshold actually IN FORCE, every iteration -- not only on the
+            # calibration iteration. Without this a run started from an explicit
+            # --smooth-hf-ref, or any resumed run, has no TB record of its own
+            # threshold.
+            if self._smooth_hf_ref is not None:
+                _sm["hf_ref"] = float(self._smooth_hf_ref)
+            if _sm:
+                _emit("smooth", _sm)
+
         # Per-chunk gap survey. Ungated on n_updates for the same reason as
         # ref_mse/*: measured at theta == theta_ref, before any step. The headline
         # is chunk_gap/cv -- compare it against the ~4-8% intrinsic xi-sampling
@@ -6047,6 +6354,24 @@ class GRPOTrainer:
                 # iteration's wandb payload rather than just this one metric.
                 # Non-finite values are filtered for the same
                 # chart-autoscale-poisoning reason as the TB side.
+                # Endpoint-roughness: give it the same dedicated, UNGATED mirror
+                # that ref_mse/chunk_gap/jitter get. Without this the keys fall
+                # through the generic `train/{k}` dump, so wandb would show
+                # `train/smooth_loss` instead of the documented `smooth/loss`, and
+                # would lose them on any iteration with n_updates == 0 -- including
+                # `smooth/hf_ref`, the frozen threshold actually in force.
+                _sm_w = {
+                    k: v for k, v in update_stats.items()
+                    if k.startswith("smooth_")
+                }
+                if _sm_w:
+                    log_dict.update({
+                        f"smooth/{k[len('smooth_'):]}": v
+                        for k, v in _sm_w.items()
+                        if isinstance(v, (int, float)) and math.isfinite(v)
+                    })
+                if self.smooth_active and self._smooth_hf_ref is not None:
+                    log_dict["smooth/hf_ref"] = float(self._smooth_hf_ref)
                 _ref_mse_w = getattr(self, "_ref_mse_stats", None)
                 if _ref_mse_w:
                     log_dict.update({
@@ -6144,6 +6469,436 @@ class GRPOTrainer:
             except Exception:
                 pass
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Endpoint-roughness constraint (the "jerk constraint")
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _setup_smoothness(self):
+        """Resolve the constrained dim set, horizon and hf_ref. No-op when off.
+
+        Every attribute this defines is also defined on the off path, so no call
+        site needs a hasattr guard. With `smooth_coef == 0` nothing is built,
+        nothing is printed, and no tensor is allocated.
+        """
+        self.smooth_active = self.config.smooth_coef > 0.0
+        self._smooth_dims = None          # LongTensor of column indices
+        self._smooth_dims_list = []       # python copy, for the guard key
+        self._smooth_kept_keys = []
+        self._smooth_horizon = None
+        self._smooth_hf_ref = None        # 0-dim fp32 tensor, or None => calibrate
+        self._smooth_calib_sum = None     # fp32 (sum R, sum M) accumulator
+        self._smooth_calib_n = 0
+        self._smooth_calib_rows = 0
+        self._smooth_calib_iter = None    # iteration the calibration ran on
+        self._smooth_ref_source = None
+        self._smooth_ref_scale_applied = None
+        if not self.smooth_active:
+            return
+
+        # Every minibatch would be skipped by the SMOOTH_MIN_ROWS_PER_MB guard, so
+        # the constraint would be a silent no-op while still paying its extra DiT
+        # forward. Worth a hard fail rather than a warning: the documented remedy
+        # for OOM is to lower mini_batch_size and raise
+        # gradient_accumulation_steps, so 8 -> 2 is a natural move that would
+        # otherwise disable the feature invisibly for a whole run.
+        if self.config.mini_batch_size < SMOOTH_MIN_ROWS_PER_MB:
+            raise ValueError(
+                f"smooth_coef={self.config.smooth_coef} > 0 requires "
+                f"mini_batch_size >= {SMOOTH_MIN_ROWS_PER_MB}, got "
+                f"{self.config.mini_batch_size}. The pooled HF over fewer rows is "
+                f"dominated by whichever row has the least energy (a near-idle "
+                f"chunk reads HF ~0.8 against a moving chunk's ~0.06), so every "
+                f"minibatch would be skipped and the term would contribute nothing "
+                f"while still costing one extra DiT forward per minibatch.\n"
+                f"Fix: raise mini_batch_size to >= {SMOOTH_MIN_ROWS_PER_MB} (use "
+                f"gradient_accumulation_steps for a larger effective batch), or set "
+                f"--smooth-coef 0 to disable the constraint."
+            )
+
+
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from smoothness import build_continuous_action_dims, describe_dim_selection
+
+        tag = EmbodimentTag[self.config.embodiment_tag]
+        acfg = self.processor.get_modality_configs()[tag.value]["action"]
+        norm = self.processor.state_action_processor.norm_params[tag.value]["action"]
+        modality_keys = list(acfg.modality_keys)
+        key_dims = {}
+        for key in modality_keys:
+            raw = norm[key]["dim"]
+            key_dims[key] = int(raw.item() if hasattr(raw, "item") else raw)
+
+        horizon = len(acfg.delta_indices)
+        dims, kept, total_dims = build_continuous_action_dims(
+            modality_keys,
+            key_dims,
+            include_gated=self.config.smooth_include_base_motion,
+        )
+
+        # Cross-check the derived layout against the mask the FM loss actually
+        # uses. A mismatch means the modality config and the mask disagree, in
+        # which case the smoothness term would be indexing different columns
+        # from the ones the surrogate scores.
+        from grpo_server import compute_action_mask
+        try:
+            mask = compute_action_mask(self._smooth_mask_probe())
+        except Exception as exc:  # pragma: no cover - defensive
+            print(
+                f"  WARNING: could not cross-check the smoothness dim layout "
+                f"against compute_action_mask ({type(exc).__name__}: {exc}). "
+                f"Proceeding with the modality-config layout."
+            )
+        else:
+            mask_horizon = int(mask.any(axis=1).sum())
+            mask_dims = int(mask.any(axis=0).sum())
+            # Hard-fail ONLY when the derived layout would reach OUTSIDE the
+            # region the FM surrogate scores: that means constraining padded
+            # columns, which is a real correctness bug. A mere disagreement is a
+            # warning, because the two derivations come from different processor
+            # accessors (`norm_params[...]["dim"]` here vs `get_action_dim` in
+            # compute_action_mask) and a benign discrepancy between them must not
+            # be able to block an otherwise-valid run.
+            if horizon > mask_horizon or total_dims > mask_dims:
+                raise RuntimeError(
+                    f"smoothness dim layout reaches outside the FM action mask: "
+                    f"modality config gives (horizon={horizon}, "
+                    f"dims={total_dims}) but the mask is only "
+                    f"(horizon={mask_horizon}, dims={mask_dims}). Constraining "
+                    f"padded columns would penalise values the surrogate never "
+                    f"scores. Refusing to start."
+                )
+            if (mask_horizon, mask_dims) != (horizon, total_dims):
+                print(
+                    f"  WARNING: smoothness layout ({horizon}, {total_dims}) "
+                    f"disagrees with compute_action_mask ({mask_horizon}, "
+                    f"{mask_dims}), but stays inside it. Using the modality-config "
+                    f"layout, which is what decode_action uses."
+                )
+
+        self._smooth_dims_list = list(dims)
+        self._smooth_dims = torch.tensor(dims, dtype=torch.long, device=self.device)
+        self._smooth_kept_keys = kept
+        self._smooth_horizon = int(horizon)
+
+        # --- Resolve hf_ref: explicit > resumed cache > auto-calibrate ---
+        # A SCALAR: the constraint is evaluated at tau = 0 only, where the
+        # (1-tau)^2 leverage weight is 1 and the DiT input is exactly eps (on the
+        # sampler's path). No per-tau vector, so nothing to mis-index.
+        source = None
+        if self.config.smooth_hf_ref is not None:
+            val = (
+                float(self.config.smooth_hf_ref[0])
+                if isinstance(self.config.smooth_hf_ref, (list, tuple))
+                else float(self.config.smooth_hf_ref)
+            )
+            if isinstance(self.config.smooth_hf_ref, (list, tuple)) and len(
+                set(float(v) for v in self.config.smooth_hf_ref)
+            ) > 1:
+                print(
+                    f"  WARNING: smooth_hf_ref was given as a list with differing "
+                    f"values {list(self.config.smooth_hf_ref)}; the constraint is "
+                    f"evaluated at a single tau (=0), so only the FIRST entry "
+                    f"({val}) is used."
+                )
+            self._smooth_hf_ref = torch.tensor(
+                val, dtype=torch.float32, device=self.device
+            )
+            source = "config"
+            self._smooth_ref_source = "config"
+            self._smooth_ref_scale_applied = None   # no scale was applied
+        elif self.config.resume_from:
+            loaded = self._load_smooth_ref(Path(self.config.resume_from))
+            if loaded is None:
+                raise RuntimeError(
+                    f"smooth_coef={self.config.smooth_coef} > 0 on a RESUMED run, "
+                    f"but no {SMOOTH_REF_FILENAME} was found at "
+                    f"{self.config.resume_from} and --smooth-hf-ref was not "
+                    f"given.\n"
+                    f"A resumed run's first iteration is NOT base-policy (its "
+                    f"log_base_ratio is already non-zero), so auto-calibration "
+                    f"there would anchor the threshold to the drift already "
+                    f"accumulated -- the ratchet this design exists to avoid.\n"
+                    f"Fix: pass --smooth-hf-ref explicitly (e.g. 0.02), or resume "
+                    f"from a checkpoint written by a run that calibrated."
+                )
+            self._smooth_hf_ref = loaded
+            source = f"cached in {self.config.resume_from}"
+            # The loaded value already has its scale baked in, so this run's
+            # --smooth-hf-ref-scale does NOT apply. Say so rather than let it look
+            # like a live knob.
+            if self.config.smooth_hf_ref_scale != self._smooth_ref_scale_applied:
+                print(
+                    f"  WARNING: --smooth-hf-ref-scale="
+                    f"{self.config.smooth_hf_ref_scale} is IGNORED on a resumed "
+                    f"run: the cached hf_ref already has scale "
+                    f"{self._smooth_ref_scale_applied} baked in. To change the "
+                    f"threshold, pass --smooth-hf-ref explicitly."
+                )
+        else:
+            # (sum R, sum M) pooled over the calibration window.
+            self._smooth_calib_sum = torch.zeros(
+                2, dtype=torch.float32, device=self.device
+            )
+            source = (
+                f"AUTO-CALIBRATE at iteration 1 (theta == theta_base), "
+                f"scaled x{self.config.smooth_hf_ref_scale}"
+            )
+
+        print(
+            f"\n  Endpoint-roughness constraint: ON (smooth_coef="
+            f"{self.config.smooth_coef})"
+        )
+        print(describe_dim_selection(modality_keys, key_dims, dims, horizon=horizon))
+        print(f"    C = {kept} -> {len(dims)} dims; horizon 0..{horizon - 1}")
+        print(f"    hf_ref: {source}")
+        print(f"    evaluated at tau = 0 on a dedicated clean DiT forward "
+              f"(+1 forward/minibatch)")
+        if self._smooth_hf_ref is not None:
+            print(f"    hf_ref = {float(self._smooth_hf_ref):.6f}")
+        if len(self.config.env_names) > 1 and self._smooth_hf_ref is None:
+            print(
+                f"    NOTE: {len(self.config.env_names)} env_names with "
+                f"round-robin task selection means iteration 1 sees only "
+                f"{self.config.env_names[0]}, so the auto-calibrated reference is "
+                f"measured on that task alone. hf_ref is state-dependent "
+                f"(~1.7x measured), so consider passing --smooth-hf-ref explicitly "
+                f"for multi-task runs."
+            )
+        if self.config.jitter_paired and (
+            self.config.jitter_pos > 0.0 or self.config.jitter_neg > 0.0
+        ):
+            print(
+                "    NOTE: jitter_paired=True gives each chunk TWO trained "
+                "entries, so this term's total mass is ~2x what the same "
+                "smooth_coef delivers with --no-jitter-paired. Not auto-adjusted "
+                "(same convention as the update_epochs note for paired jitter)."
+            )
+
+    def _smooth_mask_probe(self):
+        """Minimal duck-typed stand-in for `compute_action_mask`'s policy arg."""
+        from gr00t.data.embodiment_tags import EmbodimentTag
+
+        tag = EmbodimentTag[self.config.embodiment_tag]
+
+        class _Probe:
+            processor = self.processor
+            modality_configs = self.processor.get_modality_configs()[tag.value]
+            embodiment_tag = tag
+
+        return _Probe()
+
+    def _smooth_guard_key(self) -> dict:
+        """Everything hf_ref is only valid for.
+
+        NOTE the reference itself is measured at tau=0 on a clean forward, so it is
+        provably independent of both the tau-jitter and the eps-jitter. The jitter
+        keys are kept in the HARD-FAIL set anyway, per the spec, because they change
+        what every OTHER term in the loss does and a silent mismatch across a resume
+        is worth refusing; they are not here because hf_ref depends on them.
+        Historical note on the wording, kept because it explains the key choice:
+        `_sample_jittered_timesteps` draws
+        `tau = clamp(center + N(0, TAU_JITTER_STD), 0, noise_s)` afresh per entry
+        per iteration and unseeded, so no realized value is reproducible. hf_ref
+        is an expectation over that distribution, which makes the distribution's
+        parameters — the centers and the width — the thing that must match.
+        """
+        return {
+            "tau_centers": [float(t) for t in self.config.tau_centers],
+            "jitter_std": float(TAU_JITTER_STD),
+            # The smooth forward is clean (tau=0, original eps), so the jitter
+            # settings do NOT change what hf_ref measures. Recorded anyway so a
+            # mismatch is visible rather than having to be inferred.
+            "jitter_pos": float(self.config.jitter_pos),
+            "jitter_neg": float(self.config.jitter_neg),
+            "jitter_paired": bool(self.config.jitter_paired),
+            "dims": list(self._smooth_dims_list),
+            "horizon": int(self._smooth_horizon or 0),
+            "embodiment_tag": str(self.config.embodiment_tag),
+            "model_path": str(self.config.model_path),
+        }
+
+    def _save_smooth_ref(self, ckpt_dir: Path) -> None:
+        """Persist hf_ref + guard key. Cheap: one float, a few hundred bytes."""
+        if not self.smooth_active or self._smooth_hf_ref is None:
+            return
+        payload = {
+            "hf_ref": float(self._smooth_hf_ref),
+            "guard": self._smooth_guard_key(),
+            # Provenance travels with the value. The scale recorded is the one
+            # that was actually BAKED IN, not this run's config: a resumed run
+            # inherits an already-scaled hf_ref and its own --smooth-hf-ref-scale
+            # is not applied, so writing the live config value here would make
+            # `hf_ref / hf_ref_scale` reconstruct the wrong base HF.
+            "hf_ref_scale": self._smooth_ref_scale_applied,
+            "calibrated_at_iteration": self._smooth_calib_iter,
+            "hf_ref_source": self._smooth_ref_source,
+            # Warn-only on change (see _load_smooth_ref), so it lives outside the
+            # hard-fail guard block.
+            "env_names": list(self.config.env_names),
+        }
+        (ckpt_dir / SMOOTH_REF_FILENAME).write_text(json.dumps(payload, indent=2))
+
+    def _load_smooth_ref(self, ckpt_dir: Path):
+        """Load and validate hf_ref. Returns a 0-dim fp32 tensor, or None if absent.
+
+        Hard-fails on a guard mismatch rather than silently thresholding against
+        a reference measured under different conditions — the posture
+        `load_lora_checkpoint` already takes on a rank/target-module mismatch.
+        """
+        path = Path(ckpt_dir) / SMOOTH_REF_FILENAME
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text())
+        want, got = self._smooth_guard_key(), payload.get("guard", {})
+        mismatched = {
+            k: (got.get(k), v) for k, v in want.items() if got.get(k) != v
+        }
+        # env_names is deliberately NOT a hard-fail key: extending a run to new
+        # tasks is legitimate, but a reference calibrated on one task is
+        # mis-scaled on another (~1.7x between-state variation was measured), so
+        # it warns.
+        old_envs = payload.get("env_names")
+        if old_envs is not None and list(old_envs) != list(self.config.env_names):
+            print(
+                f"  WARNING: {SMOOTH_REF_FILENAME} was calibrated on env_names="
+                f"{list(old_envs)} but this run uses {list(self.config.env_names)}. "
+                f"hf_ref is state-dependent (~1.7x between-state variation "
+                f"measured), so the threshold may be mis-scaled for the new "
+                f"task(s). Pass --smooth-hf-ref explicitly to override."
+            )
+        if mismatched:
+            detail = "\n".join(
+                f"      {k}: checkpoint={old!r} current={new!r}"
+                for k, (old, new) in sorted(mismatched.items())
+            )
+            raise RuntimeError(
+                f"{SMOOTH_REF_FILENAME} at {path} was calibrated under different "
+                f"conditions:\n{detail}\n"
+                f"hf_ref is an expectation over a specific tau distribution and "
+                f"dim set, so a mismatch means thresholding against the wrong "
+                f"reference. Fix: pass --smooth-hf-ref explicitly, or re-calibrate "
+                f"with a fresh run under the current settings."
+            )
+        val = payload["hf_ref"]
+        if isinstance(val, (list, tuple)):     # written by an earlier per-tau build
+            val = float(val[0])
+        # Carry provenance forward so a chain of resumes does not lose where the
+        # threshold came from or which scale produced it.
+        self._smooth_ref_scale_applied = payload.get("hf_ref_scale")
+        self._smooth_calib_iter = payload.get("calibrated_at_iteration")
+        self._smooth_ref_source = payload.get("hf_ref_source") or "inherited"
+        return torch.tensor(float(val), dtype=torch.float32, device=self.device)
+
+    def _smooth_finalize_calibration(self, iteration: int) -> dict:
+        """Freeze hf_ref from the accumulated base-policy measurement.
+
+        Called once, after the first iteration's update. Returns metrics to fold
+        into `update_stats`. If nothing was accumulated (no trained rows, or the
+        iteration was skipped) the calibration stays pending and the next
+        iteration retries — but with a WARNING, because theta is no longer
+        exactly theta_base and the reference will be slightly contaminated.
+        """
+        if not self.smooth_active or self._smooth_hf_ref is not None:
+            return {}
+        min_rows = int(self.config.smooth_calib_min_rows)
+        # Cap how long calibration may run. Each extra iteration bakes more
+        # post-update drift into a reference that is then frozen for the whole run
+        # lineage, which is the ratchet the design forbids -- so past the cap,
+        # freeze what we have and say so rather than deferring indefinitely.
+        max_calib_iters = 3
+        deferring = (
+            self._smooth_calib_sum is not None
+            and 0 < self._smooth_calib_rows < min_rows
+            and iteration < max_calib_iters
+        )
+        if (
+            self._smooth_calib_sum is not None
+            and 0 < self._smooth_calib_rows < min_rows
+            and not deferring
+        ):
+            print(
+                f"  WARNING: endpoint-roughness calibration reached iteration "
+                f"{iteration} (cap {max_calib_iters}) with only "
+                f"{self._smooth_calib_rows} of {min_rows} target rows. Freezing "
+                f"hf_ref from what has been pooled rather than deferring further. "
+                f"Note theta is no longer theta_base, so the reference carries "
+                f"{iteration - 1} iteration(s) of drift; check smooth/hf_ref "
+                f"against the ~0.001-0.005 the base field is expected to give, and "
+                f"pass --smooth-hf-ref explicitly if it looks inflated."
+            )
+        if deferring:
+            print(
+                f"  Endpoint-roughness calibration has {self._smooth_calib_rows} "
+                f"of {min_rows} required rows after iteration {iteration}; "
+                f"continuing to accumulate."
+                + (
+                    f" NOTE: theta is no longer exactly theta_base, so each extra "
+                    f"iteration folds a little post-update drift into the "
+                    f"reference."
+                    if iteration > 1 else ""
+                )
+                + f" (A small window is the failure mode "
+                f"that silently neuters the feature: an 8-row window spreads the "
+                f"pooled base HF over 0.64x-1.57x, and a low-energy window reads "
+                f"up to 17x high.)"
+            )
+            return {"smooth_calib_rows": self._smooth_calib_rows}
+        if self._smooth_calib_sum is None or self._smooth_calib_n == 0:
+            print(
+                f"  WARNING: endpoint-roughness calibration collected no samples "
+                f"at iteration {iteration} (no trained rows before the first "
+                f"optimizer step). Retrying next iteration — note theta is no "
+                f"longer exactly theta_base, so the reference will carry a small "
+                f"amount of the drift already accumulated."
+            )
+            return {}
+        # Pooled ratio, NOT a mean of per-row ratios: energy-weighted, so a
+        # near-idle chunk (whose HF blows up because its own energy is the
+        # denominator) contributes in proportion to its tiny energy instead of
+        # dominating. Also batch-size invariant.
+        r_sum, m_sum = self._smooth_calib_sum[0], self._smooth_calib_sum[1]
+        base = r_sum / (6.0 * m_sum + SMOOTH_M_EPS)
+        if not bool(torch.isfinite(base).all()) or float(m_sum) <= 0.0:
+            print(
+                f"  WARNING: endpoint-roughness calibration produced an unusable "
+                f"reference (R={float(r_sum):.6g}, M={float(m_sum):.6g}) at "
+                f"iteration {iteration}; discarding it and retrying next iteration "
+                f"rather than freezing a value that would break every later loss."
+            )
+            self._smooth_calib_sum = torch.zeros_like(self._smooth_calib_sum)
+            self._smooth_calib_n = 0
+            # MUST reset the row count too. Leaving it high makes the
+            # `0 < rows < min_rows` deferral below unreachable, so the next
+            # iteration would freeze hf_ref from however few rows it happened to
+            # contribute -- exactly what smooth_calib_min_rows exists to prevent --
+            # while the console line misreported the stale total.
+            self._smooth_calib_rows = 0
+            return {}
+        # Provenance is stamped only AFTER the rejection check above. Setting it
+        # earlier left a discarded calibration claiming source="calibrated" with a
+        # scale baked in, which the resume-time scale-change warning then read as
+        # authoritative.
+        self._smooth_ref_source = "calibrated"
+        self._smooth_ref_scale_applied = float(self.config.smooth_hf_ref_scale)
+        self._smooth_hf_ref = base * float(self.config.smooth_hf_ref_scale)
+        self._smooth_calib_iter = int(iteration)
+        self._smooth_calib_sum = None
+        print(
+            f"  Endpoint-roughness hf_ref calibrated from "
+            f"{self._smooth_calib_n} pooled minibatches "
+            f"({self._smooth_calib_rows} rows) at iteration {iteration}:"
+        )
+        print(
+            f"    base HF (pooled, tau=0) = {float(base):.6f}   "
+            f"-> hf_ref = {float(self._smooth_hf_ref):.6f} "
+            f"(x{self.config.smooth_hf_ref_scale})"
+        )
+        return {
+            "smooth_calib_samples": self._smooth_calib_n,
+            "smooth_calib_rows": self._smooth_calib_rows,
+            "smooth_hf_ref": float(self._smooth_hf_ref),
+        }
+
     def _compute_lora_delta_norm(self) -> float:
         """L2 norm of (current trainable params − snapshot taken at setup time).
 
@@ -6193,6 +6948,10 @@ class GRPOTrainer:
             },
             ckpt_dir / "optimizer.pt",
         )
+        # Frozen endpoint-roughness reference (one float + guard key). Written
+        # here so a --resume-from picks it up: a resumed run's first iteration is
+        # NOT base-policy, so it cannot recalibrate without ratcheting.
+        self._save_smooth_ref(ckpt_dir)
         print(f"  Checkpoint saved: {ckpt_dir}")
 
     def _save_checkpoint_for_skipped_iter(self, iteration: int):

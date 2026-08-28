@@ -413,8 +413,10 @@ def run_update(
         lp = delta + (wterm - (f @ w.detach()))
         if records and records[-1]["nonfinite"]:
             lp = lp + float("inf")
+        # Honour the real compute_fm_log_prob return contract: extras appended
+        # after the mean, per_tau first then smooth_hf.
+        extras = []
         if kw.get("return_per_tau"):
-            # Honour the real compute_fm_log_prob contract: (mean, [K, B]).
             # Called by GRPOTrainer._jitter_gap_diagnostics on the first
             # minibatch of a jitter-enabled iteration. This surrogate is
             # value-pinned (no tau or noise_for_input dependence), so the honest
@@ -424,7 +426,20 @@ def run_update(
             # crash/plumbing check; the arithmetic is verified against a
             # tau- and noise-sensitive stand-in in test_jitter_metrics.py.
             K = int(kw["n_samples"])
-            return lp, lp.detach().unsqueeze(0).expand(K, -1)
+            extras.append(lp.detach().unsqueeze(0).expand(K, -1))
+        if kw.get("smooth_dims") is not None:
+            # [B, 2] = (R, M) moments of the implied endpoint for the
+            # endpoint-roughness constraint. Value-pinned by the same
+            # `x - x.detach()` trick used above so tests can assert the exact
+            # pooled HF, while the gradient is the real `f` — which is what proves
+            # the term actually moves the weights rather than merely being added.
+            # R = 0.6 * M gives pooled HF = 0.6/6 = 0.1 exactly, at any batch size.
+            pin = lp.unsqueeze(1) - lp.detach().unsqueeze(1)          # [B, 1], == 0
+            m_col = torch.full_like(pin, 2.0)
+            r_col = torch.full_like(pin, 1.2) + pin
+            extras.append(torch.cat((r_col, m_col), dim=1))
+        if extras:
+            return (lp, *extras)
         return lp
 
     real_fm = train_grpo.compute_fm_log_prob

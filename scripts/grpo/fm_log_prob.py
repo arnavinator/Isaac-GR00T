@@ -27,10 +27,22 @@ Key design decisions:
    only the model quality difference, not estimation noise.
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta
+
+from smoothness import roughness_moments
+
+# Std of the Gaussian jitter applied to each tau center. Named rather than left as
+# a bare default so the endpoint-roughness constraint can record it in its
+# calibration guard key. Note hf_ref does NOT depend on it -- that reference is
+# measured at tau=0 on a clean forward -- but this width changes what every other
+# term in the loss evaluates, so a silent mismatch across a resume is worth
+# refusing rather than inferring later.
+TAU_JITTER_STD = 0.02
 
 
 def compute_fm_log_prob(
@@ -48,7 +60,10 @@ def compute_fm_log_prob(
     noise_s: float = 1.0,
     noise_for_input: torch.Tensor | None = None,
     return_per_tau: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    smooth_dims: torch.Tensor | None = None,
+    smooth_horizon: int | None = None,
+    smooth_no_grad: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Compute FM log-probability surrogate for a batch of action chunks.
 
     This mirrors the forward() method of Gr00tN1d6ActionHead (gr00t_n1d6.py:149-257)
@@ -100,12 +115,42 @@ def compute_fm_log_prob(
             evaluated a second time rather than reusing the in-place `+=`
             operand) — negligible, and the only callsite is a no_grad
             diagnostic.
+        smooth_dims: Optional 1-D LongTensor of action-dim column indices. When
+            given (with `smooth_horizon`), ONE ADDITIONAL DiT forward runs at
+            `(x = noise, tau = 0)` -- the clean un-jittered interpolant, which at
+            tau=0 is exactly eps -- and its implied endpoint
+            `a_hat(0) = eps + v_theta(eps, 0)` is reduced to per-row roughness
+            moments over `[:, :smooth_horizon, smooth_dims]`. See `smoothness.py`
+            and `jerk-constraint.md` sections 6-7.
+
+            Deliberately NOT taken from the K-loop: under Jitter-GRPO the K-loop's
+            input is x'_tau, so its velocity carries the model's response to the
+            eps-jitter, landing in a_hat as (1-tau)^2 J (eps'-eps) -- white,
+            theta-independent, and at the production lambda=0.25 large enough to
+            collapse the base-vs-finetuned discrimination the constraint needs.
+
+            COSTS ONE EXTRA DiT FORWARD (~1/K of the K-loop, ~17% at K=6) and
+            raises peak activation memory by about the same fraction when the
+            result feeds the loss. Pass `smooth_no_grad=True` when it does not.
+        smooth_horizon: Valid action horizon (e.g. 16 for PandaOmron). Slicing
+            happens BEFORE differencing -- a second difference straddling the pad
+            boundary of the (50, 128) output is meaningless.
+        smooth_no_grad: Build the extra forward under `torch.no_grad()`. Correct
+            and ~1/K cheaper in activations whenever the caller only reads the
+            moments, e.g. during hf_ref calibration.
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
-        (log_probs, per_tau_log_probs): when return_per_tau=True, with
-            per_tau_log_probs of shape [K, B] (fp32), ordered to match
-            `timesteps`/`tau_centers`.
+        With `return_per_tau=True`, additionally the un-averaged [K, B] per-tau
+        log-probs. With `smooth_dims`/`smooth_horizon`, additionally the [B, 2]
+        per-row roughness moments `(R, M)` of the implied endpoint at tau=0 --
+        raw moments, not their ratio, so the caller can POOL them (see
+        `smoothness.roughness_moments`). Extras are appended in that order, so
+        the contract is:
+            neither            -> log_probs
+            per_tau only       -> (log_probs, per_tau)            [unchanged]
+            smooth only        -> (log_probs, moments)
+            both               -> (log_probs, per_tau, moments)
     """
     B = actions.shape[0]
     device = actions.device
@@ -167,6 +212,77 @@ def compute_fm_log_prob(
     # Per-τ terms, kept only when the caller asks.
     per_tau_log_probs: list[torch.Tensor] | None = [] if return_per_tau else None
 
+    # --- Endpoint-roughness (jerk constraint) bookkeeping ---
+    # Argument validation, done once here rather than inside the extra forward
+    # below. The smooth pass evaluates at tau=0 with the original eps, so it needs
+    # nothing from `timesteps` and is independent of both the tau-jitter and the
+    # eps-jitter -- see the block after the K-loop.
+    want_smooth = smooth_dims is not None or smooth_horizon is not None
+    smooth_moments: torch.Tensor | None = None
+    if want_smooth:
+        if smooth_dims is None or smooth_horizon is None:
+            raise ValueError(
+                "smooth_dims and smooth_horizon must be given together "
+                f"(got smooth_dims={'set' if smooth_dims is not None else None}, "
+                f"smooth_horizon={smooth_horizon})"
+            )
+        if not (0 < smooth_horizon <= actions.shape[1]):
+            raise ValueError(
+                f"smooth_horizon={smooth_horizon} must lie in "
+                f"(0, {actions.shape[1]}] (the padded action horizon)"
+            )
+        if int(smooth_dims.max()) >= actions.shape[2]:
+            raise ValueError(
+                f"smooth_dims max index {int(smooth_dims.max())} exceeds the "
+                f"action dim {actions.shape[2]}"
+            )
+        smooth_dims = smooth_dims.to(device=device)
+
+    def _dit_velocity(noisy_trajectory, t):
+        """One DiT forward -> pred_velocity. Factored so the endpoint-roughness
+        pass can reuse it verbatim rather than duplicating the call signature."""
+        num_timestep_buckets = action_head.num_timestep_buckets
+        t_discretized = (t * num_timestep_buckets).long()
+
+        action_features = action_head.action_encoder(
+            noisy_trajectory, t_discretized, embodiment_id
+        )
+        if action_head.config.add_pos_embed:
+            pos_ids = torch.arange(
+                action_features.shape[1], dtype=torch.long, device=device
+            )
+            pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
+            action_features = action_features + pos_embs
+        sa_embs = torch.cat((state_features, action_features), dim=1)
+
+        if action_head.config.use_alternate_vl_dit:
+            # NOTE: This call signature mirrors the model's pretraining forward()
+            # (gr00t_n1d6.py:225-233), so the FM log-prob surrogate evaluates the
+            # exact loss the model was trained with. AlternateVLDiT.forward()
+            # accepts `encoder_attention_mask` but silently ignores it — the
+            # cross-attention masks are built from
+            # `image_mask & backbone_attention_mask` internally (dit.py:322-323).
+            # We pass it anyway for parity with the pretraining forward.
+            model_output, _ = action_head.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=_backbone_attn_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=True,
+                image_mask=_image_mask,
+                backbone_attention_mask=_backbone_attn_mask,
+            )
+        else:
+            model_output, _ = action_head.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=_backbone_attn_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=True,
+            )
+        pred = action_head.action_decoder(model_output, embodiment_id)
+        return pred[:, -actions.shape[1]:]
+
     for k in range(n_samples):
         # --- Sample or use pre-specified timestep ---
         if timesteps is not None:
@@ -187,52 +303,7 @@ def compute_fm_log_prob(
         t_expanded = t[:, None, None]  # [B, 1, 1]
         noisy_trajectory = (1 - t_expanded) * eps_input + t_expanded * actions
 
-        # --- Forward pass through DiT ---
-        num_timestep_buckets = action_head.num_timestep_buckets
-        t_discretized = (t * num_timestep_buckets).long()
-
-        action_features = action_head.action_encoder(
-            noisy_trajectory, t_discretized, embodiment_id
-        )
-
-        if action_head.config.add_pos_embed:
-            pos_ids = torch.arange(
-                action_features.shape[1], dtype=torch.long, device=device
-            )
-            pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
-
-        sa_embs = torch.cat((state_features, action_features), dim=1)
-
-        if action_head.config.use_alternate_vl_dit:
-            # NOTE: This call signature mirrors the model's pretraining forward()
-            # (gr00t_n1d6.py:225-233), so the FM log-prob surrogate evaluates the
-            # exact loss the model was trained with. AlternateVLDiT.forward()
-            # accepts `encoder_attention_mask` but silently ignores it — the
-            # cross-attention masks are built from `image_mask & backbone_attention_mask`
-            # internally (dit.py:322-323). We pass it anyway for parity with the
-            # pretraining forward.
-            model_output, _ = action_head.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=_backbone_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-                image_mask=_image_mask,
-                backbone_attention_mask=_backbone_attn_mask,
-            )
-        else:
-            model_output, _ = action_head.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embeds,
-                encoder_attention_mask=_backbone_attn_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-            )
-
-        # Decode velocity prediction
-        pred = action_head.action_decoder(model_output, embodiment_id)
-        pred_velocity = pred[:, -actions.shape[1]:]
+        pred_velocity = _dit_velocity(noisy_trajectory, t)
 
         # --- Per-sample MSE in fp32 ---
         # Cast pred_velocity, velocity_target, and the mask to float32 BEFORE
@@ -258,11 +329,47 @@ def compute_fm_log_prob(
         if per_tau_log_probs is not None:
             per_tau_log_probs.append(-per_sample_mse)
 
+    # ── Endpoint roughness: ONE dedicated clean forward at tau = 0 ──────────
+    # Deliberately NOT taken from the K-loop. Under Jitter-GRPO the K-loop's DiT
+    # input is x'_tau (built from eps' = sqrt(1-lam^2)eps + lam*xi), so its
+    # velocity carries the model's RESPONSE to that perturbation:
+    #     a_hat = a + (1-tau)r + (1-tau)^2 * J * (eps' - eps)
+    # The last term is white, theta-independent, and at the production lam=0.25
+    # with the measured jacobian_fro_sq ~2.4 it DOMINATES: HF goes 0.000347 ->
+    # 0.790 at tau=0 on a base-like chunk (2275x). Because the calibration would
+    # be contaminated identically, hf_ref freezes above HF's theoretical maximum
+    # for H=16 (2.984) and the hinge can never fire -- a silent no-op.
+    #
+    # tau = 0 exactly, with the ORIGINAL eps, is both the cure and the
+    # theoretically privileged point: x_0 == eps, so this evaluation sits ON the
+    # sampler's path and a_hat(0) = eps + v_theta(eps, 0) is literally the 1-step
+    # Euler endpoint whose degradation the solver sweep isolated. The (1-tau)^2
+    # weight is 1 there, so no tau weighting is needed and hf_ref is a SCALAR.
+    #
+    # Cost: exactly one extra DiT forward per call (~1/K of the K-loop, ~17% at
+    # the default K=6), and only when the constraint is enabled.
+    if smooth_dims is not None:
+        t0 = torch.zeros(B, device=device, dtype=dtype)
+        with torch.no_grad() if smooth_no_grad else contextlib.nullcontext():
+            v0 = _dit_velocity(eps, t0)                # x_0 == eps exactly
+            sl = (slice(None), slice(0, smooth_horizon))
+            e_s = eps[sl].index_select(2, smooth_dims).float()
+            v_s = v0[sl].index_select(2, smooth_dims).float()
+            # a_hat(0) = eps + v_theta(eps,0); == a + r since target = a - eps.
+            smooth_moments = roughness_moments(e_s + v_s)
+
     # Average across K timestep samples
     log_probs = log_probs_accumulated / n_samples
 
+    # Extras are appended in a fixed order so every existing caller's unpacking
+    # keeps working: per_tau first (pre-existing), then smooth_hf.
+    extras: list[torch.Tensor] = []
     if per_tau_log_probs is not None:
-        return log_probs, torch.stack(per_tau_log_probs, dim=0)  # [K, B]
+        extras.append(torch.stack(per_tau_log_probs, dim=0))  # [K, B]
+    if smooth_moments is not None:
+        extras.append(smooth_moments)                          # [B, 2] = (R, M)
+    if extras:
+        return (log_probs, *extras)
 
     return log_probs
 
@@ -273,7 +380,7 @@ def _sample_jittered_timesteps(
     noise_s: float,
     device: torch.device,
     dtype: torch.dtype,
-    jitter_std: float = 0.02,
+    jitter_std: float = TAU_JITTER_STD,
 ) -> torch.Tensor:
     """Sample timesteps from tight Gaussians centered on user-specified τ values.
 

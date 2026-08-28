@@ -22,10 +22,12 @@ Flow-Matching (FM) log-probability surrogate.
 | `episode_buffer.py` | `EpisodeBuffer`, `GRPOEpisode`, `ActionChunk`. Loads `.npz` episodes, computes group-relative advantages. |
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
+| `smoothness.py` | Endpoint-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, and the continuous-action-dim selector. Model-free and fully unit-testable. The hinge itself lives in `train_grpo._grpo_update_inner`. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
+| `test_smoothness.py` | CPU suite for the endpoint-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the `compute_fm_log_prob` return contract, `smooth_ref.json` guard rejection, and `smooth_coef=0` bit-identity through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 
 ---
@@ -2202,196 +2204,141 @@ training-direction change).
 
 ---
 
-## Checkpointing & Resuming
+## Endpoint-Roughness Constraint (the "jerk constraint")
 
-### What gets saved
+Optional, feature-flagged. `smooth_coef = 0.0` (default) is bit-identical to a run
+without it: no extra tensors, no calibration, no `smooth/*` curves, no banner line.
 
-Every `save_interval` iterations into `<checkpoint_dir>/iter_NNNN/`:
+Orthogonal to Jitter-GRPO, and both are needed. Jitter bounds the **magnitude** of
+the velocity field's noise response (`E_ξ‖Jξ‖² = ‖J‖²_F`, isotropic); this bounds
+its **spectrum** along the horizon axis `h`. Measured independence:
+`jitter/jacobian_fro_sq` fell 32% over the same iterations in which the residual's
+high-frequency fraction rose 1.7–2.9× and relative seed dispersion rose 4.5×.
+
+Full derivation in `jerk-constraint.md`. Summary of what it constrains:
 
 ```
-iter_0050/
-  lora_weights.pt   # only the LoRA A/B tensors (~80 MB at rank=16)
-  optimizer.pt      # {"optimizer_state": ..., "param_names": [...]}
+a_hat(τ) = x_τ + (1−τ)·v_θ(x_τ, τ)   ==   a + (1−τ)·r        (an identity)
+HF(u)    = mean((D²u)²) / (6 · mean(u²).detach())            D² along h
+L_smooth = smooth_coef · relu( HF_pooled − hf_ref )
 ```
 
-LoRA weights are extracted by filtering for `"lora_" in name` (works with
-the low-level `inject_adapter_in_model` API, where
-`get_peft_model_state_dict` is unreliable).
+### Why the endpoint and not the residual
 
-`optimizer.pt` bundles the AdamW state with the **ordered list of
-trainable param names**. AdamW serializes its state by integer position;
-a peft/torch version bump that reshuffles same-shape LoRA tensors would
-silently mis-attach Adam moments without the name check.
+Measured LoRA-vs-base separation: `HF(a_hat)` **100–200×**, `HF(a)` 36–87×,
+`HF(r)` only 1.5–2.1×. And the two measured checkpoints rank **oppositely** on
+residual vs chunk roughness — `iter_0017` has 39% *less* residual energy than
+`iter_0011` yet 18% *more* path jerk. A quantity that improves while the thing you
+care about worsens is not a target.
 
-### Resume
+`a_hat` is also on the sampler's path at τ=0, where `x_τ = ε` exactly, making
+`a_hat(0) = ε + v_θ(ε,0)` literally the 1-step Euler endpoint.
 
-```bash
-uv run python scripts/grpo/train_grpo.py \
-    --resume-from grpo_data/grpo_checkpoints/iter_0050
-```
+### Why a hinge and not a penalty
 
-On resume:
+Below the threshold both the value and the gradient are exactly zero, so the term
+exerts no force — it neither rewards extra smoothness nor pulls toward it. A plain
+`coef · HF` has a nonzero gradient everywhere and would drive toward the
+conditional-mean map, which `consensus_ns4` measures at **0.365** against
+`baseline_euler`'s **0.600**. Meanwhile base itself sits at `HF(a) = 0.0014` and
+scores 0.600, so smoothness and competence do coexist — the hinge is what
+distinguishes "don't get rougher than the pretrained field" from "be as smooth as
+possible".
 
-1. LoRA arch is rebuilt from the **current** `lora_rank` / `lora_alpha` /
-   `lora_target_modules`.
-2. `load_lora_checkpoint` does a strict two-sided key match and per-key
-   shape check — **hard-fails** on:
-   - keys in save but not in model (target_modules shrank);
-   - keys in model but not in save (target_modules grew);
-   - shape mismatch (rank changed).
-3. `optimizer.pt` is loaded with `_validate_optimizer_param_names`
-   (positional order) + `_validate_optimizer_state` (param count +
-   exp_avg shape) — both raise actionable errors on mismatch.
-4. `start_iteration` is parsed from the basename via
-   `re.fullmatch(r"iter_([0-9]+)", dir_name)` (ASCII digits only — Unicode
-   digits like `iter_０` are rejected). Non-canonical names (`best/`,
-   `latest/`, `iter_50.bak`) silently fall back to `start_iteration=1`,
-   preserving backward compat for unstructured checkpoint names.
+### Evaluated at τ = 0 on a dedicated clean forward
 
-**Nothing algorithmic needs to be restored beyond the weights and Adam
-moments.** The LR schedule is recomputed per-iteration from the loop counter,
-and PAWS (`positive_advantage_weight_scaling`) derives its weight `k` from the
-CURRENT iteration's pooled mass only — see `_POS_SCALE_WARMUP_MB`. That is a
-deliberate property, not an accident: `k` used to be gated on a cross-iteration
-EMA of the `(N, D)` alive-mass terms which was **not** in the checkpoint, so the
-first update after every resume (and every fresh run) trained an entire
-iteration at `k = 1.0` regardless of
-`positive_advantage_weight_target_ratio`. That is not a mild warm-up. The
-realized post-weighting ratio is `k·D/N`, and per-minibatch renorm forces
-`N ≈ D` (the z-score makes `Σ_pos|A| ≡ Σ_neg|A|`), so `k = 1.0` takes the net
-update direction `k·D − N` from a positive reinforcement surplus to slightly
-negative — it inverts the sign. Measured consequence when resuming a
-67 %-success run: collapse to ~4 % in one iteration. If you are tempted to
-persist per-iteration trainer state to "improve" resume fidelity, prefer making
-the quantity self-sufficient within the iteration instead.
+The term does **not** reuse the K-loop's velocity. Under Jitter-GRPO the K-loop's DiT
+input is `x'_τ` built from `ε' = √(1−λ²)ε + λξ`, so its velocity carries the model's
+response to that perturbation, which lands in `â` as `(1−τ)²·J·(ε′−ε)` — white and
+θ-independent. At the production `λ=0.25` with the measured `jacobian_fro_sq ≈ 2.4`
+it dominates: HF at τ=0 goes **0.000347 → 0.790** (2275×), and since calibration
+would be contaminated identically `hf_ref` freezes above HF's theoretical maximum for
+H=16 (2.984), so the hinge could **never fire**.
 
-**One metric does not survive resume:** `lora/weight_delta_norm` measures drift
-since *this run* started (`_lora_init_params` is snapshotted after the
-checkpoint load), so it restarts at ~0 on every resume. For cumulative drift
-from the pretrained field across resumes, read
-`ref_mse/log_base_ratio_mean` instead — it is computed against the base model
-and is resume-proof.
+Instead one dedicated forward at `(x = ε, τ = 0)` with the original `ε`. That is also
+the theoretically privileged point: `x_0 = ε` exactly, so `â(0) = ε + v_θ(ε,0)` is the
+1-step Euler endpoint, and `(1−τ)² = 1` is maximal leverage. Cost: **+1 DiT forward
+per minibatch** (~17% of the K-loop at K=6), only when the constraint is on. With a
+single τ there is no weighting and `hf_ref` is a **scalar**.
 
-### Resume + reuse cached collection (`resume_from_collected_data`)
+### Pooled, not a mean of per-row ratios
 
-When a prior run crashed AFTER finishing collection but BEFORE the model
-update completed, the on-disk `episode_dir/iter_NNNN/` already contains
-fully-collected episodes that are still on-policy for the resumed
-checkpoint (they were produced by the policy whose weights live in
-`resume_from`). Set `--resume-from-collected-data` to skip the FIRST
-resumed iter's ~7 min × num_groups simulation and load those `.npz`
-files directly:
+`HF`'s denominator is a row's own energy, so a near-idle chunk (`M(a) → 0`, routine
+during a grasp) reports `HF(â) ≈ HF(r) ≈ 0.62` against a moving row's 0.0016 — ~400×.
+An unweighted mean is dominated by such rows, and `hf_ref` is frozen and persisted, so
+one unlucky draw would neuter the feature for the whole run lineage.
+`Σ R / (6 · Σ M)` is energy-weighted by construction: measured on 63 normal rows plus
+one idle one it shifts **0.31%** where the mean of ratios shifts 29%. It is exactly
+associative over batch splits, so the threshold transfers across batch sizes.
 
-```bash
-uv run python scripts/grpo/train_grpo.py \
-    --resume-from grpo_data/grpo_checkpoints/iter_0050 \
-    --resume-from-collected-data
-```
+Consequence: the term is one scalar per minibatch, so its magnitude is independent of
+row count and it needs **no anchor loss divisor** — unlike `clip_loss`/KL, which are
+per-row means. Anchor rows still contribute their `R` and `M`, which is intended.
 
-Validation runs in `setup()` BEFORE the model loads, so misconfigured
-caches fail fast. The validator checks (in order):
+### `hf_ref`: frozen scalar, calibrated from the base policy
 
-1. `resume_from` follows the canonical `iter_NNNN/` pattern (required —
-   without it the validator can't infer which iter dir to load).
-2. `episode_dir/iter_{start_iteration:04d}/` exists and is readable
-   (PermissionError surfaces with a `chmod` hint, not a misleading "Cache
-   is empty").
-3. Per-file scalars are present and well-typed: `env_name` matches the
-   round-robin task for `start_iteration`, `group_id` is a non-negative
-   int (no silent default to 0), `success` is bool/int/float (no string
-   coercion), `num_chunks` is a positive int.
-4. The first `.npz` exposes `raw_action_*` / `action_mask_*` /
-   `initial_noise_*` keys for every chunk (FM log-prob surrogate
-   prerequisite).
-5. Group counts: `num_groups <= n_observed <= max_groups`, with the
-   `min_alive_groups` criterion satisfied OR `n_observed ==
-   max_groups` exactly (the collector's exit conditions). Alive is
-   defined as `0 < group_successes < group_size` (mixed) — same
-   predicate the live collector uses.
-6. Per-group sizes: undercount warns (mirrors `_collect_episodes`'s
-   partial-collection policy), overcount raises (manual cache merge or
-   collector bug — within-group `env_seed` invariant broken).
+| `smooth_hf_ref` | behaviour |
+|---|---|
+| `float` | flat threshold. |
+| `list[float]` | first entry used, with a warning (single-τ design). |
+| `None` (default) | **auto-calibrate** at the first iteration of a fresh run, then `× smooth_hf_ref_scale` (default 4.0). |
 
-Only the FIRST resumed iter consumes the cache; subsequent iters collect
-normally. The decision is rederived as `iteration ==
-self._start_iteration AND config.resume_from_collected_data`, no mutable
-flag carried across phases.
+Auto-calibration works because PEFT zero-inits `lora_B`, so before the first optimizer
+step `θ ≡ θ_base` and the collected chunks **are** base-policy samples — confirmed by
+`ref_mse/log_base_ratio_mean` reading exactly **0** at iteration 1 of a fresh run
+versus 0.0572 at a resumed run's first iteration. Whole minibatches are pooled up to `smooth_calib_min_rows`, and the term
+contributes nothing to the loss that iteration.
 
-**When NOT to use:** do NOT enable when you've changed any
-collection-affecting config since the cache was written. The validator
-catches `env_name` and group-count mismatches but does NOT detect changes
-to `n_action_steps`, `fast_forward_steps` / `fast_forward_pct`,
-`init_state_npz_path`, or `max_episode_steps` — the
-cached iter would silently train on episodes from the old config while
-subsequent iters collect under the new one. If in doubt, leave this
-disabled and pay the collection cost.
+Persisted to `smooth_ref.json` in every checkpoint. A resumed run with
+`smooth_coef > 0` and neither an explicit `--smooth-hf-ref` nor a cached file
+**hard-fails** rather than calibrating off a non-base policy. Guard key:
+`{tau_centers, jitter_std, jitter_pos, jitter_neg, jitter_paired, C, horizon,
+embodiment_tag, model_path}` — mismatch hard-fails. `env_names` is recorded outside
+the guard and only **warns**, since extending a run to new tasks is legitimate while
+`hf_ref` is state-dependent (~1.7× measured). Multi-task runs calibrate on
+`env_names[0]` alone (per-iteration round-robin); the banner says so.
 
-**TB cosmetic:** the cached iter's `time/collect_seconds` and
-`time/collect_rollout_seconds` are logged as NaN (filtered out by
-`_log_metrics`) so those curves show a clean gap at the resumed iter rather
-than a near-zero plunge that distorts autoscale. The scalars for work that
-genuinely ran — `time/collect_load_seconds` (the npz read-back is the whole of
-Phase 1 here), `advantage`, `ref_logprob`, `update`, and overall
-`time/iteration_seconds` — log normally.
+### Constrained dims and horizon
 
-### Skip semantics (preserves iteration budget)
+Built from the checkpoint's action `modality_keys` the same way `decode_action`
+slices, so nothing is hardcoded. Note this is the **action** layout, which differs
+from the state layout: `end_effector_rotation` is 3-dim axis-angle, while the
+state's `end_effector_rotation_relative` is a 4-dim quaternion.
 
-An iteration is "skipped" if no `optimizer.step()` actually fired. Two
-paths produce this:
+| dims | key | constrained? |
+|---|---|---|
+| 0:3 | `end_effector_position` | yes |
+| 3:6 | `end_effector_rotation` | yes |
+| 6 | `gripper_close` | **never** — 0/1 thresholded at 0.5, a grasp IS a step function |
+| 7:11 | `base_motion` | off by default (`control_mode` gates it; inert in arm mode) |
+| 11 | `control_mode` | **never** — same reason as `gripper_close` |
 
-1. Outer skip: **no trainable chunks** — `n_signal_chunks == 0` and not
-   (`n_anchor_chunks > 0` and `anchor_advantage > 0`). Keyed on chunk counts, not
-   on `std_reward`: an all-fail **plus** all-success iteration has
-   `std_reward = 0.5` yet zero signal chunks, so a `std_reward` test never fires
-   for it. `n_signal_chunks == 0` is strictly stronger (a mixed group spans both
-   reward values, so `std_reward < 1e-8` implies no mixed group) and also catches
-   the mix. Anchor **chunks**, not groups, rescue the iteration — an anchor group
-   can survive classification and still contribute no rows — provided the
-   iteration can learn from them: either `anchor_advantage > 0`, or
-   `kl_coef_base_model > 0` (default 0.2), since `KL(base ‖ current)` is not
-   degenerate at `θ == θ_ref` and pulls the policy back toward the pretrained
-   model on the solved states — the very gap Layer 1 exists to close.
-   `kl_coef_last_iter` alone does not qualify: its gradient is zero at the start
-   of the update.
-2. Inner skip: per-iter `n_updates == 0` (every minibatch non-finite, OR
-   every group dead).
+The **full 16-step horizon** is measured, not `n_action_steps=8`: the FM loss masks
+with the full valid rectangle so `M` stays comparable to `ref_mse`; 14
+second-differences instead of 6 cuts the per-entry standard deviation of `R` by 1.5×
+(variance 2.2×), which is what keeps the hinge from switching on and off at random;
+and `n_action_steps` is a deployment knob while the 16-step horizon is a property of
+the checkpoint. Slicing happens **before** differencing — a `D²` straddling the pad
+boundary of the `(50, 128)` output is meaningless.
 
-In both cases the checkpoint (if scheduled this iter) is written under
-the **last successfully-updated** iter's name — not the current loop
-iter. Resuming from that dir then sets `start_iteration = last + 1`,
-which is exactly the skipped iter, so it gets a fresh attempt rather than
-being burned from `num_iterations`. If that dir already exists (the
-previous iter was itself a save-interval boundary), the write is skipped
-— the on-disk state is bit-identical.
+### Integration decisions
 
-### Episode dir retention
-
-`episode_dirs_to_keep` controls how many `iter_NNNN/` `.npz` directories
-under `episode_dir` are kept around for post-mortem inspection. Default
-is 3 (current + 2 prior). Pruning runs **before** the current iter's
-directory is created, so the on-disk count never temporarily exceeds the
-cap.
-
-At ~0.5 GB/iter for the default config, 200 iters unpruned would burn
-~100 GB; the default keeps disk under ~1.5 GB.
-
----
-
-## Configuration Reference
-
-`GRPOConfig` (in `grpo_config.py`) is the single source of truth. CLI
-overrides go through `tyro`:
-
-```bash
-uv run python scripts/grpo/train_grpo.py \
-    --lora-rank 32 --kl-coef-last-iter 0.005 --kl-coef-base-model 0.005 \
-    --num-iterations 500 \
-    --tau-centers 0.0 0.3 0.5 0.7 0.9
-```
-
-### Key knobs
-
-**Model & LoRA**
+- **No loss divisor needed.** The term is one scalar per minibatch, so its magnitude
+  is already independent of row count and anchor composition.
+- **Anchor rows are included.** Roughness is not advantage-keyed, and anchors are
+  the retention set we most want smooth.
+- **Single τ (=0)**, so there is no τ weighting and `hf_ref` is a scalar.
+- **Jitter-independent by construction.** The clean τ=0 forward means
+  `jitter_pos`/`jitter_neg`/`jitter_paired` do not change what the term measures.
+- **The denominator is detached.** `∂HF/∂M < 0`, so a live denominator lets the
+  model satisfy the term by adding DC (constant-along-`h`) energy: `D²` annihilates
+  a constant, so `R` is untouched while `M` rises and `HF` falls. Detached, the
+  directional derivative along "add DC" is **exactly zero**, because the `(1,−2,1)`
+  stencil sums to zero. Covered by `test_smoothness.py`.
+- **`a_hat` is built on a dedicated clean forward, not from the K-loop.** See
+  "Evaluated at τ = 0 on a dedicated clean forward" above — anchoring on
+  `velocity_target` alone was not sufficient, because the K-loop's velocity
+  still carries the model's Jacobian response to the ε-jitter.
 - `model_path` (default `nvidia/GR00T-N1.6-3B`)
 - `embodiment_tag` (default `ROBOCASA_PANDA_OMRON`)
 - `lora_rank` / `lora_alpha` / `lora_dropout` (default 16 / 32 / 0.0)

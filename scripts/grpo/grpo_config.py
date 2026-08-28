@@ -16,6 +16,8 @@ Usage:
 from dataclasses import dataclass, field
 from typing import Optional
 
+import math
+
 from lora_dit import DEFAULT_LORA_TARGET_MODULES
 
 
@@ -564,6 +566,93 @@ class GRPOConfig:
     #         jittered input noise.
     jitter_paired: bool = True
 
+    # ─── Endpoint-roughness constraint (the "jerk constraint") ───────────────
+    # A temporal-smoothness prior on the DiT's IMPLIED ENDPOINT along the action
+    # horizon. Orthogonal to Jitter-GRPO: jitter bounds the MAGNITUDE of the
+    # velocity field's noise response (`E_xi||J xi||^2 = ||J||_F^2`, isotropic),
+    # while this bounds its SPECTRUM along `h`. Measured independence:
+    # `jitter/jacobian_fro_sq` fell 32% over the same iterations in which the
+    # residual's high-frequency fraction rose 1.7-2.9x and relative seed
+    # dispersion rose 4.5x.
+    #
+    # The constrained quantity is
+    #     HF(a_hat(tau)) = R(a_hat) / (6 * M(a_hat).detach())
+    #     a_hat(tau)     = x_tau + (1 - tau) * v_theta  ==  a + (1 - tau) * r
+    # penalised as a HINGE against the pretrained field's own value:
+    #     L = smooth_coef * relu( HF_pooled - smooth_hf_ref )
+    #
+    # Why the endpoint and not the residual: `HF(a_hat)` separates base from the
+    # finetuned field by 100-200x versus the residual's 1.5-2.1x, and the two
+    # measured checkpoints rank OPPOSITELY on residual vs chunk roughness.
+    # Why a hinge and not a penalty: below the threshold both value and gradient
+    # are exactly 0, so it never pushes toward the conditional-mean map — which
+    # the `consensus_ns4` eval measures at 0.365 against baseline 0.600.
+    # See scripts/grpo/README.md and jerk-constraint.md for the full derivation.
+    #
+    # 0.0 (default) = feature OFF, bit-identical to a run without it: no extra
+    # tensors, no calibration, no metrics, no banner line. Suggested starting
+    # value 0.15, which puts the term at ~15% of |clip_loss| at the roughness
+    # measured on iter_0011/iter_0017. Bracket +-3x.
+    smooth_coef: float = 0.0
+
+    # Frozen SCALAR threshold. The constraint is evaluated at a single tau (=0)
+    # on a dedicated clean DiT forward, so there is no per-tau vector. Three forms:
+    #   None  (default) -> AUTO-CALIBRATE from the first iteration of a fresh run.
+    #                      PEFT initialises lora_B to zeros, so before the first
+    #                      optimizer step theta == theta_base and the collected
+    #                      chunks ARE base-policy samples (confirmed: fresh runs
+    #                      log ref_mse/log_base_ratio_mean == 0 exactly at iter 1,
+    #                      versus 0.0572 at a resumed run's first iteration). The
+    #                      measurement is taken while n_updates == 0, then scaled
+    #                      by `smooth_hf_ref_scale` and frozen.
+    #   float           -> flat scalar for every tau. Viable: base HF(a_hat)
+    #                      spans 0.0003-0.0068 across observations and tau while
+    #                      the lowest finetuned value anywhere is 0.0779, an 11x
+    #                      gap, so a flat 0.02 has ~3x margin either side.
+    #   list[float]     -> only element [0] is used, with a warning. Accepted
+    #                      for backward compatibility with per-tau configs.
+    #
+    # A single-tau design, so this is a SCALAR. A list is accepted for backward
+    # compatibility with the earlier per-tau build; only its first entry is used
+    # and a warning is printed.
+    # NEVER recomputed from the current policy. A tracking threshold would
+    # re-baseline on the roughness the previous iteration introduced, permit a
+    # little more, and never bind — the ratchet this design exists to avoid.
+    # Persisted to `smooth_ref.json` in each checkpoint and reloaded on resume,
+    # because a resumed run's first iteration is NOT base-policy.
+    smooth_hf_ref: float | list[float] | None = None
+
+    # Multiplier applied to the auto-calibrated base value. Sets how hard the
+    # constraint bites; the SHAPE across tau stays the base field's. The measured
+    # base weighted-mean HF(a_hat) is 0.0012-0.0051 depending on the state, so
+    # 4.0 lands at ~0.005-0.02 — comfortably above base and 10-40x below the
+    # finetuned field. Authority (`R(r)/R(a)`, the fraction of the chunk's D2
+    # amplitude the residual can cancel) crosses 1 at roughly 10-13x base, so
+    # values much above ~8 risk engaging only after full cancellation is gone.
+    # Ignored when `smooth_hf_ref` is set explicitly.
+    smooth_hf_ref_scale: float = 4.0
+
+    # Admit `base_motion` into the constrained dim set. OFF by default because
+    # `control_mode` gates it — arm and base are mutually exclusive under
+    # robosuite's HybridMobileBase — so in arm mode it is commanded but inert,
+    # and constraining an inert channel spends adapter capacity on dims that do
+    # not move the robot. Discrete keys (`gripper_close`, `control_mode`) are
+    # excluded unconditionally: both are 0/1 thresholded at 0.5, so a grasp IS a
+    # step function and penalising its second difference would suppress grasping.
+    smooth_include_base_motion: bool = False
+
+    # Minimum number of rows the auto-calibration must pool before freezing
+    # hf_ref. The pre-first-optimizer-step window is only
+    # `gradient_accumulation_steps` micro-batches -- ONE at the defaults, i.e.
+    # `mini_batch_size` rows -- and measured on base-like chunks an 8-row window
+    # spreads the pooled base HF over 0.64x-1.57x of its large-sample value, with a
+    # low-energy window (routine during a grasp or an approach pause) reading up to
+    # 17x high. Since hf_ref is frozen and persisted into every checkpoint, one
+    # unlucky window would silently neuter the feature for the whole run lineage.
+    # Calibration therefore accumulates across the whole iteration and, if still
+    # short, into later iterations, with a console line each time.
+    smooth_calib_min_rows: int = 512
+
     # PER-CHUNK jitter-gap survey (measurement only; changes no training math).
     #
     # 0 = off (default, zero cost). N > 0 measures the jitter gap for N individual
@@ -807,6 +896,53 @@ class GRPOConfig:
                     f"{_jname} must be in [0.0, 1.0), got {_jval}. "
                     f"Variance preservation requires λ < 1; use 0.0 to disable."
                 )
+
+        # ── Endpoint-roughness constraint ────────────────────────────────────
+        # smooth_coef == 0.0 is the OFF switch and must stay a total no-op, so
+        # only the value range is checked unconditionally; the companion knobs
+        # are validated for self-consistency either way so a typo surfaces even
+        # before the feature is switched on.
+        if self.smooth_coef < 0.0 or not math.isfinite(self.smooth_coef):
+            raise ValueError(
+                f"smooth_coef must be finite and >= 0, got {self.smooth_coef}. "
+                f"It scales relu(HF - hf_ref) >= 0, so a negative value would "
+                f"REWARD roughness. Use 0.0 to disable the constraint."
+            )
+        if self.smooth_hf_ref_scale <= 0.0 or not math.isfinite(
+            self.smooth_hf_ref_scale
+        ):
+            raise ValueError(
+                f"smooth_hf_ref_scale must be finite and > 0, got "
+                f"{self.smooth_hf_ref_scale}. It multiplies the auto-calibrated "
+                f"base HF, so <= 0 would put the threshold at or below zero and "
+                f"pin the hinge permanently open."
+            )
+        if self.smooth_calib_min_rows < 1:
+            raise ValueError(
+                f"smooth_calib_min_rows must be >= 1, got "
+                f"{self.smooth_calib_min_rows}."
+            )
+        if self.smooth_hf_ref is not None:
+            _refs = (
+                self.smooth_hf_ref
+                if isinstance(self.smooth_hf_ref, (list, tuple))
+                else [self.smooth_hf_ref]
+            )
+            if isinstance(self.smooth_hf_ref, (list, tuple)) and not _refs:
+                raise ValueError(
+                    "smooth_hf_ref=[] is empty. Pass a single float for the "
+                    "threshold (the constraint is evaluated at one tau, so the "
+                    "reference is a scalar), or None to auto-calibrate."
+                )
+            for _r in _refs:
+                if not math.isfinite(_r) or _r <= 0.0:
+                    raise ValueError(
+                        f"smooth_hf_ref entries must be finite and > 0, got "
+                        f"{self.smooth_hf_ref}. HF is a positive ratio (1.0 = white "
+                        f"along h, 2.9839 the attainable max at H=16); 0.0 would "
+                        f"pin the hinge permanently open, which is the same "
+                        f"failure smooth_hf_ref_scale refuses."
+                    )
         # KL coefficients must be NON-NEGATIVE. Each is multiplied by a Schulman
         # k3 KL term (non-negative pointwise) and added to the loss; a negative
         # coef inverts the sign and turns the anchor into a *reward for

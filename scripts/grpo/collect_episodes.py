@@ -1262,18 +1262,10 @@ class EpisodeCollector:
             # needs visible confirmation that the flag took effect. Matches
             # the FF prints above which are also unguarded for the same reason.
             print(f"  Init-state override: every group restores from {init_state_npz_path}")
-        if group_seeds is not None:
-            # Unguarded by _CLEAN_OUTPUT for the same reason as the two prints
-            # above: which scenes an iteration ran on is the whole point of the
-            # frozen pool, and this line is the only per-iteration record of it
-            # in the collector log. Print the seeds the groups will ACTUALLY use
-            # (sliced to the reachable group count) rather than the raw argument,
-            # so the log cannot disagree with what happened.
-            print(
-                f"  Scene seed pool: groups use explicit seeds "
-                f"{group_seeds[:_max_reachable_groups]} (instead of "
-                f"{base_seed} + group_idx × {GROUP_SEED_STRIDE})"
-            )
+        # NOTE: no summary line for `group_seeds`. It would be redundant — every
+        # per-group line below already prints `(seed=<the seed it used>)`, which
+        # is both more precise (it reflects what actually ran, including a
+        # dynamic extension) and impossible to get out of sync with reality.
 
         alive_groups = 0
         group_idx = 0

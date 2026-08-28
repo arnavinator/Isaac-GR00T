@@ -1392,9 +1392,12 @@ class GRPOTrainer:
     def _scene_seeds_for_iteration(self) -> list[int]:
         """This iteration's ordered per-group scene seeds ([] when pool is off).
 
-        The cursor walks the pool `num_groups` slots per iteration and wraps:
+        The cursor ADVANCES by `num_groups` per iteration, but the list handed to
+        the collector is `max(num_groups, max_groups)` long — enough to cover a
+        dynamic extension:
 
-            seeds[g] = pool[((iteration - 1) * num_groups + g) % K]
+            offset  = (iteration - 1) * num_groups
+            seeds[g] = pool[(offset + g) % K]   for g in range(n_send)
 
         `self.iteration` is 1-BASED (train()'s loop runs
         `range(self._start_iteration, num_iterations + 1)` with
@@ -1412,18 +1415,34 @@ class GRPOTrainer:
         skips a collection entirely, and would silently drift on any resume from
         a checkpoint written before the cursor existed.
 
-        Correctness of the stride depends on the `min_alive_groups == 0`
-        validation in GRPOConfig.__post_init__: the `* num_groups` term assumes
-        each iteration consumes EXACTLY num_groups slots. Dynamic group
-        extension consumes a variable count, which would desynchronise the
-        cursor from the seeds actually used.
+        WHY THE ADVANCE IS num_groups, NOT THE REALIZED GROUP COUNT. With
+        `min_alive_groups > 0` the collector may extend past `num_groups` (up to
+        `max_groups`) chasing mixed groups, so the number of slots CONSUMED per
+        iteration varies. Advancing by the realized count would keep exposure
+        perfectly balanced but requires the trainer to learn that count after the
+        fact and carry it across resumes — i.e. exactly the persisted state this
+        design exists to avoid. Advancing by the fixed `num_groups` keeps the
+        cursor (and therefore `_scene_pool_pass` and every pass boundary)
+        deterministic, at one cost: on an extended iteration the extra group
+        borrows the seed the NEXT iteration will open with, so that scene gets a
+        bonus visit and appears twice across the two iterations. It is never
+        duplicated WITHIN one iteration — `n_send` consecutive slots mod K are
+        distinct because `GRPOConfig` requires `K >= max(num_groups,
+        max_groups)`. Read `episode/n_groups` to see which iterations extended,
+        and prefer the per-scene mean of `episode/scene_sr/<seed>` over the raw
+        pass mean if you want a pass statistic that is immune to the bonus
+        visit's extra weight.
         """
         pool = self._scene_seed_pool()
         if not pool:
             return []
-        n_groups = self.config.num_groups
-        offset = (self.iteration - 1) * n_groups
-        return [pool[(offset + g) % len(pool)] for g in range(n_groups)]
+        offset = (self.iteration - 1) * self.config.num_groups
+        # Cover the worst case the collector can reach in ONE call. Sending only
+        # num_groups would make an extension die on collect()'s length check
+        # (or, worse without it, on resolve_group_seed's IndexError) partway
+        # through an iteration that has already banked ~20 minutes of rollouts.
+        n_send = max(self.config.num_groups, self.config.max_groups)
+        return [pool[(offset + g) % len(pool)] for g in range(n_send)]
 
     def _scene_pool_pass(self, iteration: int) -> int:
         """0-based index of the pass over the pool that `iteration` falls in.

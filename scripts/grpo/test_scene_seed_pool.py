@@ -59,22 +59,22 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def _pool_config(**overrides) -> GRPOConfig:
-    """A minimal pool-enabled config. K=12 / num_groups=4 / min_alive_groups=0
-    is the canonical valid combination; overrides let a test break exactly one
-    of those.
+    """A minimal pool-enabled config. K=12 / num_groups=4 / max_groups=5 (the
+    dataclass default) / min_alive_groups=2 is the canonical valid combination
+    and matches how the run is actually launched; overrides let a test break
+    exactly one of those.
 
-    `max_groups` is deliberately LEFT AT THE DATACLASS DEFAULT (5, i.e. greater
-    than num_groups) rather than pinned equal to num_groups. Pinning it would
-    hide the interaction that actually matters: the pool's minimum-K bound is
-    num_groups alone, because the mandatory min_alive_groups == 0 makes the
-    collector's dynamic extension unreachable, so max_groups must never inflate
-    the requirement.
+    min_alive_groups is deliberately NON-zero and max_groups > num_groups, i.e.
+    dynamic collection is LIVE. That is the shape that exercises the interaction
+    that matters: the trainer must hand the collector max_groups seeds (not
+    num_groups) so an extension cannot run off the end of the list, while the
+    cursor still advances by num_groups so pass boundaries stay deterministic.
     """
     kwargs = dict(
         device="cpu",
         seed=67,
         num_groups=4,
-        min_alive_groups=0,
+        min_alive_groups=2,          # dynamic collection ON: the real run's shape
         scene_seed_pool_size=12,
     )
     kwargs.update(overrides)
@@ -192,9 +192,17 @@ def test_pool_resolution():
 
 
 def test_cursor_and_pass_alignment():
-    """K=12, num_groups=4 → three iterations per pass, then wrap."""
+    """K=12, num_groups=4 → three iterations per pass, then wrap.
+
+    With dynamic collection live (max_groups=5 > num_groups=4) the list handed to
+    the collector is 5 long, but the CURSOR still advances by num_groups=4 — that
+    split is the whole design, so both halves are pinned here.
+    """
     print("\n[pool] stateless cursor across iterations (K=12, num_groups=4)")
     cfg = _pool_config()
+    # First num_groups entries = this iteration's pass block. The trailing entry
+    # is the spare an extension would consume, which is the NEXT iteration's
+    # opening seed (see _scene_seeds_for_iteration on why the advance is fixed).
     expected = {
         1: [100_067, 101_067, 102_067, 103_067],
         2: [104_067, 105_067, 106_067, 107_067],
@@ -203,16 +211,35 @@ def test_cursor_and_pass_alignment():
     }
     for it, want in expected.items():
         got = _trainer(cfg, iteration=it)._scene_seeds_for_iteration()
-        check(f"iteration {it} → {want}", got == want, f"{got}")
+        check(f"iteration {it} first {len(want)} → {want}",
+              got[:len(want)] == want, f"{got}")
+        check(f"iteration {it} sends max_groups={cfg.max_groups} seeds "
+              f"(covers a dynamic extension)", len(got) == cfg.max_groups,
+              f"{len(got)}")
+        check(f"iteration {it} sent seeds are all distinct (no scene reused "
+              f"inside one iteration, even if it extends)",
+              len(set(got)) == len(got), f"{got}")
+    check("the spare seed is the NEXT iteration's opener (fixed advance means an "
+          "extension borrows it, giving that scene a bonus visit)",
+          _trainer(cfg, 1)._scene_seeds_for_iteration()[4]
+          == _trainer(cfg, 2)._scene_seeds_for_iteration()[0] == 104_067)
 
     check("iteration 1 starts at pool index 0 (the -1 in the cursor)",
           _trainer(cfg, 1)._scene_seeds_for_iteration()[0]
           == _trainer(cfg)._scene_seed_pool()[0])
 
-    # pool_pass: 0 for iters 1-3, 1 for 4-6, ...
+    # pool_pass: 0 for iters 1-3, 1 for 4-6, ... — driven by num_groups, so it is
+    # unaffected by how many seeds get sent or consumed.
     passes = [_trainer(cfg, it)._scene_pool_pass(it) for it in range(1, 10)]
     check("pool_pass == [0,0,0,1,1,1,2,2,2] over iterations 1..9",
           passes == [0, 0, 0, 1, 1, 1, 2, 2, 2], f"{passes}")
+
+    # With max_groups == num_groups (dynamic collection off) there is no spare.
+    tight = _pool_config(min_alive_groups=0, max_groups=4)
+    check("max_groups == num_groups → exactly num_groups seeds sent, no spare",
+          _trainer(tight, 1)._scene_seeds_for_iteration()
+          == [100_067, 101_067, 102_067, 103_067],
+          f"{_trainer(tight, 1)._scene_seeds_for_iteration()}")
 
     # The cursor is a PURE function of iteration — which is what makes
     # --resume-from correct with no checkpoint state. Recomputing it out of
@@ -230,7 +257,7 @@ def test_cursor_and_pass_alignment():
           "there sequentially",
           scrambled[41][0]
           == [_trainer(cfg)._scene_seed_pool()[(40 * 4 + g) % 12]
-              for g in range(4)],
+              for g in range(cfg.max_groups)],
           f"{scrambled[41][0]}")
 
     check("pool disabled → empty seed list (nothing to append to the argv)",
@@ -255,20 +282,24 @@ def test_distinct_within_iteration():
             warnings.simplefilter("ignore")
             cfg = _pool_config(
                 scene_seed_pool_size=K, num_groups=ng,
-                # max_groups must stay >= num_groups (an unrelated, pre-existing
-                # validation), but is otherwise left off the tightest-pool path.
-                max_groups=max(ng, 5),
+                # max_groups must stay >= num_groups (pre-existing validation)
+                # AND <= K (the pool bound), since the trainer sends max_groups
+                # consecutive slots per iteration.
+                max_groups=min(K, max(ng, 5)),
             )
         tr = _trainer(cfg)
         worst = None
         for it in range(1, 60):
             tr.iteration = it
             seeds = tr._scene_seeds_for_iteration()
-            if len(set(seeds)) != len(seeds) or len(seeds) != ng:
+            # Full SENT list: num_groups plus the spares a dynamic extension
+            # could consume. All of it must be distinct.
+            if len(set(seeds)) != len(seeds) or len(seeds) != cfg.max_groups:
                 worst = (it, seeds)
                 break
-        check(f"K={K}, num_groups={ng}: {ng} distinct seeds every iteration "
-              f"over 59 iterations", worst is None, f"iter {worst}")
+        check(f"K={K}, num_groups={ng}, max_groups={cfg.max_groups}: "
+              f"{cfg.max_groups} distinct sent seeds every iteration over 59 "
+              f"iterations", worst is None, f"iter {worst}")
 
         # And every seed used is a member of the frozen pool — the pool never
         # leaks a value derived some other way.
@@ -301,23 +332,28 @@ def test_validations_raise():
     # K < num_groups — an iteration would wrap onto itself.
     _raises("K(3) < num_groups(4)",
             scene_seed_pool_size=3, num_groups=4)
-    # K == num_groups with the DEFAULT max_groups=5 must be ACCEPTED. This is
-    # the documented "every iteration directly comparable" recipe, and it is the
-    # combination a bound of max(num_groups, max_groups) would wrongly reject:
-    # min_alive_groups == 0 is mandatory here, so the collector's dynamic
-    # extension (min_alive_groups > 0 and max_groups > num_groups) can never
-    # fire and max_groups slots are unreachable.
+    # K < max_groups is rejected even when K >= num_groups: a dynamic extension
+    # consumes up to max_groups consecutive slots, so the window would wrap.
+    _raises("K(4) < max_groups(5) with dynamic collection live",
+            scene_seed_pool_size=4, num_groups=4, max_groups=5)
+    # The documented "every iteration directly comparable" recipe therefore needs
+    # dynamic collection OFF as well: K == num_groups == max_groups.
     try:
-        cfg_tight = _pool_config(scene_seed_pool_size=4, num_groups=4)
-        check("K == num_groups(4) accepted with default max_groups=5 "
-              "(dynamic extension is unreachable at min_alive_groups=0)",
-              cfg_tight.scene_seed_pool_size == 4
-              and cfg_tight.max_groups > cfg_tight.num_groups)
+        cfg_tight = _pool_config(scene_seed_pool_size=4, num_groups=4,
+                                 max_groups=4, min_alive_groups=0)
+        check("K == num_groups == max_groups(4) accepted (no extension possible, "
+              "so no spare slot is needed)",
+              cfg_tight.scene_seed_pool_size == 4 and cfg_tight.max_groups == 4)
     except ValueError as exc:
-        check("K == num_groups(4) accepted with default max_groups=5",
-              False, f"wrongly rejected: {exc}")
-    # min_alive_groups > 0 desynchronises the stateless cursor.
-    _raises("min_alive_groups(2) != 0", min_alive_groups=2, max_groups=12)
+        check("K == num_groups == max_groups(4) accepted", False,
+              f"wrongly rejected: {exc}")
+    # min_alive_groups > 0 is now SUPPORTED (the trainer sends max_groups seeds).
+    try:
+        cfg_dyn = _pool_config(min_alive_groups=2, max_groups=5)
+        check("min_alive_groups > 0 is accepted (dynamic collection supported)",
+              cfg_dyn.min_alive_groups == 2)
+    except ValueError as exc:
+        check("min_alive_groups > 0 is accepted", False, f"rejected: {exc}")
     # K < 1 while non-zero: 0 is the only disabling value.
     _raises("K = -1 (negative, would silently disable)",
             scene_seed_pool_size=-1)
@@ -348,11 +384,12 @@ def test_validations_raise():
         check("K < num_groups message names the group-relative-advantage reason",
               "group-relative" in msg and "same seed" in msg, msg[:120])
     try:
-        _pool_config(min_alive_groups=2, max_groups=12)
+        _pool_config(scene_seed_pool_size=4, num_groups=4, max_groups=5)
     except ValueError as exc:
         msg = str(exc)
-        check("min_alive_groups message names the stateless-cursor reason",
-              "stateless" in msg and "num_groups" in msg, msg[:120])
+        check("K < max_groups message names the extension and the two escapes",
+              "extends past" in msg and "max_groups == num_groups" in msg,
+              msg[:160])
 
 
 def test_non_divisible_warning():
@@ -433,13 +470,18 @@ def test_disabled_path_argv_unchanged():
 def test_enabled_argv_carries_this_iterations_seeds():
     print("\n[argv] pool enabled → --group-seeds carries the cursor's output")
     cfg = _pool_config()
+    # The csv carries max_groups seeds (num_groups for the groups themselves plus
+    # the spares a dynamic extension may consume), so the iteration's pass block
+    # is the PREFIX of the list, not the whole of it.
     for it, want in [(1, "100067,101067,102067,103067"),
                      (2, "104067,105067,106067,107067"),
                      (4, "100067,101067,102067,103067")]:
         argv = _collector_argv(cfg, iteration=it)
         got = argv[argv.index("--group-seeds") + 1]
-        check(f"iteration {it} argv → --group-seeds {want}", got == want,
-              f"{got}")
+        check(f"iteration {it} argv → --group-seeds starts {want}",
+              got.startswith(want), f"{got}")
+        check(f"iteration {it} argv carries max_groups={cfg.max_groups} seeds",
+              len(got.split(",")) == cfg.max_groups, f"{got}")
 
     # And the CLI string the trainer emits round-trips through the collector's
     # own parser back to the integer list the cursor produced. This is the only
@@ -617,8 +659,9 @@ def test_trainer_argv_feeds_collector_end_to_end():
     for label, cfg in (
         ("default shape (num_groups=3, max_groups=5)",
          _pool_config(scene_seed_pool_size=12, num_groups=3, max_groups=5)),
-        ("aligned shape (num_groups=4, max_groups=4)",
-         _pool_config(scene_seed_pool_size=12, num_groups=4)),
+        ("aligned shape (num_groups=4, max_groups=4, no extension)",
+         _pool_config(scene_seed_pool_size=12, num_groups=4, max_groups=4,
+                      min_alive_groups=0)),
     ):
         argv = _collector_argv(cfg, iteration=2)
 
@@ -626,8 +669,10 @@ def test_trainer_argv_feeds_collector_end_to_end():
             return argv[argv.index(flag) + 1]
 
         seeds = ce._comma_separated_ints(_val("--group-seeds"))
-        check(f"{label}: trainer sends num_groups seeds",
-              len(seeds) == cfg.num_groups, f"{len(seeds)} vs {cfg.num_groups}")
+        n_send = max(cfg.num_groups, cfg.max_groups)
+        check(f"{label}: trainer sends max(num_groups, max_groups) seeds so a "
+              f"dynamic extension cannot run off the end",
+              len(seeds) == n_send, f"{len(seeds)} vs {n_send}")
         try:
             by_group = _drive_collect(
                 group_size=2, num_envs=2,
@@ -637,10 +682,14 @@ def test_trainer_argv_feeds_collector_end_to_end():
                 max_groups=int(_val("--max-groups")),
                 min_alive_groups=int(_val("--min-alive-groups")),
             )
-            check(f"{label}: collect() accepts the argv and uses every seed "
-                  f"in order",
-                  by_group == {g: {s} for g, s in enumerate(seeds)},
-                  f"{by_group}")
+            # Non-dynamic runs stop at num_groups and simply leave the spares
+            # unused; a dynamic run may consume more. Either way group g must
+            # have reset with seeds[g].
+            check(f"{label}: collect() accepts the argv and each group g used "
+                  f"seeds[g] (spares left unconsumed)",
+                  all(by_group[g] == {seeds[g]} for g in by_group)
+                  and len(by_group) >= cfg.num_groups,
+                  f"{by_group} vs sent {seeds}")
         except Exception as exc:                             # noqa: BLE001
             check(f"{label}: collect() accepts the argv", False,
                   f"{type(exc).__name__}: {exc}")

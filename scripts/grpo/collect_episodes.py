@@ -262,8 +262,8 @@ def resolve_group_seed(
     breaks GRPO's independent-scene-per-group assumption silently — the exact
     thing the trainer's `scene_seed_pool_size >= num_groups`
     validation exists to prevent. Reaching here means that validation was
-    bypassed (a hand-rolled CLI invocation) or dynamic group extension is on
-    despite the `min_alive_groups == 0` requirement, and both deserve a stop.
+    bypassed (a hand-rolled CLI invocation, or a trainer/collector disagreement
+    about how many groups one call can reach), which deserves a stop.
     """
     if group_seeds is None:
         # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart

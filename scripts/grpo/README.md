@@ -369,8 +369,8 @@ forget. A persisted counter would have to survive `_save_checkpoint` / load
 and would silently drift on any resume from a checkpoint written before the
 counter existed.
 
-Its correctness depends on the `min_alive_groups == 0` validation below: the
-`* num_groups` term assumes every iteration consumes exactly `num_groups` slots.
+The `* num_groups` term is the *advance*, not the number of slots sent — see
+"Dynamic collection" below for why they differ and what that costs.
 
 **Validations** (all hard `ValueError` at config construction, because every one
 of these failure modes is otherwise *silent* — the run completes, the curves look
@@ -379,9 +379,23 @@ plausible, and the property the pool exists to provide is simply gone):
 | check | reason |
 |---|---|
 | `K >= 1` (or exactly `0` to disable) | `0` is the only disabling value. A negative K would sail past the internal `> 0` gate and disable the feature silently; a fractional `0 < K < 1` would build an empty pool and raise `ZeroDivisionError` inside the cursor, minutes into the run. |
-| `K >= num_groups` | Within one iteration two groups must never land on the same seed. Two groups on one scene correlates their group-relative advantages and double-counts that scene in the iteration mean — GRPO's group-relative baseline assumes independent scenes per group, and nothing downstream would flag the violation. The bound is `num_groups`, **not** `max(num_groups, max_groups)`: `min_alive_groups == 0` is mandatory (next row), and the collector's `dynamic_mode = min_alive_groups > 0 and max_groups > num_groups` is therefore always False, so the group loop stops at `group_idx >= num_groups` and `max_groups` slots are unreachable. Bounding on `max_groups` would reject `K == num_groups` under the **default** `max_groups=5` — the one setting where every iteration is directly comparable. `EpisodeCollector.collect`'s own `_max_reachable_groups` uses the same rule; the two must agree or one rejects a run the other accepts. |
-| `min_alive_groups == 0` | Dynamic group extension consumes a **variable** number of pool slots per iteration, which desynchronises the stateless cursor from the seeds actually used. |
+| `K >= max(num_groups, max_groups)` | Within one iteration two groups must never land on the same seed. Two groups on one scene correlates their group-relative advantages and double-counts that scene in the iteration mean — GRPO's group-relative baseline assumes independent scenes per group, and nothing downstream would flag the violation. The bound uses `max_groups` because a dynamic extension (`min_alive_groups > 0 and max_groups > num_groups`) can consume up to that many consecutive slots in one call, and the trainer sends that many. Consequence: `K == num_groups` additionally requires `max_groups == num_groups`. `EpisodeCollector.collect`'s own `_max_reachable_groups` mirrors this; the two must agree or one rejects a run the other accepts. |
 | `init_state_npz_path is None` | An init bundle overrides the scene entirely — the reset's own seeded scene is immediately overwritten by `apply_scene_bundle` — so a scene pool would be **silently inert**: seeds passed, logged and plotted with no effect on a single pixel. Silent inertness is the exact failure mode worth erroring on. |
+
+**Dynamic collection (`min_alive_groups > 0`) is supported.** The cursor advances
+by `num_groups` per iteration, but the trainer hands the collector
+`max(num_groups, max_groups)` consecutive slots so an extension cannot run off the
+end of the list mid-iteration. Advancing by the *realized* group count would keep
+exposure exactly balanced but requires the trainer to learn that count after the
+fact and carry it across resumes — the persisted state the stateless cursor exists
+to avoid. The trade: on an extended iteration the extra group borrows the seed the
+**next** iteration opens with, so that scene gets a bonus visit and appears in two
+consecutive iterations. It is never duplicated *within* one iteration (that is what
+`K >= max(num_groups, max_groups)` guarantees). Read `episode/n_groups` to see which
+iterations extended, and prefer the per-scene mean of `episode/scene_sr/<seed>` over
+the raw pass mean if you want a pass statistic immune to the bonus visit's extra
+weight. Note `K == num_groups` — the every-iteration-comparable setting — therefore
+also needs `max_groups == num_groups`.
 
 **Pass-alignment warning** (a `warnings.warn`, *not* an error): when
 `K % num_groups != 0` the pool still cycles deterministically and still never
@@ -2551,7 +2565,7 @@ boundary of the `(50, 128)` output is meaningless.
 - `scene_seed_pool_size` / `scene_seed_pool_base` — see "Frozen scene seed
   pool". Default 0 / None (**disabled**, bit-identical to a pre-feature run).
   `K > 0` freezes K scene seeds and cycles them across iterations so the same
-  scenes recur; requires `min_alive_groups == 0`, `K >= num_groups`, and no
+  scenes recur; requires `K >= max(num_groups, max_groups)` and no
   `init_state_npz_path`. `base=None` resolves in place to
   `seed + 100_000`.
 - `env_names: list[str]` — round-robin task selection.

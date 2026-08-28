@@ -1272,44 +1272,36 @@ class GRPOConfig:
                 self.scene_seed_pool_base = self.seed + 100_000
 
             # Upper bound on the pool slots a single iteration can consume, and
-            # therefore the minimum viable K. It is num_groups, NOT
-            # max(num_groups, max_groups): the min_alive_groups == 0 check below
-            # is mandatory for every pooled run, and the collector computes
-            # `dynamic_mode = min_alive_groups > 0 and max_groups > num_groups`
-            # (collect_episodes.py), so dynamic_mode is provably False here and
-            # the group loop stops at `group_idx >= num_groups`. max_groups is
-            # unreachable and must not inflate the requirement — bounding on it
-            # would reject K == num_groups under the DEFAULT max_groups=5, which
-            # is the one configuration where every single iteration is directly
-            # comparable (see the scene_seed_pool_size field comment) and is
-            # exactly what a user following that advice would pass. Mirrors
-            # EpisodeCollector.collect's own `_max_reachable_groups`; the two
+            # therefore the minimum viable K. It is max(num_groups, max_groups),
+            # NOT num_groups: with min_alive_groups > 0 the collector may extend
+            # past num_groups chasing mixed groups, up to max_groups
+            # (`dynamic_mode = min_alive_groups > 0 and max_groups > num_groups`
+            # in collect_episodes.py), and the trainer therefore hands it
+            # max(num_groups, max_groups) consecutive slots per iteration. A
+            # smaller pool would wrap inside that window.
+            #
+            # Consequence worth knowing: `K == num_groups` — the one setting where
+            # every single iteration is directly comparable — additionally
+            # requires `max_groups == num_groups`, i.e. dynamic collection off.
+            # Mirrors EpisodeCollector.collect's `_max_reachable_groups`; the two
             # bounds must agree or one of them rejects a run the other accepts.
-            if self.scene_seed_pool_size < self.num_groups:
+            _needed = max(self.num_groups, self.max_groups)
+            if self.scene_seed_pool_size < _needed:
                 raise ValueError(
                     f"scene_seed_pool_size ({self.scene_seed_pool_size}) must be "
-                    f">= num_groups ({self.num_groups}). A single iteration draws "
-                    f"its groups from consecutive pool slots, so a smaller pool "
-                    f"would wrap WITHIN one iteration and hand two groups the "
-                    f"same seed — hence the same scene. GRPO's group-relative "
-                    f"advantage assumes each group is an INDEPENDENT scene; two "
-                    f"groups sharing one would silently double-count that scene "
-                    f"in the iteration mean and correlate their advantages, and "
-                    f"nothing downstream would flag it."
-                )
-            if self.min_alive_groups != 0:
-                raise ValueError(
-                    f"scene_seed_pool_size > 0 requires min_alive_groups == 0, "
-                    f"got {self.min_alive_groups}. Dynamic group extension "
-                    f"consumes a VARIABLE number of pool slots per iteration "
-                    f"(between num_groups and max_groups), while the pool cursor "
-                    f"is deliberately stateless — it computes its offset as "
-                    f"(iteration - 1) * num_groups, which assumes exactly "
-                    f"num_groups slots are consumed each iteration. With dynamic "
-                    f"collection on, the cursor desynchronises from the seeds "
-                    f"actually used, iterations silently start re-drawing scenes "
-                    f"mid-pass, and the pass mean stops being a fixed-scene "
-                    f"average. Pass --min-alive-groups 0."
+                    f">= max(num_groups, max_groups) = {_needed} "
+                    f"(num_groups={self.num_groups}, max_groups={self.max_groups}, "
+                    f"min_alive_groups={self.min_alive_groups}). A single iteration "
+                    f"draws its groups from consecutive pool slots — up to "
+                    f"max_groups of them when dynamic collection extends past "
+                    f"num_groups — so a smaller pool would wrap WITHIN one "
+                    f"iteration and hand two groups the same seed, hence the same "
+                    f"scene. GRPO's group-relative advantage assumes each group is "
+                    f"an INDEPENDENT scene; two groups sharing one would silently "
+                    f"double-count that scene in the iteration mean and correlate "
+                    f"their advantages, and nothing downstream would flag it. "
+                    f"Either raise K, or set max_groups == num_groups to disable "
+                    f"dynamic extension."
                 )
             if self.init_state_npz_path is not None:
                 raise ValueError(

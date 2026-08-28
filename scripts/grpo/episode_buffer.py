@@ -709,16 +709,45 @@ class EpisodeBuffer:
         # Per-group success rate distribution. Each group's rate is
         # (n_successes_in_group / n_episodes_in_group); aggregated to
         # min / median / max so TB shows the spread without histograms.
+        #
+        # The SAME loop also accumulates by `env_seed` — the RoboCasa reset seed,
+        # i.e. the SCENE. Keyed on env_seed rather than group_id because that is
+        # what the frozen scene seed pool holds fixed across iterations: with the
+        # pool on, `episode/scene_sr/<seed>` is one curve per scene over the whole
+        # run, which is the only view that separates "the policy improved" from
+        # "this iteration drew easier scenes". group_id cannot do that job — it is
+        # just a per-iteration ordinal and points at a different scene every
+        # iteration when the pool is off.
+        #
+        # Accumulating into a dict (rather than zipping the two indexings) is also
+        # correct in the degenerate case where two group_ids share one seed: their
+        # episodes simply pool into one scene entry, which is the right reading of
+        # "how often did the policy solve THIS scene". That case is rejected by
+        # GRPOConfig's `scene_seed_pool_size >= num_groups`
+        # validation for pooled runs, but a hand-driven collector can still
+        # produce it and this must not double-count or drop it.
         group_to_total: dict[int, int] = {}
         group_to_succ: dict[int, int] = {}
+        seed_to_total: dict[int, int] = {}
+        seed_to_succ: dict[int, int] = {}
         for ep in self.episodes:
             group_to_total[ep.group_id] = group_to_total.get(ep.group_id, 0) + 1
+            seed_to_total[ep.env_seed] = seed_to_total.get(ep.env_seed, 0) + 1
             if ep.success:
                 group_to_succ[ep.group_id] = group_to_succ.get(ep.group_id, 0) + 1
+                seed_to_succ[ep.env_seed] = seed_to_succ.get(ep.env_seed, 0) + 1
         per_group_success = [
             group_to_succ.get(gid, 0) / group_to_total[gid]
             for gid in group_to_total
         ]
+        # (n_success, n_total) per scene, NOT a pre-divided rate: the caller
+        # (train_grpo._log_metrics) needs the denominator to tell "0/8 this
+        # iteration" from "scene absent this iteration", and a partial group
+        # (collector crash mid-group) from a full one.
+        per_scene_success = {
+            seed: (seed_to_succ.get(seed, 0), seed_to_total[seed])
+            for seed in seed_to_total
+        }
 
         return {
             "num_episodes": self.num_episodes,
@@ -765,6 +794,13 @@ class EpisodeBuffer:
             "group_success_min": float(min(per_group_success)) if per_group_success else 0.0,
             "group_success_median": float(np.median(per_group_success)) if per_group_success else 0.0,
             "group_success_max": float(max(per_group_success)) if per_group_success else 0.0,
+            # PER-SCENE success counts: {env_seed: (n_success, n_total)}. The
+            # only NON-SCALAR entry in this dict, so every consumer that bulk-
+            # dumps stats() must handle it explicitly — train_grpo._log_metrics
+            # expands it into `episode/scene_sr/<seed>` scalars (only when the
+            # frozen scene pool is on) and drops it from the wandb payload rather
+            # than letting a dict-of-tuples reach wandb.log.
+            "per_scene_success": per_scene_success,
             # Trajectory length stats. Catches the "model is rushing" failure
             # mode (mean_num_steps drops below baseline) before success_rate
             # collapse becomes visible.

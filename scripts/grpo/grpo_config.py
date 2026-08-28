@@ -223,6 +223,52 @@ class GRPOConfig:
     #     intermittently, or the iteration yields no gradient signal.
     init_state_npz_path: Optional[str] = None
 
+    # ─── Frozen scene seed pool (between-scene variance reduction) ────────────
+    # By DEFAULT every iteration trains on brand-new scenes. The trainer passes
+    # `--seed config.seed + iteration * 100_000` to the collector, which then
+    # derives `group_seed = base_seed + group_idx * GROUP_SEED_STRIDE`, so no
+    # RoboCasa seed is ever revisited across a run. Measured between-scene
+    # success-rate sd is 0.285, which makes ~84% of the per-iteration
+    # `episode/mean_reward` variance pure scene RESAMPLING rather than policy
+    # change — the training curve is then uninterpretable, because a swing
+    # between consecutive iterations says nothing about the update that happened
+    # in between.
+    #
+    # scene_seed_pool_size = K > 0 freezes a pool of K scene seeds and cycles it
+    # deterministically across iterations, so the same scenes recur and
+    # iteration-to-iteration differences are (mostly) policy differences. The
+    # cursor is a pure function of `iteration` — see
+    # GRPOTrainer._scene_seeds_for_iteration for the formula and why it is
+    # stateless (it makes --resume-from correct by construction).
+    #
+    # 0 = DISABLED, and disabled is bit-identical to the behavior before this
+    # feature existed: no `--group-seeds` argument is appended to the collector
+    # argv at all, and no per-scene TB series are emitted.
+    #
+    # IMPORTANT when reading the curves: with K > num_groups the PER-ITERATION
+    # success rate is exactly as noisy as before — each iteration still samples
+    # only num_groups of the K scenes. What the pool buys is that the sequence
+    # of iterations covers a FIXED scene set, so the readable unit becomes the
+    # PASS mean over K/num_groups consecutive iterations (see
+    # `episode/pool_pass`). Set K == num_groups if you want every single
+    # iteration to be directly comparable, at the cost of training on only
+    # num_groups distinct scenes for the whole run.
+    scene_seed_pool_size: int = 0
+
+    # First seed of the pool; the rest are `base + j * GROUP_SEED_STRIDE` for
+    # j in [0, K). None → resolved IN __post_init__ (not at the use site, so the
+    # resolved value shows up in the TensorBoard config text dump —
+    # GRPOTrainer._log_config walks dataclasses.fields and would otherwise
+    # record a `None` that tells a later reader nothing about which scenes ran)
+    # to `seed + 100_000`.
+    #
+    # Why that default: `seed + 1 * 100_000` is EXACTLY the seed block that
+    # iteration 1 would have drawn under the old per-iteration formula, so a
+    # pooled run starts on the same scenes a baseline run's first iteration saw.
+    # With the default seed=67 and K=12 the pool is
+    # 100067, 101067, ..., 111067.
+    scene_seed_pool_base: Optional[int] = None
+
     # ZMQ server host and port for model inference during collection
     server_host: str = "127.0.0.1"
     server_port: int = 5555
@@ -1191,5 +1237,114 @@ class GRPOConfig:
                     f"specific env's MjModel; round-robin training will apply "
                     f"it to mismatched envs and crash (or silently corrupt "
                     f"state). Use a single env_name with init_state.",
+                    stacklevel=3,
+                )
+
+        # ── Frozen scene seed pool validations ───────────────────────────────
+        # Every check below is a HARD error rather than a warning, because each
+        # failure mode is silent at runtime: the run completes, the curves look
+        # plausible, and the property the pool exists to provide is simply gone.
+        #
+        # The RANGE check is unconditional — exactly 0 is the "off" switch, so
+        # any other value below 1 is a typo rather than a disable. A negative K
+        # would otherwise sail past the `> 0` gate below and disable the feature
+        # silently, and a fractional 0 < K < 1 (a float arriving from a
+        # programmatic caller) would pass the gate and then build an EMPTY pool,
+        # whose `% len(pool)` raises ZeroDivisionError inside the seed cursor —
+        # after model load, minutes into the run.
+        if self.scene_seed_pool_size != 0 and self.scene_seed_pool_size < 1:
+            raise ValueError(
+                f"scene_seed_pool_size must be >= 1 to enable the frozen scene "
+                f"pool, or exactly 0 to disable it, got "
+                f"{self.scene_seed_pool_size}. (0 is the only disabling value; "
+                f"the disabled path is bit-identical to a run from before the "
+                f"feature existed.)"
+            )
+        # The rest are gated on the feature being ON so a disabled pool stays a
+        # total no-op — in particular it must not start rejecting the default
+        # min_alive_groups=2 for every existing baseline run.
+        if self.scene_seed_pool_size > 0:
+            # Resolve the base IN PLACE (see the field comment): the trainer's
+            # TB config dump reads the dataclass fields, so a lazily-resolved
+            # base would leave the log saying `None` and the actual scene set
+            # would be unrecoverable from the run's artifacts.
+            if self.scene_seed_pool_base is None:
+                self.scene_seed_pool_base = self.seed + 100_000
+
+            # Upper bound on the pool slots a single iteration can consume, and
+            # therefore the minimum viable K. It is num_groups, NOT
+            # max(num_groups, max_groups): the min_alive_groups == 0 check below
+            # is mandatory for every pooled run, and the collector computes
+            # `dynamic_mode = min_alive_groups > 0 and max_groups > num_groups`
+            # (collect_episodes.py), so dynamic_mode is provably False here and
+            # the group loop stops at `group_idx >= num_groups`. max_groups is
+            # unreachable and must not inflate the requirement — bounding on it
+            # would reject K == num_groups under the DEFAULT max_groups=5, which
+            # is the one configuration where every single iteration is directly
+            # comparable (see the scene_seed_pool_size field comment) and is
+            # exactly what a user following that advice would pass. Mirrors
+            # EpisodeCollector.collect's own `_max_reachable_groups`; the two
+            # bounds must agree or one of them rejects a run the other accepts.
+            if self.scene_seed_pool_size < self.num_groups:
+                raise ValueError(
+                    f"scene_seed_pool_size ({self.scene_seed_pool_size}) must be "
+                    f">= num_groups ({self.num_groups}). A single iteration draws "
+                    f"its groups from consecutive pool slots, so a smaller pool "
+                    f"would wrap WITHIN one iteration and hand two groups the "
+                    f"same seed — hence the same scene. GRPO's group-relative "
+                    f"advantage assumes each group is an INDEPENDENT scene; two "
+                    f"groups sharing one would silently double-count that scene "
+                    f"in the iteration mean and correlate their advantages, and "
+                    f"nothing downstream would flag it."
+                )
+            if self.min_alive_groups != 0:
+                raise ValueError(
+                    f"scene_seed_pool_size > 0 requires min_alive_groups == 0, "
+                    f"got {self.min_alive_groups}. Dynamic group extension "
+                    f"consumes a VARIABLE number of pool slots per iteration "
+                    f"(between num_groups and max_groups), while the pool cursor "
+                    f"is deliberately stateless — it computes its offset as "
+                    f"(iteration - 1) * num_groups, which assumes exactly "
+                    f"num_groups slots are consumed each iteration. With dynamic "
+                    f"collection on, the cursor desynchronises from the seeds "
+                    f"actually used, iterations silently start re-drawing scenes "
+                    f"mid-pass, and the pass mean stops being a fixed-scene "
+                    f"average. Pass --min-alive-groups 0."
+                )
+            if self.init_state_npz_path is not None:
+                raise ValueError(
+                    f"scene_seed_pool_size > 0 is incompatible with "
+                    f"init_state_npz_path ({self.init_state_npz_path!r}). An init "
+                    f"bundle overrides the scene ENTIRELY — every group restores "
+                    f"the same saved model_xml + sim_state, and the reset's own "
+                    f"seeded scene is immediately overwritten by "
+                    f"apply_scene_bundle (see collect_episodes.py, "
+                    f"_align_envs_to_group_scene). The pool would therefore be "
+                    f"silently INERT: the seeds would be passed, logged, and "
+                    f"plotted while having no effect on a single pixel of the "
+                    f"scene. Silent inertness is exactly the failure mode worth "
+                    f"erroring on. Drop one of the two flags."
+                )
+            # NOT an error: a pool that is not a whole number of iterations
+            # long still cycles deterministically and still never repeats a seed
+            # inside one iteration (that is what the K >= max_groups check
+            # above guarantees). What it loses is only READABILITY — pass
+            # boundaries drift relative to iteration boundaries, so there is no
+            # fixed iteration stride whose mean is a full-pool average, and
+            # `episode/pool_pass` increments mid-iteration-block. Warn so the
+            # user knows the "average K/num_groups consecutive iterations"
+            # recipe does not apply to their K.
+            if self.scene_seed_pool_size % self.num_groups != 0:
+                import warnings
+                warnings.warn(
+                    f"scene_seed_pool_size ({self.scene_seed_pool_size}) is not "
+                    f"a multiple of num_groups ({self.num_groups}). The pool "
+                    f"still cycles deterministically and never repeats a seed "
+                    f"within an iteration, but a full pass over the pool no "
+                    f"longer aligns with a whole number of iterations, so you "
+                    f"cannot read a pass mean off a fixed iteration stride. Use "
+                    f"a multiple of num_groups (e.g. "
+                    f"{self.num_groups * max(1, round(self.scene_seed_pool_size / self.num_groups))}) "
+                    f"if you want pass-aligned iteration blocks.",
                     stacklevel=3,
                 )

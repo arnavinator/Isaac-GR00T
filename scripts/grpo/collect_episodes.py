@@ -39,6 +39,7 @@ Usage:
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import time
@@ -235,6 +236,131 @@ def _release_worker_memory_to_os() -> None:
 # at 1000 this is safe for num_groups <= 100 (num_groups=101 collides at
 # the iter boundary).
 GROUP_SEED_STRIDE = 1000
+
+
+def resolve_group_seed(
+    group_idx: int, base_seed: int, group_seeds: list[int] | None = None
+) -> int:
+    """Scene seed for group `group_idx` of one collect() call.
+
+    Two modes, and this function is the ONLY place the choice is made:
+
+      * `group_seeds is None` (default) — derive `base_seed + group_idx *
+        GROUP_SEED_STRIDE`, i.e. every iteration walks a brand-new seed block.
+      * `group_seeds` provided — take `group_seeds[group_idx]` verbatim. The
+        trainer builds this list from its frozen scene seed pool
+        (GRPOTrainer._scene_seeds_for_iteration) so the same scenes recur across
+        iterations and `episode/mean_reward` stops being dominated by scene
+        resampling.
+
+    Module-level and pure so the mapping is unit-testable without constructing
+    an EpisodeCollector (which needs gymnasium vector envs and a live policy
+    server).
+
+    Raises IndexError when `group_idx` runs past the supplied list. It does NOT
+    wrap: wrapping would hand two groups of the SAME iteration one scene, which
+    breaks GRPO's independent-scene-per-group assumption silently — the exact
+    thing the trainer's `scene_seed_pool_size >= num_groups`
+    validation exists to prevent. Reaching here means that validation was
+    bypassed (a hand-rolled CLI invocation) or dynamic group extension is on
+    despite the `min_alive_groups == 0` requirement, and both deserve a stop.
+    """
+    if group_seeds is None:
+        # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart
+        # RoboCasa scenes (closer seeds tend to produce visually similar
+        # kitchens/layouts, which dampens per-iteration diversity).
+        return base_seed + group_idx * GROUP_SEED_STRIDE
+    if group_idx >= len(group_seeds):
+        raise IndexError(
+            f"group_idx={group_idx} exceeds the {len(group_seeds)} explicit "
+            f"--group-seeds provided ({group_seeds}). Refusing to wrap: two "
+            f"groups in one iteration would then share a scene, silently "
+            f"breaking the independent-scene-per-group assumption behind "
+            f"group-relative advantages. Pass at least as many seeds as the "
+            f"maximum number of groups this call can collect (max_groups when "
+            f"dynamic collection is on, else num_groups)."
+        )
+    return group_seeds[group_idx]
+
+
+def scene_fingerprint(bundle: dict | None) -> str:
+    """Compact identity of the scene a group actually ran on.
+
+    Answers the one question no CPU test can reach: does a given `group_seed`
+    reproduce the SAME scene across iterations? The frozen scene seed pool
+    (GRPOConfig.scene_seed_pool_size) rests on the premise that it does, and
+    that premise is NOT obviously true here. RoboCasa picks
+    layout/style/textures at env CONSTRUCTION time from a per-instance RNG and
+    stores them in the model XML rather than in MjSimState (see this module's
+    header and _align_envs_to_group_scene, which is why the scene-bundle
+    broadcast exists at all), while `RoboCasaEnv.reset(seed=)` reseeds
+    random/np.random/env.rng and re-places objects. If the kitchen turns out to
+    be per-PROCESS rather than per-seed, then `episode/scene_sr/<seed>` compares
+    different kitchens across iterations instead of tracking one scene — and
+    both cases print byte-identical group log lines, so the failure is invisible
+    unless measured.
+
+    Reported parts, easiest-to-read first:
+
+      * `layout` / `style` — RoboCasa's own `layout_id` / `style_id`, lifted
+        straight out of `ep_meta`. These ARE the kitchen choice, so two groups
+        agreeing here are almost certainly in the same kitchen; no hash
+        comparison needed to eyeball it. Absent until robosuite's reset has
+        populated ep_meta (it mutates the dict in place — see _get_init_bundle),
+        hence the graceful omission rather than a "?" placeholder.
+      * `xml` — sha1 of the full model XML. Strictly stronger than layout/style:
+        also covers textures, fixture placement and camera poses.
+      * `state` — sha1 of the flattened MjSimState. Strongest of the three: it
+        additionally pins the reset's OBJECT placements, which is the part
+        `reset(seed=)` does control. So `xml` equal + `state` differing means
+        "same kitchen, different placements"; `xml` differing means the pool is
+        not freezing the scene at all.
+
+    Cost is one sha1 over a bundle the caller ALREADY holds (the branch point
+    _align_envs_to_group_scene captured for the turn driver) — no extra
+    get_scene_bundle RPC, no sim stepping, ~1 ms against a ~5 min group.
+
+    Never raises. A diagnostic must cost the diagnostic, not the 22 minutes of
+    rollouts the iteration has already banked, so malformed or missing fields
+    degrade to "?" and a non-dict bundle to "n/a".
+    """
+    if not isinstance(bundle, dict):
+        # group_size == 1 takes the singleton fast path in
+        # _align_envs_to_group_scene and never captures a bundle. Fingerprinting
+        # it would mean adding the get_scene_bundle RPC that path deliberately
+        # skips, so report "n/a" instead of paying for a degenerate debug config.
+        return "n/a"
+
+    parts: list[str] = []
+    try:
+        ep_meta = bundle.get("ep_meta")
+        if isinstance(ep_meta, dict):
+            for key, label in (("layout_id", "layout"), ("style_id", "style")):
+                if key in ep_meta:
+                    parts.append(f"{label}={ep_meta[key]}")
+    except Exception:                                            # noqa: BLE001
+        parts.append("layout=?")
+
+    def _digest(payload) -> str:
+        try:
+            if payload is None:
+                return "?"
+            if isinstance(payload, str):
+                raw = payload.encode("utf-8", "replace")
+            else:
+                # Pin dtype and C order so the digest identifies the scene, not
+                # the array's memory layout: a non-contiguous view or an
+                # upstream float32/float64 change would otherwise read as a
+                # different scene and manufacture exactly the false alarm this
+                # function exists to rule out.
+                raw = np.ascontiguousarray(payload, dtype=np.float64).tobytes()
+            return hashlib.sha1(raw).hexdigest()[:8]
+        except Exception:                                        # noqa: BLE001
+            return "?"
+
+    parts.append(f"xml={_digest(bundle.get('model_xml'))}")
+    parts.append(f"state={_digest(bundle.get('sim_state'))}")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +787,43 @@ def _make_collector_env(
 # ---------------------------------------------------------------------------
 
 
+def _comma_separated_ints(text: str) -> list[int]:
+    """argparse `type=` for a comma-separated int list ("100067,101067").
+
+    Comma-separated rather than `nargs="*"` (which `--dropped-video-keys` uses):
+    the whole list stays ONE argv token, so it round-trips through
+    subprocess.Popen and shows up as a single readable field in the collector's
+    startup log and in `ps` output, and it cannot accidentally swallow a
+    following flag the way a greedy `nargs="*"` can. It also makes "flag present
+    but empty" unrepresentable, which is what we want here — an empty seed list
+    would mean "no scenes", not "keep the default derivation" (that is `None`,
+    i.e. omitting the flag).
+
+    Empty entries from a stray trailing comma are dropped; anything non-integer
+    raises argparse.ArgumentTypeError so the error names the offending token
+    instead of surfacing as a bare ValueError traceback.
+    """
+    out: list[int] = []
+    for tok in text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--group-seeds expects comma-separated integers; "
+                f"{tok!r} in {text!r} is not an integer."
+            ) from None
+    if not out:
+        raise argparse.ArgumentTypeError(
+            f"--group-seeds was passed {text!r}, which contains no integers. "
+            f"Omit the flag entirely to use the default "
+            f"base_seed + group_idx * {GROUP_SEED_STRIDE} derivation."
+        )
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Collect episodes in groups for GRPO training via PolicyClient + AsyncVectorEnv"
@@ -737,6 +900,31 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for environment initialization.",
     )
     parser.add_argument(
+        "--group-seeds", type=_comma_separated_ints, default=None,
+        metavar="S0,S1,...",
+        help="Explicit per-group scene seeds, comma-separated (e.g. "
+             "'100067,101067,102067'). Group g resets with group_seeds[g] "
+             "instead of the default --seed + g * 1000. Used by the trainer's "
+             "frozen scene seed pool (GRPOConfig.scene_seed_pool_size) so the "
+             "same scenes recur across iterations and the success-rate curve "
+             "stops being dominated by scene resampling. Must supply at least "
+             "as many seeds as groups this call can collect, or the run raises "
+             "rather than reusing a scene within one iteration. Omit to keep "
+             "the default derivation.",
+    )
+    parser.add_argument(
+        "--log-scene-fingerprint", action="store_true",
+        help="Append a scene-identity fingerprint (layout/style ids + sha1 of "
+             "model_xml and sim_state) to each group's log line. Verifies the "
+             "premise behind the frozen scene seed pool: that a given group seed "
+             "reproduces the SAME scene across iterations. Compare the same pool "
+             "slot between passes — matching 'xml=' means the kitchen is pinned; "
+             "differing 'xml=' means the pool is not freezing the scene, so the "
+             "per-scene curves are comparing different kitchens. Costs one sha1 "
+             "over an already-captured bundle (no extra RPC). The trainer sets "
+             "this automatically whenever the pool is enabled.",
+    )
+    parser.add_argument(
         "--min-alive-groups", type=int, default=0,
         help="Min ALIVE groups (mixed: 0 < group_successes < group_size, "
              "i.e., per-group reward std > 0) before "
@@ -792,6 +980,7 @@ class EpisodeCollector:
         num_async_vector_env: int | None = None,
         skip_intermediate_render: bool = True,
         dropped_video_keys: tuple = DEFAULT_DROPPED_VIDEO_KEYS,
+        log_scene_fingerprint: bool = False,
     ):
         self.env_name = env_name
         self.group_size = group_size            # LOGICAL rollouts per group
@@ -818,6 +1007,18 @@ class EpisodeCollector:
         self.output_dir = Path(output_dir)
         self.skip_intermediate_render = skip_intermediate_render
         self.dropped_video_keys = tuple(dropped_video_keys or ())
+        # Scene-identity diagnostic (see scene_fingerprint). Off by default so
+        # the group log line stays byte-identical for unpooled runs; the trainer
+        # turns it on for every frozen-pool run, because a pool whose seeds do
+        # not actually pin the scene produces the same log lines as one that does.
+        self.log_scene_fingerprint = log_scene_fingerprint
+        # Fingerprint of the scene the CURRENT group was aligned to, published by
+        # _align_envs_to_group_scene and consumed by collect()'s per-group print.
+        # Passed via an attribute rather than a return value because the two FF
+        # and non-FF group collectors sit between the two, and threading a
+        # diagnostic string through both signatures would put it in the way of
+        # the code it is diagnosing.
+        self._last_scene_fingerprint: str | None = None
 
         env_fns = [
             partial(
@@ -909,6 +1110,7 @@ class EpisodeCollector:
         min_alive_groups: int = 0,
         max_groups: int | None = None,
         init_state_npz_path: str | None = None,
+        group_seeds: list[int] | None = None,
     ) -> list[dict]:
         """Collect groups of self.group_size rollouts each.
 
@@ -917,6 +1119,12 @@ class EpisodeCollector:
         group, different outcomes arise from the policy's denoising noise
         (torch.randn in the action head), NOT from environmental randomness;
         GRPO advantages compare these outcomes against each other.
+
+        `group_seeds`, when given, replaces the default
+        `base_seed + group_idx * GROUP_SEED_STRIDE` derivation with an explicit
+        per-group list (see `resolve_group_seed`). The trainer supplies it from
+        its frozen scene seed pool so the same scenes recur across iterations;
+        `base_seed` is still used for everything else it drives.
 
         Fast-forward is decided ONCE per call (per training iteration), not
         per group. With probability `fast_forward_pct`, ALL groups in this
@@ -964,6 +1172,32 @@ class EpisodeCollector:
                 f"max_groups={max_groups} with GROUP_SEED_STRIDE={GROUP_SEED_STRIDE} "
                 f"would overflow the trainer's per-iter seed stride (100_000), "
                 f"causing seed collisions across iterations."
+            )
+        # Explicit scene seeds (frozen pool). Check the LENGTH up front rather
+        # than letting resolve_group_seed raise mid-collection: hitting the
+        # IndexError at group 5 of 6 throws away ~35 minutes of already-collected
+        # rollouts, whereas this fires before the first env.reset().
+        #
+        # The bound is the number of groups this call can ACTUALLY reach, which
+        # is num_groups unless dynamic mode is live — the loop's stop condition
+        # below is `group_idx >= num_groups` whenever `dynamic_mode` is False,
+        # and max_groups only binds as the cap on a dynamic extension. Using
+        # max_groups unconditionally would reject the DEFAULT config
+        # (num_groups=3, max_groups=5, min_alive_groups=0), where the trainer
+        # correctly sends only num_groups seeds because only num_groups groups
+        # will ever be collected.
+        _max_reachable_groups = max_groups if dynamic_mode else num_groups
+        if group_seeds is not None and len(group_seeds) < _max_reachable_groups:
+            raise ValueError(
+                f"--group-seeds supplied {len(group_seeds)} seeds "
+                f"({group_seeds}) but this call can collect up to "
+                f"{_max_reachable_groups} groups (num_groups={num_groups}, "
+                f"max_groups={max_groups}, min_alive_groups={min_alive_groups}, "
+                f"dynamic_mode={dynamic_mode}). Supply at least that many seeds "
+                f"— the collector refuses to reuse a seed within one iteration, "
+                f"since two groups on one scene breaks the "
+                f"independent-scene-per-group assumption behind group-relative "
+                f"advantages."
             )
 
         all_episodes: list[dict] = []
@@ -1028,14 +1262,26 @@ class EpisodeCollector:
             # needs visible confirmation that the flag took effect. Matches
             # the FF prints above which are also unguarded for the same reason.
             print(f"  Init-state override: every group restores from {init_state_npz_path}")
+        if group_seeds is not None:
+            # Unguarded by _CLEAN_OUTPUT for the same reason as the two prints
+            # above: which scenes an iteration ran on is the whole point of the
+            # frozen pool, and this line is the only per-iteration record of it
+            # in the collector log. Print the seeds the groups will ACTUALLY use
+            # (sliced to the reachable group count) rather than the raw argument,
+            # so the log cannot disagree with what happened.
+            print(
+                f"  Scene seed pool: groups use explicit seeds "
+                f"{group_seeds[:_max_reachable_groups]} (instead of "
+                f"{base_seed} + group_idx × {GROUP_SEED_STRIDE})"
+            )
 
         alive_groups = 0
         group_idx = 0
         while True:
-            # Wide GROUP_SEED_STRIDE so consecutive groups land on far-apart
-            # RoboCasa scenes (closer seeds tend to produce visually similar
-            # kitchens/layouts, which dampens per-iteration diversity).
-            group_seed = base_seed + group_idx * GROUP_SEED_STRIDE
+            # Explicit pool seed when the trainer supplied one, else the default
+            # base_seed + group_idx * GROUP_SEED_STRIDE. Single source of truth
+            # for the mapping so it stays unit-testable (see resolve_group_seed).
+            group_seed = resolve_group_seed(group_idx, base_seed, group_seeds)
 
             if use_ff_for_iteration:
                 group_episodes = self._collect_one_group_with_fast_forward(
@@ -1088,8 +1334,18 @@ class EpisodeCollector:
             else:
                 progress_str = f"total: {n_done}/{self.group_size * num_groups}"
                 count_str = f"{group_idx}/{num_groups}"
+            # Scene identity, appended right next to the seed so "did seed X give
+            # the same scene as last pass?" is a same-column eyeball rather than
+            # a cross-referencing exercise. Empty string when the flag is off, so
+            # an unpooled run's line is byte-identical to before. "n/a" when the
+            # group took a path that captures no bundle (group_size == 1).
+            _scene = (
+                f" {self._last_scene_fingerprint or 'n/a'}"
+                if self.log_scene_fingerprint
+                else ""
+            )
             print(
-                f"  Group {count_str} (seed={group_seed}) {ff_label}: "
+                f"  Group {count_str} (seed={group_seed}{_scene}) {ff_label}: "
                 f"{group_successes}/{self.group_size} success | "
                 f"{progress_str} ({rate:.0f} eps/min)"
             )
@@ -1333,12 +1589,26 @@ class EpisodeCollector:
         seeds = [group_seed] * self.num_envs
         vector_obs, _ = self.envs.reset(seed=seeds)
 
+        # Reset the published fingerprint FIRST, before anything can return
+        # early. Otherwise the singleton path below (which captures no bundle)
+        # would leave the previous group's value in place and collect() would
+        # attribute one group's scene to another — a diagnostic that lies is
+        # worse than one that says "n/a".
+        self._last_scene_fingerprint = None
+
         if self._active_init_bundle_path is not None:
             # Saved-state override: ignore env 0's scene entirely and broadcast
             # the loaded bundle to all envs (including the num_envs==1 case — the
             # user explicitly asked to start from this saved state).
             bundle = self._get_init_bundle(self._active_init_bundle_path)
             obs_tuple = self.envs.call("apply_scene_bundle", bundle)
+            # Fingerprinted too, even though init-state mode is mutually
+            # exclusive with the frozen pool: here it should read IDENTICALLY on
+            # every group of every iteration, which makes it a positive control
+            # for the diagnostic itself. If it ever varies, the fingerprint (or
+            # the bundle cache) is at fault, not the pool.
+            if self.log_scene_fingerprint:
+                self._last_scene_fingerprint = scene_fingerprint(bundle)
             return list(obs_tuple), bundle
 
         if self.group_size == 1:
@@ -1355,6 +1625,12 @@ class EpisodeCollector:
         # branch point would carry turn-1 reset state into turns 2..k.
         bundles = self.envs.call("get_scene_bundle")
         branch_bundle = copy.deepcopy(bundles[0])
+        # Fingerprint the PRISTINE branch point, not bundles[0]: the apply below
+        # mutates ep_meta in place, so hashing after it would fold turn-1 reset
+        # state into the digest and make the same scene read differently
+        # depending on when it was measured.
+        if self.log_scene_fingerprint:
+            self._last_scene_fingerprint = scene_fingerprint(branch_bundle)
         obs_tuple = self.envs.call("apply_scene_bundle", bundles[0])
         return list(obs_tuple), branch_bundle
 
@@ -1899,6 +2175,7 @@ def main():
         num_async_vector_env=args.num_async_vector_env,
         skip_intermediate_render=args.skip_intermediate_render,
         dropped_video_keys=tuple(args.dropped_video_keys),
+        log_scene_fingerprint=args.log_scene_fingerprint,
     )
 
     try:
@@ -1910,6 +2187,7 @@ def main():
             min_alive_groups=args.min_alive_groups,
             max_groups=args.max_groups,
             init_state_npz_path=args.init_state_npz_path,
+            group_seeds=args.group_seeds,
         )
         save_episodes(episodes, args.output_dir)
     finally:

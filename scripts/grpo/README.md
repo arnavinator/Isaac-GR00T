@@ -29,6 +29,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
 | `test_smoothness.py` | CPU suite for the endpoint-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the `compute_fm_log_prob` return contract, `smooth_ref.json` guard rejection, and `smooth_coef=0` bit-identity through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
+| `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
 
 ---
 
@@ -305,6 +306,187 @@ Constraints and caveats:
 - The trainer's per-iter seed stride is 100,000
   (`config.seed + iteration * 100_000`), so two consecutive iters' group
   ranges never collide. This caps `max_groups` at 100.
+
+### Frozen scene seed pool (`scene_seed_pool_size`)
+
+The per-iter stride above means **every iteration trains on, and reports,
+brand-new scenes**. Measured between-scene success-rate sd is **0.285**, so at
+`num_groups=4` roughly **84% of the per-iteration `episode/mean_reward` variance
+is scene resampling**, not policy change. The training curve is then
+uninterpretable: a swing between consecutive iterations says nothing about the
+update that happened in between.
+
+`scene_seed_pool_size = K > 0` freezes a pool of K scene seeds and cycles it
+deterministically across iterations, so the same scenes recur.
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --scene-seed-pool-size 12 \
+    --num-groups 4 --max-groups 4 --min-alive-groups 0 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env
+# optional: pin the pool explicitly instead of deriving it from --seed
+#   --scene-seed-pool-base 300000
+```
+
+`--min-alive-groups 0` is the only *mandatory* companion flag (the default is 2).
+`max_groups` does not have to be lowered to `num_groups` — it only has to satisfy
+`K >= max_groups`, so the stock `max_groups=5` is fine at `K=12`. It stays inert
+anyway: with `min_alive_groups=0` the collector always stops at exactly
+`num_groups`, which is why the trainer sends exactly `num_groups` seeds.
+
+**Knobs.**
+
+| knob | meaning |
+|---|---|
+| `scene_seed_pool_size` (K) | Pool size. **0 = DISABLED**, and disabled is bit-identical to a pre-feature run: no `--group-seeds` argument is appended to the collector argv, and no per-scene TB series are emitted. |
+| `scene_seed_pool_base` | First seed; the pool is `base + j * GROUP_SEED_STRIDE` for `j in [0, K)`. `None` → resolved **in `__post_init__`** to `seed + 100_000`, which is exactly the seed block iteration 1 would have drawn under the old formula. At the default `seed=67` and `K=12` the pool is `100067, 101067, ..., 111067`. Resolution happens in place (not at the use site) so the concrete value lands in the TensorBoard `config` text dump — otherwise the run's own artifacts would not record which scenes it trained on. |
+
+**Cursor.** Per iteration, `num_groups` consecutive pool slots, wrapping:
+
+```
+pool     = [base + j * GROUP_SEED_STRIDE for j in range(K)]
+seeds[g] = pool[((iteration - 1) * num_groups + g) % K]
+```
+
+`self.iteration` is **1-based** (`train()` loops
+`range(self._start_iteration, num_iterations + 1)`, and the legacy `--seed`
+formula yields `100067` at iteration 1 with `seed=67`), so the `- 1` makes
+iteration 1 start at pool index 0. At `K=12, num_groups=4`:
+
+| iteration | seeds | `episode/pool_pass` |
+|---|---|---|
+| 1 | 100067, 101067, 102067, 103067 | 0 |
+| 2 | 104067, 105067, 106067, 107067 | 0 |
+| 3 | 108067, 109067, 110067, 111067 | 0 |
+| 4 | 100067, 101067, 102067, 103067 | 1 |
+
+**Why stateless.** The cursor is a pure function of `iteration`, not a persisted
+counter. That makes `--resume-from` correct *by construction*: resuming at
+iteration 37 recomputes exactly the seeds iteration 37 would have used in an
+uninterrupted run, with no new checkpoint state to write, load, validate or
+forget. A persisted counter would have to survive `_save_checkpoint` / load
+**and** the `resume_from_collected_data` path that skips a collection entirely,
+and would silently drift on any resume from a checkpoint written before the
+counter existed.
+
+Its correctness depends on the `min_alive_groups == 0` validation below: the
+`* num_groups` term assumes every iteration consumes exactly `num_groups` slots.
+
+**Validations** (all hard `ValueError` at config construction, because every one
+of these failure modes is otherwise *silent* — the run completes, the curves look
+plausible, and the property the pool exists to provide is simply gone):
+
+| check | reason |
+|---|---|
+| `K >= 1` (or exactly `0` to disable) | `0` is the only disabling value. A negative K would sail past the internal `> 0` gate and disable the feature silently; a fractional `0 < K < 1` would build an empty pool and raise `ZeroDivisionError` inside the cursor, minutes into the run. |
+| `K >= num_groups` | Within one iteration two groups must never land on the same seed. Two groups on one scene correlates their group-relative advantages and double-counts that scene in the iteration mean — GRPO's group-relative baseline assumes independent scenes per group, and nothing downstream would flag the violation. The bound is `num_groups`, **not** `max(num_groups, max_groups)`: `min_alive_groups == 0` is mandatory (next row), and the collector's `dynamic_mode = min_alive_groups > 0 and max_groups > num_groups` is therefore always False, so the group loop stops at `group_idx >= num_groups` and `max_groups` slots are unreachable. Bounding on `max_groups` would reject `K == num_groups` under the **default** `max_groups=5` — the one setting where every iteration is directly comparable. `EpisodeCollector.collect`'s own `_max_reachable_groups` uses the same rule; the two must agree or one rejects a run the other accepts. |
+| `min_alive_groups == 0` | Dynamic group extension consumes a **variable** number of pool slots per iteration, which desynchronises the stateless cursor from the seeds actually used. |
+| `init_state_npz_path is None` | An init bundle overrides the scene entirely — the reset's own seeded scene is immediately overwritten by `apply_scene_bundle` — so a scene pool would be **silently inert**: seeds passed, logged and plotted with no effect on a single pixel. Silent inertness is the exact failure mode worth erroring on. |
+
+**Pass-alignment warning** (a `warnings.warn`, *not* an error): when
+`K % num_groups != 0` the pool still cycles deterministically and still never
+repeats a seed within an iteration, but a full pass no longer aligns with a whole
+number of iterations, so **you cannot read a pass mean off a fixed iteration
+stride** and `episode/pool_pass` increments mid-block.
+
+**New TB scalars** (emitted only when the pool is enabled):
+
+| scalar | meaning |
+|---|---|
+| `episode/scene_sr/<seed>` | Per-scene success rate for every seed present in the iteration. One curve per scene over the run — the only view that separates "the policy improved" from "this iteration drew easier scenes". Routed through `_log_metrics`' `_emit` helper, so a non-finite value is dropped with a warning rather than poisoning chart autoscale. |
+| `episode/pool_pass` | `((iteration - 1) * num_groups) // K` — 0-based pass index, for binning iterations into passes. |
+
+Gated on the pool because with it **off** every iteration has fresh seeds, so
+unconditional emission would create `num_groups` brand-new single-point series
+per iteration (200+ over a 50-iteration run at `num_groups=4`), bloating the
+event file and the TB sidebar for no benefit.
+
+**How to read the result — the important caveat.** With `K > num_groups` the
+**per-ITERATION success rate is exactly as noisy as before**: each iteration
+still samples only `num_groups` of the K scenes, so between-scene variance is
+undiminished within one point. What the pool buys is that the *sequence* of
+iterations covers a fixed scene set, so the readable unit is the **pass mean over
+`K / num_groups` consecutive iterations** — and `episode/scene_sr/<seed>` gives
+per-scene curves that are directly comparable across iterations. If you want
+every single iteration to be comparable on its own, set `K == num_groups`, at the
+cost of training on only `num_groups` distinct scenes for the whole run.
+
+#### Verifying the pool's premise (`--log-scene-fingerprint`)
+
+The pool assumes a `group_seed` reproduces the same **scene** across iterations.
+That is not obviously true in RoboCasa, and if it is false the pool still trains
+fine but delivers none of the measurement gain — while printing byte-identical
+logs either way. So the trainer turns this diagnostic on for **every** pooled run
+(no config knob to disable it) and `collect_episodes.scene_fingerprint` appends
+scene identity to each group's log line:
+
+```
+Group 1/4 (seed=100067 layout=3 style=7 xml=a3f9c1d2 state=7b2e40aa) (from seed): 10/12 success | ...
+```
+
+Why it might be false: RoboCasa chooses layout/style/textures at env
+**construction** time from a per-instance RNG and stores them in the model XML,
+not in `MjSimState` (this module's header; `_align_envs_to_group_scene` — the
+scene-bundle broadcast exists *because* same-seed envs render different scenes),
+whereas `RoboCasaEnv.reset(seed=)` reseeds `random`/`np.random`/`env.rng` and
+re-places objects. Every iteration is a fresh collector subprocess with fresh
+workers, so a group's kitchen may come from whatever env 0 happened to construct
+rather than from its pool seed.
+
+| part | covers | reading |
+|---|---|---|
+| `layout=` / `style=` | RoboCasa's own `layout_id` / `style_id`, straight out of `ep_meta` | The kitchen choice itself — eyeballable with no hash comparison. Omitted until robosuite's reset has populated `ep_meta`. |
+| `xml=` | sha1 of the full model XML | Stronger: also covers textures, fixture placement, camera poses. |
+| `state=` | sha1 of the flattened `MjSimState` | Strongest: additionally pins the reset's **object placements**, the part `reset(seed=)` does control. |
+
+**How to read it.** Compare the same pool slot across two passes (at `K=12,
+num_groups=4`: iteration 1 group 1 vs iteration 4 group 1):
+
+- `xml=` matches → the kitchen is pinned; the pool works and `episode/scene_sr/<seed>`
+  is a genuine per-scene learning curve.
+- `xml=` matches, `state=` differs → same kitchen, different object placements.
+- `xml=` differs → **the pool is not freezing the scene.** Gradients are still
+  valid (the scene-bundle broadcast keeps every rollout in a group on one scene,
+  so group-relative advantages hold), but the cross-iteration comparison is
+  confounded and the pass mean is not a fixed-scene average.
+
+Also worth checking on the first iteration: whether the four groups share one
+`xml=`. If they do, layout is per-process and only placements vary per seed.
+
+Cost is one sha1 over the branch-point bundle `_align_envs_to_group_scene`
+**already captured** for the turn driver — no extra `get_scene_bundle` RPC, no sim
+stepping, ~1 ms against a ~5 min group. It fingerprints the pristine deep copy
+rather than `bundles[0]`, because `apply_scene_bundle` mutates `ep_meta` in place
+and hashing after that would make one scene read differently depending on when it
+was measured. `scene_fingerprint` never raises (malformed fields degrade to `?`, a
+missing bundle to `n/a`), and the published value is cleared at the top of every
+alignment so a path that captures no bundle — `group_size == 1` — cannot leave the
+previous group's fingerprint to be misattributed. In `init_state_npz_path` mode it
+is a positive control: it should read identically on every group of every
+iteration, so variation there indicts the diagnostic or the bundle cache, not the
+pool.
+
+**Interaction with `--resume-from` / `resume_from_collected_data`.** Resume needs
+nothing extra (that is the point of the stateless cursor), as long as `K`,
+`scene_seed_pool_base` and `num_groups` are unchanged — change any of them and
+the resumed run trains on different scenes than the prefix did, which
+`_validate_collected_data_cache` does not check (it verifies env name, group
+counts and FM keys). `resume_from_collected_data` is consistent by construction:
+the cached iteration skips collection, and the per-scene curves are keyed on the
+`env_seed` stored in each `.npz`, so they carry the seeds the episodes were
+actually collected under. Episodes written before `env_seed` existed default to
+`0` (`episode_buffer.load_episodes`) and would all pool into
+`episode/scene_sr/0`.
+
+**Interaction with `toy_train_grpo.py`.** Do **not** combine the pool with the
+toy trainer. `ToyGRPOTrainer._collect_episodes` achieves fixed seeds by a
+different mechanism — it temporarily mutates `config.seed`, `config.num_groups`
+and `self.iteration` around each one-group subprocess call — which the pool
+cursor would read as its inputs and override with pool seeds. `ToyGRPOConfig`
+inherits the default `scene_seed_pool_size = 0`, so this only arises if you pass
+the flag explicitly; it is not validated against.
+
+Covered by `test_scene_seed_pool.py`.
 
 ### Multi-env / multi-task support
 
@@ -2366,6 +2548,12 @@ boundary of the `(50, 128)` output is meaningless.
 - `init_state_npz_path` — see "Init from saved sim state". Default None
   (disabled). When set, overrides the seed-based scene init for every
   group; intended for overfitting / curriculum experiments.
+- `scene_seed_pool_size` / `scene_seed_pool_base` — see "Frozen scene seed
+  pool". Default 0 / None (**disabled**, bit-identical to a pre-feature run).
+  `K > 0` freezes K scene seeds and cycles them across iterations so the same
+  scenes recur; requires `min_alive_groups == 0`, `K >= num_groups`, and no
+  `init_state_npz_path`. `base=None` resolves in place to
+  `seed + 100_000`.
 - `env_names: list[str]` — round-robin task selection.
 - `episode_dir`, `episode_dirs_to_keep`.
 
@@ -2444,7 +2632,9 @@ these differ under gradient accumulation),
 non-finite gradient; should stay flat at 0),
 `train/learning_rate`, `time/iteration_seconds`, and (when
 `dynamic_epoch_training=True` and at least one gradient step fired)
-`balanced/{actual_epochs,success_fraction}`. `mean_log_ratio_abs`
+`balanced/{actual_epochs,success_fraction}`. With `scene_seed_pool_size > 0`,
+also `episode/scene_sr/<seed>` (one curve per pooled scene) and
+`episode/pool_pass`. `mean_log_ratio_abs`
 is the primary diagnostic for DPPO-style surrogates: large values mean
 the FM-MSE log-prob is noisy enough that most updates clip.
 

@@ -80,6 +80,19 @@ from episode_buffer import EpisodeBuffer, ActionChunk
 ITER_DIR_RE = re.compile(r"iter_([0-9]+)")
 
 
+# Spacing between successive group seeds inside ONE collection call.
+#
+# THIS IS A MIRROR, NOT THE SOURCE OF TRUTH: collect_episodes.GROUP_SEED_STRIDE
+# is the definition, and it is the value that actually reaches env.reset(seed=).
+# It is duplicated here because collect_episodes.py runs in the robocasa venv and
+# imports gymnasium/robosuite at module scope, so the trainer cannot import it
+# just to read one integer. The trainer only needs the constant when the frozen
+# scene seed pool is enabled (_scene_seeds_for_iteration), where the seeds it
+# builds must land on the SAME scenes the collector's own formula would produce.
+# test_scene_seed_pool.py asserts the two literals agree so they cannot drift.
+GROUP_SEED_STRIDE = 1000
+
+
 # Dynamic positive-advantage weighting (config.positive_advantage_weight_scaling).
 # The tunables (k cap, target ratio) are config fields; these are the fixed
 # constants. See _grpo_update_inner for the full algorithm.
@@ -555,6 +568,22 @@ class GRPOTrainer:
                 f"  Async vector envs: {self._resolved_num_async_vector_env()} "
                 f"workers → {self._turns_per_group()} turns/group "
                 f"(group_size={self.config.group_size})"
+            )
+        if self.config.scene_seed_pool_size > 0:
+            # Which scenes the run trains on is the single most load-bearing
+            # fact about a pooled run's curves, so print the pool bounds and the
+            # pass length rather than making the operator recompute them from
+            # base + K. Iterations-per-pass is integer division on purpose: it is
+            # only exact when K % num_groups == 0, which __post_init__ warns
+            # about, and the warning already fired by the time this prints.
+            _pool = self._scene_seed_pool()
+            print(
+                f"  Frozen scene seed pool: ON — K={len(_pool)} seeds "
+                f"{_pool[0]}..{_pool[-1]} (stride {GROUP_SEED_STRIDE}), "
+                f"{self.config.num_groups} per iter → "
+                f"{len(_pool) // self.config.num_groups} iters/pass. "
+                f"Per-ITERATION success rate is still {self.config.num_groups} "
+                f"scenes wide; read the pass mean (episode/pool_pass)."
             )
         print(f"  Update epochs: {self.config.update_epochs}")
         print(f"  Mini-batch size: {self.config.mini_batch_size}")
@@ -1341,6 +1370,82 @@ class GRPOTrainer:
         one-env-per-rollout case)."""
         return self.config.group_size // self._resolved_num_async_vector_env()
 
+    def _scene_seed_pool(self) -> list[int]:
+        """The FROZEN pool of RoboCasa scene seeds, or [] when disabled.
+
+        `[base + j * GROUP_SEED_STRIDE for j in range(K)]` — the same spacing
+        the collector uses between groups, so every pool entry is a seed the
+        old per-iteration formula could itself have produced, and so
+        consecutive entries land on visually-distinct kitchens (close seeds
+        tend to produce similar layouts; see collect_episodes.GROUP_SEED_STRIDE).
+
+        `scene_seed_pool_base` is resolved by GRPOConfig.__post_init__, so it is
+        never None here when the pool is on.
+        """
+        if self.config.scene_seed_pool_size <= 0:
+            return []
+        return [
+            self.config.scene_seed_pool_base + j * GROUP_SEED_STRIDE
+            for j in range(self.config.scene_seed_pool_size)
+        ]
+
+    def _scene_seeds_for_iteration(self) -> list[int]:
+        """This iteration's ordered per-group scene seeds ([] when pool is off).
+
+        The cursor walks the pool `num_groups` slots per iteration and wraps:
+
+            seeds[g] = pool[((iteration - 1) * num_groups + g) % K]
+
+        `self.iteration` is 1-BASED (train()'s loop runs
+        `range(self._start_iteration, num_iterations + 1)` with
+        `_start_iteration >= 1`, which is also why the legacy `--seed` formula
+        yields 100067 at iteration 1 with seed=67, and why TB steps run 1..N).
+        The `- 1` therefore makes iteration 1 start at pool index 0 rather than
+        skipping the first block.
+
+        DELIBERATELY STATELESS — a pure function of `iteration`, not a persisted
+        counter. That is what makes `--resume-from` correct by construction:
+        resuming at iteration 37 recomputes exactly the seeds iteration 37 would
+        have used in an uninterrupted run, with no new checkpoint state to save,
+        load, validate or forget. A persisted cursor would need to survive both
+        `_save_checkpoint`/`load` AND the `resume_from_collected_data` path that
+        skips a collection entirely, and would silently drift on any resume from
+        a checkpoint written before the cursor existed.
+
+        Correctness of the stride depends on the `min_alive_groups == 0`
+        validation in GRPOConfig.__post_init__: the `* num_groups` term assumes
+        each iteration consumes EXACTLY num_groups slots. Dynamic group
+        extension consumes a variable count, which would desynchronise the
+        cursor from the seeds actually used.
+        """
+        pool = self._scene_seed_pool()
+        if not pool:
+            return []
+        n_groups = self.config.num_groups
+        offset = (self.iteration - 1) * n_groups
+        return [pool[(offset + g) % len(pool)] for g in range(n_groups)]
+
+    def _scene_pool_pass(self, iteration: int) -> int:
+        """0-based index of the pass over the pool that `iteration` falls in.
+
+        `((iteration - 1) * num_groups) // K`. Logged as `episode/pool_pass` so
+        the user can group iterations into passes and average within one — the
+        per-ITERATION success rate is still only num_groups scenes wide and
+        therefore just as noisy as before the pool existed (see README "Frozen
+        scene seed pool"). Only exact when K is a multiple of num_groups; the
+        config warns otherwise, because a pass then straddles iterations.
+
+        Takes `iteration` explicitly rather than reading `self.iteration`: the
+        sole caller is `_log_metrics`, which already receives the iteration it is
+        logging as an argument (and is driven with a bare `__new__`'d trainer,
+        with no `self.iteration`, by the CPU test suites).
+        """
+        if self.config.scene_seed_pool_size <= 0:
+            return 0
+        return (
+            (iteration - 1) * self.config.num_groups
+        ) // self.config.scene_seed_pool_size
+
     def _collect_via_subprocess(
         self,
         env_name: str,
@@ -1387,6 +1492,38 @@ class GRPOTrainer:
             "--min-alive-groups", str(self.config.min_alive_groups),
             "--max-groups", str(self.config.max_groups),
         ]
+
+        # Frozen scene seed pool. When enabled, hand the collector this
+        # iteration's explicit per-group seed list; it then uses seeds[g] for
+        # group g instead of deriving base_seed + g * GROUP_SEED_STRIDE.
+        #
+        # `--seed` above is deliberately left ALONE in both cases. It is not only
+        # the scene-seed base: the collector also seeds numpy's global RNG from
+        # it (collect_episodes.main), and the trainer's own RNG sites at the
+        # torch.manual_seed / np.random.seed calls in main() and setup() key off
+        # config.seed. Overwriting it to freeze scenes would silently couple
+        # those to the pool.
+        #
+        # When the pool is OFF, append NOTHING — the baseline argv must stay
+        # byte-identical, so an A/B against a pre-feature run compares the same
+        # command line.
+        if self.config.scene_seed_pool_size > 0:
+            _scene_seeds = self._scene_seeds_for_iteration()
+            cmd.extend(
+                ["--group-seeds", ",".join(str(s) for s in _scene_seeds)]
+            )
+            # Always on for a pooled run, with no config knob to turn it off.
+            # The pool's whole value is that iteration N and iteration N + K/G
+            # measure the SAME scenes, and that premise is not guaranteed by the
+            # seeds alone: RoboCasa bakes layout/style/textures at env
+            # construction from a per-instance RNG, not from the reset seed (see
+            # collect_episodes.scene_fingerprint). A pool that silently fails to
+            # pin the scene prints byte-identical logs to one that works, so the
+            # fingerprint is the only evidence that the run means what it looks
+            # like it means — and it costs one sha1 over a bundle the collector
+            # already holds. Compare the same pool slot across passes: matching
+            # `xml=` confirms the kitchen is pinned.
+            cmd.append("--log-scene-fingerprint")
 
         # Optional saved-state override. Only append when set so the existing
         # CLI behavior (no flag → no override) is unchanged for baseline runs.
@@ -6066,6 +6203,41 @@ class GRPOTrainer:
         if _ref_mse:
             _emit("ref_mse", _ref_mse)
 
+        # ── Per-SCENE success rate (frozen scene seed pool only) ─────────────
+        # Placed here rather than up in the `if stats:` block purely because it
+        # routes through _emit, which is defined just above — same non-finite /
+        # non-numeric filtering as every other _emit'd family.
+        #
+        # GATED ON THE POOL BEING ON, deliberately. With the pool off, every
+        # iteration draws brand-new seeds (`config.seed + iter * 100_000 +
+        # group_idx * 1000`), so unconditional emission would create num_groups
+        # BRAND-NEW TB series per iteration — 200+ single-point curves over a
+        # 50-iteration run at num_groups=4. That bloats the event file, makes the
+        # TB scalar sidebar unusable, and buys nothing: a curve with one point
+        # cannot show a trend. With the pool on the seed set is fixed, so each
+        # series accumulates one point per iteration in which its scene was drawn
+        # and IS a per-scene learning curve.
+        #
+        # `episode/pool_pass` is emitted alongside so iterations can be binned
+        # into passes over the pool; the per-ITERATION success rate still samples
+        # only num_groups of the K scenes and is therefore just as noisy as
+        # before (see README "Frozen scene seed pool"). The readable unit is the
+        # mean over one pass.
+        if stats and self.config.scene_seed_pool_size > 0:
+            _scene = stats.get("per_scene_success") or {}
+            _emit(
+                "episode/scene_sr",
+                # Absent seeds emit nothing at all (curve gap) rather than a 0,
+                # which would be indistinguishable from a real 0/G iteration.
+                # n_total is never 0 here — a seed only appears in the mapping
+                # because at least one episode carried it.
+                {str(seed): n_succ / n_total
+                 for seed, (n_succ, n_total) in sorted(_scene.items())},
+            )
+            self.writer.add_scalar(
+                "episode/pool_pass", self._scene_pool_pass(iteration), iteration
+            )
+
         # Endpoint-roughness constraint. UNGATED on n_updates, for the same reason
         # as ref_mse/* and jitter/*: these are measurements of the field taken
         # before any optimizer step, so they stay valid on an iteration whose
@@ -6346,6 +6518,24 @@ class GRPOTrainer:
                                    "n_anchor_episodes_dropped",
                                    "n_signal_chunks", "n_anchor_chunks"):
                             log_dict.pop(_k, None)
+                    # per_scene_success is the one NON-SCALAR entry stats()
+                    # returns ({env_seed: (n_success, n_total)}), so it is popped
+                    # UNCONDITIONALLY — wandb.log would otherwise flatten a
+                    # dict-of-tuples into whatever it makes of a 2-sequence and
+                    # attach it to every run, pool on or off. Re-added below as
+                    # flat `episode/scene_sr/<seed>` rates, mirroring the TB side
+                    # exactly (same gate, same values).
+                    _scene_w = log_dict.pop("per_scene_success", None)
+                    if _scene_w and self.config.scene_seed_pool_size > 0:
+                        log_dict.update({
+                            f"episode/scene_sr/{seed}": n_succ / n_total
+                            for seed, (n_succ, n_total) in sorted(
+                                _scene_w.items()
+                            )
+                        })
+                        log_dict["episode/pool_pass"] = self._scene_pool_pass(
+                            iteration
+                        )
                 # Mirror the TB-side ref_mse/* block, which is deliberately
                 # ungated on n_updates (see the comment there). getattr, not
                 # attribute access: on a trainer built without __init__ a bare
@@ -6360,8 +6550,16 @@ class GRPOTrainer:
                 # `train/smooth_loss` instead of the documented `smooth/loss`, and
                 # would lose them on any iteration with n_updates == 0 -- including
                 # `smooth/hf_ref`, the frozen threshold actually in force.
+                # PRE-EXISTING BUG FIX: `update_stats or {}`, matching the TB
+                # half of this block. `update_stats` is None on the "no trainable
+                # chunks" skip path (see the _log_metrics call in train()), and a
+                # bare `.items()` there raised AttributeError INSIDE the
+                # `except Exception: pass` below — silently discarding the whole
+                # iteration's wandb payload (episode stats, lr, iter_time, phase
+                # times), not just the smooth keys. TB was unaffected, so the two
+                # dashboards disagreed on exactly the iterations worth inspecting.
                 _sm_w = {
-                    k: v for k, v in update_stats.items()
+                    k: v for k, v in (update_stats or {}).items()
                     if k.startswith("smooth_")
                 }
                 if _sm_w:

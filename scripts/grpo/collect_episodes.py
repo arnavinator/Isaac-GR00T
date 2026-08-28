@@ -1331,16 +1331,22 @@ class EpisodeCollector:
             # a cross-referencing exercise. Empty string when the flag is off, so
             # an unpooled run's line is byte-identical to before. "n/a" when the
             # group took a path that captures no bundle (group_size == 1).
-            _scene = (
-                f" {self._last_scene_fingerprint or 'n/a'}"
-                if self.log_scene_fingerprint
-                else ""
-            )
             print(
-                f"  Group {count_str} (seed={group_seed}{_scene}) {ff_label}: "
+                f"  Group {count_str} (seed={group_seed}) {ff_label}: "
                 f"{group_successes}/{self.group_size} success | "
                 f"{progress_str} ({rate:.0f} eps/min)"
             )
+            # Scene identity on its OWN line, deliberately. Inlining it inside the
+            # seed parenthesis pushed the success count and the eps/min rate --
+            # the two numbers actually read per group -- far enough right to be
+            # hard to scan, and it changed a log line that predates this feature.
+            # Indented one level past the group line so it reads as subordinate
+            # detail. Only emitted when the flag is on, so the group line above is
+            # byte-identical to a pre-feature run either way.
+            if self.log_scene_fingerprint:
+                print(
+                    f"      scene: {self._last_scene_fingerprint or 'n/a'}"
+                )
 
             # Stop conditions. have_signal is True when the dynamic criterion
             # is met OR when dynamic mode is disabled (in which case we just

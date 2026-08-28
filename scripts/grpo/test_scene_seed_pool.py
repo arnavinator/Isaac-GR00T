@@ -1027,15 +1027,28 @@ def test_fingerprint_appears_in_group_log_line():
         return buf.getvalue()
 
     on = _run(True)
-    group_lines = [l for l in on.splitlines() if "(seed=" in l]
-    check("every group line carries the fingerprint next to its seed",
+    lines = on.splitlines()
+    group_lines = [l for l in lines if "(seed=" in l]
+    scene_lines = [l for l in lines if l.strip().startswith("scene:")]
+    check("the group line itself is UNCHANGED — seed parenthesis closes right "
+          "after the number, no fingerprint inlined",
           len(group_lines) == 2
-          and all("xml=" in l and "state=" in l for l in group_lines),
+          and all(l.split("(seed=")[1].split(")")[0].isdigit()
+                  for l in group_lines)
+          and all("xml=" not in l for l in group_lines),
           f"{group_lines}")
-    check("the fingerprint sits inside the same parenthesis as the seed",
-          all(l.split("(seed=")[1].split(")")[0].startswith(("100067 ", "101067 "))
-              for l in group_lines),
-          f"{group_lines}")
+    check("one separate `scene:` line per group, carrying the fingerprint",
+          len(scene_lines) == 2
+          and all("xml=" in l and "state=" in l for l in scene_lines),
+          f"{scene_lines}")
+    check("each scene line immediately FOLLOWS its group line (so the pairing is "
+          "unambiguous when groups interleave with other output)",
+          all(lines[lines.index(g) + 1].strip().startswith("scene:")
+              for g in group_lines),
+          f"{lines}")
+    check("the scene line is indented past the group line (reads as subordinate)",
+          all(l.startswith("      scene:") for l in scene_lines),
+          f"{scene_lines}")
 
     off = _run(False)
     off_lines = [l for l in off.splitlines() if "(seed=" in l]
@@ -1043,6 +1056,9 @@ def test_fingerprint_appears_in_group_log_line():
           len(off_lines) == 2
           and all("xml=" not in l and "state=" not in l for l in off_lines),
           f"{off_lines}")
+    check("flag off → NO scene line emitted at all",
+          not [l for l in off.splitlines() if l.strip().startswith("scene:")],
+          f"{[l for l in off.splitlines() if 'scene' in l]}")
     check("flag off → seed parenthesis closes immediately after the number",
           all(l.split("(seed=")[1].split(")")[0].isdigit() for l in off_lines),
           f"{off_lines}")

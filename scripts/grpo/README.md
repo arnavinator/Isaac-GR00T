@@ -425,6 +425,55 @@ per-scene curves that are directly comparable across iterations. If you want
 every single iteration to be comparable on its own, set `K == num_groups`, at the
 cost of training on only `num_groups` distinct scenes for the whole run.
 
+#### Per-group scene uniqueness (`clear_ep_meta`)
+
+Until this was fixed, **every group after the first in a collector process
+inherited group 1's kitchen.** Observed directly in the fingerprint log: four
+seeds in one iteration all reporting `layout=7 style=10` with four different
+`xml=` hashes — i.e. one kitchen, four object arrangements. That contradicts
+`collect_episodes.py`'s own claim that "each group gets a unique seed → unique
+initial kitchen/object configuration".
+
+The chain, all four links verified in source:
+
+1. `apply_scene_bundle` calls `set_ep_meta(bundle["ep_meta"])` — this robosuite has
+   no `set_attrs_from_ep_meta`, so the `hasattr` chain falls through to the `elif`
+   — and `set_ep_meta` is a plain `self._ep_meta = meta` that **persists for the
+   life of the process** (`robosuite/environments/base.py:404-410`).
+2. `KitchenEnv._load_model` takes `layout_id` / `style_id` straight from
+   `self._ep_meta` when present, and only otherwise draws
+   `self.rng.choice(self.layout_and_style_ids)`
+   (`robocasa/environments/kitchen/kitchen.py:355-360`).
+3. `reset()` *does* re-run `_load_model` every time — robosuite defaults are
+   `hard_reset=True`, `deterministic_reset=False` (`base.py:106,139,290`) — so the
+   layout is re-decided each reset; it just kept re-deciding in favour of the pin.
+4. `reset_from_xml_string` sets `deterministic_reset=True` and then restores it to
+   `False` (`base.py:664-673`), so it is *not* an additional persistent pin.
+
+`GroupAlignmentWrapper.clear_ep_meta()` drops the pin via robosuite's own
+`unset_ep_meta()`, and `_align_envs_to_group_scene` calls it on every env
+**immediately before** the reset (clearing afterwards would be a no-op, since the
+reset is where `_load_model` consults it). Each group's kitchen then comes from
+`default_rng(group_seed)` — unique per seed and still reproducible across
+iterations, which is what the pool depends on. Roughly 11 distinct kitchens from 12
+seeds, versus 3 before.
+
+Three placement details, each pinned by a test in `test_scene_seed_pool.py`:
+
+| where | behaviour | why |
+|---|---|---|
+| `_align_envs_to_group_scene` | clears, once per group, before the reset | the group's own seed must choose its kitchen |
+| `_restart_at_branch_point` | **never** clears | turns 2..k must reproduce turn 1's scene; the pin turn 1 left is what stops this reset drawing a different kitchen in the moment before the bundle restores it |
+| init-state mode | skips the clear | the loaded bundle overrides the scene wholesale; clearing would only buy a wasted model rebuild per group |
+
+Unconditional, not behind a flag — the previous behaviour contradicted the
+documented contract, so there is no configuration in which inheriting group 1's
+kitchen is the desired outcome. Note the cost: four *different* kitchens per
+iteration instead of one means four MjModel builds per collector process rather
+than one repeated layout, so expect higher peak worker RSS and more wall-clock
+variance (heavy kitchens are real — one observed iteration collected at 1 ep/min
+against 2–3 elsewhere).
+
 #### Verifying the pool's premise (`--log-scene-fingerprint`)
 
 The pool assumes a `group_seed` reproduces the same **scene** across iterations.

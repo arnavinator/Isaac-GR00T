@@ -88,6 +88,7 @@ class FakeVectorEnv:
         self.calls: list = []
         self.apply_bundle_args: list = []
         self.get_bundle_returns: list = []
+        self.clear_ep_meta_calls = 0
         self.step_count = 0
         self._bundle_counter = 0
         self._autoreset = [False] * num_envs  # NEXT_STEP pending-autoreset flags
@@ -121,6 +122,14 @@ class FakeVectorEnv:
             out = tuple(out)
             self.get_bundle_returns.append(out)
             return out
+        if method == "clear_ep_meta":
+            # Drops the previous group's layout/style pin so the coming reset
+            # re-derives the kitchen from group_seed. Recorded in self.calls (like
+            # every other RPC) so tests can assert it fires once per group and
+            # NEVER on a turn restart. Returns a per-env tuple to match
+            # gymnasium's env.call() contract.
+            self.clear_ep_meta_calls += 1
+            return tuple(None for _ in range(self.num_envs))
         if method == "apply_scene_bundle":
             self.apply_bundle_args.append(args[0])
             return tuple(_one_obs() for _ in range(self.num_envs))

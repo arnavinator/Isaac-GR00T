@@ -532,6 +532,56 @@ class GroupAlignmentWrapper(MultiStepWrapper):
     wrapper.unwrapped.env directly.
     """
 
+    def clear_ep_meta(self) -> None:
+        """Drop the episode-meta pin so the NEXT reset re-derives the scene.
+
+        Without this, every group after the first in a collector process inherits
+        group 1's kitchen. The chain:
+
+          1. `apply_scene_bundle` below calls `set_ep_meta(bundle["ep_meta"])`
+             (this robosuite has no `set_attrs_from_ep_meta`, so the hasattr
+             chain falls through to the `elif`), and `set_ep_meta` is a plain
+             `self._ep_meta = meta` that persists for the life of the process.
+          2. `KitchenEnv._load_model` reads `layout_id` / `style_id` straight out
+             of `self._ep_meta` when they are present, and only falls back to
+             `self.rng.choice(self.layout_and_style_ids)` when they are not.
+          3. `reset()` DOES re-run `_load_model` every time (robosuite sets
+             `hard_reset=True`, `deterministic_reset=False` by default), so the
+             layout is re-decided on each reset — it just keeps re-deciding in
+             favour of the pin.
+
+        Net effect before this method existed: group 1 picked a kitchen from its
+        own seed, pinned it, and groups 2..N reset into that same kitchen with
+        only their object placements varying. Observed directly — four seeds in
+        one iteration all reporting `layout=7 style=10` with four different
+        `xml=` hashes. That contradicts this module's own promise that "each
+        group gets a unique seed → unique initial kitchen/object configuration".
+
+        Clearing the pin restores the fallback path, so each group's kitchen
+        comes from `default_rng(group_seed)` — unique per seed and still fully
+        reproducible across iterations, which is what the frozen scene seed pool
+        relies on.
+
+        Uses robosuite's own `unset_ep_meta()` (`environments/base.py`) when
+        available, falling back to clearing the attribute directly — same
+        version-tolerance pattern as `apply_scene_bundle`'s set_ep_meta chain.
+        Raises rather than no-op'ing if neither exists: a silent failure here is
+        indistinguishable from the bug it fixes.
+        """
+        robosuite_env = self.env.unwrapped.env
+        if hasattr(robosuite_env, "unset_ep_meta"):
+            robosuite_env.unset_ep_meta()
+        elif hasattr(robosuite_env, "_ep_meta"):
+            robosuite_env._ep_meta = {}
+        else:
+            raise AttributeError(
+                f"{type(robosuite_env).__name__} exposes neither unset_ep_meta() "
+                f"nor _ep_meta, so the per-group scene pin cannot be cleared. "
+                f"Every group after the first would silently inherit group 1's "
+                f"kitchen (layout_id/style_id), which is exactly the bug this "
+                f"call exists to prevent."
+            )
+
     def get_scene_bundle(self) -> dict:
         """Snapshot the underlying env's scene + dynamic state."""
         robosuite_env = self.env.unwrapped.env
@@ -1510,6 +1560,13 @@ class EpisodeCollector:
         """
         # Clear SyncVectorEnv's per-env terminated guard left by the previous
         # turn's terminating steps before re-applying the branch point.
+        #
+        # Deliberately NO clear_ep_meta here, unlike _align_envs_to_group_scene:
+        # turns 2..k must reproduce turn 1's scene bit-identically, and the pin
+        # turn 1's apply_scene_bundle left behind is what keeps this reset from
+        # picking a different kitchen in the moment before the bundle overwrites
+        # it. Clearing here for symmetry would buy a wasted full model rebuild per
+        # turn and put a fresh RNG draw between the reset and the restore.
         self.envs.reset(seed=[group_seed] * self.num_envs)
         if self._active_init_bundle_path is not None:
             bundle = self._get_init_bundle(self._active_init_bundle_path)
@@ -1584,6 +1641,22 @@ class EpisodeCollector:
         returned bundle is the loaded fixed bundle; the driver re-fetches a
         fresh copy each turn (see _restart_at_branch_point).
         """
+        # Drop any episode-meta pin left by a PREVIOUS group's
+        # apply_scene_bundle, so this group's reset(seed=group_seed) picks its own
+        # kitchen instead of inheriting group 1's. See clear_ep_meta for the full
+        # mechanism. Must happen BEFORE the reset below — that reset is where
+        # _load_model consults the pin, so clearing afterwards would be a no-op.
+        #
+        # All envs, not just env 0: env 0's choice is what gets broadcast, but the
+        # group_size == 1 singleton path below returns without a broadcast, so its
+        # single env has to be cleared too.
+        #
+        # Skipped in init-state mode, where the loaded bundle overrides the scene
+        # wholesale a few lines down — clearing there would buy nothing but an
+        # extra full model rebuild per group.
+        if self._active_init_bundle_path is None:
+            self.envs.call("clear_ep_meta")
+
         seeds = [group_seed] * self.num_envs
         vector_obs, _ = self.envs.reset(seed=seeds)
 

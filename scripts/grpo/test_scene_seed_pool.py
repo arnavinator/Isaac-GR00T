@@ -1065,6 +1065,134 @@ def test_fingerprint_appears_in_group_log_line():
 
 
 # ---------------------------------------------------------------------------
+# 7. Per-group scene uniqueness (the layout/style pin)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRobosuiteEnv:
+    """Stands in for the robosuite env behind the wrapper, `_ep_meta` and all."""
+
+    def __init__(self, with_api: bool = True):
+        self._ep_meta = {"layout_id": 7, "style_id": 10, "lang": "serve mug"}
+        self.unset_calls = 0
+        if not with_api:
+            del self.__dict__["unset_calls"]
+
+    def unset_ep_meta(self):
+        self.unset_calls += 1
+        self._ep_meta = {}
+
+
+def _wrapper_with(robosuite_env):
+    """A bare GroupAlignmentWrapper whose .env.unwrapped.env is `robosuite_env`."""
+    w = ce.GroupAlignmentWrapper.__new__(ce.GroupAlignmentWrapper)
+    gym_env = type("G", (), {})()
+    gym_env.env = robosuite_env
+    holder = type("H", (), {})()
+    holder.unwrapped = gym_env
+    w.env = holder
+    return w
+
+
+def test_clear_ep_meta_drops_the_layout_pin():
+    """The real wrapper method must actually empty _ep_meta.
+
+    That dict is the whole mechanism: KitchenEnv._load_model reads layout_id /
+    style_id out of it when present and only falls back to
+    rng.choice(layout_and_style_ids) when it is empty. Leaving even the layout
+    keys behind reproduces the bug (four groups, one kitchen).
+    """
+    print("\n[scene-uniq] clear_ep_meta empties the pin via robosuite's own API")
+    rs = _FakeRobosuiteEnv()
+    _wrapper_with(rs).clear_ep_meta()
+    check("prefers robosuite's unset_ep_meta() when present", rs.unset_calls == 1,
+          f"{rs.unset_calls}")
+    check("_ep_meta is empty afterwards, so _load_model takes the rng branch",
+          rs._ep_meta == {}, f"{rs._ep_meta}")
+
+    # Version tolerance: no unset_ep_meta(), but the attribute exists.
+    class _Older:
+        def __init__(self):
+            self._ep_meta = {"layout_id": 3, "style_id": 4}
+    older = _Older()
+    _wrapper_with(older).clear_ep_meta()
+    check("falls back to clearing the attribute when unset_ep_meta() is absent",
+          older._ep_meta == {}, f"{older._ep_meta}")
+
+    # Neither available -> RAISE. A silent no-op is indistinguishable from the bug.
+    class _Neither:
+        pass
+    try:
+        _wrapper_with(_Neither()).clear_ep_meta()
+        check("raises when neither unset_ep_meta() nor _ep_meta exists", False,
+              "returned silently")
+    except AttributeError as exc:
+        check("raises when neither unset_ep_meta() nor _ep_meta exists", True)
+        check("the error names the consequence (inherited kitchen)",
+              "kitchen" in str(exc) and "group 1" in str(exc), str(exc)[:120])
+
+
+def test_clear_ep_meta_called_once_per_group_never_on_restart():
+    """Once per group in _align, and NEVER in _restart_at_branch_point.
+
+    Clearing on a turn restart would put a fresh layout draw between the reset and
+    the bundle restore, so turns 2..k of one group could momentarily disagree with
+    turn 1 — the exact within-group scene identity the broadcast exists to hold.
+    """
+    print("\n[scene-uniq] one clear per group; none on turn restarts")
+    # group_size 4 over 2 workers = 2 turns/group, so a group does 1 align + 1
+    # restart. Two groups => 2 clears, not 4.
+    c = tc._make_collector(group_size=4, num_async_vector_env=2)
+    try:
+        c.collect(num_groups=2, base_seed=555_000, fast_forward_steps=0,
+                  fast_forward_pct=0.0, min_alive_groups=0, max_groups=None,
+                  group_seeds=[100_067, 101_067])
+        n_clear = c.envs.clear_ep_meta_calls
+        n_align = len([m for m, _ in c.envs.calls if m == "get_scene_bundle"])
+        check("clear_ep_meta fired once per GROUP (2), not once per turn (4)",
+              n_clear == 2, f"{n_clear} clears vs {n_align} aligns")
+    finally:
+        c.close()
+
+    # Ordering: the clear must precede the reset it is meant to affect, or
+    # _load_model consults the stale pin and the clear is a no-op.
+    c2 = tc._make_collector(group_size=2, num_async_vector_env=2)
+    try:
+        c2._align_envs_to_group_scene(100_067)
+        seq = [m for m, _ in c2.envs.calls]
+        check("clear_ep_meta is the FIRST rpc of an alignment (before the reset)",
+              seq and seq[0] == "clear_ep_meta", f"{seq}")
+        check("the reset was recorded after it",
+              len(c2.envs.reset_calls) >= 1, f"{c2.envs.reset_calls}")
+    finally:
+        c2.close()
+
+
+def test_no_clear_in_init_state_mode():
+    """Init-state mode overrides the scene wholesale, so clearing buys nothing.
+
+    The loaded bundle is broadcast a few lines later and pins layout/style anyway;
+    clearing first would only cost a full model rebuild per group.
+    """
+    print("\n[scene-uniq] init-state mode skips the clear")
+    c = tc._make_collector(group_size=2, num_async_vector_env=2)
+    try:
+        c._active_init_bundle_path = "/tmp/fake_init.npz"
+        c._init_bundle = {"ep_meta": {}, "model_xml": "<m/>",
+                          "sim_state": np.zeros(3), "consumed_substeps": 0}
+        c._init_bundle_path = "/tmp/fake_init.npz"
+        c._align_envs_to_group_scene(100_067)
+        check("no clear_ep_meta rpc in init-state mode",
+              c.envs.clear_ep_meta_calls == 0,
+              f"{c.envs.clear_ep_meta_calls}")
+        check("the bundle was still broadcast",
+              len(c.envs.apply_bundle_args) == 1,
+              f"{len(c.envs.apply_bundle_args)}")
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     test_stride_constants_agree()
@@ -1088,6 +1216,9 @@ if __name__ == "__main__":
     test_scene_fingerprint_never_raises()
     test_collector_publishes_fingerprint()
     test_fingerprint_appears_in_group_log_line()
+    test_clear_ep_meta_drops_the_layout_pin()
+    test_clear_ep_meta_called_once_per_group_never_on_restart()
+    test_no_clear_in_init_state_mode()
 
     print()
     if _failures:

@@ -20,14 +20,14 @@ Flow-Matching (FM) log-probability surrogate.
 | `grpo_server.py` | Extends `PolicyServer` to capture per-call denoising noise + raw `(B, 50, 128)` action. Required for FM log-prob. |
 | `collect_episodes.py` | Runs in the robocasa venv. `EpisodeCollector` does group rollouts via `AsyncVectorEnv`, including fast-forward branching and scene-bundle alignment. |
 | `episode_buffer.py` | `EpisodeBuffer`, `GRPOEpisode`, `ActionChunk`. Loads `.npz` episodes, computes group-relative advantages. |
-| `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`). |
+| `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`), production sampler schedule (`inference_schedule`) and the last-step-differentiable chunk rollout (`_smooth_chunk_rollout`) the roughness constraint measures. |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
-| `smoothness.py` | Endpoint-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, and the continuous-action-dim selector. Model-free and fully unit-testable. The hinge itself lives in `train_grpo._grpo_update_inner`. |
+| `smoothness.py` | Trajectory-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, the continuous-action-dim selector and `build_key_dim_span`. Model-free and fully unit-testable. The 4-step chunk rollout lives in `fm_log_prob._smooth_chunk_rollout` (it needs the DiT); the hinge lives in `train_grpo._grpo_update_inner`. |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
-| `test_smoothness.py` | CPU suite for the endpoint-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the `compute_fm_log_prob` return contract, `smooth_ref.json` guard rejection, and `smooth_coef=0` bit-identity through the real `_grpo_update_inner`. |
+| `test_smoothness.py` | CPU suite for the trajectory-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the derived sampler schedule, the last-step-differentiable rollout (exact value + gradient localized to the final step), the `compute_fm_log_prob` return contract, both instruments' jitter-invariance, the executed-chunk metrics, `smooth_ref.json` guard rejection **including instrument mismatch**, and `smooth_coef=0` bit-identity (stats, weights and RNG stream) through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
 
@@ -2449,10 +2449,12 @@ training-direction change).
 
 ---
 
-## Endpoint-Roughness Constraint (the "jerk constraint")
+## Trajectory-Roughness Constraint (the "jerk constraint")
 
 Optional, feature-flagged. `smooth_coef = 0.0` (default) is bit-identical to a run
-without it: no extra tensors, no calibration, no `smooth/*` curves, no banner line.
+without it: no extra tensors, no extra DiT forwards, no extra RNG consumption, no
+calibration, no `smooth/*` curves, no banner line. That off-switch invariant is
+asserted bit-for-bit — including RNG-stream identity — in `test_smoothness.py`.
 
 Orthogonal to Jitter-GRPO, and both are needed. Jitter bounds the **magnitude** of
 the velocity field's noise response (`E_ξ‖Jξ‖² = ‖J‖²_F`, isotropic); this bounds
@@ -2463,21 +2465,81 @@ high-frequency fraction rose 1.7–2.9× and relative seed dispersion rose 4.5×
 Full derivation in `jerk-constraint.md`. Summary of what it constrains:
 
 ```
-a_hat(τ) = x_τ + (1−τ)·v_θ(x_τ, τ)   ==   a + (1−τ)·r        (an identity)
 HF(u)    = mean((D²u)²) / (6 · mean(u²).detach())            D² along h
 L_smooth = smooth_coef · relu( HF_pooled − hf_ref )
 ```
 
-### Why the endpoint and not the residual
+`u` is the trajectory named by `smooth_instrument`. The operator is the same
+`(1,−2,1)` second difference either way; only *which trajectory it differences*
+changes.
 
-Measured LoRA-vs-base separation: `HF(a_hat)` **100–200×**, `HF(a)` 36–87×,
-`HF(r)` only 1.5–2.1×. And the two measured checkpoints rank **oppositely** on
-residual vs chunk roughness — `iter_0017` has 39% *less* residual energy than
-`iter_0011` yet 18% *more* path jerk. A quantity that improves while the thing you
-care about worsens is not a target.
+### Which instrument, and why the endpoint was abandoned
 
-`a_hat` is also on the sampler's path at τ=0, where `x_τ = ε` exactly, making
-`a_hat(0) = ε + v_θ(ε,0)` literally the 1-step Euler endpoint.
+| `smooth_instrument` | `u` | forwards | gradient |
+|---|---|---|---|
+| **`"chunk"`** (default) | the `num_inference_timesteps`-step **generated chunk** — what the robot executes | N (only 1 with a graph) | last step only, biased |
+| `"endpoint"` | the 1-step **implied endpoint** `â(0) = ε + v_θ(ε,0)` at τ=0 | 1 | exact |
+
+The endpoint was the original instrument. A sweep over 16 checkpoints of a real
+training run showed it **does not control the quantity the constraint exists to
+bound** (physical EEF path jerk):
+
+- Over iterations 10–16 of the unconstrained run the endpoint HF **fell 9%**
+  (0.331 → 0.300) while EEF path jerk **rose 11%** (0.516 → 0.572). Spearman ρ
+  between them over that window: **+0.00**.
+- A run *with* the constraint at `smooth_coef=0.15` pinned endpoint HF at 3–6×
+  base for six iterations, and its executed chunks degraded anyway: chunk HF
+  2.2× → 8.6× base, path jerk 1.45× → 2.86× base.
+
+The **4-step chunk's** HF correlates with path jerk at **ρ = +0.98** overall and
+**+0.96** over the late iterations. So the instrument moved; the operator, the
+hinge, the pooling and the calibration machinery did not.
+
+`"endpoint"` is retained and reproduces the previous **compute path** bit-for-bit. Note it does not by itself reproduce an old run end-to-end: the same diff moved `smooth_hf_ref_scale`'s default 4.0 → 15.0, so an otherwise-identical CLI now calibrates a 3.75× looser threshold. Pass `--smooth-hf-ref-scale 4.0` alongside it (the trainer warns if you do not). So
+runs calibrated against it stay reproducible. It is not recommended for new runs,
+and the startup banner says so.
+
+### Last-step-differentiable rollout
+
+The chunk instrument rolls out the **production sampler**: step count, `dt` and
+the continuous `t` values all come from `action_head.num_inference_timesteps`, read
+the same way `Gr00tN1d6ActionHead.get_action_with_features` reads them
+(`gr00t_n1d6.py:317-321`) — nothing is hardcoded, so a checkpoint that overrides the
+config gets *its* schedule. At the shipped `num_inference_timesteps = 4` that is
+`t = [0, 0.25, 0.5, 0.75]`, `dt = 0.25`. `fm_log_prob.inference_schedule` is the one
+place this is derived; the banner prints the resolved values so a mismatch is
+visible rather than inferred.
+
+The rollout starts from the **clean collected ε** (never the jittered `ε'`) and
+runs the first N−1 velocity evaluations under `torch.no_grad()` with an explicit
+`detach()` on the carried state. Only the final `x = x + dt·v` carries a graph.
+
+The `t` tensor is built in **float64**, not the batch's bf16. Note the reason is *not*
+that bf16 cannot represent the timesteps — `0.75` is exactly representable in bf16. What
+rounds is the **product**: bucketizing computes `t · 1000`, and the nearest bf16 to `750.0`
+is `752.0`, so a bf16 `t` conditions the DiT on bucket **752** against production's
+**750** — a different AdaLayerNorm conditioning from the sampler's, on the very step that
+carries the gradient, and entirely silent. Not unique to N=4 nor always in the same
+direction (N=8: `0.375 → 376`, `0.625 → 624`; N=3: `1/3 → 334` vs 333). fp32 would also
+be exact; fp64 matches the width of the Python floats the schedule is built from. Pinned
+per-bucket at N=4 and N=8 in `test_smoothness.py`.
+
+- **The forward VALUE is exact** — it is the true 4-step chunk the sampler would
+  produce from this ε, so calibration and measurement remain the same functional
+  and a frozen threshold stays meaningful.
+- **The gradient is biased.** It misses how θ shapes the earlier steps and hence
+  the sampler path the last step is evaluated on — roughly a quarter of the true
+  gradient's magnitude at N=4. This is an accepted, documented tradeoff:
+  differentiating all four steps costs 4 graph-forwards, estimated **29.1 GB
+  against 25.3 GB available** at `mini_batch_size=8`, i.e. an OOM or a halved
+  batch. With one graph-forward, VRAM is unchanged and `mini_batch_size=8` is
+  preserved. Compensate with a larger `smooth_coef` (suggested **0.15–0.5** for
+  the chunk instrument).
+
+Covered by `test_smoothness.py`: the rollout's value is bit-identical to a plain
+no-grad rollout; against a fake head whose every step uses its own parameter, the
+earlier steps' gradients are zero/None and only the last step's is non-zero, and
+it equals what a fully-differentiated rollout puts on that same step.
 
 ### Why a hinge and not a penalty
 
@@ -2490,9 +2552,9 @@ scores 0.600, so smoothness and competence do coexist — the hinge is what
 distinguishes "don't get rougher than the pretrained field" from "be as smooth as
 possible".
 
-### Evaluated at τ = 0 on a dedicated clean forward
+### Dedicated CLEAN forwards, never the K-loop's
 
-The term does **not** reuse the K-loop's velocity. Under Jitter-GRPO the K-loop's DiT
+Neither instrument reuses the K-loop's velocity. Under Jitter-GRPO the K-loop's DiT
 input is `x'_τ` built from `ε' = √(1−λ²)ε + λξ`, so its velocity carries the model's
 response to that perturbation, which lands in `â` as `(1−τ)²·J·(ε′−ε)` — white and
 θ-independent. At the production `λ=0.25` with the measured `jacobian_fro_sq ≈ 2.4`
@@ -2500,18 +2562,23 @@ it dominates: HF at τ=0 goes **0.000347 → 0.790** (2275×), and since calibra
 would be contaminated identically `hf_ref` freezes above HF's theoretical maximum for
 H=16 (2.984), so the hinge could **never fire**.
 
-Instead one dedicated forward at `(x = ε, τ = 0)` with the original `ε`. That is also
-the theoretically privileged point: `x_0 = ε` exactly, so `â(0) = ε + v_θ(ε,0)` is the
-1-step Euler endpoint, and `(1−τ)² = 1` is maximal leverage. Cost: **+1 DiT forward
-per minibatch** (~17% of the K-loop at K=6), only when the constraint is on. With a
-single τ there is no weighting and `hf_ref` is a **scalar**.
+Every smooth forward therefore starts from the original ε.
+`test_smoothness.py` asserts both instruments' moments are **bit-identical** with
+and without jitter.
+
+Cost, only when the constraint is on:
+
+| instrument | extra DiT forwards | retained activations |
+|---|---|---|
+| `"endpoint"` | 1 (~1/K of the K-loop, ~17% at K=6) | that 1 forward |
+| `"chunk"` | `num_inference_timesteps` (4) | **1** forward |
 
 ### Pooled, not a mean of per-row ratios
 
-`HF`'s denominator is a row's own energy, so a near-idle chunk (`M(a) → 0`, routine
-during a grasp) reports `HF(â) ≈ HF(r) ≈ 0.62` against a moving row's 0.0016 — ~400×.
-An unweighted mean is dominated by such rows, and `hf_ref` is frozen and persisted, so
-one unlucky draw would neuter the feature for the whole run lineage.
+`HF`'s denominator is a row's own energy, so a near-idle chunk (`M → 0`, routine
+during a grasp) reports hundreds of times a moving row's value. An unweighted mean
+is dominated by such rows, and `hf_ref` is frozen and persisted, so one unlucky draw
+would neuter the feature for the whole run lineage.
 `Σ R / (6 · Σ M)` is energy-weighted by construction: measured on 63 normal rows plus
 one idle one it shifts **0.31%** where the mean of ratios shifts 29%. It is exactly
 associative over batch splits, so the threshold transfers across batch sizes.
@@ -2520,28 +2587,64 @@ Consequence: the term is one scalar per minibatch, so its magnitude is independe
 row count and it needs **no anchor loss divisor** — unlike `clip_loss`/KL, which are
 per-row means. Anchor rows still contribute their `R` and `M`, which is intended.
 
+Below `SMOOTH_MIN_ROWS_PER_MB = 4` rows the term is **skipped**: relu convexity means
+a near-single-row minibatch reinstates the idle-row blow-up pooling exists to remove
+(8 singleton minibatches deliver 4.6× the penalty of one 8-row minibatch). The skips
+are counted in `smooth/undersized_mbs`, and `mini_batch_size < 4` with
+`smooth_coef > 0` is a hard config error rather than a silent no-op.
+
 ### `hf_ref`: frozen scalar, calibrated from the base policy
 
 | `smooth_hf_ref` | behaviour |
 |---|---|
-| `float` | flat threshold. |
-| `list[float]` | first entry used, with a warning (single-τ design). |
-| `None` (default) | **auto-calibrate** at the first iteration of a fresh run, then `× smooth_hf_ref_scale` (default 4.0). |
+| `float` | flat threshold, **in the units of the selected instrument**. |
+| `list[float]` | first entry used, with a warning (single-scalar design). |
+| `None` (default) | **auto-calibrate** at the first iteration of a fresh run, then `× smooth_hf_ref_scale`. |
 
 Auto-calibration works because PEFT zero-inits `lora_B`, so before the first optimizer
 step `θ ≡ θ_base` and the collected chunks **are** base-policy samples — confirmed by
 `ref_mse/log_base_ratio_mean` reading exactly **0** at iteration 1 of a fresh run
-versus 0.0572 at a resumed run's first iteration. Whole minibatches are pooled up to `smooth_calib_min_rows`, and the term
-contributes nothing to the loss that iteration.
+versus 0.0572 at a resumed run's first iteration. Whole minibatches are pooled up to
+`smooth_calib_min_rows`, capped at 3 iterations, and the term contributes nothing to
+the loss while calibrating.
+
+**`smooth_hf_ref_scale` default is 15.0, and it is instrument-specific.** The scale
+is a multiple of the *measured base value*, and the two instruments have completely
+different useful ranges even though their base values are similar (chunk 0.00141,
+endpoint 0.00157). Measured chunk HF on the control run:
+
+| iter | 1 | 2 | 3 | 4 | 6 | 12 | 16 |
+|---|---|---|---|---|---|---|---|
+| chunk HF | 0.0023 | 0.0072 | 0.0152 | 0.0244 | 0.0408 | 0.0959 | 0.1131 |
+
+i.e. it reaches ~80× base (0.00141). Corresponding EEF path jerk: base 0.0689,
+iter4 0.2720, iter12 0.5358. A bound near **15–17× base (~0.024)** targets the
+iteration-4 roughness level — about **2× less path jerk** than the control's
+peak-success iteration — which is a real reduction that is still reachable.
+**For `smooth_instrument="endpoint"`, 4.0 remains the right value** (base endpoint
+HF 0.0012–0.0051 → threshold ~0.005–0.02).
 
 Persisted to `smooth_ref.json` in every checkpoint. A resumed run with
 `smooth_coef > 0` and neither an explicit `--smooth-hf-ref` nor a cached file
-**hard-fails** rather than calibrating off a non-base policy. Guard key:
-`{tau_centers, jitter_std, jitter_pos, jitter_neg, jitter_paired, C, horizon,
-embodiment_tag, model_path}` — mismatch hard-fails. `env_names` is recorded outside
-the guard and only **warns**, since extending a run to new tasks is legitimate while
-`hf_ref` is state-dependent (~1.7× measured). Multi-task runs calibrate on
-`env_names[0]` alone (per-iteration round-robin); the banner says so.
+**hard-fails** rather than calibrating off a non-base policy.
+
+**Guard key** (hard-fail on mismatch): `{tau_centers, jitter_std, jitter_pos,
+jitter_neg, jitter_paired, dims (the constrained set C), horizon, instrument, embodiment_tag, model_path}`, plus
+`{sampler_steps, sampler_dt}` **only under `"chunk"`** — the endpoint is one forward at
+τ=0 and provably cannot depend on a schedule it never walks, so gating it on those would
+be a false rejection. `instrument` matters more than the rest: a threshold calibrated on
+the endpoint is *meaningless* for the chunk, and because the two base values are so close
+(0.00157 vs 0.00141) a stale sidecar would load with **no numeric red flag at all** while
+thresholding at 15× the wrong quantity.
+
+**Back-compat.** A sidecar written before `smooth_instrument` existed has no `instrument`
+key. Its value is not a guess — the endpoint was the only instrument then — so it is
+backfilled as `"endpoint"` with a printed NOTE, and such a checkpoint resumes normally
+under `--smooth-instrument endpoint`. Under `"chunk"` the backfilled value still
+mismatches and still refuses, which is correct: that threshold measured another quantity.
+`env_names` is recorded outside the guard and only **warns**, since extending a run to
+new tasks is legitimate while `hf_ref` is state-dependent (~1.7× measured). Multi-task
+runs calibrate on `env_names[0]` alone (per-iteration round-robin); the banner says so.
 
 ### Constrained dims and horizon
 
@@ -2566,24 +2669,62 @@ and `n_action_steps` is a deployment knob while the 16-step horizon is a propert
 the checkpoint. Slicing happens **before** differencing — a `D²` straddling the pad
 boundary of the `(50, 128)` output is meaningless.
 
+### `smooth/*` metrics
+
+All three HF readings are pooled the same way (`ΣR / 6ΣM`), so they sit on one axis.
+
+| scalar | meaning |
+|---|---|
+| `smooth/hf_mean` | pooled HF of **whichever instrument is constrained** — the number `hf_ref` is compared against. Comparable across runs *as "the constrained quantity"*, not as a fixed physical quantity. |
+| `smooth/instrument` | provenance (a TB text summary at step 0, a wandb string). Read this before comparing two runs' `hf_mean`. |
+| `smooth/chunk_hf_mean` | pooled HF of the differentiable N-step chunk. Numerically identical to `hf_mean` under `"chunk"`; **absent** under `"endpoint"`, where no chunk is rolled out. |
+**Running a control that still logs the executed metrics.** `smooth_coef = 0` is a
+*hard* off-switch: no extra forwards, no extra RNG, and no `smooth/*` key at all — which
+means a `coef=0` control emits no baseline for `executed_hf_mean` / `executed_jerk_ratio`
+either, even though those need no forward pass. That is deliberate (the invariant is worth
+more than the convenience), so for an A/B where the control must still report the
+deliverable, pass a negligible coefficient instead of zero:
+
+```
+--smooth-coef 1e-8      # measurement on, pressure off (~1e-8 x dHF/dtheta against a
+                        # grad norm of ~0.02, i.e. nothing), same compute as the
+                        # constrained arm so the two are paired on cost as well
+```
+
+| `smooth/hf_max` | the largest single-minibatch pooled HF of the iteration. A rising max against a flat `hf_mean` means individual chunks are roughening while the energy-weighted pool hides it. |
+| `smooth/calib_prestep_hf` | pooled HF over only the rows measured at exactly θ_base (before the first optimizer step of iteration 1). Compare against `hf_ref / smooth_hf_ref_scale` to see the in-iteration drift baked into the frozen threshold. At production sizes the window is `gradient_accumulation_steps × mini_batch_size` rows, so its own sampling noise is comparable to the drift it reports — read it as a coarse check, not a correction. |
+| `smooth/endpoint_hf_mean` | pooled HF of the τ=0 implied endpoint. Monitoring only, and **free** — the chunk rollout's first step *is* `v_θ(ε, 0)`. |
+| `smooth/executed_hf_mean` | pooled HF of `ready_actions` — the chunks the sampler actually emitted during collection. No forward at all, non-differentiable, measured on the real rollout distribution rather than reconstructed. Covers the **full valid horizon**, so it is directly comparable to `hf_mean`. Emitted whenever the feature is active *and* the pooled denominator is non-zero (an all-zero action buffer yields no reading rather than a divide-by-zero). |
+| `smooth/executed_jerk_ratio` | `Σ\|D²a\| / Σ\|a\|` (L1) over the **`end_effector_position` dims** of `ready_actions`, restricted to the **executed prefix** `h < n_action_steps` — a normalized-space analogue of the physical path-jerk metric, needing no denormalization or decoding. `MultiStepWrapper` plays only steps `0..n_action_steps-1` into the sim and discards the rest (8 of 16 at the default), so a full-horizon number would half-measure something the robot never performed. The `(n-2)`-term numerator over an `n`-term denominator is the reference statistic's own shape, matching the notebook's `Σ\|diff(pos,n=3)\| / Σ\|deltas\|`. The position span comes from `modality_keys` exactly as the constrained set does; if the embodiment lacks the key the metric is **omitted** rather than redefined over dims that mix metres with radians. Neither executed metric sees the **chunk-boundary seam**, where physical jerk is typically worst — treat both as a lower bound. |
+| `smooth/hf_ref` | the threshold actually in force, every iteration. |
+| `smooth/loss`, `excess_mean`, `active_frac`, `hinge_mbs` | **hinge**-describing. Deliberately **ABSENT** — not 0.0 — on the calibration iteration and on any iteration where the hinge never evaluated, since a reported 0.0 is indistinguishable from "the field is already smooth", which is the reading the docs tell an operator to expect at the fixed point. |
+| `smooth/rows`, `measured_mbs`, `nonfinite_mbs`, `undersized_mbs`, `nonfinite_loss_mbs` | coverage and skip accounting. |
+| `smooth/calib_*` | calibration progress, including `calib_prestep_rows` (the strictly-`θ_base` subtotal, so residual drift is auditable). |
+
+Every one of these is **ungated on `n_updates`**: they are measurements of the field
+taken before the non-finite loss guard, so they stay valid on an iteration whose
+update was discarded — and an iteration the smooth term itself killed is exactly the
+one where they are most needed.
+
 ### Integration decisions
 
 - **No loss divisor needed.** The term is one scalar per minibatch, so its magnitude
   is already independent of row count and anchor composition.
 - **Anchor rows are included.** Roughness is not advantage-keyed, and anchors are
   the retention set we most want smooth.
-- **Single τ (=0)**, so there is no τ weighting and `hf_ref` is a scalar.
-- **Jitter-independent by construction.** The clean τ=0 forward means
-  `jitter_pos`/`jitter_neg`/`jitter_paired` do not change what the term measures.
+- **Jitter-independent by construction.** Every smooth forward starts from the
+  original ε, so `jitter_pos`/`jitter_neg`/`jitter_paired` do not change what the
+  term measures.
 - **The denominator is detached.** `∂HF/∂M < 0`, so a live denominator lets the
   model satisfy the term by adding DC (constant-along-`h`) energy: `D²` annihilates
   a constant, so `R` is untouched while `M` rises and `HF` falls. Detached, the
   directional derivative along "add DC" is **exactly zero**, because the `(1,−2,1)`
   stencil sums to zero. Covered by `test_smoothness.py`.
-- **`a_hat` is built on a dedicated clean forward, not from the K-loop.** See
-  "Evaluated at τ = 0 on a dedicated clean forward" above — anchoring on
-  `velocity_target` alone was not sufficient, because the K-loop's velocity
-  still carries the model's Jacobian response to the ε-jitter.
+- **A non-finite HF never reaches the loss.** The smooth forwards run on
+  large-magnitude inputs (pure noise at the first step) and are the likeliest of the
+  K+N to overflow bf16 while every other term stays healthy. The term screens its own
+  value and counts rejections in `smooth/nonfinite_loss_mbs`, so a bad reading costs
+  one measurement instead of an iteration mis-attributed to bf16 ratio overflow.
 - `model_path` (default `nvidia/GR00T-N1.6-3B`)
 - `embodiment_tag` (default `ROBOCASA_PANDA_OMRON`)
 - `lora_rank` / `lora_alpha` / `lora_dropout` (default 16 / 32 / 0.0)
@@ -2660,6 +2801,31 @@ boundary of the `(50, 128)` output is meaningless.
 - `anchor_max_row_frac` (default `1.0`) — cap on anchor chunks as a multiple of
   the signal chunk count; the compute knob and the strength knob at once. Waived
   when there are no signal chunks (an all-success iteration).
+
+**Trajectory-roughness constraint** — see "Trajectory-Roughness Constraint" above.
+- `smooth_coef` (default `0.0` = **OFF**, bit-identical to a run without the
+  feature). Suggested starting range for the chunk instrument **0.15–0.5**: the
+  last-step-differentiable rollout retains roughly a quarter of the true 4-step
+  gradient's magnitude, so the coefficient may need raising relative to the 0.15
+  that was calibrated on the endpoint. Bracket ±3×.
+- `smooth_instrument` (default `"chunk"`) — `"chunk"` constrains the N-step
+  generated chunk (ρ = +0.98 with EEF path jerk); `"endpoint"` constrains the
+  1-step implied endpoint and reproduces the pre-change behaviour bit-for-bit
+  (ρ = +0.00 late, which is why it is no longer the default). Anything else is a
+  hard config error, validated even when `smooth_coef == 0`.
+- `smooth_hf_ref` (default `None` = auto-calibrate from iteration 1 of a fresh
+  run). A float is a flat threshold **in the units of the selected instrument**.
+- `smooth_hf_ref_scale` (default **15.0**, was 4.0) — multiplier on the
+  auto-calibrated base value. Instrument-specific: 15–17× base (~0.024) targets
+  the iteration-4 chunk roughness level, ~2× less path jerk than the control
+  run's peak-success iteration. **Use 4.0 with `smooth_instrument="endpoint"`.**
+  Ignored when `smooth_hf_ref` is set explicitly, and ignored on a resume (the
+  cached value already has its scale baked in — a warning says so).
+- `smooth_include_base_motion` (default `False`) — admit `base_motion` into the
+  constrained dim set. Off because `control_mode` gates it, so it is inert in arm
+  mode. Discrete keys are excluded unconditionally.
+- `smooth_calib_min_rows` (default `512`) — rows the auto-calibration must pool
+  before freezing `hf_ref`, capped at 3 iterations.
 
 **Optimizer**
 - `learning_rate` (default 3e-5; ~3× lower than supervised FT because RL

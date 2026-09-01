@@ -1,21 +1,36 @@
-"""Endpoint-roughness constraint for Jitter-GRPO (the "jerk constraint").
+"""Trajectory-roughness constraint for Jitter-GRPO (the "jerk constraint").
 
 Self-contained primitives for the temporal-smoothness term described in
 ``jerk-constraint.md``. Kept out of ``fm_log_prob.py`` so every piece is
-testable without a DiT: this module never touches the model.
+testable without a DiT: this module never touches the model. (The 4-step
+rollout that PRODUCES the constrained trajectory does need the DiT, so it lives
+in ``fm_log_prob._smooth_chunk_rollout``; everything that operates on the
+resulting tensor lives here.)
 
-The quantity being constrained is the roughness of the flow model's IMPLIED
-ENDPOINT along the action-chunk horizon axis ``h``:
+The quantity being constrained is the roughness, along the action-chunk horizon
+axis ``h``, of one of two trajectories -- selected by ``smooth_instrument``:
 
-    a_hat(tau) = x_tau + (1 - tau) * v_theta(x_tau, tau)   ==   a + (1 - tau) * r
+  * ``"chunk"`` (default) -- the GENERATED action chunk, i.e. what the robot
+    executes: the production Euler rollout from the collected noise.
+  * ``"endpoint"`` -- the flow model's IMPLIED ENDPOINT at tau = 0,
+        a_hat(0) = eps + v_theta(eps, 0)   ==   a + r
+    where ``r = v_theta - (a - eps)`` is the velocity residual.
 
-where ``r = v_theta - (a - eps)`` is the velocity residual. Two facts from the
-measurements motivate targeting the endpoint rather than the residual:
+Both apply the SAME operator; they differ only in what they difference.
 
-  * ``HF(a_hat)`` separates the pretrained field from the GRPO-finetuned one by
-    100-200x, against the residual's 1.5-2.1x.
-  * The two checkpoints measured rank OPPOSITELY on residual roughness versus
-    chunk roughness, so residual roughness does not control what you see.
+Why the chunk and not the endpoint. The endpoint separates the pretrained field
+from a GRPO-finetuned one by 100-200x, against the residual's 1.5-2.1x, and that
+sharpness is why it was chosen first. But a 16-checkpoint sweep showed it does
+not CONTROL physical trajectory jerk: over the late iterations the endpoint's HF
+fell 9% while EEF path jerk rose 11% (Spearman rho +0.00), and a constrained run
+held the endpoint at 3-6x base for six iterations while its executed chunks
+degraded 2.2x -> 8.6x. The 4-step chunk's HF correlates with path jerk at
+rho = +0.98 overall / +0.96 late. ``"endpoint"`` is retained so runs calibrated
+against it stay reproducible.
+
+Why neither is the residual. ``r`` lives in error space, and the two measured
+checkpoints rank OPPOSITELY on residual roughness versus chunk roughness, so
+residual roughness does not control what you see either.
 
 Roughness is decomposed into two independent coordinates, ``R = 6 * M * HF``:
 
@@ -27,7 +42,8 @@ Roughness is decomposed into two independent coordinates, ``R = 6 * M * HF``:
 The ``6`` is the squared norm of the ``(1, -2, 1)`` stencil, which pins
 ``HF = 1`` for a column that is white along ``h``. ``HF`` is scale-free, so it
 reports the SHAPE of the sequence and not its size; ``M`` carries the size.
-Verified calibration: constant 0.00, smooth half-sine 0.01, white 1.00,
+Verified calibration: constant 0.00, smooth half-sine 0.0004 (measured 3.6e-4
+at H=16), white 1.00,
 alternating +-c 8/3.
 
 See ``jerk-constraint.md`` sections 1, 6 and 7 for the derivations.
@@ -55,6 +71,25 @@ DEFAULT_DISCRETE_ACTION_KEYS: tuple[str, ...] = ("gripper_close", "control_mode"
 # Constraining an inert channel spends the adapter's limited capacity on dims
 # that do not move the robot, so it is excluded unless explicitly requested.
 DEFAULT_GATED_ACTION_KEYS: tuple[str, ...] = ("base_motion",)
+
+# The two trajectories the roughness operator can be applied to. Both use the
+# SAME (1, -2, 1) stencil along `h`; they differ only in WHAT they difference:
+#
+#   "chunk"    the 4-step generated chunk -- what the robot executes.
+#   "endpoint" the 1-step implied endpoint a_hat(0) = eps + v_theta(eps, 0).
+#
+# Lives here rather than in `fm_log_prob` so `grpo_config` can validate against
+# it without importing the model-facing module. The rollout that produces the
+# "chunk" trajectory does live in `fm_log_prob`, since it needs the DiT.
+SMOOTH_INSTRUMENTS: tuple[str, ...] = ("chunk", "endpoint")
+
+# The action key carrying the gripper's Cartesian delta. Named because the
+# `executed_jerk_ratio` diagnostic is the normalized-space analogue of the
+# PHYSICAL EEF path-jerk metric, which is measured on position alone -- mixing
+# in the axis-angle rotation dims would average radians with metres. Resolved
+# against the checkpoint's modality_keys by `build_key_dim_span`, never
+# hardcoded as an index.
+DEFAULT_EEF_POSITION_KEY = "end_effector_position"
 
 
 def second_difference(u: torch.Tensor) -> torch.Tensor:
@@ -182,8 +217,10 @@ def implied_endpoint(
         whose last term is white, theta-independent, and at the production
         ``lam = 0.25`` large enough to invert the base-vs-finetuned discrimination
         the constraint depends on -- a silent no-op. The production path instead
-        takes a dedicated clean forward at ``tau = 0`` and forms ``eps + v0``
-        directly (``fm_log_prob.compute_fm_log_prob``).
+        runs its own clean forward(s) from the ORIGINAL eps: under
+        ``smooth_instrument="endpoint"`` it forms ``eps + v0`` directly, and under
+        ``"chunk"`` it rolls out the production sampler
+        (``fm_log_prob.compute_fm_log_prob``).
 
         Kept because the identity ``a_hat = a + (1-tau) r`` is part of the theory
         (``jerk-constraint.md`` section 6) and is worth asserting in tests.
@@ -258,6 +295,45 @@ def build_continuous_action_dims(
             f"nothing to constrain."
         )
     return dims, kept, start
+
+
+def build_key_dim_span(
+    modality_keys: list[str],
+    key_dims: dict[str, int],
+    target_key: str = DEFAULT_EEF_POSITION_KEY,
+) -> list[int]:
+    """Column indices of ONE action key, from the CHECKPOINT layout.
+
+    Derived exactly the way ``build_continuous_action_dims`` derives its set:
+    walk the embodiment's ``modality_keys`` IN ORDER, accumulating each key's
+    normalized ``dim`` width, and return the span belonging to ``target_key``.
+    A ``"prefix."`` is tolerated and stripped for matching, same as there.
+
+    Used for the ``smooth/executed_jerk_ratio`` diagnostic, which is a
+    normalized-space analogue of the physical EEF path-jerk metric and therefore
+    wants the position dims ALONE -- averaging rotation and position into one
+    ratio would mix radians with metres.
+
+    Returns an EMPTY list when the key is absent, rather than raising or
+    guessing: this is a diagnostic, and an embodiment that names its position
+    channel something else must not be able to abort a run. The caller
+    (`_setup_smoothness`) then DROPS the dependent metric rather than redefining
+    it over the constrained dim set -- a jerk ratio mixing position with
+    axis-angle rotation would mix metres with radians and would not be the
+    path-jerk analogue its name promises.
+    """
+    short_target = target_key.split(".")[-1]
+    start = 0
+    for key in modality_keys:
+        if key not in key_dims:
+            # Same failure the constrained-dim builder raises on, but this is a
+            # diagnostic path -- degrade rather than abort.
+            return []
+        width = int(key_dims[key])
+        if key.split(".")[-1] == short_target:
+            return list(range(start, start + width))
+        start += width
+    return []
 
 
 def describe_dim_selection(

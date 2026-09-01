@@ -19,6 +19,7 @@ from typing import Optional
 import math
 
 from lora_dit import DEFAULT_LORA_TARGET_MODULES
+from smoothness import SMOOTH_INSTRUMENTS
 
 
 @dataclass
@@ -612,24 +613,21 @@ class GRPOConfig:
     #         jittered input noise.
     jitter_paired: bool = True
 
-    # ─── Endpoint-roughness constraint (the "jerk constraint") ───────────────
-    # A temporal-smoothness prior on the DiT's IMPLIED ENDPOINT along the action
-    # horizon. Orthogonal to Jitter-GRPO: jitter bounds the MAGNITUDE of the
-    # velocity field's noise response (`E_xi||J xi||^2 = ||J||_F^2`, isotropic),
-    # while this bounds its SPECTRUM along `h`. Measured independence:
-    # `jitter/jacobian_fro_sq` fell 32% over the same iterations in which the
-    # residual's high-frequency fraction rose 1.7-2.9x and relative seed
-    # dispersion rose 4.5x.
+    # ─── Trajectory-roughness constraint (the "jerk constraint") ─────────────
+    # A temporal-smoothness prior on the DiT's generated action chunk along the
+    # action horizon. Orthogonal to Jitter-GRPO: jitter bounds the MAGNITUDE of
+    # the velocity field's noise response (`E_xi||J xi||^2 = ||J||_F^2`,
+    # isotropic), while this bounds its SPECTRUM along `h`. Measured
+    # independence: `jitter/jacobian_fro_sq` fell 32% over the same iterations in
+    # which the residual's high-frequency fraction rose 1.7-2.9x and relative
+    # seed dispersion rose 4.5x.
     #
     # The constrained quantity is
-    #     HF(a_hat(tau)) = R(a_hat) / (6 * M(a_hat).detach())
-    #     a_hat(tau)     = x_tau + (1 - tau) * v_theta  ==  a + (1 - tau) * r
+    #     HF(u) = R(u) / (6 * M(u).detach())        D2 along h
     # penalised as a HINGE against the pretrained field's own value:
     #     L = smooth_coef * relu( HF_pooled - smooth_hf_ref )
-    #
-    # Why the endpoint and not the residual: `HF(a_hat)` separates base from the
-    # finetuned field by 100-200x versus the residual's 1.5-2.1x, and the two
-    # measured checkpoints rank OPPOSITELY on residual vs chunk roughness.
+    # where `u` is the trajectory named by `smooth_instrument` (default: the
+    # 4-step generated chunk).
     # Why a hinge and not a penalty: below the threshold both value and gradient
     # are exactly 0, so it never pushes toward the conditional-mean map — which
     # the `consensus_ns4` eval measures at 0.365 against baseline 0.600.
@@ -637,12 +635,47 @@ class GRPOConfig:
     #
     # 0.0 (default) = feature OFF, bit-identical to a run without it: no extra
     # tensors, no calibration, no metrics, no banner line. Suggested starting
-    # value 0.15, which puts the term at ~15% of |clip_loss| at the roughness
-    # measured on iter_0011/iter_0017. Bracket +-3x.
+    # range for the CHUNK instrument is 0.15-0.5: the last-step-differentiable
+    # rollout retains roughly a quarter of the true 4-step gradient's magnitude
+    # (one of four steps carries a graph), so the coefficient may need raising
+    # relative to the 0.15 that was calibrated on the endpoint instrument, whose
+    # single forward IS its whole gradient. Bracket +-3x either way.
     smooth_coef: float = 0.0
 
-    # Frozen SCALAR threshold. The constraint is evaluated at a single tau (=0)
-    # on a dedicated clean DiT forward, so there is no per-tau vector. Three forms:
+    # WHICH trajectory the (1,-2,1) second-difference operator is applied to.
+    # Exactly two values; anything else is a hard config error.
+    #
+    #   "chunk" (default) -- the 4-step GENERATED chunk, i.e. what the robot
+    #       executes. Rolled out on the production sampler schedule from the
+    #       collected eps, with only the LAST Euler step differentiable: the
+    #       forward VALUE is the exact 4-step chunk, while only 1 graph-forward
+    #       is added so VRAM (and hence mini_batch_size=8) is unchanged. The
+    #       gradient is biased -- it misses how theta shapes the earlier steps
+    #       and the sampler path -- which is an accepted, documented tradeoff
+    #       against the ~29.1 GB a fully-differentiated rollout needs versus the
+    #       25.3 GB available.
+    #
+    #   "endpoint" -- the historical instrument: the 1-step implied endpoint
+    #       `a_hat(0) = eps + v_theta(eps, 0)` on a dedicated clean forward at
+    #       tau = 0. Reproduces the pre-change behaviour bit-for-bit, so runs
+    #       calibrated against it stay reproducible.
+    #
+    # Why the default is "chunk". An empirical sweep over 16 checkpoints of a
+    # real training run showed the endpoint does NOT control physical trajectory
+    # jerk, which is the quantity the constraint exists to bound:
+    #   * Over iterations 10-16 of the unconstrained run the endpoint HF FELL 9%
+    #     (0.331 -> 0.300) while EEF path jerk ROSE 11% (0.516 -> 0.572).
+    #     Spearman rho between them over that window: +0.00.
+    #   * A run WITH the constraint at coef 0.15 pinned endpoint HF at 3-6x base
+    #     for six iterations, yet its executed chunks still degraded: chunk HF
+    #     2.2x -> 8.6x base, path jerk 1.45x -> 2.86x base.
+    # The 4-step chunk's HF, by contrast, correlates with path jerk at
+    # rho = +0.98 overall and +0.96 over the late iterations.
+    smooth_instrument: str = "chunk"
+
+    # Frozen SCALAR threshold on the pooled HF of whichever instrument
+    # `smooth_instrument` selects. One number, not a per-tau vector: both
+    # instruments reduce to a single pooled scalar per minibatch. Three forms:
     #   None  (default) -> AUTO-CALIBRATE from the first iteration of a fresh run.
     #                      PEFT initialises lora_B to zeros, so before the first
     #                      optimizer step theta == theta_base and the collected
@@ -651,16 +684,18 @@ class GRPOConfig:
     #                      versus 0.0572 at a resumed run's first iteration). The
     #                      measurement is taken while n_updates == 0, then scaled
     #                      by `smooth_hf_ref_scale` and frozen.
-    #   float           -> flat scalar for every tau. Viable: base HF(a_hat)
-    #                      spans 0.0003-0.0068 across observations and tau while
-    #                      the lowest finetuned value anywhere is 0.0779, an 11x
-    #                      gap, so a flat 0.02 has ~3x margin either side.
+    #   float           -> flat scalar threshold. Must be in the units of the
+    #                      SELECTED instrument -- the two have similar base
+    #                      values (chunk 0.00141, endpoint 0.00157) but very
+    #                      different useful ranges, so a value carried over from
+    #                      the other instrument will mis-bind. See
+    #                      `smooth_hf_ref_scale` for measured levels.
     #   list[float]     -> only element [0] is used, with a warning. Accepted
     #                      for backward compatibility with per-tau configs.
     #
-    # A single-tau design, so this is a SCALAR. A list is accepted for backward
-    # compatibility with the earlier per-tau build; only its first entry is used
-    # and a warning is printed.
+    # A single-scalar design. A list is accepted for backward compatibility with
+    # the earlier per-tau build; only its first entry is used and a warning is
+    # printed.
     # NEVER recomputed from the current policy. A tracking threshold would
     # re-baseline on the roughness the previous iteration introduced, permit a
     # little more, and never bind — the ratchet this design exists to avoid.
@@ -669,14 +704,29 @@ class GRPOConfig:
     smooth_hf_ref: float | list[float] | None = None
 
     # Multiplier applied to the auto-calibrated base value. Sets how hard the
-    # constraint bites; the SHAPE across tau stays the base field's. The measured
-    # base weighted-mean HF(a_hat) is 0.0012-0.0051 depending on the state, so
-    # 4.0 lands at ~0.005-0.02 — comfortably above base and 10-40x below the
-    # finetuned field. Authority (`R(r)/R(a)`, the fraction of the chunk's D2
-    # amplitude the residual can cancel) crosses 1 at roughly 10-13x base, so
-    # values much above ~8 risk engaging only after full cancellation is gone.
-    # Ignored when `smooth_hf_ref` is set explicitly.
-    smooth_hf_ref_scale: float = 4.0
+    # constraint bites. Ignored when `smooth_hf_ref` is set explicitly.
+    #
+    # The scale is a MULTIPLE OF THE MEASURED BASE VALUE, and the two instruments
+    # have completely different useful ranges even though their base values are
+    # similar. Which is why this default moved 4.0 -> 15.0 when the instrument
+    # moved endpoint -> chunk: 4.0 was calibrated for the endpoint and is far too
+    # tight for the chunk.
+    #
+    # Measured chunk HF on the control run (base = 0.00141):
+    #     iter1 0.0023  iter2 0.0072  iter3 0.0152  iter4 0.0244
+    #     iter6 0.0408  iter12 0.0959  iter16 0.1131          -> ~80x base
+    # Corresponding EEF path jerk: base 0.0689, iter4 0.2720, iter12 0.5358.
+    # A bound near 15-17x base (~0.024) therefore targets the iteration-4
+    # roughness level, which carries ~2x LESS path jerk than the control run's
+    # peak-success iteration -- a real reduction that is still reachable rather
+    # than a threshold the field can never get back under.
+    #
+    # For `smooth_instrument="endpoint"`, 4.0 remains the right value: the
+    # measured base endpoint HF is 0.0012-0.0051 depending on state, so 4.0 lands
+    # at ~0.005-0.02, comfortably above base and 10-40x below the finetuned
+    # field, and the endpoint's own authority (`R(r)/R(a)`) crosses 1 at roughly
+    # 10-13x base.
+    smooth_hf_ref_scale: float = 15.0
 
     # Admit `base_motion` into the constrained dim set. OFF by default because
     # `control_mode` gates it — arm and base are mutually exclusive under
@@ -943,7 +993,7 @@ class GRPOConfig:
                     f"Variance preservation requires λ < 1; use 0.0 to disable."
                 )
 
-        # ── Endpoint-roughness constraint ────────────────────────────────────
+        # ── Trajectory-roughness constraint ──────────────────────────────────
         # smooth_coef == 0.0 is the OFF switch and must stay a total no-op, so
         # only the value range is checked unconditionally; the companion knobs
         # are validated for self-consistency either way so a typo surfaces even
@@ -953,6 +1003,23 @@ class GRPOConfig:
                 f"smooth_coef must be finite and >= 0, got {self.smooth_coef}. "
                 f"It scales relu(HF - hf_ref) >= 0, so a negative value would "
                 f"REWARD roughness. Use 0.0 to disable the constraint."
+            )
+        # Validated unconditionally (even at smooth_coef == 0) for the same
+        # reason as the knobs below: a typo must surface at construction, not
+        # the first time someone switches the feature on. The two instruments
+        # measure DIFFERENT quantities with similar base values (chunk 0.00141
+        # vs endpoint 0.00157), so a silent fall-through to a default would be
+        # invisible in the numbers.
+        if self.smooth_instrument not in SMOOTH_INSTRUMENTS:
+            raise ValueError(
+                f"smooth_instrument must be one of "
+                f"{sorted(SMOOTH_INSTRUMENTS)}, got "
+                f"{self.smooth_instrument!r}. 'chunk' constrains the 4-step "
+                f"generated chunk (what the robot executes; correlates with EEF "
+                f"path jerk at rho=+0.98); 'endpoint' constrains the 1-step "
+                f"implied endpoint a_hat(0) = eps + v(eps, 0) and reproduces the "
+                f"pre-change behaviour (rho=+0.00 against path jerk over the "
+                f"late iterations, which is why it is no longer the default)."
             )
         if self.smooth_hf_ref_scale <= 0.0 or not math.isfinite(
             self.smooth_hf_ref_scale
@@ -977,8 +1044,9 @@ class GRPOConfig:
             if isinstance(self.smooth_hf_ref, (list, tuple)) and not _refs:
                 raise ValueError(
                     "smooth_hf_ref=[] is empty. Pass a single float for the "
-                    "threshold (the constraint is evaluated at one tau, so the "
-                    "reference is a scalar), or None to auto-calibrate."
+                    "threshold (both instruments reduce to one pooled scalar per "
+                    "minibatch, so the reference is a scalar), or None to "
+                    "auto-calibrate."
                 )
             for _r in _refs:
                 if not math.isfinite(_r) or _r <= 0.0:

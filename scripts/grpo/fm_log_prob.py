@@ -34,15 +34,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta
 
-from smoothness import roughness_moments
+from smoothness import SMOOTH_INSTRUMENTS, roughness_moments
 
 # Std of the Gaussian jitter applied to each tau center. Named rather than left as
-# a bare default so the endpoint-roughness constraint can record it in its
-# calibration guard key. Note hf_ref does NOT depend on it -- that reference is
-# measured at tau=0 on a clean forward -- but this width changes what every other
-# term in the loss evaluates, so a silent mismatch across a resume is worth
-# refusing rather than inferring later.
+# a bare default so the roughness constraint can record it in its calibration
+# guard key. Note hf_ref does NOT depend on it -- the smooth pass runs on clean
+# forwards from the original eps -- but this width changes what every other term
+# in the loss evaluates, so a silent mismatch across a resume is worth refusing
+# rather than inferring later.
 TAU_JITTER_STD = 0.02
+
+# `SMOOTH_INSTRUMENTS` is defined in `smoothness` rather than here so
+# `grpo_config` can validate against it without importing this model-facing
+# module; it is imported above so callers of `compute_fm_log_prob` need not
+# learn a second module name.
+
+
+def inference_schedule(action_head: nn.Module) -> tuple[list[float], float]:
+    """The PRODUCTION denoising schedule, read off the model config.
+
+    Mirrors ``Gr00tN1d6ActionHead.get_action_with_features``
+    (``gr00t/model/gr00t_n1d6/gr00t_n1d6.py:317-321``) exactly:
+
+        dt     = 1.0 / num_inference_timesteps
+        t_cont = t / float(num_inference_timesteps)   for t in range(N)
+
+    Nothing here is hardcoded. At the shipped ``num_inference_timesteps = 4``
+    this returns ``([0.0, 0.25, 0.5, 0.75], 0.25)``, but a checkpoint that
+    overrides the config gets its own schedule -- which matters because a
+    schedule mismatch would silently constrain a trajectory the robot never
+    executes, i.e. exactly the failure this instrument exists to fix.
+
+    UNITS. The returned values are CONTINUOUS t in [0, 1), not bucket indices.
+    ``_dit_velocity`` does the bucketization itself (``(t * num_timestep_buckets)
+    .long()``), matching what ``get_action_with_features`` does inline
+    (``int(t_cont * num_timestep_buckets)``), and matching the existing smooth
+    pass, which builds ``t0 = torch.zeros(B)`` -- a continuous 0.0, not bucket 0.
+    Note ``noise_s`` (0.999) does NOT appear: it scales the Beta-sampled TRAINING
+    timesteps (``gr00t_n1d6.py:140``), while inference walks the raw ``t/N`` grid.
+
+    PRECISION. These are Python floats (float64), and a caller building a tensor
+    from them must NOT narrow to bf16. Note the reason is NOT that bf16 cannot
+    represent the timesteps: 0.75 is exactly representable in bf16 (it is
+    2^-1 + 2^-2). What loses precision is the PRODUCT: bucketizing computes
+    ``t * num_timestep_buckets``, and with 8 mantissa bits the nearest bf16 to
+    750.0 is 752.0, so ``t=0.75`` bucketizes to 752 where production's
+    Python-float ``int(t_cont * num_timestep_buckets)`` gives 750 -- a different
+    AdaLayerNorm conditioning from the one the sampler actually uses. See the
+    dtype comment in ``_smooth_chunk_rollout``.
+
+    Returns:
+        ``(t_values, dt)`` -- the per-step continuous timesteps and the Euler
+        step size.
+    """
+    n_steps = int(action_head.num_inference_timesteps)
+    if n_steps < 1:
+        raise ValueError(
+            f"num_inference_timesteps must be >= 1, got {n_steps}. The chunk "
+            f"instrument rolls the production sampler out, so there is no "
+            f"trajectory to difference below one step."
+        )
+    dt = 1.0 / n_steps
+    return [i / float(n_steps) for i in range(n_steps)], dt
 
 
 def compute_fm_log_prob(
@@ -63,6 +116,7 @@ def compute_fm_log_prob(
     smooth_dims: torch.Tensor | None = None,
     smooth_horizon: int | None = None,
     smooth_no_grad: bool = False,
+    smooth_instrument: str = "chunk",
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Compute FM log-probability surrogate for a batch of action chunks.
 
@@ -116,41 +170,69 @@ def compute_fm_log_prob(
             operand) — negligible, and the only callsite is a no_grad
             diagnostic.
         smooth_dims: Optional 1-D LongTensor of action-dim column indices. When
-            given (with `smooth_horizon`), ONE ADDITIONAL DiT forward runs at
-            `(x = noise, tau = 0)` -- the clean un-jittered interpolant, which at
-            tau=0 is exactly eps -- and its implied endpoint
-            `a_hat(0) = eps + v_theta(eps, 0)` is reduced to per-row roughness
-            moments over `[:, :smooth_horizon, smooth_dims]`. See `smoothness.py`
-            and `jerk-constraint.md` sections 6-7.
+            given (with `smooth_horizon`), the smoothness pass runs and reduces a
+            trajectory to per-row roughness moments over
+            `[:, :smooth_horizon, smooth_dims]`. See `smoothness.py` and
+            `jerk-constraint.md` sections 6-7. WHICH trajectory is decided by
+            `smooth_instrument`.
 
             Deliberately NOT taken from the K-loop: under Jitter-GRPO the K-loop's
             input is x'_tau, so its velocity carries the model's response to the
             eps-jitter, landing in a_hat as (1-tau)^2 J (eps'-eps) -- white,
             theta-independent, and at the production lambda=0.25 large enough to
             collapse the base-vs-finetuned discrimination the constraint needs.
+            Every forward here uses the ORIGINAL, un-jittered eps.
 
-            COSTS ONE EXTRA DiT FORWARD (~1/K of the K-loop, ~17% at K=6) and
-            raises peak activation memory by about the same fraction when the
-            result feeds the loss. Pass `smooth_no_grad=True` when it does not.
+            Pass `smooth_no_grad=True` when the caller only reads the moments
+            (e.g. hf_ref calibration) -- no graph is then retained anywhere.
         smooth_horizon: Valid action horizon (e.g. 16 for PandaOmron). Slicing
             happens BEFORE differencing -- a second difference straddling the pad
             boundary of the (50, 128) output is meaningless.
-        smooth_no_grad: Build the extra forward under `torch.no_grad()`. Correct
-            and ~1/K cheaper in activations whenever the caller only reads the
+        smooth_no_grad: Build the smooth forward(s) under `torch.no_grad()`.
+            Correct and cheaper in activations whenever the caller only reads the
             moments, e.g. during hf_ref calibration.
+        smooth_instrument: WHICH trajectory the roughness operator is applied to.
+
+            "chunk" (default) -- the 4-step generated chunk, i.e. the thing the
+                robot executes. A full production-schedule Euler rollout from the
+                collected eps, with only the LAST velocity evaluation carrying a
+                graph (see `_smooth_chunk_rollout`). Costs `num_inference_timesteps`
+                DiT forwards but only ONE forward's activations.
+            "endpoint" -- the historical instrument: the 1-step implied endpoint
+                `a_hat(0) = eps + v_theta(eps, 0)`, from a single differentiable
+                forward at tau=0. Kept bit-for-bit so old runs stay reproducible.
+
+            Why the default moved. An empirical sweep over 16 checkpoints of a
+            real run found the endpoint does NOT control physical trajectory
+            jerk: over iterations 10-16 the endpoint HF FELL 9% while EEF path
+            jerk ROSE 11% (Spearman rho over that window: +0.00), and a run
+            constrained at coef 0.15 pinned endpoint HF at 3-6x base for six
+            iterations while its executed chunks still degraded 2.2x -> 8.6x
+            base. The 4-step chunk's HF correlates with path jerk at rho = +0.98
+            overall and +0.96 over the late iterations. Same (1,-2,1) operator;
+            different trajectory.
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
         With `return_per_tau=True`, additionally the un-averaged [K, B] per-tau
-        log-probs. With `smooth_dims`/`smooth_horizon`, additionally the [B, 2]
-        per-row roughness moments `(R, M)` of the implied endpoint at tau=0 --
-        raw moments, not their ratio, so the caller can POOL them (see
-        `smoothness.roughness_moments`). Extras are appended in that order, so
-        the contract is:
+        log-probs. With `smooth_dims`/`smooth_horizon`, additionally a 2-tuple
+        `(moments, endpoint_moments)` of [B, 2] per-row roughness moments
+        `(R, M)` -- raw moments, not their ratio, so the caller can POOL them
+        (see `smoothness.roughness_moments`).
+
+        `moments` is the CONSTRAINED instrument (whichever `smooth_instrument`
+        selected); `endpoint_moments` is always the tau=0 endpoint, monitoring
+        only. Under `smooth_instrument="endpoint"` the two are the same tensor
+        object, so the caller must not assume they are independent. Under
+        "chunk" the endpoint pair is a FREE byproduct: the rollout's first step
+        is `v_theta(eps, t=0)`, which is exactly the endpoint's velocity, and it
+        runs under `no_grad` so it carries no gradient.
+
+        Extras are appended in a fixed order:
             neither            -> log_probs
             per_tau only       -> (log_probs, per_tau)            [unchanged]
-            smooth only        -> (log_probs, moments)
-            both               -> (log_probs, per_tau, moments)
+            smooth only        -> (log_probs, (mom, endpoint_mom))
+            both               -> (log_probs, per_tau, (mom, endpoint_mom))
     """
     B = actions.shape[0]
     device = actions.device
@@ -212,13 +294,14 @@ def compute_fm_log_prob(
     # Per-τ terms, kept only when the caller asks.
     per_tau_log_probs: list[torch.Tensor] | None = [] if return_per_tau else None
 
-    # --- Endpoint-roughness (jerk constraint) bookkeeping ---
-    # Argument validation, done once here rather than inside the extra forward
-    # below. The smooth pass evaluates at tau=0 with the original eps, so it needs
-    # nothing from `timesteps` and is independent of both the tau-jitter and the
-    # eps-jitter -- see the block after the K-loop.
+    # --- Roughness (jerk constraint) bookkeeping ---
+    # Argument validation, done once here rather than inside the smooth block
+    # below. Every smooth forward uses the ORIGINAL eps and the production
+    # timestep schedule, so it needs nothing from `timesteps` and is independent
+    # of both the tau-jitter and the eps-jitter -- see the block after the K-loop.
     want_smooth = smooth_dims is not None or smooth_horizon is not None
     smooth_moments: torch.Tensor | None = None
+    endpoint_moments: torch.Tensor | None = None
     if want_smooth:
         if smooth_dims is None or smooth_horizon is None:
             raise ValueError(
@@ -226,10 +309,21 @@ def compute_fm_log_prob(
                 f"(got smooth_dims={'set' if smooth_dims is not None else None}, "
                 f"smooth_horizon={smooth_horizon})"
             )
-        if not (0 < smooth_horizon <= actions.shape[1]):
+        if smooth_instrument not in SMOOTH_INSTRUMENTS:
+            raise ValueError(
+                f"smooth_instrument must be one of {sorted(SMOOTH_INSTRUMENTS)}, "
+                f"got {smooth_instrument!r}"
+            )
+        if not (3 <= smooth_horizon <= actions.shape[1]):
             raise ValueError(
                 f"smooth_horizon={smooth_horizon} must lie in "
-                f"(0, {actions.shape[1]}] (the padded action horizon)"
+                f"[3, {actions.shape[1]}] (the padded action horizon). The lower "
+                f"bound is the (1,-2,1) stencil's span: at 1 or 2 rows "
+                f"`second_difference` raises from inside the loss path, which "
+                f"would surface as a mid-training crash rather than a config "
+                f"error. Rejected HERE, once, before the first forward -- the "
+                f"metrics path guards the same condition by degrading to 'no "
+                f"reading', but the loss cannot degrade, so it must not start."
             )
         if int(smooth_dims.max()) >= actions.shape[2]:
             raise ValueError(
@@ -239,8 +333,13 @@ def compute_fm_log_prob(
         smooth_dims = smooth_dims.to(device=device)
 
     def _dit_velocity(noisy_trajectory, t):
-        """One DiT forward -> pred_velocity. Factored so the endpoint-roughness
-        pass can reuse it verbatim rather than duplicating the call signature."""
+        """One DiT forward -> pred_velocity.
+
+        Factored so the roughness pass can reuse it verbatim rather than
+        duplicating the call signature -- BOTH instruments go through it: the
+        endpoint calls it once at tau=0, the chunk calls it once per Euler step
+        via `_smooth_chunk_rollout`.
+        """
         num_timestep_buckets = action_head.num_timestep_buckets
         t_discretized = (t * num_timestep_buckets).long()
 
@@ -329,7 +428,7 @@ def compute_fm_log_prob(
         if per_tau_log_probs is not None:
             per_tau_log_probs.append(-per_sample_mse)
 
-    # ── Endpoint roughness: ONE dedicated clean forward at tau = 0 ──────────
+    # ── Roughness instrument: dedicated CLEAN forward(s) with the ORIGINAL eps ──
     # Deliberately NOT taken from the K-loop. Under Jitter-GRPO the K-loop's DiT
     # input is x'_tau (built from eps' = sqrt(1-lam^2)eps + lam*xi), so its
     # velocity carries the model's RESPONSE to that perturbation:
@@ -338,40 +437,182 @@ def compute_fm_log_prob(
     # with the measured jacobian_fro_sq ~2.4 it DOMINATES: HF goes 0.000347 ->
     # 0.790 at tau=0 on a base-like chunk (2275x). Because the calibration would
     # be contaminated identically, hf_ref freezes above HF's theoretical maximum
-    # for H=16 (2.984) and the hinge can never fire -- a silent no-op.
+    # for H=16 (2.984) and the hinge can never fire -- a silent no-op. Both
+    # instruments below start from the clean, collected eps, so both are immune.
     #
-    # tau = 0 exactly, with the ORIGINAL eps, is both the cure and the
-    # theoretically privileged point: x_0 == eps, so this evaluation sits ON the
-    # sampler's path and a_hat(0) = eps + v_theta(eps, 0) is literally the 1-step
-    # Euler endpoint whose degradation the solver sweep isolated. The (1-tau)^2
-    # weight is 1 there, so no tau weighting is needed and hf_ref is a SCALAR.
+    # WHICH trajectory gets differenced is `smooth_instrument`:
     #
-    # Cost: exactly one extra DiT forward per call (~1/K of the K-loop, ~17% at
-    # the default K=6), and only when the constraint is enabled.
+    #   "endpoint" -- the historical one-step implied endpoint at tau = 0. There
+    #       x_0 == eps exactly, so a_hat(0) = eps + v_theta(eps, 0) is literally
+    #       the 1-step Euler endpoint, and the (1-tau)^2 leverage weight is 1.
+    #       One differentiable DiT forward. Retained bit-for-bit so the runs
+    #       calibrated against it stay reproducible.
+    #
+    #   "chunk" -- the 4-step GENERATED chunk, i.e. what the robot executes.
+    #       Measured over 16 checkpoints of a real run: the endpoint's HF has
+    #       Spearman rho = +0.00 with EEF path jerk over the late iterations
+    #       (endpoint HF fell 9% while path jerk rose 11%), while the chunk's HF
+    #       correlates at +0.98 overall / +0.96 late. Constraining the endpoint
+    #       therefore does not control the deliverable; constraining the chunk
+    #       does. Same operator, different trajectory.
+    #
+    # Cost: the endpoint pass is exactly one extra DiT forward (~1/K of the
+    # K-loop, ~17% at the default K=6). The chunk pass is `num_inference_timesteps`
+    # forwards but only ONE forward's ACTIVATIONS (see _smooth_chunk_rollout),
+    # which is what keeps mini_batch_size=8 inside the 25.3 GB budget -- a fully
+    # differentiated 4-step rollout was estimated at 29.1 GB and OOMs.
     if smooth_dims is not None:
-        t0 = torch.zeros(B, device=device, dtype=dtype)
+        sl = (slice(None), slice(0, smooth_horizon))
+
+        def _slice_f32(u):
+            """Slice to the constrained rectangle and upcast, BEFORE differencing.
+
+            A D2 straddling the pad boundary at h = smooth_horizon of the
+            (50, 128) output would difference real actions against padding.
+
+            The fp32 cast is applied to each operand as it enters, which matters
+            for the ENDPOINT path: `eps + v0` is summed after both are upcast, so
+            the squared quantity R does not lose mantissa to a bf16 addition.
+            It does NOT apply to the chunk path, and must not: the Euler sum
+            `x + dt*v` there is accumulated in bf16 on purpose, because that is
+            precisely what production does (`gr00t_n1d6.py:328`). Upcasting the
+            rollout would make the measured chunk differ from the executed one,
+            which is the whole property `_smooth_chunk_rollout` exists to keep.
+            """
+            return u[sl].index_select(2, smooth_dims).float()
+
         with torch.no_grad() if smooth_no_grad else contextlib.nullcontext():
-            v0 = _dit_velocity(eps, t0)                # x_0 == eps exactly
-            sl = (slice(None), slice(0, smooth_horizon))
-            e_s = eps[sl].index_select(2, smooth_dims).float()
-            v_s = v0[sl].index_select(2, smooth_dims).float()
-            # a_hat(0) = eps + v_theta(eps,0); == a + r since target = a - eps.
-            smooth_moments = roughness_moments(e_s + v_s)
+            if smooth_instrument == "endpoint":
+                # x_0 == eps exactly, so a_hat(0) = eps + v_theta(eps, 0).
+                # == a + r, since velocity_target = a - eps.
+                t0 = torch.zeros(B, device=device, dtype=dtype)
+                v0 = _dit_velocity(eps, t0)
+                smooth_moments = roughness_moments(_slice_f32(eps) + _slice_f32(v0))
+                # The constrained instrument IS the endpoint here, so the
+                # monitoring pair is the same tensor -- no second forward, and
+                # smooth/hf_mean == smooth/endpoint_hf_mean by construction.
+                endpoint_moments = smooth_moments
+            else:
+                chunk, v0 = _smooth_chunk_rollout(
+                    _dit_velocity, eps, action_head
+                )
+                smooth_moments = roughness_moments(_slice_f32(chunk))
+                # FREE byproduct: the rollout's first step evaluates
+                # v_theta(eps, t=0), which is exactly the endpoint's velocity, so
+                # a_hat(0) = eps + v0 costs no forward. It comes from the
+                # no_grad leg of the rollout, hence carries no gradient -- which
+                # is all a monitoring metric needs.
+                with torch.no_grad():
+                    endpoint_moments = roughness_moments(
+                        _slice_f32(eps) + _slice_f32(v0)
+                    )
 
     # Average across K timestep samples
     log_probs = log_probs_accumulated / n_samples
 
     # Extras are appended in a fixed order so every existing caller's unpacking
-    # keeps working: per_tau first (pre-existing), then smooth_hf.
-    extras: list[torch.Tensor] = []
+    # keeps working: per_tau first (pre-existing), then the smooth pair.
+    extras: list = []
     if per_tau_log_probs is not None:
         extras.append(torch.stack(per_tau_log_probs, dim=0))  # [K, B]
     if smooth_moments is not None:
-        extras.append(smooth_moments)                          # [B, 2] = (R, M)
+        # A TUPLE, not two positional extras: the constrained instrument and the
+        # monitoring endpoint travel together, so a caller cannot unpack one and
+        # silently drop the other, and adding the endpoint did not renumber the
+        # per_tau slot.
+        extras.append((smooth_moments, endpoint_moments))     # each [B, 2]=(R,M)
     if extras:
         return (log_probs, *extras)
 
     return log_probs
+
+
+def _smooth_chunk_rollout(
+    dit_velocity,
+    eps: torch.Tensor,
+    action_head: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Production Euler rollout with only the LAST step differentiable.
+
+    Runs the full ``inference_schedule(action_head)`` -- same step count, same
+    ``dt``, same continuous ``t`` values as ``get_action_with_features`` -- from
+    the collected ``eps``. The first N-1 velocity evaluations run under
+    ``torch.no_grad()`` and their outputs are explicitly ``detach()``-ed, so the
+    graph contains exactly one DiT forward.
+
+    Two consequences, both deliberate:
+
+    * **The forward VALUE is exact.** Nothing is approximated in the number the
+      hinge compares against ``hf_ref``; it is the true 4-step chunk the sampler
+      would produce from this ``eps``. Calibration and measurement therefore stay
+      the same functional, which is what makes a frozen threshold meaningful.
+
+    * **The gradient is BIASED.** It misses how theta shapes the first N-1 steps
+      and hence the sampler path that step N is evaluated on -- roughly a quarter
+      of the true gradient's magnitude at N=4. Accepted: differentiating all four
+      steps costs 4 graph-forwards, estimated 29.1 GB against 25.3 GB available at
+      ``mini_batch_size=8``, i.e. an OOM or a halved batch. The retained term
+      still points downhill on the roughness of the executed chunk, which is what
+      the constraint needs; ``smooth_coef`` may need raising to compensate for the
+      smaller magnitude (suggested 0.15-0.5, see ``grpo_config``).
+
+    Args:
+        dit_velocity: ``(x, t) -> v``, the closure over the batch's conditioning.
+        eps: ``[B, H_pad, D_pad]`` the CLEAN collected noise (never the jittered
+            ``eps'``) -- the sampler's own starting point.
+        action_head: read for ``num_inference_timesteps``.
+
+    Returns:
+        ``(chunk, v_first)`` -- the rolled-out chunk (graph on the last step
+        only) and the FIRST step's velocity ``v_theta(eps, t=0)``, which is the
+        endpoint instrument's velocity and comes free of charge. ``v_first`` is
+        detached whenever N > 1.
+    """
+    t_values, dt = inference_schedule(action_head)
+    last = len(t_values) - 1
+    B = eps.shape[0]
+
+    x = eps
+    v_first: torch.Tensor | None = None
+    for i, t_val in enumerate(t_values):
+        # FLOAT64, deliberately, and NOT the batch dtype. `_dit_velocity`'s only
+        # use of `t` is `(t * num_timestep_buckets).long()`, and it is that
+        # PRODUCT, not the timestep itself, that bf16 cannot hold: 0.75 IS exact
+        # in bf16 (2^-1 + 2^-2), but with 8 mantissa bits the nearest bf16 to
+        # 750.0 is 752.0, so a bf16 `t` bucketizes to 752 where production's
+        # Python-float `int(t_cont * num_timestep_buckets)` gives 750. Two
+        # buckets is a DIFFERENT AdaLayerNorm conditioning from the one the
+        # sampler uses, i.e. the exact "constrains a trajectory the robot never
+        # executes" failure this instrument exists to fix. Not unique to N=4 and
+        # not always in the same direction -- at N=8, t=0.375 -> 376 and
+        # t=0.625 -> 624; at N=3, t=1/3 -> 334 vs 333.
+        # fp32 would also be exact here (24 mantissa bits covers 0..1000);
+        # fp64 is used because `t_values` are already Python floats, so it
+        # matches their width with no conversion to reason about.
+        # Cost is a [B] fp64 tensor per step -- 64 bytes at B=8.
+        # (The endpoint instrument never hit this: t=0 bucketizes to 0 in any
+        # dtype, which is why the pre-existing `t0 = zeros(B, dtype=dtype)` was
+        # safe.)
+        t_i = torch.full((B,), float(t_val), device=eps.device, dtype=torch.float64)
+        # nullcontext on the final step only. torch.no_grad() nests correctly
+        # inside an outer no_grad (the caller's smooth_no_grad path), so this
+        # needs no special-casing there.
+        ctx = torch.no_grad() if i < last else contextlib.nullcontext()
+        with ctx:
+            v = dit_velocity(x, t_i)
+        if i == 0:
+            v_first = v
+        if i < last:
+            # Explicit detach even though the no_grad above already severs the
+            # graph: it states the intent at the point the value is CARRIED
+            # FORWARD, and it keeps the invariant if the context ever changes.
+            # `dt` is a Python float so `dt * v` stays in v's dtype, exactly as
+            # production's `actions = actions + dt * pred_velocity` does.
+            x = (x + dt * v).detach()
+        else:
+            # The one term the gradient flows through.
+            x = x + dt * v
+    return x, v_first
 
 
 def _sample_jittered_timesteps(

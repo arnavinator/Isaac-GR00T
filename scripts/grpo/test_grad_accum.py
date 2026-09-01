@@ -287,6 +287,11 @@ def _reference_masses(cfg: GRPOConfig, rec: dict) -> tuple:
     return n_mass, d_mass
 
 
+# Opt-in switch for `_fake_fm_log_prob`'s smooth moments (see there). Default
+# OFF so the exact-value assertions elsewhere in this file keep holding.
+SMOOTH_ROW_VARYING_MOMENTS = False
+
+
 def run_update(
     k: int,
     *,
@@ -428,16 +433,42 @@ def run_update(
             K = int(kw["n_samples"])
             extras.append(lp.detach().unsqueeze(0).expand(K, -1))
         if kw.get("smooth_dims") is not None:
-            # [B, 2] = (R, M) moments of the implied endpoint for the
-            # endpoint-roughness constraint. Value-pinned by the same
-            # `x - x.detach()` trick used above so tests can assert the exact
+            # A (constrained, endpoint) PAIR of [B, 2] = (R, M) moments, matching
+            # the real compute_fm_log_prob's smooth contract. Value-pinned by the
+            # same `x - x.detach()` trick used above so tests can assert the exact
             # pooled HF, while the gradient is the real `f` — which is what proves
             # the term actually moves the weights rather than merely being added.
             # R = 0.6 * M gives pooled HF = 0.6/6 = 0.1 exactly, at any batch size.
             pin = lp.unsqueeze(1) - lp.detach().unsqueeze(1)          # [B, 1], == 0
-            m_col = torch.full_like(pin, 2.0)
+            if SMOOTH_ROW_VARYING_MOMENTS:
+                # OPT-IN: per-row moments that make pooling OBSERVABLE. With every
+                # row pinned to the same (R, M), sum(R)/(6*sum(M)) and a mean of
+                # per-minibatch ratios agree for ANY split, so a test claiming to
+                # distinguish them cannot fail. Here M alternates 2.0 / 0.5 down
+                # the batch while R stays 1.2, so the two statistics differ as
+                # soon as minibatch sizes differ.
+                # NOT an alternating pattern: 2.0/0.5 by parity is BALANCED in
+                # every even-sized minibatch, so R/M -- and hence the ratio -- is
+                # identical across batches and the two statistics coincide again.
+                # Loading only the FIRST row makes the mix depend on batch SIZE,
+                # which is exactly what separates pooled from mean-of-ratios.
+                idx = torch.arange(pin.shape[0], device=pin.device).unsqueeze(1)
+                m_col = torch.where(idx == 0,
+                                    torch.full_like(pin, 2.0),
+                                    torch.full_like(pin, 0.5))
+            else:
+                m_col = torch.full_like(pin, 2.0)
             r_col = torch.full_like(pin, 1.2) + pin
-            extras.append(torch.cat((r_col, m_col), dim=1))
+            mom = torch.cat((r_col, m_col), dim=1)
+            # The endpoint companion is monitoring-only and detached in
+            # production (it comes off the rollout's no_grad first step), and it
+            # is pinned to a DIFFERENT value (R=0.9 -> HF 0.075) so a test can
+            # tell `smooth/endpoint_hf_mean` apart from `smooth/hf_mean` rather
+            # than having them coincide by accident.
+            ep = torch.cat(
+                (torch.full_like(pin, 0.9), torch.full_like(pin, 2.0)), dim=1
+            ).detach()
+            extras.append((mom, ep))
         if extras:
             return (lp, *extras)
         return lp
@@ -1433,9 +1464,18 @@ def test_result_shapes_are_loggable():
     class _RecordingWriter:
         def __init__(self):
             self.calls = []
+            self.texts = []
 
         def add_scalar(self, tag, value, step):
             self.calls.append((tag, float(value), step))
+
+        # The real SummaryWriter has this, and _log_metrics uses it for the
+        # `smooth/instrument` provenance summary. The TB half of _log_metrics has
+        # NO try/except (only the wandb half does), so a writer missing add_text
+        # raises straight out of _log_metrics and kills the iteration -- which is
+        # exactly what the smooth-active case below asserts does not happen.
+        def add_text(self, tag, text, global_step=None):
+            self.texts.append((tag, str(text), global_step))
 
     shapes = [
         ("k=1", run_update(1, n_chunks=16, mb_size=4, epochs=2).result),
@@ -1483,6 +1523,80 @@ def test_result_shapes_are_loggable():
                         "train/n_skipped_nonfinite", "train/n_nonfinite_grad_steps"):
                 check(f"{label} (dynamic_epoch={dyn}): {tag} emitted",
                       tag in tags, str(sorted(tags)))
+
+    # ── The SMOOTH branch of _log_metrics, actually entered ──────────────────
+    # Everything above builds the trainer via __new__, so `smooth_active` sits at
+    # its class-level False and the whole `if self.smooth_active:` block in
+    # _log_metrics is UNREACHABLE: add_text is never called and no `smooth/*`
+    # scalar is emitted, so the duplicate-tag and non-finite assertions above
+    # never see one. Set the attributes that block reads and drive it for real,
+    # once per instrument.
+    for instrument in ("chunk", "endpoint"):
+        trainer = GRPOTrainer.__new__(GRPOTrainer)
+        trainer.config = GRPOConfig(
+            device="cpu", use_wandb=False, smooth_coef=0.15,
+            smooth_instrument=instrument,
+            smooth_hf_ref_scale=15.0 if instrument == "chunk" else 4.0,
+        )
+        trainer.writer = _RecordingWriter()
+        trainer.smooth_active = True
+        trainer._smooth_hf_ref = torch.tensor(0.021)
+        trainer._smooth_schedule = (0.0, 0.25, 0.5, 0.75)
+        trainer._smooth_schedule_dt = 0.25
+        trainer._smooth_instrument_logged = False
+        smooth_stats = {
+            "loss": -0.3, "n_updates": 4, "n_micro_batches": 8,
+            "smooth_hf_mean": 0.004, "smooth_hf_max": 0.02, "smooth_rows": 32,
+            "smooth_measured_mbs": 8, "smooth_hinge_mbs": 8,
+            "smooth_loss": 1e-4, "smooth_excess_mean": 6.7e-4,
+            "smooth_active_frac": 0.25, "smooth_endpoint_hf_mean": 0.0016,
+            "smooth_executed_hf_mean": 0.9, "smooth_executed_jerk_ratio": 2.2,
+            "smooth_calib_prestep_hf": 0.0015,
+            **({"smooth_chunk_hf_mean": 0.004} if instrument == "chunk" else {}),
+        }
+        try:
+            trainer._log_metrics(
+                7, {"success_rate": 0.5}, smooth_stats, lr=1.5e-5, iter_time=1.0,
+                phase_times={"collect": 1.0}, lora_delta_norm=0.01,
+            )
+            raised = None
+        except Exception as exc:                                    # noqa: BLE001
+            raised = f"{type(exc).__name__}: {exc}"
+        check(f"smooth-active ({instrument}): _log_metrics does not raise",
+              raised is None, str(raised))
+        if raised is None:
+            tags = [t for t, _, _ in trainer.writer.calls]
+            for tag in ("smooth/hf_mean", "smooth/hf_ref", "smooth/loss",
+                        "smooth/endpoint_hf_mean", "smooth/executed_hf_mean",
+                        "smooth/executed_jerk_ratio", "smooth/calib_prestep_hf"):
+                check(f"smooth-active ({instrument}): {tag} emitted",
+                      tag in tags,
+                      str(sorted(t for t in tags if "smooth" in t)))
+            check(f"smooth-active ({instrument}): chunk_hf_mean present iff chunk",
+                  ("smooth/chunk_hf_mean" in tags) == (instrument == "chunk"))
+            # Provenance: written exactly once, and it must not describe a
+            # rollout the endpoint never walks.
+            check(f"smooth-active ({instrument}): provenance written once",
+                  len(trainer.writer.texts) == 1
+                  and trainer.writer.texts[0][0] == "smooth/instrument",
+                  str(trainer.writer.texts))
+            body = trainer.writer.texts[0][1] if trainer.writer.texts else ""
+            check(f"smooth-active ({instrument}): provenance names the instrument",
+                  instrument in body, body)
+            if instrument == "endpoint":
+                check("smooth-active (endpoint): provenance claims NO rollout",
+                      "Euler rollout" not in body and "no rollout" in body, body)
+            # A second call must not re-emit the text (the one-shot latch).
+            trainer._log_metrics(
+                8, {"success_rate": 0.5}, smooth_stats, lr=1.5e-5, iter_time=1.0,
+                phase_times={"collect": 1.0}, lora_delta_norm=0.01,
+            )
+            check(f"smooth-active ({instrument}): provenance latch holds",
+                  len(trainer.writer.texts) == 1, str(trainer.writer.texts))
+            nonfinite2 = [t for t, v, _ in trainer.writer.calls
+                          if not math.isfinite(v)]
+            check(f"smooth-active ({instrument}): no non-finite smooth scalars",
+                  not nonfinite2, str(nonfinite2))
 
     # The counters must make the "trained but nothing applied" case legible.
     dropped = dict(shapes[3][1])

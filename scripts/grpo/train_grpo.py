@@ -52,20 +52,35 @@ from lora_dit import (
 )
 from fm_log_prob import (
     compute_fm_log_prob,
+    inference_schedule,
     _sample_jittered_timesteps,
     TAU_JITTER_STD,
 )
-from smoothness import pooled_hf, SMOOTH_M_EPS
+from smoothness import (
+    pooled_hf,
+    roughness_moments,
+    second_difference,
+    SMOOTH_M_EPS,
+)
 
-# Filename for the frozen endpoint-roughness reference inside each checkpoint.
+# Filename for the frozen trajectory-roughness reference inside each checkpoint.
 SMOOTH_REF_FILENAME = "smooth_ref.json"
 
-# Minimum rows in a minibatch for the endpoint-roughness hinge to apply. The hinge
+# Minimum rows in a minibatch for the roughness hinge to apply. The hinge
 # is evaluated on the minibatch's POOLED HF, and relu convexity means a very small
 # minibatch reinstates the single-row ratio blow-up that pooling removes (a lone
 # near-idle row reads HF ~0.8 against a moving row's ~0.05). 4 is well below any
 # production mini_batch_size and only excludes degenerate trailing batches.
 SMOOTH_MIN_ROWS_PER_MB = 4
+
+# Scale that each instrument's threshold guidance was derived for (see the
+# `smooth_hf_ref_scale` docstring in grpo_config). The default is the CHUNK
+# value, so selecting "endpoint" without also passing a scale silently
+# thresholds 3.75x looser than the setting every endpoint run was calibrated
+# under -- and because calibration is auto and relative, the resulting hf_ref
+# looks perfectly plausible. Warn rather than override: the scale is the
+# operator's to choose, and a deliberate sweep must not be second-guessed.
+SMOOTH_RECOMMENDED_SCALE = {"chunk": 15.0, "endpoint": 4.0}
 from episode_buffer import EpisodeBuffer, ActionChunk
 
 
@@ -207,7 +222,7 @@ class GRPOTrainer:
     - Checkpointing
     """
 
-    # ── Endpoint-roughness constraint: OFF-state class defaults ──────────────
+    # ── Trajectory-roughness constraint: OFF-state class defaults ────────────
     # Declared at class level, not only in _setup_smoothness(), because several
     # test harnesses (test_grad_accum, test_anchor_groups, test_jitter_metrics,
     # test_phase_timing_logs, test_video_key_filter) construct the trainer via
@@ -218,6 +233,8 @@ class GRPOTrainer:
     _smooth_dims_list = ()
     _smooth_kept_keys = ()
     _smooth_horizon = None
+    _smooth_eef_pos_dims = None          # EEF-position span, for executed_jerk
+    _smooth_n_exec = None                # executed prefix (n_action_steps)
     _smooth_hf_ref = None
     _smooth_calib_sum = None
     _smooth_calib_n = 0
@@ -225,6 +242,9 @@ class GRPOTrainer:
     _smooth_calib_iter = None
     _smooth_ref_source = None            # "config" | "calibrated" | "inherited"
     _smooth_ref_scale_applied = None     # the scale baked into hf_ref, if any
+    _smooth_schedule = ()                # resolved sampler t values, for the guard
+    _smooth_schedule_dt = None
+    _smooth_instrument_logged = False    # one-shot latch for the TB text summary
 
     def __init__(self, config: GRPOConfig):
         """Initialize the GRPO trainer.
@@ -487,7 +507,7 @@ class GRPOTrainer:
         print(f"  AdamW: lr={self.config.learning_rate}, wd={self.config.weight_decay}")
         print(f"  Trainable params in optimizer: {sum(p.numel() for p in trainable_params):,}")
 
-        # --- Step 3b: Endpoint-roughness constraint (no-op when smooth_coef==0) ---
+        # --- Step 3b: Trajectory-roughness constraint (no-op when smooth_coef==0) ---
         self._setup_smoothness()
 
         # --- Step 4: Setup logging ---
@@ -836,7 +856,7 @@ class GRPOTrainer:
             phase3_time = time.time() - phase3_start
             self._log_vram(vram)
 
-            # Freeze the endpoint-roughness reference from this iteration's
+            # Freeze the trajectory-roughness reference from this iteration's
             # measurement. On a fresh run iteration 1 is theta == theta_base
             # (PEFT zero-inits lora_B), so the samples accumulated while
             # n_updates == 0 are base-policy. No-op on every later iteration and
@@ -2838,7 +2858,7 @@ class GRPOTrainer:
         # comparable across k instead of being inflated k-fold.
         n_updates = 0
         n_micro_batches = 0
-        # --- Endpoint-roughness constraint accumulators (all stay 0 when off) ---
+        # --- Trajectory-roughness constraint accumulators (all stay 0 when off) ---
         smooth_loss_sum = 0.0          # per-minibatch term value, for the mean
         smooth_r_sum = 0.0             # ΣR over minibatches (energy-weighted HF)
         smooth_m_sum = 0.0             # ΣM over minibatches
@@ -2848,12 +2868,38 @@ class GRPOTrainer:
         smooth_active_mbs = 0          # minibatches above the threshold
         smooth_rows = 0
         smooth_nonfinite_loss_mbs = 0   # HF non-finite -> term skipped, iter saved
+        # Monitoring-only companions, pooled the same way as the constrained
+        # instrument so all three HF numbers are directly comparable:
+        #   endpoint_*  the tau=0 implied endpoint -- a FREE byproduct of the
+        #               chunk rollout's first step (and literally the same tensor
+        #               under smooth_instrument="endpoint").
+        #   executed_*  the chunks the robot ACTUALLY executed during collection
+        #               (`ready_actions`). Costs no forward at all -- the tensor
+        #               is already in hand -- is non-differentiable, and is
+        #               measured on the real rollout distribution rather than
+        #               reconstructed, which makes it the most honest read on the
+        #               deliverable available anywhere in this loop.
+        smooth_endpoint_r_sum = 0.0
+        smooth_endpoint_m_sum = 0.0
+        smooth_executed_r_sum = 0.0
+        smooth_executed_m_sum = 0.0
+        # Normalised-space analogue of the physical path-jerk metric, over the
+        # EEF-position dims only: sum|D2 a| / sum|a| (L1, second difference along
+        # the horizon). Accumulated as two sums so the reported ratio is
+        # energy-weighted across minibatches for the same reason pooled_hf is.
+        smooth_executed_jerk_num = 0.0
+        smooth_executed_jerk_den = 0.0
         # Minibatches where the hinge was actually EVALUATED (finite HF, enough
         # rows, hf_ref resolved). The correct divisor for the hinge-describing
         # metrics -- see _smooth_stats.
         smooth_hinge_mbs = 0
         smooth_undersized_mbs = 0       # too few rows to hinge on (see below)
         smooth_calib_prestep_rows = 0   # subtotal measured at exactly theta_base
+        # R/M of that same strict window, so the widened-window bias in hf_ref
+        # is a LOGGED number rather than an inference from ref_mse (which moves
+        # independently of roughness -- the premise of this whole instrument).
+        smooth_calib_prestep_r = 0.0
+        smooth_calib_prestep_m = 0.0
         # Own counter: the HF measurements are accumulated BEFORE the non-finite
         # guard (they describe the field, which is valid even for a minibatch
         # whose loss is later discarded), so they must not be divided by
@@ -3545,12 +3591,14 @@ class GRPOTrainer:
 
                 # Only compute current model's log-prob (with gradient)
                 # `smooth_dims`/`smooth_horizon` are None unless the
-                # endpoint-roughness constraint is on, in which case
-                # compute_fm_log_prob ALSO takes one dedicated clean forward at
-                # tau=0 and returns [B, 2] roughness moments (R, M). That forward
-                # is an EXTRA DiT pass (~1/K of the K-loop, ~17% at K=6): it is
-                # not taken from the K-loop, whose velocity is contaminated by the
-                # eps-jitter. See the block after the K-loop in fm_log_prob.py.
+                # roughness constraint is on, in which case compute_fm_log_prob
+                # ALSO runs the smooth instrument and returns a
+                # (constrained, endpoint) pair of [B, 2] roughness moments (R, M).
+                # Those forwards are EXTRA DiT passes -- one for the endpoint
+                # instrument, `num_inference_timesteps` (but only ONE forward's
+                # activations) for the chunk instrument. They are not taken from
+                # the K-loop, whose velocity is contaminated by the eps-jitter.
+                # See the block after the K-loop in fm_log_prob.py.
                 fm_out = compute_fm_log_prob(
                     action_head=self.model.action_head,
                     backbone_output=ready_backbone,
@@ -3571,12 +3619,14 @@ class GRPOTrainer:
                     smooth_horizon=(
                         self._smooth_horizon if self.smooth_active else None
                     ),
+                    smooth_instrument=self.config.smooth_instrument,
                 )
                 if self.smooth_active:
-                    current_log_probs, smooth_moments = fm_out
+                    current_log_probs, (smooth_moments, endpoint_moments) = fm_out
                 else:
                     current_log_probs = fm_out
                     smooth_moments = None
+                    endpoint_moments = None
 
                 log_ratio = current_log_probs - ref_log_probs
                 ratio = log_ratio.exp()
@@ -3831,20 +3881,27 @@ class GRPOTrainer:
                     else row_loss.sum() / loss_divisor
                 )
 
-                # --- Endpoint-roughness constraint (jerk constraint) ---
+                # --- Trajectory-roughness constraint (jerk constraint) ---
                 # L = coef * relu( HF_pooled - hf_ref )
                 #
-                # HF is evaluated on ONE dedicated clean DiT forward at tau = 0
-                # inside compute_fm_log_prob, with the ORIGINAL eps, so it is
-                # immune to the jitter Jacobian response that would otherwise
-                # dominate it (see the comment there). tau = 0 needs no (1-tau)^2
-                # weight, so hf_ref is a scalar.
+                # HF is evaluated inside compute_fm_log_prob on dedicated CLEAN
+                # forwards with the ORIGINAL eps, so it is immune to the jitter
+                # Jacobian response that would otherwise dominate it (see the
+                # comment there). Which trajectory is differenced is
+                # `config.smooth_instrument`:
+                #   "chunk"    the 4-step generated chunk -- what the robot
+                #              executes, and the only one of the two whose HF
+                #              tracks EEF path jerk (rho +0.98 vs +0.00).
+                #   "endpoint" the 1-step implied endpoint at tau=0 (the previous
+                #              behaviour, kept reproducible).
+                # Either way it reduces to ONE pooled scalar, so hf_ref is a
+                # scalar and there is no tau weighting.
                 #
                 # POOLED, not a mean of per-row ratios: HF's denominator is a
-                # row's own energy, so a near-idle chunk reports HF(a_hat) ->
-                # HF(r), hundreds of times a moving chunk's value, and an
-                # unweighted mean would be dominated by it. sum(R)/(6 sum(M)) is
-                # energy-weighted by construction and batch-size invariant.
+                # row's own energy, so a near-idle chunk reports a value hundreds
+                # of times a moving chunk's, and an unweighted mean would be
+                # dominated by it. sum(R)/(6 sum(M)) is energy-weighted by
+                # construction and batch-size invariant.
                 #
                 # Because the term is one scalar per minibatch, its magnitude does
                 # not depend on row count, so it needs no anchor loss divisor --
@@ -3866,15 +3923,50 @@ class GRPOTrainer:
                         n_r = mom_det.shape[0]
                         smooth_rows += n_r
                         smooth_measured_mbs += 1
-                        if math.isfinite(hf_pooled_det):
+                        if bool(torch.isfinite(mom_det).all()):
                             # Pool R and M across minibatches rather than
                             # averaging their ratios: reporting mean(pooled_mb)
                             # would reintroduce, one level up, exactly the
                             # mean-of-ratios bias that pooling exists to remove.
+                            #
+                            # Tested on the RAW MOMENTS, not on the pooled ratio,
+                            # and this is not interchangeable. A row with M=+inf
+                            # and finite R makes the ratio R/(6*inf) = 0.0, which
+                            # IS finite, so a ratio test admits the minibatch and
+                            # `smooth_m_sum` absorbs the inf -- after which
+                            # `smooth_hf_mean` reports exactly 0.0 for the rest of
+                            # the iteration, i.e. "perfectly smooth", the precise
+                            # opposite of what an overflowing field means. The
+                            # calibration accumulator below and the endpoint
+                            # companion already test the moments; this matches
+                            # them so all three readings share one criterion.
                             smooth_r_sum += float(mom_det[:, 0].sum())
                             smooth_m_sum += float(mom_det[:, 1].sum())
                             smooth_hf_max = max(smooth_hf_max, hf_pooled_det)
                             smooth_hf_finite_mbs += 1
+                        # Monitoring-only companions, pooled identically so the
+                        # three HF curves are read on one scale. Guarded on
+                        # finiteness individually: the endpoint can overflow bf16
+                        # on the pure-noise input while the chunk (which the
+                        # sampler denoises toward a real action) stays healthy,
+                        # and vice versa, so one poisoning the other's running
+                        # total would misattribute the failure.
+                        if endpoint_moments is not None:
+                            ep_det = endpoint_moments.detach()
+                            if bool(torch.isfinite(ep_det).all()):
+                                smooth_endpoint_r_sum += float(ep_det[:, 0].sum())
+                                smooth_endpoint_m_sum += float(ep_det[:, 1].sum())
+                        # The executed chunks. Free: no forward, the tensor is
+                        # already the minibatch's `actions`. Sliced to the same
+                        # horizon/dims as the constrained instrument so the number
+                        # is comparable to it rather than to a different rectangle.
+                        ex_mom, ex_jerk = self._smooth_executed_stats(ready_actions)
+                        if ex_mom is not None:
+                            smooth_executed_r_sum += float(ex_mom[0])
+                            smooth_executed_m_sum += float(ex_mom[1])
+                        if ex_jerk is not None:
+                            smooth_executed_jerk_num += float(ex_jerk[0])
+                            smooth_executed_jerk_den += float(ex_jerk[1])
 
                     if self._smooth_hf_ref is None:
                         # Calibration: pool R and M rather than HF, so the
@@ -3897,21 +3989,44 @@ class GRPOTrainer:
                         # grasp or an approach pause) reads up to 17x high -- which,
                         # since hf_ref is frozen and persisted into every
                         # checkpoint, would silently neuter the feature for the
-                        # whole run lineage. Widening trades that for one
-                        # iteration's worth of drift, which is small: ref_mse moves
-                        # 0.0042 -> 0.0040 over iterations 1-2 in the measured runs.
+                        # whole run lineage. Widening trades that for some
+                        # in-iteration drift.
+                        #
+                        # SIZE OF THAT TRADE, corrected. This used to cite
+                        # "ref_mse moves 0.0042 -> 0.0040 over iterations 1-2",
+                        # which does NOT bound the error for the chunk instrument:
+                        # the checkpoint sweep measured chunk HF rising 0.00141
+                        # (base) -> 0.0023 by the END of iteration 1, i.e. +63% in
+                        # one iteration, so a window covering the first ~22% of the
+                        # iteration biases hf_ref roughly 5-25% HIGH depending on
+                        # how front-loaded that rise is. The direction is fail-safe
+                        # (a looser threshold under-constrains rather than
+                        # over-constrains) but it is NOT negligible, and ref_mse is
+                        # the wrong proxy for it -- roughness and residual energy
+                        # move independently, which is the whole reason this
+                        # instrument exists. Measure, don't infer:
                         # `smooth_calib_prestep_rows` records the strict-theta_base
-                        # subtotal so the drift is auditable.
+                        # row subtotal and `smooth_calib_prestep_hf` its pooled HF,
+                        # so the drift is a logged number rather than an estimate.
                         # Stop once the row target is met. Accumulating past it
                         # buys no statistical precision and maximises how much
                         # in-iteration drift is baked into a reference that is then
                         # frozen and persisted for the whole run lineage. At
                         # production sizes the target is reached ~64 micro-batches
                         # in, against ~250 per epoch, so this cuts the drift
-                        # exposure ~4x AND keeps the measurement inside the first
-                        # epoch (so update_epochs never double-counts a chunk).
+                        # exposure ~4x. Restricted to epoch 0 EXPLICITLY rather
+                        # than relying on the row target being reached first: at
+                        # production sizes it is (~64 micro-batches into ~250),
+                        # but that is a property of the batch size, not an
+                        # invariant. A smaller run (e.g. num_groups=3 with early
+                        # successes, ~320 rows/epoch against min_rows=512) rolls
+                        # into epoch 1, where the SAME chunks are re-pooled at an
+                        # already-stepped theta -- so the reference would be half
+                        # drift-contaminated and `smooth_calib_rows` would count
+                        # 512 rows of which only ~320 are distinct.
                         if (
                             self._smooth_calib_sum is not None
+                            and epoch == 0
                             and self._smooth_calib_rows
                             < int(self.config.smooth_calib_min_rows)
                         ):
@@ -3924,17 +4039,39 @@ class GRPOTrainer:
                                     self._smooth_calib_n += 1
                                     self._smooth_calib_rows += n_r
                                     smooth_calib_added += 1
-                                    if n_updates == 0:
+                                    # theta == theta_base requires BOTH that no
+                                    # optimizer step has fired in this call AND
+                                    # that this is the first iteration. `n_updates`
+                                    # is local to _grpo_update_inner and resets
+                                    # every call, so on a DEFERRED calibration
+                                    # (rows < smooth_calib_min_rows carries it into
+                                    # iterations 2-3, see max_calib_iters) it means
+                                    # only "before this iteration's first step" --
+                                    # a policy that has already taken a full
+                                    # iteration's worth of steps. Counting those
+                                    # rows as the theta_base subtotal would make
+                                    # `hf_mean - calib_prestep_hf` UNDER-report the
+                                    # baked-in drift, i.e. fail in the direction
+                                    # that hides the very thing the metric exists
+                                    # to surface. getattr keeps the harnesses that
+                                    # build the trainer via __new__ working.
+                                    if (n_updates == 0
+                                            and getattr(self, "iteration", 1) <= 1):
                                         smooth_calib_prestep_rows += n_r
+                                        smooth_calib_prestep_r += float(rm[0])
+                                        smooth_calib_prestep_m += float(rm[1])
                                 else:
                                     smooth_calib_nonfinite += 1
                     else:
                         hf_pooled = pooled_hf(smooth_moments)
-                        # A non-finite HF must NOT reach the loss. The tau=0 pass
-                        # is the one evaluation on pure noise -- the
-                        # largest-magnitude DiT input of the K+1 forwards -- so it
-                        # is the likeliest to overflow bf16 while every other term
-                        # (log-probs, clip, KL) stays finite and healthy. Letting
+                        # A non-finite HF must NOT reach the loss. The smooth
+                        # instrument's forwards are the likeliest in the pass to
+                        # overflow bf16 while every other term (log-probs, clip,
+                        # KL) stays finite and healthy: under "endpoint" it
+                        # evaluates on pure noise, the largest-magnitude DiT input
+                        # of the K+1 forwards, and under "chunk" it rolls the
+                        # sampler out over K+N forwards, so a divergence anywhere
+                        # in the rollout lands here. Letting
                         # it through would NaN the total loss, the pre-existing
                         # guard would drop the micro-batch, and with every
                         # micro-batch affected the whole iteration is discarded --
@@ -3953,7 +4090,9 @@ class GRPOTrainer:
                         # high-pass update.
                         if n_r < SMOOTH_MIN_ROWS_PER_MB:
                             smooth_undersized_mbs += 1
-                        elif math.isfinite(float(hf_pooled.detach())):
+                        elif bool(torch.isfinite(mom_det).all()) and math.isfinite(
+                            float(hf_pooled.detach())
+                        ):
                             excess = (
                                 hf_pooled - self._smooth_hf_ref
                             ).clamp(min=0.0)
@@ -3963,6 +4102,20 @@ class GRPOTrainer:
                                 smooth_excess_sum += ex
                                 smooth_active_mbs += int(ex > 0.0)
                                 smooth_hinge_mbs += 1
+                                # Accumulated HERE, beside its own divisor, not at
+                                # the backward site further down. That site sits
+                                # AFTER the `if not torch.isfinite(loss): continue`
+                                # guard while `smooth_hinge_mbs` is incremented
+                                # before it, so on an iteration with any dropped
+                                # micro-batch the numerator covered fewer
+                                # minibatches than the divisor and the reported
+                                # `smooth/loss` no longer equalled
+                                # `smooth_coef * smooth/excess_mean` -- the exact
+                                # identity an operator uses to sanity-check the
+                                # term. All four hinge metrics now share one
+                                # population: the minibatches the hinge was
+                                # EVALUATED on.
+                                smooth_loss_sum += self.config.smooth_coef * ex
                         else:
                             smooth_nonfinite_loss_mbs += 1
 
@@ -4112,8 +4265,9 @@ class GRPOTrainer:
                     clipfracs.append(clipfrac)
                     total_loss += loss.item()
                     total_clip_loss += clip_loss.item()
-                    if smooth_loss is not None:
-                        smooth_loss_sum += smooth_loss.item()
+                    # smooth_loss_sum is accumulated at the hinge site, not here:
+                    # this point is past the non-finite-loss `continue`, which
+                    # would give it a smaller population than its own divisor.
                     total_kl_last_iter += kl_loss_last_iter.item()
                     if compute_base:
                         total_kl_base_model += kl_loss_base_model.item()
@@ -4334,7 +4488,7 @@ class GRPOTrainer:
         # stay safe either way: a step requires at least one backward(), so
         # n_updates > 0 implies n_micro_batches > 0.
         def _smooth_stats() -> dict:
-            """Endpoint-roughness metrics, or {} when the feature is off.
+            """Trajectory-roughness metrics, or {} when the feature is off.
 
             Defined here so BOTH the early-return path and the normal result dict
             report them: the readings are taken before the non-finite loss guard,
@@ -4343,6 +4497,14 @@ class GRPOTrainer:
             if not self.smooth_active or smooth_measured_mbs == 0:
                 return {}
             out = {
+                # `hf_mean` ALWAYS means "the pooled HF of the CONSTRAINED
+                # instrument", whichever that is -- the one number `hf_ref` is
+                # compared against and `excess_mean` is derived from. That is
+                # what keeps the hinge story readable on one curve regardless of
+                # config. `smooth/instrument` carries the provenance, and
+                # `chunk_hf_mean` / `endpoint_hf_mean` name the two quantities
+                # explicitly so a cross-instrument comparison does not require
+                # knowing which run was which.
                 "smooth_hf_mean": (
                     smooth_r_sum / (6.0 * smooth_m_sum)
                     if smooth_m_sum > 0.0 else float("nan")
@@ -4356,7 +4518,46 @@ class GRPOTrainer:
                 "smooth_calib_nonfinite": smooth_calib_nonfinite,
                 "smooth_calib_added": smooth_calib_added,
                 "smooth_calib_prestep_rows": smooth_calib_prestep_rows,
+                # Pooled HF over ONLY the rows measured at exactly theta_base.
+                # Compare against hf_mean on the calibration iteration: the gap
+                # IS the drift baked into the frozen hf_ref.
+                **({"smooth_calib_prestep_hf":
+                    smooth_calib_prestep_r / (6.0 * smooth_calib_prestep_m)}
+                   if smooth_calib_prestep_m > 0.0 else {}),
             }
+            # The three roughness readings, all pooled the same way (ΣR / 6ΣM)
+            # so they sit on one scale and one axis:
+            #   chunk_hf_mean     the differentiable 4-step chunk. Under
+            #                     smooth_instrument="chunk" this is numerically
+            #                     the SAME number as hf_mean, emitted under both
+            #                     names deliberately: hf_mean is "whatever is
+            #                     constrained" (comparable across runs with
+            #                     different instruments), chunk_hf_mean is "the
+            #                     chunk" (comparable across runs regardless).
+            #                     Absent under "endpoint" -- no chunk is rolled
+            #                     out there, and emitting the endpoint's value
+            #                     under a chunk name would be a lie.
+            #   endpoint_hf_mean  the tau=0 implied endpoint. Monitoring only;
+            #                     free (the chunk rollout's first step).
+            #   executed_hf_mean  the chunks the robot ACTUALLY executed. No
+            #                     forward at all, non-differentiable, measured on
+            #                     the real rollout distribution -- the most honest
+            #                     read on the deliverable, so it is emitted
+            #                     whenever the feature is active.
+            if self.config.smooth_instrument == "chunk" and smooth_m_sum > 0.0:
+                out["smooth_chunk_hf_mean"] = smooth_r_sum / (6.0 * smooth_m_sum)
+            if smooth_endpoint_m_sum > 0.0:
+                out["smooth_endpoint_hf_mean"] = (
+                    smooth_endpoint_r_sum / (6.0 * smooth_endpoint_m_sum)
+                )
+            if smooth_executed_m_sum > 0.0:
+                out["smooth_executed_hf_mean"] = (
+                    smooth_executed_r_sum / (6.0 * smooth_executed_m_sum)
+                )
+            if smooth_executed_jerk_den > 0.0:
+                out["smooth_executed_jerk_ratio"] = (
+                    smooth_executed_jerk_num / smooth_executed_jerk_den
+                )
             # excess/active_frac describe the HINGE, so they divide by the number of
             # minibatches where the hinge was actually EVALUATED -- not by
             # smooth_hf_finite_mbs, which also counts undersized minibatches and
@@ -4468,7 +4669,7 @@ class GRPOTrainer:
             # TB curve is a flat zero line you can glance at, rather than a
             # missing series you'd have to know to look for.
             "n_nonfinite_grad_steps": n_nonfinite_grad_steps,
-            # Endpoint-roughness constraint. Absent when the feature is off. Built by
+            # Trajectory-roughness constraint. Absent when the feature is off. Built by
             # _smooth_stats() so the early-return path above reports the same keys.
             # `active_frac` is the fraction of hinge-EVALUATED minibatches whose
             # pooled HF exceeded the threshold. Per section 7 of jerk-constraint.md
@@ -6257,7 +6458,7 @@ class GRPOTrainer:
                 "episode/pool_pass", self._scene_pool_pass(iteration), iteration
             )
 
-        # Endpoint-roughness constraint. UNGATED on n_updates, for the same reason
+        # Trajectory-roughness constraint. UNGATED on n_updates, for the same reason
         # as ref_mse/* and jitter/*: these are measurements of the field taken
         # before any optimizer step, so they stay valid on an iteration whose
         # update was discarded -- and an iteration the smooth term itself killed is
@@ -6277,6 +6478,45 @@ class GRPOTrainer:
                 _sm["hf_ref"] = float(self._smooth_hf_ref)
             if _sm:
                 _emit("smooth", _sm)
+                # Which quantity `hf_mean` / `hf_ref` refer to. A TEXT summary
+                # rather than a scalar because `_emit` only writes numerics and
+                # an index-coded scalar would be one more thing to decode. It
+                # matters because the two instruments' base values are similar
+                # (chunk 0.00141, endpoint 0.00157): without provenance, two
+                # runs' `smooth/hf_mean` curves look directly comparable when
+                # they measure different trajectories. Written once, at
+                # global_step 0, so it does not accumulate per iteration.
+                if not self._smooth_instrument_logged:
+                    # Describe only what the selected instrument actually does.
+                    # Reporting "N Euler steps, dt=..." under "endpoint" would be
+                    # false -- it walks no rollout, it is one forward at tau=0 --
+                    # and stating it in the very field whose purpose is
+                    # disambiguation is worse than saying nothing.
+                    # Do not latch a degenerate description: if the schedule
+                    # somehow has not resolved yet, skip and try next iteration
+                    # rather than freezing "0 steps, dt=None" at step 0.
+                    if (self.config.smooth_instrument == "chunk"
+                            and not self._smooth_schedule):
+                        _instr_desc = None
+                    elif self.config.smooth_instrument == "chunk":
+                        _instr_desc = (
+                            f"the {len(self._smooth_schedule)}-step generated "
+                            f"chunk (Euler rollout, dt={self._smooth_schedule_dt}, "
+                            f"last step differentiable)"
+                        )
+                    else:
+                        _instr_desc = (
+                            "the 1-step implied endpoint a_hat(0) = eps + "
+                            "v(eps, 0), one forward at tau=0 (no rollout)"
+                        )
+                    if _instr_desc is not None:
+                        self.writer.add_text(
+                            "smooth/instrument",
+                            f"hf_mean and hf_ref refer to "
+                            f"'{self.config.smooth_instrument}': {_instr_desc}",
+                            global_step=0,
+                        )
+                        self._smooth_instrument_logged = True
 
         # Per-chunk gap survey. Ungated on n_updates for the same reason as
         # ref_mse/*: measured at theta == theta_ref, before any step. The headline
@@ -6563,7 +6803,7 @@ class GRPOTrainer:
                 # iteration's wandb payload rather than just this one metric.
                 # Non-finite values are filtered for the same
                 # chart-autoscale-poisoning reason as the TB side.
-                # Endpoint-roughness: give it the same dedicated, UNGATED mirror
+                # Trajectory-roughness: give it the same dedicated, UNGATED mirror
                 # that ref_mse/chunk_gap/jitter get. Without this the keys fall
                 # through the generic `train/{k}` dump, so wandb would show
                 # `train/smooth_loss` instead of the documented `smooth/loss`, and
@@ -6589,6 +6829,16 @@ class GRPOTrainer:
                     })
                 if self.smooth_active and self._smooth_hf_ref is not None:
                     log_dict["smooth/hf_ref"] = float(self._smooth_hf_ref)
+                if self.smooth_active:
+                    # Same provenance the TB side writes as a text summary.
+                    # wandb takes strings in a normal log dict, so it rides along
+                    # here rather than needing its own call. It matters because
+                    # the two instruments' base values are similar (chunk
+                    # 0.00141, endpoint 0.00157), so without it two runs'
+                    # `smooth/hf_mean` curves look comparable when they are not.
+                    log_dict["smooth/instrument"] = str(
+                        self.config.smooth_instrument
+                    )
                 _ref_mse_w = getattr(self, "_ref_mse_stats", None)
                 if _ref_mse_w:
                     log_dict.update({
@@ -6643,7 +6893,16 @@ class GRPOTrainer:
                                 # "dropped ... rather than poisoning the charts".
                                 "clipfrac_effective_pos",
                                 "clipfrac_effective_neg",
-                            )
+                            ) and not k.startswith("smooth_")
+                            # `smooth_*` is excluded for the same reason as the
+                            # two keys above: the dedicated `smooth/` mirror
+                            # further down is meant to be the ONLY source of
+                            # these, and its own comment says so. Without this,
+                            # every smooth key reached wandb TWICE -- once as
+                            # `train/smooth_hf_mean` here and once as
+                            # `smooth/hf_mean` there -- so a dashboard built on
+                            # the documented name silently coexisted with a
+                            # near-duplicate under the wrong prefix.
                         })
                     # Mirror the TB-side jitter/* block. Ungated on n_updates for
                     # the same reason ref_mse/* is: the measurement happens at
@@ -6687,7 +6946,7 @@ class GRPOTrainer:
                 pass
 
     # ══════════════════════════════════════════════════════════════════════
-    # Endpoint-roughness constraint (the "jerk constraint")
+    # Trajectory-roughness constraint (the "jerk constraint")
     # ══════════════════════════════════════════════════════════════════════
 
     def _setup_smoothness(self):
@@ -6702,6 +6961,8 @@ class GRPOTrainer:
         self._smooth_dims_list = []       # python copy, for the guard key
         self._smooth_kept_keys = []
         self._smooth_horizon = None
+        self._smooth_eef_pos_dims = None  # LongTensor, or None if unrecoverable
+        self._smooth_n_exec = None        # executed prefix, resolved below
         self._smooth_hf_ref = None        # 0-dim fp32 tensor, or None => calibrate
         self._smooth_calib_sum = None     # fp32 (sum R, sum M) accumulator
         self._smooth_calib_n = 0
@@ -6709,6 +6970,9 @@ class GRPOTrainer:
         self._smooth_calib_iter = None    # iteration the calibration ran on
         self._smooth_ref_source = None
         self._smooth_ref_scale_applied = None
+        self._smooth_schedule = ()
+        self._smooth_schedule_dt = None
+        self._smooth_instrument_logged = False
         if not self.smooth_active:
             return
 
@@ -6726,15 +6990,23 @@ class GRPOTrainer:
                 f"dominated by whichever row has the least energy (a near-idle "
                 f"chunk reads HF ~0.8 against a moving chunk's ~0.06), so every "
                 f"minibatch would be skipped and the term would contribute nothing "
-                f"while still costing one extra DiT forward per minibatch.\n"
-                f"Fix: raise mini_batch_size to >= {SMOOTH_MIN_ROWS_PER_MB} (use "
-                f"gradient_accumulation_steps for a larger effective batch), or set "
-                f"--smooth-coef 0 to disable the constraint."
+                f"while still costing the extra DiT forward(s) per minibatch "
+                f"(1 for --smooth-instrument endpoint, num_inference_timesteps "
+                f"for chunk).\n"
+                f"Fix: raise mini_batch_size to >= {SMOOTH_MIN_ROWS_PER_MB}, or "
+                f"set --smooth-coef 0 to disable the constraint. Note "
+                f"gradient_accumulation_steps does NOT help here: the hinge is "
+                f"evaluated on each MICRO-batch's pooled HF, so the pooling pool "
+                f"is mini_batch_size regardless of the effective batch size."
             )
 
 
         from gr00t.data.embodiment_tags import EmbodimentTag
-        from smoothness import build_continuous_action_dims, describe_dim_selection
+        from smoothness import (
+            build_continuous_action_dims,
+            build_key_dim_span,
+            describe_dim_selection,
+        )
 
         tag = EmbodimentTag[self.config.embodiment_tag]
         acfg = self.processor.get_modality_configs()[tag.value]["action"]
@@ -6797,10 +7069,41 @@ class GRPOTrainer:
         self._smooth_kept_keys = kept
         self._smooth_horizon = int(horizon)
 
+        # EEF-position span for the `executed_jerk_ratio` diagnostic. Derived the
+        # same way the constrained set is -- by walking modality_keys -- so it
+        # cannot drift out of sync with the checkpoint's layout.
+        #
+        # If the embodiment does not carry the key, the metric is DROPPED rather
+        # than silently redefined over the constrained dim set: the same posture
+        # `chunk_hf_mean` takes under `smooth_instrument="endpoint"`. A jerk ratio
+        # mixing position with axis-angle rotation is not the path-jerk analogue
+        # the name promises -- it would mix metres with radians -- and two runs on
+        # different embodiments would plot incomparable numbers under one key.
+        pos_dims = build_key_dim_span(modality_keys, key_dims)
+        self._smooth_eef_pos_dims = (
+            torch.tensor(pos_dims, dtype=torch.long, device=self.device)
+            if pos_dims else None
+        )
+        # Executed prefix for `executed_jerk_ratio`: MultiStepWrapper plays only
+        # steps 0..n_action_steps-1 into the sim. Cached here so the metrics path
+        # never touches self.config (see _smooth_executed_stats).
+        self._smooth_n_exec = min(int(self.config.n_action_steps), int(horizon))
+
+        # --- Resolve the sampler schedule the "chunk" instrument rolls out ---
+        # Read off the model config exactly as get_action_with_features does, so
+        # a checkpoint that overrides num_inference_timesteps gets ITS schedule.
+        # Resolved (and printed) even for smooth_instrument="endpoint": it costs
+        # nothing and having it in the banner of both runs is what makes a
+        # cross-instrument comparison legible. It does NOT enter the guard key
+        # there -- see _smooth_guard_key, where the sampler keys are chunk-only
+        # because the endpoint provably cannot depend on a schedule it never walks.
+        sched, sched_dt = inference_schedule(self.model.action_head)
+        self._smooth_schedule = tuple(float(t) for t in sched)
+        self._smooth_schedule_dt = float(sched_dt)
+
         # --- Resolve hf_ref: explicit > resumed cache > auto-calibrate ---
-        # A SCALAR: the constraint is evaluated at tau = 0 only, where the
-        # (1-tau)^2 leverage weight is 1 and the DiT input is exactly eps (on the
-        # sampler's path). No per-tau vector, so nothing to mis-index.
+        # A SCALAR: both instruments reduce to one pooled number per minibatch,
+        # so there is no per-tau vector and nothing to mis-index.
         source = None
         if self.config.smooth_hf_ref is not None:
             val = (
@@ -6813,8 +7116,8 @@ class GRPOTrainer:
             ) > 1:
                 print(
                     f"  WARNING: smooth_hf_ref was given as a list with differing "
-                    f"values {list(self.config.smooth_hf_ref)}; the constraint is "
-                    f"evaluated at a single tau (=0), so only the FIRST entry "
+                    f"values {list(self.config.smooth_hf_ref)}; the constraint "
+                    f"reduces to a single pooled scalar, so only the FIRST entry "
                     f"({val}) is used."
                 )
             self._smooth_hf_ref = torch.tensor(
@@ -6860,16 +7163,98 @@ class GRPOTrainer:
                 f"AUTO-CALIBRATE at iteration 1 (theta == theta_base), "
                 f"scaled x{self.config.smooth_hf_ref_scale}"
             )
+            # Only meaningful on the calibrate path: on the other two branches
+            # hf_ref is given or inherited and the scale does not apply at all.
+            _rec = SMOOTH_RECOMMENDED_SCALE.get(self.config.smooth_instrument)
+            if _rec is not None and self.config.smooth_hf_ref_scale != _rec:
+                print(
+                    f"  WARNING: --smooth-hf-ref-scale="
+                    f"{self.config.smooth_hf_ref_scale} with "
+                    f"--smooth-instrument {self.config.smooth_instrument!r}, "
+                    f"whose guidance was derived at {_rec}. The two instruments "
+                    f"have similar BASE values but very different useful ranges, "
+                    f"so the calibrated hf_ref will look plausible either way. "
+                    f"Intentional for a threshold sweep; otherwise pass "
+                    f"--smooth-hf-ref-scale {_rec}."
+                )
 
+        instrument = self.config.smooth_instrument
         print(
-            f"\n  Endpoint-roughness constraint: ON (smooth_coef="
-            f"{self.config.smooth_coef})"
+            f"\n  Trajectory-roughness constraint: ON (smooth_coef="
+            f"{self.config.smooth_coef}, instrument={instrument!r})"
         )
         print(describe_dim_selection(modality_keys, key_dims, dims, horizon=horizon))
         print(f"    C = {kept} -> {len(dims)} dims; horizon 0..{horizon - 1}")
+        # Self-verifying: the resolved schedule is printed, not assumed. A
+        # mismatch against the production sampler would silently constrain a
+        # trajectory the robot never executes, which is the exact class of bug
+        # the instrument change exists to fix -- so it must be readable in the
+        # log rather than inferred from the config.
+        _sched_txt = ", ".join(f"{t:.4g}" for t in self._smooth_schedule)
+        print(
+            f"    sampler schedule (from action_head.num_inference_timesteps): "
+            f"{len(self._smooth_schedule)} Euler steps, dt="
+            f"{self._smooth_schedule_dt:.4g}, t = [{_sched_txt}]"
+        )
+        if instrument == "chunk":
+            print(
+                f"    hf_ref is calibrated against, and the hinge constrains, the "
+                f"{len(self._smooth_schedule)}-STEP GENERATED CHUNK (what the "
+                f"robot executes)."
+            )
+            print(
+                f"    rollout is last-step-differentiable: "
+                f"{len(self._smooth_schedule)} DiT forwards, "
+                f"{len(self._smooth_schedule) - 1} under no_grad, so the forward "
+                f"VALUE is exact and only 1 forward's activations are retained. "
+                f"The gradient is biased (it misses how theta shapes the earlier "
+                f"steps); raise smooth_coef toward 0.5 to compensate."
+            )
+        else:
+            print(
+                f"    hf_ref is calibrated against, and the hinge constrains, the "
+                f"1-STEP IMPLIED ENDPOINT a_hat(0) = eps + v(eps, 0), on a "
+                f"dedicated clean DiT forward at tau=0 (+1 forward/minibatch)."
+            )
+            print(
+                f"    NOTE: the endpoint instrument does NOT track physical path "
+                f"jerk (measured Spearman rho +0.00 over late iterations, against "
+                f"the chunk's +0.98). Retained for reproducing runs calibrated "
+                f"against it; prefer --smooth-instrument chunk for new runs."
+            )
+        # Gate the PROMISE on the same condition the metric is gated on. The
+        # executed prefix needs 3 rows for the (1,-2,1) stencil, so at
+        # n_action_steps < 3 (1 is legitimate -- replan every step) the ratio is
+        # dropped on every minibatch. Announcing it anyway would send an operator
+        # hunting TensorBoard for a curve that was never going to exist.
+        if pos_dims and self._smooth_n_exec >= 3:
+            print(
+                f"    smooth/executed_jerk_ratio over end_effector_position dims "
+                f"{pos_dims}, executed prefix h 0..{self._smooth_n_exec - 1} "
+                f"(n_action_steps={self.config.n_action_steps}); "
+                f"smooth/executed_hf_mean over the full horizon 0..{horizon - 1}"
+            )
+            if self._smooth_n_exec == 3:
+                print(
+                    f"    NOTE: the executed prefix is exactly 3 rows, so the jerk "
+                    f"ratio's numerator has ONE second-difference term per row -- "
+                    f"read it as a coarse trend, not a stable statistic."
+                )
+        elif pos_dims:
+            print(
+                f"    NOTE: n_action_steps={self.config.n_action_steps} leaves an "
+                f"executed prefix of {self._smooth_n_exec} row(s), below the 3 the "
+                f"(1,-2,1) stencil spans, so smooth/executed_jerk_ratio is NOT "
+                f"emitted. smooth/executed_hf_mean (full horizon) is unaffected."
+            )
+        else:
+            print(
+                f"    NOTE: no 'end_effector_position' key in this embodiment's "
+                f"action modality_keys, so smooth/executed_jerk_ratio is NOT "
+                f"emitted (a ratio mixing position with rotation dims is not a "
+                f"path-jerk analogue). smooth/executed_hf_mean is unaffected."
+            )
         print(f"    hf_ref: {source}")
-        print(f"    evaluated at tau = 0 on a dedicated clean DiT forward "
-              f"(+1 forward/minibatch)")
         if self._smooth_hf_ref is not None:
             print(f"    hf_ref = {float(self._smooth_hf_ref):.6f}")
         if len(self.config.env_names) > 1 and self._smooth_hf_ref is None:
@@ -6891,6 +7276,105 @@ class GRPOTrainer:
                 "(same convention as the update_epochs note for paired jitter)."
             )
 
+    def _smooth_executed_stats(self, ready_actions):
+        """Roughness of the COLLECTED chunks. Free, no forward.
+
+        `ready_actions` is the minibatch's collected `(B, 50, 128)` raw action
+        tensor -- already in hand, already on device, and exactly what the sampler
+        emitted during collection. Measuring it costs two second-differences and
+        four reductions.
+
+        It is non-differentiable BY CONSTRUCTION (it is buffer data, `d/dtheta`
+        is identically 0), so it can never be a training target -- which is
+        precisely why it is the honest read: it is measured on the real rollout
+        distribution rather than reconstructed from a re-run of the sampler on a
+        stored eps, so nothing about the reconstruction can flatter it.
+
+        TWO DIFFERENT WINDOWS, deliberately, because the two readings answer
+        different questions:
+
+        * ``moments_sum`` covers the FULL valid horizon and the constrained dim
+          set, so ``smooth/executed_hf_mean`` is directly comparable to
+          ``smooth/hf_mean`` rather than to a different rectangle.
+        * ``jerk_pair`` covers only the first ``n_action_steps`` rows, because
+          only those are ever played into the sim: ``MultiStepWrapper`` executes
+          steps ``0..n_action_steps-1`` and DISCARDS the rest (8 of 16 at the
+          default), so a full-horizon jerk number is half-measuring something the
+          robot never performed. This is the metric standing in for the physical
+          deliverable, so it tracks what executes.
+
+        Neither reading sees the CHUNK-BOUNDARY seam (last step of chunk k to
+        first step of chunk k+1), which is where executed jerk is typically
+        worst. Both are within-chunk statistics; treat them as a lower bound on
+        the physical roughness, not a complete account of it.
+
+        Returns:
+            ``(moments_sum, jerk_pair)``:
+              * ``moments_sum`` -- ``(sum R, sum M)`` over the batch across the
+                full valid horizon, for pooling by the caller. ``None`` if
+                unusable (missing dims/horizon, wrong shape, non-finite).
+              * ``jerk_pair`` -- ``(sum|D2 a|, sum|a|)`` over the EEF-POSITION
+                dims and the EXECUTED prefix only, the normalised-space analogue
+                of the physical path-jerk metric. ``None`` when that span could
+                not be recovered (see ``_smooth_eef_pos_dims``), the prefix is
+                too short to difference, or the reading is non-finite.
+        """
+        dims = self._smooth_dims
+        horizon = self._smooth_horizon
+        if dims is None or not horizon:
+            return None, None
+        if ready_actions is None or ready_actions.dim() != 3:
+            return None, None
+        if ready_actions.shape[1] < horizon or horizon < 3:
+            # `second_difference` needs 3 rows; a short/padded tensor would
+            # otherwise raise inside a metrics path and cost the iteration.
+            return None, None
+        # The DIM axis too, not just the horizon: `index_select` raises on an
+        # out-of-range index, and this method's contract is that it never raises.
+        # A checkpoint whose action layout is narrower than the recorded dim set
+        # (a mismatched embodiment, a truncated buffer) must degrade to "no
+        # reading", not kill the iteration for a diagnostic.
+        n_cols = ready_actions.shape[2]
+        if int(dims.max()) >= n_cols:
+            return None, None
+        with torch.no_grad():
+            a = ready_actions[:, :horizon].index_select(2, dims).float()
+            mom = roughness_moments(a).sum(dim=0)          # (sum R, sum M)
+            out_mom = mom if bool(torch.isfinite(mom).all()) else None
+
+            out_jerk = None
+            pos_dims = self._smooth_eef_pos_dims
+            # Only the EXECUTED prefix: MultiStepWrapper plays steps
+            # 0..n_action_steps-1 into the sim and discards the remainder, so the
+            # rows beyond it never reach the robot. Resolved at setup (not read from self.config here) because the
+            # class-level default keeps this metrics path callable on a trainer
+            # built via __new__, and because a metrics path must never be the
+            # thing that raises. An explicit `is None` test, NOT `or`: a
+            # configured n_action_steps of 0 is falsy and would silently widen
+            # the window to the full horizon -- reporting a number over rows the
+            # robot never executes under a name that says it does.
+            n_exec = horizon if self._smooth_n_exec is None else int(
+                self._smooth_n_exec
+            )
+            n_exec = min(n_exec, horizon)
+            if (pos_dims is not None and pos_dims.numel() > 0 and n_exec >= 3
+                    and int(pos_dims.max()) < n_cols):
+                # L1, not L2: this mirrors the notebook's physical path-jerk
+                # statistic (sum of |jerk| over the path divided by path length),
+                # which is what the rho=+0.98 correlation was measured against.
+                # The (n-2)-term numerator over an n-term denominator is that
+                # statistic's own shape, not an oversight: the notebook divides
+                # sum|diff(pos, n=3)| (T-2 terms) by sum|deltas| (T terms).
+                # Reading it in NORMALISED action space needs no denormalisation
+                # and no decode_action, so it costs nothing and cannot drift out
+                # of sync with the checkpoint's norm stats.
+                p = ready_actions[:, :n_exec].index_select(2, pos_dims).float()
+                num = second_difference(p).abs().sum()
+                den = p.abs().sum()
+                if bool(torch.isfinite(num)) and bool(torch.isfinite(den)):
+                    out_jerk = (num, den)
+        return out_mom, out_jerk
+
     def _smooth_mask_probe(self):
         """Minimal duck-typed stand-in for `compute_action_mask`'s policy arg."""
         from gr00t.data.embodiment_tags import EmbodimentTag
@@ -6907,22 +7391,32 @@ class GRPOTrainer:
     def _smooth_guard_key(self) -> dict:
         """Everything hf_ref is only valid for.
 
-        NOTE the reference itself is measured at tau=0 on a clean forward, so it is
-        provably independent of both the tau-jitter and the eps-jitter. The jitter
-        keys are kept in the HARD-FAIL set anyway, per the spec, because they change
-        what every OTHER term in the loss does and a silent mismatch across a resume
-        is worth refusing; they are not here because hf_ref depends on them.
+        NOTE the reference is measured on clean forwards from the original eps, so
+        it is provably independent of both the tau-jitter and the eps-jitter. The
+        jitter keys are kept in the HARD-FAIL set anyway, per the spec, because
+        they change what every OTHER term in the loss does and a silent mismatch
+        across a resume is worth refusing; they are not here because hf_ref depends
+        on them.
         Historical note on the wording, kept because it explains the key choice:
         `_sample_jittered_timesteps` draws
         `tau = clamp(center + N(0, TAU_JITTER_STD), 0, noise_s)` afresh per entry
         per iteration and unseeded, so no realized value is reproducible. hf_ref
         is an expectation over that distribution, which makes the distribution's
         parameters — the centers and the width — the thing that must match.
+
+        `instrument` and the sampler `schedule` ARE keys hf_ref genuinely depends
+        on, and they are the reason this guard matters more than it used to. A
+        threshold calibrated on the endpoint is meaningless for the chunk: the two
+        are different quantities that happen to have SIMILAR BASE VALUES (0.00157
+        vs 0.00141), so a stale sidecar would load with no numeric red flag at all
+        while thresholding at the wrong instrument's scale (15x vs 4x). Likewise a
+        checkpoint whose `num_inference_timesteps` differs produces a different
+        chunk from the same eps, so its reference does not transfer.
         """
         return {
             "tau_centers": [float(t) for t in self.config.tau_centers],
             "jitter_std": float(TAU_JITTER_STD),
-            # The smooth forward is clean (tau=0, original eps), so the jitter
+            # The smooth forwards are clean (original eps), so the jitter
             # settings do NOT change what hf_ref measures. Recorded anyway so a
             # mismatch is visible rather than having to be inferred.
             "jitter_pos": float(self.config.jitter_pos),
@@ -6930,8 +7424,29 @@ class GRPOTrainer:
             "jitter_paired": bool(self.config.jitter_paired),
             "dims": list(self._smooth_dims_list),
             "horizon": int(self._smooth_horizon or 0),
+            "instrument": str(self.config.smooth_instrument),
             "embodiment_tag": str(self.config.embodiment_tag),
             "model_path": str(self.config.model_path),
+            # Sampler keys ONLY for "chunk". Step count and dt, not the raw t
+            # list: the t values are a pure function of the step count under the
+            # production schedule (t_i = i/N), so recording both is redundant,
+            # while dt is what an alternative sampler could change independently.
+            #
+            # Omitted entirely under "endpoint" because hf_ref PROVABLY does not
+            # depend on them there: the endpoint is one forward at tau=0, which
+            # never touches the schedule. Including them would hard-fail a resume
+            # whose only difference is a knob the reference cannot see -- a false
+            # rejection, and the guard's value comes from being trusted.
+            **(
+                {
+                    "sampler_steps": len(self._smooth_schedule),
+                    "sampler_dt": (
+                        float(self._smooth_schedule_dt)
+                        if self._smooth_schedule_dt is not None else None
+                    ),
+                }
+                if self.config.smooth_instrument == "chunk" else {}
+            ),
         }
 
     def _save_smooth_ref(self, ckpt_dir: Path) -> None:
@@ -6967,6 +7482,23 @@ class GRPOTrainer:
             return None
         payload = json.loads(path.read_text())
         want, got = self._smooth_guard_key(), payload.get("guard", {})
+        # BACK-COMPAT: a sidecar written before `smooth_instrument` existed has no
+        # `instrument` key, and the only instrument that existed then was the
+        # endpoint -- so its value is not a guess, it is implied. Backfill it
+        # rather than letting `None != "endpoint"` hard-fail every pre-change
+        # checkpoint, which would break the one property `"endpoint"` is retained
+        # for (reproducing runs calibrated against it). Under "chunk" the
+        # backfilled value still mismatches and still refuses, which is correct:
+        # that threshold was measured on a different quantity.
+        if "instrument" not in got:
+            got = {**got, "instrument": "endpoint"}
+            if self.config.smooth_instrument == "endpoint":
+                print(
+                    f"  NOTE: {SMOOTH_REF_FILENAME} predates the smooth_instrument "
+                    f"knob, so it was necessarily calibrated on the endpoint. "
+                    f"Treating it as instrument='endpoint', which matches this run."
+                )
+        _backfilled = "instrument" not in payload.get("guard", {})
         mismatched = {
             k: (got.get(k), v) for k, v in want.items() if got.get(k) != v
         }
@@ -6984,8 +7516,24 @@ class GRPOTrainer:
                 f"task(s). Pass --smooth-hf-ref explicitly to override."
             )
         if mismatched:
+            def _describe_old(k, val):
+                # A key ABSENT from the sidecar must not print as a literal
+                # `None`, which reads as "the file says None" -- an operator
+                # diffing the JSON would not find the key at all. This is the
+                # message every pre-change checkpoint produces, so it has to be
+                # unambiguous about which values were read and which inferred.
+                if k == "instrument" and _backfilled:
+                    return f"(absent, inferred as {val!r})"
+                if k not in payload.get("guard", {}):
+                    return "(absent from this sidecar)"
+                return repr(val)
+
             detail = "\n".join(
-                f"      {k}: checkpoint={old!r} current={new!r}"
+                # Label a backfilled value as INFERRED rather than letting it read
+                # as something the sidecar contained -- an operator diffing the
+                # file against this message would otherwise not find the key.
+                f"      {k}: checkpoint="
+                f"{_describe_old(k, old)} current={new!r}"
                 for k, (old, new) in sorted(mismatched.items())
             )
             raise RuntimeError(
@@ -7034,7 +7582,7 @@ class GRPOTrainer:
             and not deferring
         ):
             print(
-                f"  WARNING: endpoint-roughness calibration reached iteration "
+                f"  WARNING: trajectory-roughness calibration reached iteration "
                 f"{iteration} (cap {max_calib_iters}) with only "
                 f"{self._smooth_calib_rows} of {min_rows} target rows. Freezing "
                 f"hf_ref from what has been pooled rather than deferring further. "
@@ -7045,7 +7593,7 @@ class GRPOTrainer:
             )
         if deferring:
             print(
-                f"  Endpoint-roughness calibration has {self._smooth_calib_rows} "
+                f"  Trajectory-roughness calibration has {self._smooth_calib_rows} "
                 f"of {min_rows} required rows after iteration {iteration}; "
                 f"continuing to accumulate."
                 + (
@@ -7062,7 +7610,7 @@ class GRPOTrainer:
             return {"smooth_calib_rows": self._smooth_calib_rows}
         if self._smooth_calib_sum is None or self._smooth_calib_n == 0:
             print(
-                f"  WARNING: endpoint-roughness calibration collected no samples "
+                f"  WARNING: trajectory-roughness calibration collected no samples "
                 f"at iteration {iteration} (no trained rows before the first "
                 f"optimizer step). Retrying next iteration — note theta is no "
                 f"longer exactly theta_base, so the reference will carry a small "
@@ -7077,7 +7625,7 @@ class GRPOTrainer:
         base = r_sum / (6.0 * m_sum + SMOOTH_M_EPS)
         if not bool(torch.isfinite(base).all()) or float(m_sum) <= 0.0:
             print(
-                f"  WARNING: endpoint-roughness calibration produced an unusable "
+                f"  WARNING: trajectory-roughness calibration produced an unusable "
                 f"reference (R={float(r_sum):.6g}, M={float(m_sum):.6g}) at "
                 f"iteration {iteration}; discarding it and retrying next iteration "
                 f"rather than freezing a value that would break every later loss."
@@ -7101,12 +7649,16 @@ class GRPOTrainer:
         self._smooth_calib_iter = int(iteration)
         self._smooth_calib_sum = None
         print(
-            f"  Endpoint-roughness hf_ref calibrated from "
+            f"  Trajectory-roughness hf_ref calibrated from "
             f"{self._smooth_calib_n} pooled minibatches "
             f"({self._smooth_calib_rows} rows) at iteration {iteration}:"
         )
         print(
-            f"    base HF (pooled, tau=0) = {float(base):.6f}   "
+            # Names the instrument, because the two have SIMILAR base values
+            # (chunk 0.00141, endpoint 0.00157) and a log line reading only
+            # "base HF = 0.0014" would not say which quantity was measured.
+            f"    base HF (pooled, {self.config.smooth_instrument}) = "
+            f"{float(base):.6f}   "
             f"-> hf_ref = {float(self._smooth_hf_ref):.6f} "
             f"(x{self.config.smooth_hf_ref_scale})"
         )
@@ -7165,7 +7717,7 @@ class GRPOTrainer:
             },
             ckpt_dir / "optimizer.pt",
         )
-        # Frozen endpoint-roughness reference (one float + guard key). Written
+        # Frozen trajectory-roughness reference (one float + guard key). Written
         # here so a --resume-from picks it up: a resumed run's first iteration is
         # NOT base-policy, so it cannot recalibrate without ratcheting.
         self._save_smooth_ref(ckpt_dir)

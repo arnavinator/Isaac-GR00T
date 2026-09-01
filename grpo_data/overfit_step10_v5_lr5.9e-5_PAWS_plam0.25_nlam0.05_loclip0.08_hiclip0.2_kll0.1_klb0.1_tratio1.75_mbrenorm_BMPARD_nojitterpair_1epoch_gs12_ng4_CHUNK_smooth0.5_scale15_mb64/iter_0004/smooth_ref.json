@@ -1,0 +1,37 @@
+{
+  "hf_ref": 0.017220305278897285,
+  "guard": {
+    "tau_centers": [
+      0.0,
+      0.25,
+      0.35,
+      0.5,
+      0.6,
+      0.75
+    ],
+    "jitter_std": 0.02,
+    "jitter_pos": 0.25,
+    "jitter_neg": 0.05,
+    "jitter_paired": false,
+    "dims": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "horizon": 16,
+    "instrument": "chunk",
+    "embodiment_tag": "ROBOCASA_PANDA_OMRON",
+    "model_path": "nvidia/GR00T-N1.6-3B",
+    "sampler_steps": 4,
+    "sampler_dt": 0.25
+  },
+  "hf_ref_scale": 15.0,
+  "calibrated_at_iteration": 1,
+  "hf_ref_source": "calibrated",
+  "env_names": [
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+  ]
+}

@@ -497,6 +497,7 @@ class ToyGRPOTrainer(GRPOTrainer):
         skip_reason=None,
         phase_times=None,
         lora_delta_norm=None,
+        lora_cosines=None,
     ):
         """Extend parent logging with per-seed success rates.
 
@@ -520,6 +521,7 @@ class ToyGRPOTrainer(GRPOTrainer):
         super()._log_metrics(
             iteration, stats, update_stats, lr, iter_time, skip_reason,
             phase_times=phase_times, lora_delta_norm=lora_delta_norm,
+            lora_cosines=lora_cosines,
         )
         if self.writer is None:
             return
@@ -581,6 +583,12 @@ def main():
     print(f"  KL coef:        last_iter={config.kl_coef_last_iter} "
           f"base_model={config.kl_coef_base_model}")
     print(f"  Clip eps lo/hi: {config.clip_eps_low} / {config.clip_eps_high}")
+    # Per-row MSE-referenced lower clip. Printed here (in addition to the
+    # resolved-arithmetic block GRPOTrainer.train() emits) for the same reason the
+    # jitter line is: the toy's whole value is that a flag can be confirmed to
+    # have flowed through before the run starts.
+    print(f"  Clip low MSE c: {config.clip_low_mse_coef}"
+          f"{' (OFF - flat clip)' if config.clip_low_mse_coef == 0.0 else ''}")
     print(f"  Jitter pos/neg: {config.jitter_pos} / {config.jitter_neg} "
           f"(paired={config.jitter_paired})")
     print(f"  FF steps / pct: {config.fast_forward_steps} / "

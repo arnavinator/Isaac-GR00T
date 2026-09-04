@@ -314,6 +314,35 @@ class GRPOConfig:
     clip_eps_low: float = 0.2
     clip_eps_high: float = 0.2
 
+    # PER-ROW, MSE-REFERENCED lower clip. 0.0 (default) = OFF and bit-identical
+    # to a flat `1 - clip_eps_low` floor on every row.
+    #
+    # WHY. The importance ratio is rho = exp(MSE_ref - MSE_theta), so
+    # `clip_eps_low` is specified in LOG-RATIO (nat) units while the quantity
+    # that actually diverges is MSE_theta. A flat epsilon therefore grants wildly
+    # non-uniform MSE headroom WITHIN ONE ITERATION: at clip_eps_low=0.08 the
+    # allowed MSE inflation measured 261x at `ref_mse/p10` and 2.1x at
+    # `ref_mse/max`. When > 0 each row instead gets a budget proportional to its
+    # own MSE_ref:
+    #
+    #     budget_i    = min(clip_low_mse_coef * MSE_ref_i,
+    #                       |ln(1 - clip_eps_low)|)          # nats
+    #     rho_floor_i = exp(-budget_i)
+    #
+    # so every row is allowed the same RELATIVE inflation, 1 + clip_low_mse_coef,
+    # until the ceiling binds.
+    #
+    # `clip_eps_low` stays an ABSOLUTE CEILING on the budget (the min above), so
+    # this mechanism can only ever be TIGHTER than a flat clip, never looser.
+    # That is deliberate: MSE_ref GROWS as the field degrades (measured
+    # 0.0023 -> 0.0297 over one run), so an uncapped c * MSE_ref budget would
+    # WIDEN the clip exactly when it needs to tighten.
+    #
+    # Pairs with paws_k_floor_at_target: a tighter lower clip kills more negative
+    # rows, which shrinks PAWS's alive-erosion mass N and hence LOWERS k — see
+    # that field.
+    clip_low_mse_coef: float = 0.0
+
     # Number of optimization epochs over collected data per each iteration
     # each epoch shuffles all action chunks from data collection
     # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
@@ -357,6 +386,24 @@ class GRPOConfig:
     # so values > 1 tilt further toward reinforcement. Only consulted when the
     # scaling flag is True.
     positive_advantage_weight_target_ratio: float = 1.0
+
+    # Floor the MEASURED k at positive_advantage_weight_target_ratio instead of
+    # at 1.0. False (default) = today's behaviour.
+    #
+    # WHY. The measured branch is
+    # `k = clamp(tratio * N/D, floor, max)` with N = alive erosion mass and
+    # D = alive amplified-positive mass. `clip_low_mse_coef > 0` deliberately
+    # kills MORE negative rows, which shrinks N, which under the current
+    # controller LOWERS k — so tightening the erosion brake would also weaken
+    # reinforcement, the opposite of the intent. Flooring at tratio removes only
+    # the "amplify LESS than target" case; it never amplifies more.
+    #
+    # Measured: N/D sits at 1.04-1.06 in healthy iterations, so the floor is
+    # INERT there (k = tratio * 1.05 > tratio); it falls to 0.66 during collapse,
+    # which is exactly where it binds. Only consulted when the scaling flag is
+    # True. Requires target_ratio >= 1.0 (validated): flooring below 1.0 would
+    # pin k under the no-op point and invert the mechanism's intent.
+    paws_k_floor_at_target: bool = False
 
     # ─── Balanced Training (two independent mechanisms) ──────────────────────
     # Both address gradient instability from skewed episode outcomes, and each
@@ -873,6 +920,28 @@ class GRPOConfig:
     # too.
     clean_output: bool = True
 
+    # ─── Weight-step direction cosines (`lora/cos_step_*`) ────────────────────
+    # Always emitted; these two knobs only choose the FROZEN EARLY reference
+    # `L_early` that `lora/cos_step_early` is measured against.
+    #
+    # WHY a frozen reference. Measured across 6 runs, cos(step, L_early) has a
+    # minimum of -0.058 over 41 updates on the runs that stayed healthy and
+    # reaches -0.49 / -0.62 on the two that collapsed directionally. The
+    # `cos_step_cumulative` variant is self-referential — once a run turns,
+    # `W_prev - W_init` turns with it — and measured POORLY: it stayed at
+    # +0.37..+0.53 straight through a collapse. Read `cos_step_early`.
+    #
+    # cos_ref_lora_paths: (path_a, path_b), each an existing `iter_NNNN/` LoRA
+    #   checkpoint dir or a `lora_weights.pt` file. L_early = W(b) - W(a), loaded
+    #   ONCE at setup. Use this to score a NEW run against a KNOWN-GOOD run's
+    #   early direction; without it the reference is this run's own early motion,
+    #   which cannot detect a run that turned before it was frozen.
+    # cos_ref_iterations: when cos_ref_lora_paths is None, freeze
+    #   L_early = W_now - W_init after this many LOGGED (non-zero-step)
+    #   iterations. Must be >= 1.
+    cos_ref_lora_paths: Optional[tuple[str, str]] = None
+    cos_ref_iterations: int = 2
+
     def __post_init__(self):
         """Validate config invariants at construction time.
 
@@ -1137,6 +1206,104 @@ class GRPOConfig:
                 f"or inverted clip window."
             )
 
+        # Per-row MSE-referenced lower clip. Validated unconditionally (the same
+        # posture as the two epsilons above) so a typo is caught even in a run
+        # that leaves the mechanism off. 0.0 IS the off switch, so only negative
+        # and non-finite values are rejected.
+        if self.clip_low_mse_coef < 0.0 or not math.isfinite(self.clip_low_mse_coef):
+            raise ValueError(
+                f"clip_low_mse_coef must be finite and >= 0, got "
+                f"{self.clip_low_mse_coef}. 0.0 is the OFF switch (flat "
+                f"1 - clip_eps_low floor on every row); a positive value gives "
+                f"each row a budget of min(coef * MSE_ref_i, "
+                f"|ln(1 - clip_eps_low)|) nats. A negative coefficient would put "
+                f"the floor ABOVE 1.0, clipping every row that did not move."
+            )
+
+        # SILENT-INERTNESS TRAP. `clip_eps_low` is BOTH the off-path floor and the
+        # absolute ceiling on the per-row budget, so setting it to the value you
+        # actually want as a budget makes the coefficient unreachable: every row
+        # pins to the ceiling and the mechanism silently reverts to the flat clip
+        # it was added to replace. The run completes, the curves look plausible,
+        # and `drift/neg_frac_over_budget` reports against the flat budget, so
+        # nothing downstream flags it. Costs a full arm to discover.
+        #
+        # Probe value is the measured HEALTHY-REGIME per-iteration `ref_mse/mean`
+        # (0.0040-0.0050 over iterations 3-9 of the reference run; 0.00398 at the
+        # iteration the collapse ignited). The per-row mechanism only does work
+        # where `coef * MSE_ref < ceiling`, so if the ceiling already binds at the
+        # healthy operating point it binds for essentially the whole run. Compare
+        # against train_grpo.MSE_REF_BANNER_PROBES, which brackets the full
+        # early-to-degraded range (0.0023-0.0297); this is a point inside it, not
+        # its low end, because the low end is only touched at iteration 1.
+        # Duplicated rather than imported: train_grpo imports THIS module, so
+        # importing back would be circular. Keep them consistent.
+        #
+        # Correct usage: leave clip_eps_low LOOSE (its current/default value) and
+        # let the coefficient set the budget; use clip_low_mse_coef=0 with a tight
+        # clip_eps_low for a FLAT-budget arm. Do not tighten both at once.
+        if self.clip_low_mse_coef > 0.0:
+            _ceil_nats = -math.log(max(1.0 - self.clip_eps_low, 1e-12))
+            _binds_at = _ceil_nats / self.clip_low_mse_coef
+            if _binds_at <= 0.005:
+                import warnings
+                warnings.warn(
+                    f"clip_low_mse_coef={self.clip_low_mse_coef:g} is effectively "
+                    f"INERT at clip_eps_low={self.clip_eps_low:g}: the ceiling "
+                    f"|ln(1-clip_eps_low)|={_ceil_nats:.5f} nats binds for every "
+                    f"row with MSE_ref >= {_binds_at:.5f}, at or below the top of "
+                    f"the measured healthy-regime ref_mse/mean (~0.004-0.005). "
+                    f"Nearly every row will "
+                    f"pin to the ceiling and the per-row mechanism reduces to the "
+                    f"flat clip it replaces. Either raise clip_eps_low (leave it at "
+                    f"its default and let the coefficient set the budget) or set "
+                    f"clip_low_mse_coef=0.0 for a deliberate flat-budget arm.",
+                    stacklevel=2,
+                )
+
+            # BORN-DEAD TRAP. `budget_i` is measured from rho = 1, but with
+            # jitter active a NEGATIVE-advantage row is not born there: its DiT
+            # input is eps' rather than eps while the velocity target stays at
+            # a - eps, so its MSE_theta carries an offset
+            #     gap_neg = E_k[(1-tau)^2] * jitter_neg^2 * ||J||_F^2 / D
+            # from step 0. If gap_neg exceeds the row's whole budget the row is
+            # born BELOW its own floor and its erosion gradient is dead on
+            # arrival — the per-row clip silently becomes an erosion ABLATION
+            # rather than a cap, and it does so most on the rows the reference
+            # fits BEST (smallest MSE_ref, hence smallest budget).
+            #
+            # Estimate: gap_neg ~= 0.9 * jitter_neg^2, calibrated against the
+            # measured 0.0016-0.0026 at jitter_neg=0.05 with the shipped
+            # tau_centers and jacobian_fro_sq ~ 2. It scales as lambda^2, so
+            # halving jitter_neg cuts it 4x. `jitter/gap_neg` logs the real value
+            # per iteration; this is only for a config-time sanity check.
+            #
+            # Compared against `coef * 0.004` (the measured healthy-regime
+            # ref_mse/mean), i.e. the budget a TYPICAL row gets. The pre-existing
+            # `jitter/neg_clip_budget_used` is the same quantity for the FLAT clip,
+            # where its documented wall is ~0.30.
+            _gap_est = 0.9 * self.jitter_neg * self.jitter_neg
+            _typ_budget = self.clip_low_mse_coef * 0.004
+            if _gap_est > 0.5 * _typ_budget:
+                import warnings
+                warnings.warn(
+                    f"jitter_neg={self.jitter_neg:g} implies gap_neg ~= "
+                    f"{_gap_est:.5f} nats, against a typical per-row budget of "
+                    f"clip_low_mse_coef * ref_mse/mean ~= {_typ_budget:.5f} nats "
+                    f"({100 * _gap_est / max(_typ_budget, 1e-12):.0f}% of it). "
+                    f"Negative rows are born at rho=exp(-gap_neg), so rows with "
+                    f"MSE_ref < {_gap_est / self.clip_low_mse_coef:.5f} start "
+                    f"BELOW their own floor and are clip-dead on arrival: the "
+                    f"per-row clip becomes an erosion ablation, not a cap, biased "
+                    f"toward the rows the reference fits best. Either raise "
+                    f"clip_low_mse_coef, or lower jitter_neg (gap_neg scales as "
+                    f"jitter_neg^2; 0.0 makes negative rows born at exactly "
+                    f"rho=1). Watch drift/neg_frac_born_dead, which is scoped to the "
+                    f"pre-step micro-batches where this is measurable — it "
+                    f"reads ~1.0 when this has bitten.",
+                    stacklevel=2,
+                )
+
         # Dynamic positive-advantage weighting bounds (only meaningful when
         # positive_advantage_weight_scaling=True, but validated unconditionally
         # so a bad value is caught even if the flag is toggled on later). k is
@@ -1153,6 +1320,106 @@ class GRPOConfig:
                 f"positive_advantage_weight_target_ratio must be > 0, got "
                 f"{self.positive_advantage_weight_target_ratio}."
             )
+        # Flooring the measured k at target_ratio only makes sense ABOVE the
+        # no-op point. Below 1.0 the floor would PIN k under 1.0, i.e. force the
+        # mechanism to de-amplify reinforcement on every iteration whose measured
+        # N/D is healthy — the exact inversion of what the flag exists for.
+        # Ordering: checked after the > 0 test so a negative target reports the
+        # simpler error first.
+        if (
+            self.paws_k_floor_at_target
+            and self.positive_advantage_weight_target_ratio < 1.0
+        ):
+            raise ValueError(
+                f"paws_k_floor_at_target=True requires "
+                f"positive_advantage_weight_target_ratio >= 1.0, got "
+                f"{self.positive_advantage_weight_target_ratio}. The flag replaces "
+                f"the measured k's lower clamp of 1.0 with target_ratio; a target "
+                f"below 1.0 would floor k BELOW the no-op point and force "
+                f"de-amplification of reinforcement, inverting the intent. Either "
+                f"raise the target ratio or leave paws_k_floor_at_target=False."
+            )
+
+        # ...and the floor must not sit ABOVE the cap. `k = min(max(measured,
+        # floor), max)`, so target_ratio > positive_advantage_weight_max collapses
+        # the expression to the constant `max` for EVERY measurement: the
+        # measurement-driven controller silently becomes a fixed amplifier, and the
+        # banner prints an inverted interval ("clamped to [5, 2]") as if it were a
+        # range. Only reachable with the flag on — without it the floor is 1.0,
+        # which the `max > 1.0` check above already keeps below the cap.
+        if (
+            self.paws_k_floor_at_target
+            and self.positive_advantage_weight_target_ratio
+            >= self.positive_advantage_weight_max
+        ):
+            raise ValueError(
+                f"paws_k_floor_at_target=True requires "
+                f"positive_advantage_weight_target_ratio "
+                f"({self.positive_advantage_weight_target_ratio}) < "
+                f"positive_advantage_weight_max "
+                f"({self.positive_advantage_weight_max}). k is computed as "
+                f"min(max(measured, target_ratio), max); with the target at or above the "
+                f"cap that is the constant `max` for every measurement, which "
+                f"turns PAWS from a controller into a fixed amplifier without "
+                f"warning. Raise positive_advantage_weight_max or lower the target."
+            )
+
+        # Weight-step direction cosines. Both knobs are validated
+        # unconditionally: the cosines are always emitted, so a bad value here is
+        # never dormant.
+        if self.cos_ref_iterations < 1:
+            raise ValueError(
+                f"cos_ref_iterations must be >= 1, got "
+                f"{self.cos_ref_iterations}. It is the number of LOGGED "
+                f"iterations after which L_early = W_now - W_init is frozen as "
+                f"the lora/cos_step_early reference; 0 would freeze a zero "
+                f"reference vector, whose cosine is undefined."
+            )
+        if self.cos_ref_lora_paths is not None:
+            _paths = self.cos_ref_lora_paths
+            # `isinstance(..., (list, tuple))` rather than `len(tuple(_paths))`:
+            # the latter raises a bare TypeError on a non-iterable (an int from a
+            # config file, say) instead of this method's ValueError, and it would
+            # silently ACCEPT a 2-character string as a 2-tuple of characters.
+            if not isinstance(_paths, (list, tuple)) or len(_paths) != 2:
+                raise ValueError(
+                    f"cos_ref_lora_paths must be a 2-tuple (path_a, path_b), got "
+                    f"{self.cos_ref_lora_paths!r}. L_early = W(path_b) - "
+                    f"W(path_a), so exactly two checkpoints are required."
+                )
+            # Normalise to a tuple so the TB config dump and the setup-time load
+            # see one shape regardless of how tyro/YAML delivered it (list vs
+            # tuple). Done before the existence check so the error message quotes
+            # the resolved value.
+            self.cos_ref_lora_paths = (str(_paths[0]), str(_paths[1]))
+            # Local alias, NOT a bare `from pathlib import Path`: two later
+            # blocks in this same method already bind `Path` / `_Path` locally,
+            # and a function-local `import ... as Path` makes that name local for
+            # the WHOLE function body — so using the plain name here would raise
+            # UnboundLocalError before those imports execute.
+            from pathlib import Path as _CosPath
+            for _p in self.cos_ref_lora_paths:
+                _pp = _CosPath(_p)
+                if not _pp.exists():
+                    raise ValueError(
+                        f"cos_ref_lora_paths entry {_p!r} does not exist. Pass "
+                        f"existing iter_NNNN/ checkpoint directories (or "
+                        f"lora_weights.pt files) — the reference direction is "
+                        f"loaded ONCE at setup, so a bad path must fail before "
+                        f"the multi-minute model load rather than hours in."
+                    )
+                # Existence alone is not enough to keep that promise: a directory
+                # without a lora_weights.pt (or a plain wrong directory such as
+                # /tmp) validated fine here and then failed inside
+                # _load_cos_ref_direction, which runs AFTER the model load.
+                if _pp.is_dir() and not (_pp / "lora_weights.pt").exists():
+                    raise ValueError(
+                        f"cos_ref_lora_paths entry {_p!r} is a directory with no "
+                        f"lora_weights.pt in it. Point at an iter_NNNN/ checkpoint "
+                        f"directory (which contains lora_weights.pt) or at the "
+                        f".pt file itself; the reference is loaded once at setup, "
+                        f"after the multi-minute model load."
+                    )
 
         if self.balanced_minibatch_training and not (
             0.0 < self.balanced_minibatch_positive_adv_ratio < 1.0

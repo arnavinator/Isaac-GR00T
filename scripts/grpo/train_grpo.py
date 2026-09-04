@@ -144,6 +144,15 @@ GROUP_SEED_STRIDE = 1000
 # _grpo_update_inner.
 _POS_SCALE_EPS = 1e-8
 
+# MSE_ref values the startup banner evaluates the per-row lower-clip budget at
+# (config.clip_low_mse_coef). These bracket the MEASURED per-iteration mean over
+# one full run — 0.0023 early, 0.0297 late as the field degraded — so printing the
+# resolved budget at both ends makes a mis-set coefficient obvious: a value that
+# already pins the EARLY probe to the |ln(1-clip_eps_low)| ceiling has reverted the
+# mechanism to the flat clip it replaces. Banner-only; nothing reads these in the
+# training path.
+MSE_REF_BANNER_PROBES = (0.0023, 0.0297)
+
 
 def is_anchor_row(chunk, include_anchor_groups: bool) -> bool:
     """Whether a chunk gets ANCHOR treatment this iteration.
@@ -163,7 +172,7 @@ def clip_killed_gradient(
     ratio: torch.Tensor,
     surr1: torch.Tensor,
     surr2: torch.Tensor,
-    clip_eps_low: float,
+    clip_eps_low: "float | torch.Tensor",
     clip_eps_high: float,
 ) -> torch.Tensor:
     """Which rows had their CLIP-TERM gradient zeroed by the clamp.
@@ -172,20 +181,39 @@ def clip_killed_gradient(
     predicate instead of re-deriving it — a re-derived copy would keep passing
     if this expression were changed.
 
+    LOW-BOUND ARGUMENT, two accepted forms (see `rho_floor` in
+    _grpo_update_inner). The four-case table below is per ROW and holds for
+    either, because the derivation only ever compares a row's ratio against ITS
+    OWN bound:
+      - `float`  → an EPSILON. The bound is `1 - clip_eps_low`, uniform over
+        rows. This is the legacy form and every existing float call site keeps
+        working unchanged.
+      - `Tensor` → the per-row LOWER BOUND ITSELF (`rho_floor`, shape [B]), NOT
+        an epsilon. Used when `config.clip_low_mse_coef > 0` makes the floor
+        MSE-referenced and therefore different on every row. Passing the bound
+        rather than a tensor of epsilons is deliberate: `_grpo_update_inner`
+        computes exactly one `rho_floor` tensor and hands the SAME object to all
+        six `clip_eps_low` consumers, so the loss and every clip metric cannot
+        desynchronise from each other.
+
     `torch.min(surr1, surr2)` returns the clamped bound iff `surr2 <= surr1`;
     that bound is a CONSTANT in `ratio` only when the clamp actually moved the
-    ratio. Hence the conjunction. Verified against all four cases:
+    ratio. Hence the conjunction. Verified against all four cases (`lo` denoting
+    the row's own lower bound, i.e. `1 - clip_eps_low` or `rho_floor_i`):
 
-        A>0, rho < 1-lo : surr1 = A*rho < A*(1-lo) = surr2  -> min picks surr1, ALIVE
-        A>0, rho > 1+hi : surr1 = A*rho > A*(1+hi) = surr2  -> min picks surr2, DEAD
-        A<0, rho < 1-lo : surr1 = A*rho > A*(1-lo) = surr2  -> min picks surr2, DEAD
-        A<0, rho > 1+hi : surr1 = A*rho < A*(1+hi) = surr2  -> min picks surr1, ALIVE
+        A>0, rho < lo    : surr1 = A*rho < A*lo     = surr2  -> min picks surr1, ALIVE
+        A>0, rho > 1+hi  : surr1 = A*rho > A*(1+hi) = surr2  -> min picks surr2, DEAD
+        A<0, rho < lo    : surr1 = A*rho > A*lo     = surr2  -> min picks surr2, DEAD
+        A<0, rho > 1+hi  : surr1 = A*rho < A*(1+hi) = surr2  -> min picks surr1, ALIVE
 
     i.e. positive-advantage rows can only ever die on the UPPER bound and
     negative ones only on the LOWER bound. That asymmetry is what the
     sign-agnostic `clipfrac` hides, and it is why a large `jitter_pos` — which
     pushes every positive row's ratio BELOW `1-clip_eps_low` — inflates
-    `clipfrac` to ~1.0 while killing nothing.
+    `clipfrac` to ~1.0 while killing nothing. It is also why a per-row
+    MSE-referenced lower clip (`clip_low_mse_coef`), however tight, cannot kill a
+    positive row: tightening `lo` only moves a bound the positive branch never
+    dies on.
 
     NAMING CAVEAT: this is the gradient of the CLIP TERM only. With
     kl_coef_last_iter / kl_coef_base_model > 0 (both default 0.2) a "dead" row
@@ -206,7 +234,10 @@ def clip_killed_gradient(
     instead of the 1.0 that "no gradient" would suggest. Watch
     `n_pos_flipped_by_renorm` and the `_neg` denominator if that curve looks odd.
     """
-    clamp_moved = (ratio < 1 - clip_eps_low) | (ratio > 1 + clip_eps_high)
+    lo_bound = (
+        clip_eps_low if torch.is_tensor(clip_eps_low) else 1 - clip_eps_low
+    )
+    clamp_moved = (ratio < lo_bound) | (ratio > 1 + clip_eps_high)
     return clamp_moved & (surr2 <= surr1)
 
 
@@ -245,6 +276,19 @@ class GRPOTrainer:
     _smooth_schedule = ()                # resolved sampler t values, for the guard
     _smooth_schedule_dt = None
     _smooth_instrument_logged = False    # one-shot latch for the TB text summary
+
+    # ── Weight-step direction cosines: OFF-state class defaults ──────────────
+    # Same reason as the block above: the CPU test harnesses build the trainer
+    # via __new__, so _compute_lora_step_cosines() must degrade to "no curves"
+    # rather than raising AttributeError. All three snapshots are per-name dicts
+    # shaped exactly like _lora_init_params.
+    _lora_prev_params = None      # W at the previous LOGGED iteration (on device)
+    _lora_prev_step = None        # (W_prev - W_prev_prev), on device
+    _lora_cos_ref = None          # L_early, kept on CPU — see the method docstring
+    # "paths" | "frozen_after_N_logged_iters_of_run" | "none"
+    _lora_cos_ref_source = None
+    _lora_cos_n_logged = 0        # iterations whose step was non-zero
+    _lora_cos_ref_logged = False  # one-shot latch for the TB text summary
 
     def __init__(self, config: GRPOConfig):
         """Initialize the GRPO trainer.
@@ -452,6 +496,32 @@ class GRPOTrainer:
             if p.requires_grad
         }
 
+        # Weight-step direction cosines (lora/cos_step_*). Resolve the frozen
+        # early reference L_early NOW so a bad --cos-ref-lora-paths fails here
+        # rather than at the first log call, and reset the per-run history so a
+        # resumed run does not compare against the previous process's snapshots.
+        self._lora_prev_params = None
+        self._lora_prev_step = None
+        self._lora_cos_ref = None
+        self._lora_cos_n_logged = 0
+        self._lora_cos_ref_logged = False
+        if self.config.cos_ref_lora_paths is not None:
+            self._lora_cos_ref = self._load_cos_ref_direction(
+                *self.config.cos_ref_lora_paths
+            )
+            self._lora_cos_ref_source = "paths"
+            print(
+                f"  cos_step_early reference: W(b) - W(a) over "
+                f"{len(self._lora_cos_ref)} trainable tensors from\n"
+                f"    a = {self.config.cos_ref_lora_paths[0]}\n"
+                f"    b = {self.config.cos_ref_lora_paths[1]}"
+            )
+        else:
+            # Frozen lazily, after cos_ref_iterations logged iterations. Source
+            # stays None (reported as "none") until then, so the TB text summary
+            # never claims a reference that does not exist yet.
+            self._lora_cos_ref_source = None
+
         # --- Step 3: Setup optimizer (only LoRA params) ---
         print("\n[3/4] Setting up optimizer...")
         # Capture (name, param) pairs in the SAME order that
@@ -616,6 +686,75 @@ class GRPOTrainer:
             f"base_model={self.config.kl_coef_base_model}"
             f"{' (disabled)' if self.config.kl_coef_base_model == 0.0 else ''}"
         )
+        # Per-row MSE-referenced lower clip. The RESOLVED arithmetic is printed,
+        # not just the coefficient: the knob is in units nobody has intuition for
+        # (nats per nat of MSE_ref), so a mis-set value is only visible as the
+        # budget it produces. `MSE_REF_BANNER_PROBES` brackets the measured
+        # per-iteration range, so a coefficient that pins every row to the ceiling
+        # — i.e. reverts to the flat clip — is legible on the second line.
+        if self.config.clip_low_mse_coef > 0.0:
+            _coef = self.config.clip_low_mse_coef
+            _ceil = -math.log(max(1.0 - self.config.clip_eps_low, 1e-12))
+            print(
+                f"  Per-row MSE-referenced lower clip: ON "
+                f"(clip_low_mse_coef={_coef:g})"
+            )
+            print(
+                f"    budget_i = min({_coef:g} x MSE_ref_i, "
+                f"|ln(1-clip_eps_low)| = {_ceil:.4f}) nats; "
+                f"rho_floor_i = exp(-budget_i)"
+            )
+            print(
+                f"    uniform allowed MSE_theta inflation {1.0 + _coef:.2f}x "
+                f"until the ceiling binds, which is at "
+                f"MSE_ref >= {_ceil / _coef:.5f}"
+            )
+            for _probe in MSE_REF_BANNER_PROBES:
+                _b = min(_coef * _probe, _ceil)
+                print(
+                    f"    at MSE_ref={_probe:.4f}: budget={_b:.5f} nats -> "
+                    f"rho_floor={math.exp(-_b):.5f}"
+                    f"{'  (CEILING)' if _b >= _ceil else ''}"
+                )
+            # BORN-DEAD threshold, stated unconditionally rather than only when
+            # the config-time guard trips. That guard triggers on the TYPICAL row
+            # (gap_neg vs coef * healthy ref_mse/mean), but the failure is in the
+            # LOW-MSE_ref TAIL: a negative row is born at rho = exp(-gap_neg), so
+            # any row whose whole budget is under gap_neg is clip-dead on arrival.
+            # Printing the threshold lets the operator compare it directly against
+            # the ref_mse/p10 curve, which is the population that actually dies and
+            # which no config-time check can see.
+            if self.config.jitter_neg > 0.0:
+                _gap_est = 0.9 * self.config.jitter_neg ** 2
+                print(
+                    f"    negative rows are born at rho=exp(-gap_neg), gap_neg ~= "
+                    f"{_gap_est:.5f} (est. from jitter_neg={self.config.jitter_neg:g}); "
+                    f"rows with MSE_ref < {_gap_est / _coef:.5f} start clip-DEAD "
+                    f"-- compare against ref_mse/p10"
+                )
+            else:
+                print(
+                    "    jitter_neg=0 -> negative rows are born at rho=1 exactly; "
+                    "no row can start clip-dead"
+                )
+        if (
+            self.config.paws_k_floor_at_target
+            and self.config.positive_advantage_weight_scaling
+        ):
+            print(
+                f"  PAWS k floored at target_ratio: ON (measured k clamped to "
+                f"[{self.config.positive_advantage_weight_target_ratio:g}, "
+                f"{self.config.positive_advantage_weight_max:g}] instead of "
+                f"[1.0, {self.config.positive_advantage_weight_max:g}]) — inert "
+                f"while N/D > 1, binds when a tighter lower clip erodes N"
+            )
+        elif self.config.paws_k_floor_at_target:
+            # Flag set without the mechanism it modifies: say so rather than
+            # letting the operator infer from a missing line that it took effect.
+            print(
+                "  PAWS k floored at target_ratio: set but INERT — "
+                "positive_advantage_weight_scaling is False, so no k is computed."
+            )
         if self.config.balanced_minibatch_training:
             print(
                 f"  Balanced mini-batch sampling: ON "
@@ -804,6 +943,7 @@ class GRPOTrainer:
                         "advantage": phase2_time,
                     },
                     lora_delta_norm=self._compute_lora_delta_norm(),
+                    lora_cosines=self._compute_lora_step_cosines(),
                 )
                 # Save under the LAST UPDATED iter's name (not the current loop
                 # iter), so resume from this checkpoint retries the current
@@ -866,7 +1006,7 @@ class GRPOTrainer:
             # Treat an iter as "updated" only if at least one optimizer.step()
             # actually fired. Two paths lead to n_updates=0 here that the outer
             # chunk-keyed skip-check above does NOT catch:
-            #   1. Every minibatch had non-finite loss (bf16 ratio overflow).
+            #   1. Every minibatch had non-finite loss (fp32 ratio overflow).
             #   2. Every accumulation window was dropped because its ACCUMULATED
             #      gradient was non-finite (see _apply_accumulated_grads). Unlike
             #      1 and 2 this one CAN coincide with n_micro_batches > 0 —
@@ -920,6 +1060,11 @@ class GRPOTrainer:
                     "update": phase3_time,
                 },
                 lora_delta_norm=self._compute_lora_delta_norm(),
+                # Direction cosines of this iteration's weight step. Advances the
+                # W_prev / step_prev history, so it must be called exactly once
+                # per logged iteration — both here and on the early-skip path
+                # above (where the step is zero and it is a no-op by design).
+                lora_cosines=self._compute_lora_step_cosines(),
             )
 
             collect_label = (
@@ -3019,6 +3164,68 @@ class GRPOTrainer:
         # None when jitter is off, which leaves the jitter/* curves absent).
         jitter_diag: dict | None = None
 
+        # Once-per-iteration per-ROW erosion-drift distribution (`drift/*`).
+        # Populated by POOLING every trained micro-batch's negative signal rows
+        # across the whole iteration, plus at-birth counts over the PRE-STEP
+        # micro-batches. Stays empty when the iteration held no
+        # pre-renorm-negative signal row (a curve gap, not a fabricated 0).
+        # Emitted unconditionally when present — a pure addition, not gated on any
+        # feature flag.
+        #
+        # WHY POOLED, NOT THE FIRST MICRO-BATCH. An earlier revision took the
+        # percentiles from the first TRAINED micro-batch, which is the one point in
+        # the iteration where the quantity is identically zero:
+        # `_compute_ref_log_probs` runs BEFORE `_grpo_update`, so at
+        # `n_updates == 0` the weights ARE the reference weights and `log_ratio` is
+        # 0 for a fixed row and exactly `-gap` for a jittered one. The percentiles
+        # then read ~0 no matter how far the policy drifted inside the iteration —
+        # the opposite of what they exist to measure, and unusable for the
+        # calibration the README points at. (The sibling `jitter/*` block gates on
+        # `n_updates == 0` DELIBERATELY, for the opposite reason: it wants a
+        # drift-free measurement.)
+        #
+        # Pooling also removes two lesser defects: a first micro-batch holding no
+        # negative row no longer loses the family for the whole iteration (~17% of
+        # iterations at an 80%-positive mix, against the ~0.4% the sibling block
+        # guards with a retry loop), and under `jitter_paired=True` the fixed
+        # copies are no longer all pinned at 0.
+        #
+        # The at-birth fraction is kept SEPARATELY and is scoped to the
+        # micro-batches whose FORWARD ran at theta == theta_ref, because that is the
+        # only place it is meaningful: there, a row already past its budget is a row
+        # born clip-dead, which is the tripwire `grpo_config.py`'s born-dead warning
+        # tells the operator to watch.
+        #
+        # THE SCOPE IS SUBTLE — two earlier revisions got it wrong:
+        #   * `drift_born_dead is None` (a content latch) is NOT positional. When the
+        #     first trained micro-batch holds no finite negative non-anchor row the
+        #     latch defers to a LATER micro-batch, past an optimizer step, and
+        #     reports post-step drift as at-birth death.
+        #   * Inferring pre-step-ness INSIDE the stats block cannot work, because
+        #     that block runs after `_apply_accumulated_grads()`. `n_updates == 0`
+        #     alone captures nothing at k=1 (the step already fired); adding
+        #     `n_micro_batches == 1` fixes k=1 but still drops the micro-batch that
+        #     CLOSES each window, so coverage was k-1 of k (measured: 7 of 8).
+        # Resolved by capturing `_fwd_was_pre_step = (n_updates == 0)` at the FORWARD,
+        # before backward()/step. Counts rather than a latch, so the fraction pools
+        # over every pre-step micro-batch — all k of them.
+        #
+        # Cost: two small on-device tensors per trained micro-batch (~10 KB per
+        # iteration at 300 x 8 rows), concatenated once at the end. The append is
+        # UNCONDITIONAL: an earlier revision gated it on `bool(_dr_fin.any())`, which
+        # is a device->host sync on every micro-batch. Empty tensors concatenate
+        # fine, so the non-finite filter runs once in the finalizer instead.
+        drift_down: list = []          # per-row -log_ratio (positive = eroded)
+        drift_budget: list = []        # per-row nat budget the loss enforced
+        # On-device counters, synced ONCE in the finalizer. Python ints here would
+        # need an .item() per micro-batch, which is what the unconditional append
+        # above exists to avoid — and on an iteration where every gradient window is
+        # dropped, `n_updates` stays 0 for the whole iteration so the born-dead
+        # branch runs on EVERY micro-batch, making a per-mb sync strictly worse than
+        # the one it replaced.
+        drift_born_over = torch.zeros((), device=self.device, dtype=torch.long)
+        drift_born_rows = torch.zeros((), device=self.device, dtype=torch.long)
+
         # ── Balanced training: dynamic epoch count ───────────────────────────
         # When dynamic_epoch_training=True, scale update_epochs using a tent function
         # of the positive-advantage fraction among live-group episodes:
@@ -3161,6 +3368,22 @@ class GRPOTrainer:
             k_last = 1.0
             k_min = None
             k_max = None
+            # HOW OFTEN a clamp bound the measured k, tracked because `k_min` alone
+            # cannot distinguish "the measurement was 2.25" from "the floor is 2.25".
+            #
+            # Deliberately FRACTIONS and not a pre-clamp `k_raw_min`, which an
+            # earlier revision emitted and which had three defects: `clamp` is
+            # monotone, so `k_min == clamp(k_raw_min)` and a cap-bound minimum can
+            # NEVER satisfy `k_raw_min < k_min` — the cap was structurally
+            # unreportable; it fired on default (unfloored) configs too, since the
+            # historical floor is still 1.0; and `k_raw` is a PREFIX estimate, so a
+            # minimum over ~300 micro-batches selects the shortest, noisiest prefix
+            # and reads exactly 0.0 whenever the first trained micro-batch had no
+            # alive negative rows (N_iter == 0) — a fabricated zero. Counting
+            # bindings is robust to all three.
+            k_floor_binds = 0
+            k_cap_binds = 0
+            k_measured_n = 0
 
         # Effective balanced-sampler positive ratio this iter, for logging — the
         # same value _iter_balanced_minibatches will use (via _effective_pos_ratio).
@@ -3676,6 +3899,15 @@ class GRPOTrainer:
                 # constant, not a group-relative comparison, so they are
                 # neither "good" nor "bad" in this sense.
                 pre_renorm_pos_adv_mask = (ready_advantages > 0) & ~anchor_row_mask
+                # Whether THIS micro-batch's forward ran at theta == theta_ref.
+                # Captured HERE, before backward()/_apply_accumulated_grads(), which
+                # is the whole point: the stats block runs AFTER the step, so
+                # inferring it there mis-scopes the micro-batch that CLOSES an
+                # accumulation window — its forward was pre-step but by then
+                # n_updates is already 1. That cost 1 of every k micro-batches
+                # (measured: k=8 captured 7) and left the born-dead sample short on
+                # exactly the recommended --gradient-accumulation-steps settings.
+                _fwd_was_pre_step = (n_updates == 0)
 
                 # Gated on anchors being enabled for the ITERATION, for the
                 # same reason as loss_divisor: a batch the fractional quota left
@@ -3758,11 +3990,141 @@ class GRPOTrainer:
                         anchor_row_mask, scaled_anchor, signal_vals
                     )
 
+                # --- Per-row lower clip bound (`rho_floor`) ------------------
+                # ONE tensor, SIX consumers (the five listed below plus the drift
+                # budget read-back). `1 - clip_eps_low` is read by the
+                # surrogate below, by PAWS's `alive_neg_mask`, by `clipfrac`, by
+                # `clip_killed_gradient` and by the jitter `over_clip` split. If
+                # any of those disagreed with the loss, PAWS's alive-erosion mass
+                # N (and hence k) and every clip metric would silently describe a
+                # different clip than the optimizer actually applied. So the bound
+                # is materialised exactly once, here, as a [B] tensor on ratio's
+                # device/dtype, and every one of those sites reads THIS tensor.
+                # None of them consults config.clip_eps_low for its bound.
+                #
+                # OFF (config.clip_low_mse_coef == 0.0, the default): a
+                # full-of-scalar tensor equal to `1 - clip_eps_low`. Values are
+                # bitwise identical to the scalar `torch.clamp` this replaced (the
+                # scalar is cast to the tensor dtype either way).
+                #
+                # ON: rho = exp(MSE_ref - MSE_theta) with MSE_theta >= 0, so the
+                # ratio's whole reachable range is `rho <= exp(MSE_ref)` — measured
+                # 1.002-1.03 against `1 + clip_eps_high = 1.2`. `clip_eps_low` is
+                # in NAT units while the quantity that diverges is MSE_theta, so a
+                # flat epsilon grants wildly non-uniform MSE headroom within ONE
+                # iteration (measured 261x allowed inflation at `ref_mse/p10` vs
+                # 2.1x at `ref_mse/max`, at clip_eps_low=0.08). Per row instead:
+                #
+                #     MSE_ref_i   = max(-ref_log_prob_i, 0)
+                #     budget_i    = min(coef * MSE_ref_i, |ln(1 - clip_eps_low)|)
+                #     rho_floor_i = exp(-budget_i)
+                #
+                # so every row gets the same RELATIVE budget, 1 + coef.
+                #
+                # The `min(...)` keeps clip_eps_low an ABSOLUTE CEILING, so this
+                # can only ever be TIGHTER than the flat clip, never looser. That
+                # is the point: MSE_ref GROWS as the field degrades (measured
+                # 0.0023 -> 0.0297 over one run), so an uncapped coef * MSE_ref
+                # budget would WIDEN the clip exactly when it must tighten.
+                #
+                # MSE_ref is clamped at >= 0 before use. It is `-MSE` upstream so
+                # ref_log_prob should never be positive; the clamp exists so an fp
+                # edge case (or a stubbed/hand-built chunk) cannot produce a floor
+                # ABOVE 1.0, which would clip every row that failed to move.
+                #
+                # NON-FINITE ref_log_prob, stated precisely because the earlier
+                # version of this comment was wrong in both directions:
+                #   ref_log_prob = -inf -> MSE_ref = +inf -> budget pinned to the
+                #     ceiling, so the FLOOR degrades to the flat clip -- but
+                #     log_ratio is then +inf too, so the micro-batch is dropped
+                #     wholesale by the pre-existing non-finite-loss guard. The
+                #     graceful floor never actually gets used.
+                #   ref_log_prob = +inf -> MSE_ref = -inf -> clamp_min(0) -> budget
+                #     0 -> floor exactly 1.0, the TIGHTEST floor, not the ceiling.
+                #   NaN -> NaN floor -> NaN loss -> dropped by the same guard. Fails
+                #     LOUD rather than silently un-clipping the row (every
+                #     comparison against a NaN floor is False).
+                #
+                # PRECISION: `exp(-(-log(1 - eps)))` does NOT reliably round-trip to
+                # `1 - eps` in fp32 — swept over eps in {0.001..0.999} it lands one
+                # `1 - eps` in fp32. Measured ULP-delta histogram over eps in
+                # {0.001..0.999}: {-2: 5, -1: 118, 0: 745, +1: 123, +2: 6, +3: 2}.
+                # The maximum(...) below pins the 123 below-cases up, which is what
+                # makes "never looser than the flat clip" true and makes a
+                # ceiling-pinned floor bitwise equal to the OFF path's in the 745+123
+                # cases; in the 131 above-cases it stays 1-3 ULP tighter. The off
+                # switch remains a separate branch so the flags-off path is a literal
+                # `full_like`, not an exp round-trip.
+                #
+                # ANCHOR ROWS get the same formula — their ref_log_prob is a real
+                # measurement, and they do pass through the surrogate, so they need
+                # an entry. It is inert for them by the four-case table in
+                # clip_killed_gradient(): an anchor row carries a constant POSITIVE
+                # advantage, and a positive row's `min()` always picks the
+                # unclamped branch when the ratio is below the lower bound, so
+                # tightening `rho_floor` cannot kill an anchor row's gradient. It
+                # can only change the sign-agnostic `clipfrac`, which is a metric.
+                # (Anchors are excluded from the PAWS masses upstream, so a tighter
+                # floor cannot move k through them either.)
+                _flat_floor = 1 - self.config.clip_eps_low
+                if self.config.clip_low_mse_coef > 0.0:
+                    with torch.no_grad():
+                        _mse_ref = (-ref_log_probs).clamp_min(0.0)
+                        _budget = (
+                            self.config.clip_low_mse_coef * _mse_ref
+                        ).clamp_max(-math.log(max(_flat_floor, 1e-12)))
+                        # maximum(..., _flat_floor) is REQUIRED for the "never
+                        # looser than the flat clip" property, not belt-and-braces:
+                        # `exp(-(-log(1 - eps)))` does not round-trip to `1 - eps`
+                        # in fp32. Swept over eps in {0.001..0.999}, 123 of 999
+                        # values land BELOW it (eps=0.067 -> 0.9329999685 vs
+                        # 0.9330000281; 118 by one ULP, 5 by two), i.e. a
+                        # ceiling-pinned row would be marginally LOOSER than the flat
+                        # clip. Snapping up costs at most 2 ULP of tightness on a
+                        # ceiling-pinned row and makes its floor BITWISE EQUAL to the
+                        # OFF path's wherever the round-trip is exact or low.
+                        rho_floor = torch.maximum(
+                            torch.exp(-_budget).to(
+                                device=ratio.device, dtype=ratio.dtype
+                            ),
+                            torch.full_like(ratio, _flat_floor),
+                        )
+                else:
+                    rho_floor = torch.full_like(ratio, _flat_floor)
+
                 # --- Clipped surrogate loss ---
                 surr1 = ready_advantages * ratio
+                # torch.clamp with BOTH bounds as TENSORS. Value-identical to the
+                # scalar-bound form for a uniform bound (bitwise over 2e5 random
+                # rows x fp32/bf16/fp64, exact-boundary values included) AND
+                # gradient-identical to it, including at an exact tie.
+                #
+                # An earlier revision used maximum(minimum(...)). That is
+                # value-identical but NOT gradient-identical: at `ratio == bound`
+                # clamp routes the full gradient to the selected branch while
+                # maximum/minimum split it 0.5/0.5, measuring d(loss)/d(ratio) =
+                # -0.75 against clamp's -1.00 for either advantage sign. The outer
+                # `torch.min(surr1, surr2)` does NOT compensate — a differential
+                # test against the pre-change tree diverged in `grad_norm_max` and
+                # in the final weights on a batch containing boundary ratios, so
+                # this broke the off-switch invariant. Ties are rare but reachable:
+                # `ratio` is fp32 (fm_log_prob.py:293,511 accumulate in fp32), and
+                # a narrow fp32-ULP window of `log_ratio` maps exactly onto a bound
+                # (measured: 4 ULP at the lower bound with clip_eps_low=0.2, 8 at
+                # 0.08; 7 at the upper bound with clip_eps_high=0.2 but only 2 at
+                # 0.4 — it is per-bound, not a single figure), ~6e-7 per row.
+                #
+                # Two further reasons to prefer clamp: it also removes an order
+                # dependence (`max(min(x,hi),lo)` disagrees with clamp's
+                # `min(max(x,lo),hi)` whenever lo > hi — unreachable today given the
+                # eps validation, but latent), and both bounds must be tensors
+                # because torch.clamp rejects a mixed (Tensor min, Number max) call.
                 surr2 = ready_advantages * torch.clamp(
-                    ratio, 1 - self.config.clip_eps_low, 1 + self.config.clip_eps_high
+                    ratio,
+                    min=rho_floor,
+                    max=torch.full_like(ratio, 1 + self.config.clip_eps_high),
                 )
+
                 # UNWEIGHTED per-row loss — measured for the dynamic weight BEFORE
                 # weighting so the k estimate never feeds back on itself.
                 row_loss = -torch.min(surr1, surr2)
@@ -3786,8 +4148,10 @@ class GRPOTrainer:
 
                     # MEASURE (detached) this minibatch's ALIVE loss mass:
                     #   N = alive erosion = negative-adv rows whose gradient still
-                    #       flows (DEAD iff ratio < 1 - clip_eps_low: the clamp
-                    #       saturates and torch.min picks the constant branch).
+                    #       flows (DEAD iff ratio < rho_floor_i — the row's own
+                    #       lower bound, flat at 1 - clip_eps_low unless
+                    #       clip_low_mse_coef > 0: the clamp saturates and
+                    #       torch.min picks the constant branch).
                     #   D = alive reinforcement = exactly the rows we AMPLIFY that
                     #       still have gradient (DEAD iff upper-clipped, i.e.
                     #       ratio > 1 + clip_eps_high — rare here, but filtered so a
@@ -3801,10 +4165,15 @@ class GRPOTrainer:
                     with torch.no_grad():
                         r_det = ratio.detach()
                         rl_abs = row_loss.detach().abs()
+                        # `rho_floor`, NOT `1 - config.clip_eps_low`: the alive
+                        # test must be the SAME bound the surrogate above applied,
+                        # per row. With clip_low_mse_coef > 0 the two differ, and
+                        # reading the config here would make N count rows the loss
+                        # had already clip-killed — inflating N and therefore k.
                         alive_neg_mask = (
                             (~pre_renorm_pos_adv_mask)
                             & (~anchor_row_mask)
-                            & (r_det >= 1 - self.config.clip_eps_low)
+                            & (r_det >= rho_floor)
                         )
                         amp_alive_mask = pos_amp_mask & (
                             r_det <= 1 + self.config.clip_eps_high
@@ -3850,11 +4219,41 @@ class GRPOTrainer:
                     # minibatch), so N/D is unconstrained and there is no prior to
                     # stand on; 1.0 is the only defensible fallback there.
                     tratio = self.config.positive_advantage_weight_target_ratio
+                    # LOWER CLAMP on the MEASURED k (config.paws_k_floor_at_target).
+                    # Default 1.0 = the historical behaviour: "never de-amplify".
+                    #
+                    # WHY the tratio option exists. A tighter lower clip
+                    # (clip_low_mse_coef > 0) deliberately kills MORE negative
+                    # rows, which shrinks N, which through `tratio * N/D` LOWERS k
+                    # — so tightening the erosion brake would ALSO weaken
+                    # reinforcement, the opposite of the intent. Flooring at tratio
+                    # removes only the "amplify LESS than target" case; it never
+                    # amplifies more than the measurement asks for, because the
+                    # `min(..., max)` cap is applied after.
+                    #
+                    # Measured: N/D sits at 1.04-1.06 on healthy iterations, so
+                    # `tratio * N/D > tratio` and the floor is INERT there; N/D
+                    # falls to 0.66 during collapse, which is exactly where it
+                    # binds. __post_init__ requires tratio >= 1.0 when the flag is
+                    # on, so this floor is never below the historical one.
+                    #
+                    # The two OTHER branches are deliberately untouched:
+                    #   - the unmeasured prior (D_iter == 0) is ALREADY
+                    #     `min(max(tratio, 1.0), max)`, i.e. it already tracks
+                    #     tratio; with tratio >= 1.0 enforced it equals what this
+                    #     flag would ask for, so there is nothing to change.
+                    #   - the per_iteration_advantage_norm fallback is `k = 1.0`
+                    #     because that path has NO prior to stand on (the buffer-
+                    #     wide z-score breaks the minibatch zero-mean identity that
+                    #     makes N/D ~ 1). Flooring an unmeasured, unjustified value
+                    #     at tratio would amplify on the strength of nothing.
+                    _k_floor = tratio if self.config.paws_k_floor_at_target else 1.0
                     if D_iter > 0.0:
-                        k = min(max(
-                            tratio * N_iter / (D_iter + _POS_SCALE_EPS),
-                            1.0,
-                        ), self.config.positive_advantage_weight_max)
+                        k_raw = tratio * N_iter / (D_iter + _POS_SCALE_EPS)
+                        k = min(
+                            max(k_raw, _k_floor),
+                            self.config.positive_advantage_weight_max,
+                        )
                         k_measured = True
                     elif not self.config.per_iteration_advantage_norm:
                         k = min(
@@ -3862,13 +4261,17 @@ class GRPOTrainer:
                             self.config.positive_advantage_weight_max,
                         )
                         k_measured = False
+                        k_raw = float("nan")   # unmeasured: nothing to bracket
                     else:
                         k = 1.0
                         k_measured = False
+                        k_raw = float("nan")
                     # Stage the mass for post-guard commit (only if finite, so a
                     # ratio overflow can never poison the pool).
                     if math.isfinite(n_mass) and math.isfinite(d_mass):
-                        pending_pos_scale = (k, n_mass, d_mass, k_measured)
+                        pending_pos_scale = (
+                            k, n_mass, d_mass, k_measured, k_raw
+                        )   # k_raw is pre-clamp; see the binding counters
                     # row_weight is exactly k on amplified rows, 1.0 elsewhere.
                     # (Weighting an upper-clipped positive would be a no-op — its
                     # gradient is already zero — so pos_amp_mask needs no alive
@@ -4075,7 +4478,7 @@ class GRPOTrainer:
                         # it through would NaN the total loss, the pre-existing
                         # guard would drop the micro-batch, and with every
                         # micro-batch affected the whole iteration is discarded --
-                        # attributed by the surviving warning to "bf16 ratio
+                        # attributed by the surviving warning to "fp32 ratio
                         # overflow", which is the wrong cause. Skipping just this
                         # term costs one measurement instead of an iteration.
                         # relu is convex, so hinging per minibatch gives
@@ -4168,7 +4571,7 @@ class GRPOTrainer:
                 if smooth_loss is not None:
                     loss = loss + smooth_loss
 
-                # NaN/Inf guard: a single bad batch (e.g., bf16 overflow in
+                # NaN/Inf guard: a single bad batch (e.g., fp32 overflow in
                 # ratio = log_ratio.exp() when log_ratio is large, or NaN
                 # creeping in from numerical edge cases in the backbone)
                 # would otherwise propagate through optimizer.step() and
@@ -4204,13 +4607,24 @@ class GRPOTrainer:
                 # is a RATIO so the effect is second-order
                 # (n_nonfinite_grad_steps surfaces it).
                 if pending_pos_scale is not None:
-                    k_last, _n_mass, _d_mass, _k_measured = pending_pos_scale
+                    (k_last, _n_mass, _d_mass, _k_measured,
+                     _k_raw) = pending_pos_scale
                     # k_min/k_max track the MEASURED k's only — the prior is a
                     # config-derived constant, so folding it in would pin k_min to
                     # that constant and hide the measured spread entirely.
                     if _k_measured:
                         k_min = k_last if k_min is None else min(k_min, k_last)
                         k_max = k_last if k_max is None else max(k_max, k_last)
+                        if math.isfinite(_k_raw):
+                            k_measured_n += 1
+                            _fl = (
+                                tratio if self.config.paws_k_floor_at_target
+                                else 1.0
+                            )
+                            if _k_raw < _fl:
+                                k_floor_binds += 1
+                            elif _k_raw > self.config.positive_advantage_weight_max:
+                                k_cap_binds += 1
                     N_iter += _n_mass
                     D_iter += _d_mass
                     # Weighted positive mass, at the k this micro-batch was
@@ -4258,8 +4672,13 @@ class GRPOTrainer:
                     # part of it. For the signal-only view use
                     # clipfrac_effective_{pos,neg} (sign-bucketed, anchors
                     # excluded) and mean_ratio_anchor for the anchor split.
+                    #
+                    # `rho_floor`, not `1 - config.clip_eps_low` — see the
+                    # rho_floor block: all consumers of the lower bound read
+                    # the one tensor the surrogate applied, so this fraction cannot
+                    # describe a different clip than the optimizer used.
                     clipfrac = (
-                        (ratio < 1 - self.config.clip_eps_low)
+                        (ratio < rho_floor)
                         | (ratio > 1 + self.config.clip_eps_high)
                     ).float().mean().item()
                     clipfracs.append(clipfrac)
@@ -4279,7 +4698,7 @@ class GRPOTrainer:
                     total_log_ratio_abs += log_ratio.abs().mean().item()
                     # Ratio distribution tails — when mean_ratio≈1 but
                     # clipfrac jumps, the tail values are doing the clipping.
-                    # bf16 `ratio = log_ratio.exp()` can overflow to +inf
+                    # fp32 `ratio = log_ratio.exp()` can overflow to +inf
                     # even when the clipped loss stays finite (clamp bounds
                     # the loss but not the raw ratio). Filter the same way
                     # as grad_norms to keep TB charts clean.
@@ -4302,6 +4721,67 @@ class GRPOTrainer:
                         (pre_renorm_pos_adv_mask & (ready_advantages <= 0)).sum().item()
                     )
 
+                    # --- Per-ROW erosion-drift distribution (`drift/*`) --------
+                    # Accumulated on EVERY trained micro-batch and pooled at the
+                    # end; see the accumulator declaration for why the first
+                    # micro-batch alone measures nothing.
+                    #
+                    # Scope: PRE-renorm-NEGATIVE advantage, non-anchor rows. Erosion
+                    # is a group-relative notion (matching the sibling
+                    # clipfrac_{branch}_neg metrics), and anchors have no
+                    # group-relative sign.
+                    #
+                    # SIGNED, one-sided. The clip fires when `ratio < rho_floor`,
+                    # i.e. `log_ratio < -budget`, so the quantity is
+                    # `-log_ratio` (positive = eroded downward) tested against
+                    # `+budget`. An earlier revision used `|log_ratio| > budget`,
+                    # which also counted rows that drifted UPWARD past +budget — for
+                    # a negative-advantage row that is the UPPER bound, which by
+                    # clip_killed_gradient's four-case table leaves the row ALIVE.
+                    # Measured 4x over-report on a batch with one up-drifted row.
+                    # Rows that moved up appear as NEGATIVE values in the
+                    # percentiles, which is the honest representation.
+                    #
+                    # `budget_i` is read back off `rho_floor`, so it is the flat
+                    # |ln(1-clip_eps_low)| when clip_low_mse_coef == 0 and the
+                    # per-row min(coef*MSE_ref, ceiling) when it is on — one
+                    # expression for both.
+                    #
+                    # Non-finite rows are DROPPED. Note this filters `log_ratio`
+                    # and `rho_floor`, NOT `ratio`: a row whose `ratio` overflowed
+                    # to +inf still has a finite `log_ratio` and is correctly kept
+                    # (it is a real, very large upward move). What is excluded is a
+                    # non-finite `log_ratio` or floor, which comes from a
+                    # non-finite ref_log_prob — and that path makes the whole
+                    # micro-batch non-finite and drops it upstream anyway, so the
+                    # filter is a backstop. `drift/neg_rows` is the surviving
+                    # count, so a poisoned minibatch shows a small denominator
+                    # rather than a NaN curve.
+                    _dr_mask = (
+                        (~pre_renorm_pos_adv_mask) & (~anchor_row_mask)
+                    )
+                    _dr_down = (-log_ratio)[_dr_mask].float()
+                    _dr_bud = (-torch.log(rho_floor))[_dr_mask].float()
+                    # Unconditional append, no `.any()` sync; filtered in the
+                    # finalizer. Empty slices are harmless to torch.cat.
+                    drift_down.append(_dr_down)
+                    drift_budget.append(_dr_bud)
+                    # At-birth counts: PRE-STEP micro-batches only. See the
+                    # accumulator declaration for why the predicate is this and not
+                    # `n_updates == 0` alone (which captures nothing at k=1) nor a
+                    # content latch (which defers past a step). Strict `>` because
+                    # the loss's clip fires on `ratio < rho_floor`, so a row sitting
+                    # exactly AT its floor is not clipped. (The comparison is in log
+                    # space while the clip is in ratio space, so the two disagree
+                    # over a 2-16 fp32-ULP window around equality — the same order
+                    # as the clamp tie window, i.e. negligible.)
+                    if _fwd_was_pre_step:
+                        _bd_fin = (
+                            torch.isfinite(_dr_down) & torch.isfinite(_dr_bud)
+                        )
+                        drift_born_rows += _bd_fin.sum()
+                        drift_born_over += ((_dr_down > _dr_bud) & _bd_fin).sum()
+
                     # --- EFFECTIVE clipfrac (clip-term gradient zeroed) -------
                     # See the accumulator declarations for why this is not the
                     # same as `clipfrac`, and clip_killed_gradient() for the
@@ -4318,9 +4798,15 @@ class GRPOTrainer:
                     # clipfrac_effective_pos and break the one property that
                     # makes this metric useful — that _pos stays at 0 unless the
                     # ratio genuinely exceeded 1+clip_eps_high.
+                    #
+                    # `rho_floor` (a per-row TENSOR) is passed where the scalar
+                    # clip_eps_low used to go — clip_killed_gradient accepts either
+                    # and treats a tensor as the BOUND itself. Same tensor the
+                    # surrogate used, so clipfrac_effective_{pos,neg} can never
+                    # disagree with the clip the loss applied.
                     grad_dead = clip_killed_gradient(
                         ratio, surr1, surr2,
-                        self.config.clip_eps_low, self.config.clip_eps_high,
+                        rho_floor, self.config.clip_eps_high,
                     )
                     # Anchor rows sit in neither bucket — they have no
                     # group-relative sign, and pooling them into _pos would make
@@ -4382,8 +4868,9 @@ class GRPOTrainer:
                     # designed to surface — if it shrinks across iters, the
                     # regularizer is working.
                     if lam_pos > 0.0 or lam_neg > 0.0:
+                        # Same `rho_floor` tensor as the loss (consumer 5 of 6).
                         over_clip = (
-                            (ratio < 1 - self.config.clip_eps_low)
+                            (ratio < rho_floor)
                             | (ratio > 1 + self.config.clip_eps_high)
                         ).float()
                         log_ratio_abs = log_ratio.abs()
@@ -4487,6 +4974,64 @@ class GRPOTrainer:
         # the two apart instead of seeing a bare empty dict. The divisions below
         # stay safe either way: a step requires at least one backward(), so
         # n_updates > 0 implies n_micro_batches > 0.
+        def _drift_stats() -> dict | None:
+            """Pooled per-row erosion-drift distribution, or None if no rows.
+
+            Defined beside _smooth_stats() and for the same reason: BOTH the
+            early-return path and the normal result dict need it, and duplicating
+            the arithmetic would let the two drift apart.
+
+            Pools every trained micro-batch's negative signal rows (see the
+            accumulator declaration for why a single micro-batch cannot measure
+            this). One concatenation and one quantile per ITERATION, not per
+            micro-batch.
+            """
+            if not drift_down:
+                return None
+            down = torch.cat(drift_down)
+            bud = torch.cat(drift_budget)
+            # Single non-finite filter for the whole iteration, replacing a per-mb
+            # `.any()` sync. A non-finite log_ratio or floor comes from a
+            # non-finite ref_log_prob, which makes the whole micro-batch's loss
+            # non-finite and drops it upstream — so this is a backstop, and
+            # `neg_rows` is the surviving count.
+            fin = torch.isfinite(down) & torch.isfinite(bud)
+            down = down[fin]
+            bud = bud[fin]
+            n = int(down.numel())
+            if n == 0:
+                return None
+            q = torch.quantile(
+                down, torch.tensor([0.1, 0.5, 0.9], device=down.device)
+            )
+            out = {
+                # `neg_down_*` = -log_ratio on negative-advantage rows, so
+                # POSITIVE means eroded downward (toward the floor) and a negative
+                # value means that row drifted UP instead. Strict `>` matches the
+                # loss: the clip fires on `ratio < rho_floor`, so a row sitting
+                # exactly at its floor is not clipped.
+                "neg_down_p10": float(q[0]),
+                "neg_down_p50": float(q[1]),
+                "neg_down_p90": float(q[2]),
+                "neg_down_max": float(down.max()),
+                "neg_rows": n,
+                "neg_frac_over_budget": float((down > bud).float().mean()),
+                # Pooled mean of the per-row budget, so the percentiles above can
+                # be read against the constraint without recomputing it from the
+                # config. Not a threshold — the budget is per-row.
+                "budget_mean": float(bud.mean()),
+            }
+            _bd_rows = int(drift_born_rows.item())      # the single sync
+            if _bd_rows > 0:
+                # At theta == theta_ref, "over budget" == "born clip-dead". Absent
+                # (a curve gap) when no PRE-STEP micro-batch held a finite negative
+                # non-anchor row — never silently deferred to a post-step one.
+                out["neg_frac_born_dead"] = (
+                    int(drift_born_over.item()) / _bd_rows
+                )
+                out["neg_born_rows"] = _bd_rows
+            return out
+
         def _smooth_stats() -> dict:
             """Trajectory-roughness metrics, or {} when the feature is off.
 
@@ -4606,7 +5151,7 @@ class GRPOTrainer:
             #     step could have fired, so discarding it because the update was
             #     later thrown away loses a reading that is still correct. It is
             #     also the most likely EXPLANATION for landing in this branch: a
-            #     large gap means a large |log_ratio|, and bf16 `ratio =
+            #     large gap means a large |log_ratio|, and fp32 `ratio =
             #     log_ratio.exp()` overflowing is precisely what trips the
             #     non-finite-loss guard.
             #   - the effective clipfracs come from micro-batches that actually
@@ -4622,6 +5167,22 @@ class GRPOTrainer:
             early.update(_smooth_stats())
             if jitter_diag:
                 early["_jitter_diag"] = jitter_diag
+            # Same reasoning as the effective clipfracs below: `drift/*` comes off
+            # a micro-batch that TRAINED, so it is populated on the
+            # dropped-gradient path (n_micro_batches > 0) and simply absent when
+            # every minibatch was non-finite. A blown-up per-row drift is also a
+            # likely CAUSE of landing here, so this is where it matters most.
+            try:
+                _dd = _drift_stats()
+            except Exception as _e:        # noqa: BLE001 - diagnostic only
+                # print, not warnings.warn: Python's default filter dedupes a
+                # warning to ONCE per process, so a systematic failure would go
+                # silent after the first iteration. The sibling jitter handler
+                # prints for the same reason, to the same stream as the trainer.
+                print(f"  WARNING: drift/* diagnostic failed, skipping: {_e}")
+                _dd = None
+            if _dd:
+                early["_drift_diag"] = _dd
             if n_rows_pos_total > 0:
                 early["clipfrac_effective_pos"] = (
                     clipfrac_eff_sum_pos / n_rows_pos_total
@@ -4635,7 +5196,7 @@ class GRPOTrainer:
         if n_skipped_nonfinite > 0:
             print(
                 f"  WARNING: skipped {n_skipped_nonfinite} minibatch(es) for "
-                f"non-finite loss (NaN/Inf) — likely bf16 ratio overflow"
+                f"non-finite loss (NaN/Inf) — likely fp32 ratio overflow"
             )
         if n_nonfinite_grad_steps > 0:
             print(
@@ -4767,6 +5328,20 @@ class GRPOTrainer:
             if k_min is not None:
                 result["pos_adv_weight_k_min"] = k_min
                 result["pos_adv_weight_k_max"] = k_max
+                # Fraction of MEASURED micro-batches whose k a clamp moved. Read
+                # these before reading k_min/k_max: a floor_frac near 1 means k_min
+                # IS the floor and carries no information about N/D, which is
+                # exactly the ambiguity these resolve. Emitted whenever the
+                # iteration measured at all, including with the flag off (where the
+                # floor is the historical 1.0) — a clamp binding is worth seeing
+                # either way.
+                if k_measured_n > 0:
+                    result["pos_adv_k_floor_binds_frac"] = (
+                        k_floor_binds / k_measured_n
+                    )
+                    result["pos_adv_k_cap_binds_frac"] = (
+                        k_cap_binds / k_measured_n
+                    )
             if N_iter > 0.0:
                 _realized = Dw_iter / N_iter
                 if math.isfinite(_realized):
@@ -4856,6 +5431,25 @@ class GRPOTrainer:
         # over the iteration like everything else in `result`.
         if jitter_diag:
             result["_jitter_diag"] = jitter_diag
+        # Per-ROW erosion-drift distribution. Namespaced under `drift/` by
+        # _log_metrics for the same reason as `jitter/`: it is a
+        # pooled per-row distribution over the iteration, not a per-mb mean of the
+        # iteration. Emitted for every run, jitter and clip_low_mse_coef on or
+        # off.
+        # try/except for the same reason the jitter diagnostic has one: a failure in
+        # a DIAGNOSTIC must cost the metric, not ~13 minutes of collected simulation.
+        # torch.quantile also has a hard 2**24-element input limit — unreachable at
+        # realistic pool sizes (~3k-12k) but no longer bounded by mini_batch_size the
+        # way the pre-pooling version was.
+        try:
+            _dd = _drift_stats()
+        except Exception as _e:            # noqa: BLE001 - diagnostic only
+            # print, not warnings.warn — see the sibling handler on the
+            # early-return path for why (default filter dedupes to once/process).
+            print(f"  WARNING: drift/* diagnostic failed, skipping: {_e}")
+            _dd = None
+        if _dd:
+            result["_drift_diag"] = _dd
         return result
 
     def _per_chunk_gap_survey(self, chunks: list) -> dict | None:
@@ -5194,11 +5788,30 @@ class GRPOTrainer:
         n_jp = int(jp.sum().item())
         n_jn = int(jn.sum().item())
 
+        # FLAT `|ln(1 - clip_eps_low)|`, shared by pos_clip_budget_used and
+        # neg_clip_budget_used. Deliberately NOT the per-row rho_floor budget even
+        # when clip_low_mse_coef > 0: these two curves exist to be compared ACROSS
+        # RUNS, and a per-row denominator would silently change the y-axis of an
+        # existing curve the moment the coefficient was set. Hoisted above both
+        # branches so the two shares are provably on one denominator.
+        lo_budget = -math.log(max(1.0 - self.config.clip_eps_low, 1e-12))
+
         if n_jp > 0:
             gap_pos = float(gap_row[jp].mean().item())
             out["gap_pos"] = gap_pos
             out["jacobian_fro_sq"] = float(jac_row[jp].mean().item())
             out["n_rows_pos"] = n_jp
+            # Same share, POSITIVE side. Reported because only the harmless
+            # negative side was, and reading one without the other is what makes
+            # `train/clipfrac` unreadable: measured, gap_neg eats 1.9-3.1% of this
+            # budget while gap_pos silently eats 53-76% of the SAME budget — enough
+            # to push the sign-agnostic clipfrac toward 1.0 while killing nothing,
+            # since `min()` always picks the unclamped branch on a positive row
+            # (see clip_killed_gradient's four-case table). So this is NOT a
+            # ceiling on jitter_pos the way its sibling is a ceiling on jitter_neg;
+            # it is the explanation for a clipfrac reading that looks alarming and
+            # is not. The real positive-side ceiling is headroom_multiplier.
+            out["pos_clip_budget_used"] = gap_pos / lo_budget
             # STAGE-0 per-chunk spread. gap_row is already PER CHUNK; everything
             # else here collapses it to a mean. The coefficient of variation across
             # the rows of this one minibatch is the cheapest possible test of
@@ -5251,9 +5864,12 @@ class GRPOTrainer:
             # jitter_neg=0.05 this is a few percent (harmless); as it approaches
             # 1.0 every negative row is born outside the clip and contributes no
             # gradient at all. This is the hard ceiling on jitter_neg, and it is
-            # the only place clip_eps_low interacts with jitter — it cannot clip
-            # a POSITIVE row (min() always picks the unclamped branch there).
-            lo_budget = -math.log(max(1.0 - self.config.clip_eps_low, 1e-12))
+            # the only place clip_eps_low interacts with jitter in a way that can
+            # kill a row — it cannot clip a POSITIVE row (min() always picks the
+            # unclamped branch there), which is what pos_clip_budget_used above
+            # measures instead. `lo_budget` is the FLAT denominator, computed once
+            # above; its meaning is unchanged by clip_low_mse_coef so the curve
+            # stays comparable across runs.
             out["neg_clip_budget_used"] = out["gap_neg"] / lo_budget
         if int(fixed_row_mask.sum().item()) > 0:
             # Self-check, paired mode only: must read ~0 (bounded by bf16 noise,
@@ -6219,6 +6835,7 @@ class GRPOTrainer:
         skip_reason=None,
         phase_times=None,
         lora_delta_norm=None,
+        lora_cosines=None,
     ):
         """Log training metrics to TensorBoard and wandb."""
         if self.writer is None:
@@ -6389,7 +7006,7 @@ class GRPOTrainer:
         # Why it matters: phase_times documents the reason — one nan/inf poisons
         # wandb's chart autoscale for the REST OF THE RUN. And it is reachable
         # for the sign-split ratio metrics specifically: the comment on
-        # ratio_maxes notes that bf16 `ratio = log_ratio.exp()` can overflow to
+        # ratio_maxes notes that fp32 `ratio = log_ratio.exp()` can overflow to
         # +inf while the clipped loss stays FINITE (for A>0,
         # min(A*inf, A*(1+hi)) is the finite bound), so an inf ratio survives the
         # torch.isfinite(loss) guard and lands in ratio_sum_*. ref_log_prob is
@@ -6545,12 +7162,42 @@ class GRPOTrainer:
         #   jitter/neg_clip_budget_used = fraction of the erosion clip budget the
         #       negative rows' gap eats before any drift. -> 1.0 means every
         #       negative row is born clipped; that is the ceiling on jitter_neg.
+        #   jitter/pos_clip_budget_used = the SAME share on the positive side, on
+        #       the same FLAT denominator. NOT a ceiling: a positive row cannot die
+        #       on the lower bound. It exists because gap_pos measured 53-76% of
+        #       that budget while gap_neg measured 1.9-3.1%, which is why the
+        #       sign-agnostic train/clipfrac can read ~1.0 while killing nothing.
         #   jitter/n_rows_{pos,neg}     = row counts backing the two gaps. A
         #       ONE-MINIBATCH count, not an iteration total — the whole jitter/*
         #       block is a single-minibatch snapshot.
         #   jitter/gap_fixed_rows_selfcheck = must be ~0 (paired mode only).
         if update_stats and update_stats.get("_jitter_diag"):
             _emit("jitter", update_stats["_jitter_diag"])
+
+        # Per-ROW erosion-drift distribution. Its own `drift/` prefix for the same
+        # reason as `jitter/`: it is a pooled per-ROW distribution, not a
+        # per-mb mean over the iteration like every `train/` scalar. Ungated on
+        # n_updates — it comes off a micro-batch that trained, so it survives an
+        # iteration whose gradient windows were all dropped, and that is exactly
+        # the iteration whose diagnosis needs it.
+        #
+        # Reading guide:
+        #   drift/neg_down_p10/p50/p90/max = per-ROW `-log_ratio` on
+        #       pre-renorm-negative non-anchor rows, POOLED over every trained
+        #       micro-batch. POSITIVE = eroded toward the floor; NEGATIVE = that row
+        #       drifted up. Signed and one-sided on purpose: the clip fires on
+        #       `ratio < rho_floor`, so an upward move hits the UPPER bound and
+        #       leaves the row alive.
+        #   drift/neg_rows      = surviving (finite) pooled row count. An ITERATION
+        #       total with per-epoch multiplicity, not a single-minibatch count.
+        #   drift/budget_mean   = pooled mean of the per-row nat budget.
+        #   drift/neg_frac_over_budget = pooled fraction past their own budget --
+        #       "how much erosion is this clip killing".
+        #   drift/neg_frac_born_dead, drift/neg_born_rows = the same fraction over
+        #       PRE-STEP micro-batches only, where theta == theta_ref and therefore
+        #       "over budget" == "born clip-dead". The born-dead tripwire.
+        if update_stats and update_stats.get("_drift_diag"):
+            _emit("drift", update_stats["_drift_diag"])
 
         # Effective clipfrac. Ungated on n_updates for the same reason as the two
         # blocks above: it is populated by micro-batches that TRAINED, which
@@ -6672,7 +7319,7 @@ class GRPOTrainer:
                 # moving up = positive-branch headroom being consumed).
                 #
                 # Routed through _emit (unlike the un-split versions above) so
-                # the sign-split ratio metrics get the non-finite filter: a bf16
+                # the sign-split ratio metrics get the non-finite filter: an fp32
                 # `ratio = exp(log_ratio)` overflow reaches ratio_sum_* while the
                 # clipped loss stays finite, so +inf here is reachable in a way
                 # it is not for the pre-existing curves.
@@ -6713,6 +7360,11 @@ class GRPOTrainer:
                 "pos_adv_weight_k",
                 "pos_adv_weight_k_min",
                 "pos_adv_weight_k_max",
+                # Fraction of measured micro-batches whose k the floor / the cap
+                # moved. A floor_frac near 1 means pos_adv_weight_k_min IS the floor
+                # and says nothing about N/D.
+                "pos_adv_k_floor_binds_frac",
+                "pos_adv_k_cap_binds_frac",
                 "pos_adv_alive_neg_mass",
                 "pos_adv_pos_mass",
                 "n_pos_flipped_by_renorm",
@@ -6756,6 +7408,61 @@ class GRPOTrainer:
         # commentary matters — the model is unchanged.
         if lora_delta_norm is not None:
             self.writer.add_scalar("lora/weight_delta_norm", lora_delta_norm, iteration)
+
+        # Direction cosines of this iteration's weight step. Routed through _emit
+        # for the same non-finite filtering as every other diagnostic family.
+        #
+        # READ `lora/cos_step_early`. Measured across 6 runs its minimum is -0.058
+        # over 41 updates on runs that stayed healthy, and it reaches -0.49 / -0.62
+        # on the two that collapsed directionally — i.e. it turns negative BEFORE
+        # the success curve does. `lora/cos_step_cumulative` is emitted only
+        # because it is free: it is self-referential (once the run turns,
+        # `W_prev - W_init` turns with it) and measured POORLY, holding
+        # +0.37..+0.53 straight through a collapse. `lora/cos_step_prev` is
+        # step-to-step consistency, useful for telling a genuine direction change
+        # from per-iteration sampling noise.
+        if lora_cosines:
+            _emit("lora", lora_cosines)
+        # Provenance of the cos_step_early reference, written once PER DISTINCT
+        # SOURCE (at global_step 0, so it does not accumulate per iteration). A
+        # TEXT summary rather than a scalar because _emit only writes numerics and
+        # an index-coded scalar would be one more thing to decode — and it
+        # matters: an in-run freeze scores a run against ITS OWN early direction
+        # (blind to a run that had already turned by iteration N), while "paths"
+        # scores it against another run's, and "none" means the curve is absent
+        # rather than unexamined.
+        #
+        # Latched on the source STRING, not a bool, so the pre-freeze "none" state
+        # is recorded once and then superseded once by the resolved source — at
+        # most two writes per run, never one per iteration. Gated on
+        # `lora_cosines is not None` so a caller that does not use this diagnostic
+        # at all (and a writer stub without add_text) is unaffected.
+        if lora_cosines is not None:
+            _src = self._lora_cos_ref_source or "none"
+            if _src != self._lora_cos_ref_logged:
+                if _src == "none":
+                    _txt = (
+                        "lora/cos_step_early is NOT being emitted: the L_early "
+                        "source is 'none' (no cos_ref_lora_paths, and the own-run "
+                        "reference has not frozen yet)."
+                    )
+                elif _src == "paths":
+                    _txt = (
+                        f"lora/cos_step_early is measured against L_early = "
+                        f"W(b) - W(a) from explicit paths: "
+                        f"a={self.config.cos_ref_lora_paths[0]}, "
+                        f"b={self.config.cos_ref_lora_paths[1]}"
+                    )
+                else:
+                    _txt = (
+                        f"lora/cos_step_early is measured against L_early from "
+                        f"'{_src}' — this run's OWN W_now - W_init, frozen after "
+                        f"{self.config.cos_ref_iterations} logged iteration(s). It "
+                        f"cannot detect a run that had already turned by then; "
+                        f"pass --cos-ref-lora-paths for an external reference."
+                    )
+                self.writer.add_text("lora/cos_ref_source", _txt, global_step=0)
+                self._lora_cos_ref_logged = _src
 
         # Wandb logging. Mirror the TB gates so the wandb dashboard doesn't
         # show fake zeros either.
@@ -6882,6 +7589,8 @@ class GRPOTrainer:
                                 # Nested dict, not a scalar — mirrored under the
                                 # jitter/ prefix just below, same as the TB side.
                                 "_jitter_diag",
+                                # Likewise nested; mirrored under drift/ below.
+                                "_drift_diag",
                                 # Excluded so the finite-filtered copies added
                                 # below are the ONLY source of these keys.
                                 # Without this exclusion the unfiltered value
@@ -6913,6 +7622,14 @@ class GRPOTrainer:
                             for k, v in update_stats["_jitter_diag"].items()
                             if math.isfinite(v)
                         })
+                    # Mirror the TB-side drift/* block, ungated for the same
+                    # reason: it comes off a micro-batch that trained.
+                    if update_stats.get("_drift_diag"):
+                        log_dict.update({
+                            f"drift/{k}": v
+                            for k, v in update_stats["_drift_diag"].items()
+                            if math.isfinite(v)
+                        })
                     # Effective clipfrac, also ungated (populated by any
                     # micro-batch that trained, including on a dropped-window
                     # iteration).
@@ -6935,6 +7652,12 @@ class GRPOTrainer:
                     })
                 if lora_delta_norm is not None:
                     log_dict["lora/weight_delta_norm"] = lora_delta_norm
+                if lora_cosines:
+                    log_dict.update({
+                        f"lora/{k}": v
+                        for k, v in lora_cosines.items()
+                        if math.isfinite(v)
+                    })
                 if (self.config.dynamic_epoch_training and update_stats is not None
                         and update_stats.get("n_updates", 0) > 0):
                     if "actual_epochs" in update_stats:
@@ -7682,7 +8405,8 @@ class GRPOTrainer:
         policy regardless of what the loss says.
 
         Accumulates the squared-delta sum on-device with a single sync at
-        the end. The naive per-param `.item()` pattern triggers one
+        the end. (Exception: the one-shot reference FREEZE does a per-tensor
+        `.cpu()` and `float(...)`, on exactly one iteration per run.) The naive per-param `.item()` pattern triggers one
         GPU→CPU sync per LoRA tensor (~hundreds), measurably stalling the
         log call on real hardware.
         """
@@ -7699,6 +8423,292 @@ class GRPOTrainer:
                     delta = p.detach().float() - self._lora_init_params[name].float()
                     total_sq = total_sq + delta.pow(2).sum()
         return float(total_sq.sqrt().item())
+
+    # ── Weight-step direction cosines (lora/cos_step_*) ──────────────────────
+
+    def _dit_param_prefix(self) -> str:
+        """Prefix that turns a DiT-relative state_dict key into a model-relative one.
+
+        `save_lora_checkpoint` filters `model.action_head.model.state_dict()`, so
+        a checkpoint's keys are DiT-relative (`transformer_blocks.0...`) while
+        `model.named_parameters()` yields model-relative ones
+        (`action_head.model.transformer_blocks.0...`). Derived by IDENTITY —
+        walking named_modules until the object IS the DiT — rather than
+        hardcoding "action_head.model.", so a future refactor that moves the DiT
+        cannot silently produce an all-keys-missing reference.
+        """
+        dit = self.model.action_head.model
+        for name, mod in self.model.named_modules():
+            if mod is dit:
+                return f"{name}." if name else ""
+        raise RuntimeError(
+            "could not locate action_head.model inside model.named_modules(); "
+            "cannot map LoRA checkpoint keys onto trainable parameter names."
+        )
+
+    def _load_lora_state(self, path: "str | Path") -> dict:
+        """Trainable-param-name → tensor for one LoRA checkpoint, on CPU.
+
+        Accepts either an `iter_NNNN/` directory or a `lora_weights.pt` file, and
+        returns keys in the SAME namespace as `_lora_init_params` (model-relative
+        `named_parameters()` names) so the two can be differenced tensor-by-tensor.
+
+        A plain `torch.load` of the filtered state dict rather than
+        `load_lora_checkpoint`: that function LOADS INTO the live model, which is
+        exactly what must not happen here — the reference direction is a
+        measurement input, not a weight restore.
+
+        Hard-fails on a key-set or shape mismatch against the live trainable set.
+        A silently-partial reference would make `cos_step_early` a cosine against
+        a different subspace than the step lives in, which reads as a plausible
+        number and is meaningless.
+        """
+        path = Path(path)
+        pt = path if path.is_file() else path / "lora_weights.pt"
+        if not pt.is_file():
+            raise RuntimeError(
+                f"cos_ref_lora_paths entry {path} holds no lora_weights.pt "
+                f"(looked at {pt}). Point at an iter_NNNN/ checkpoint directory "
+                f"written by _save_checkpoint, or at the .pt file itself."
+            )
+        raw = torch.load(pt, map_location="cpu")
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                f"{pt} did not deserialise to a state dict (got "
+                f"{type(raw).__name__}); it is not a LoRA checkpoint."
+            )
+        prefix = self._dit_param_prefix()
+        loaded = {f"{prefix}{k}": v for k, v in raw.items() if "lora_" in k}
+        live = {
+            name: p for name, p in self.model.named_parameters() if p.requires_grad
+        }
+        missing = sorted(set(live) - set(loaded))
+        extra = sorted(set(loaded) - set(live))
+        if missing or extra:
+            raise RuntimeError(
+                f"LoRA reference checkpoint {pt} does not match the live "
+                f"trainable parameter set: {len(missing)} live key(s) absent from "
+                f"the file (first: {missing[:3]}), {len(extra)} file key(s) not "
+                f"trainable here (first: {extra[:3]}). Most likely lora_rank / "
+                f"lora_target_modules differ from the run that wrote it."
+            )
+        for name, p in live.items():
+            if tuple(loaded[name].shape) != tuple(p.shape):
+                raise RuntimeError(
+                    f"LoRA reference shape mismatch on '{name}': file "
+                    f"{tuple(loaded[name].shape)}, live {tuple(p.shape)} (in "
+                    f"{pt}). Most likely lora_rank differs."
+                )
+        return {name: loaded[name].float() for name in live}
+
+    def _load_cos_ref_direction(self, path_a: str, path_b: str) -> dict:
+        """L_early = W(path_b) − W(path_a), as a CPU per-name dict.
+
+        Kept on CPU deliberately. The memory budget for this diagnostic is TWO
+        extra snapshots of `_lora_init_params`' size (~80 MB each at rank 16), and
+        those two are spent on the always-needed history (`_lora_prev_params`,
+        `_lora_prev_step`). L_early is a frozen constant read once per iteration —
+        i.e. once per ~13 minutes of wall clock — so paying a per-tensor H2D copy
+        for it costs nothing measurable and keeps device-resident extra memory at
+        exactly the budgeted two snapshots.
+        """
+        a = self._load_lora_state(path_a)
+        b = self._load_lora_state(path_b)
+        ref = {name: (b[name] - a[name]) for name in a}
+        total_sq = sum(float(t.pow(2).sum()) for t in ref.values())
+        if not (total_sq > 0.0) or not math.isfinite(total_sq):
+            raise RuntimeError(
+                f"cos_ref_lora_paths gave a degenerate reference direction "
+                f"(||W(b) - W(a)||^2 = {total_sq}). The two checkpoints are "
+                f"identical (or non-finite), so cos_step_early would divide by "
+                f"zero. Pass two DIFFERENT iterations of the same run."
+            )
+        return ref
+
+    def _compute_lora_step_cosines(self) -> dict:
+        """Direction cosines of THIS iteration's LoRA weight step. Advances history.
+
+        Emits (under `lora/` in _log_metrics):
+            cos_step_prev        cos(step_now, step_prev)
+            cos_step_cumulative  cos(step_now, W_prev - W_init)
+            cos_step_early       cos(step_now, L_early)   -- only when available
+            step_norm            ||step_now||, so a cosine can be read against the
+                                 size of the move that produced it
+
+        READ `cos_step_early`. Measured across 6 runs it has a minimum of -0.058
+        over 41 updates on the runs that stayed healthy and reaches -0.49 and
+        -0.62 on the two that collapsed directionally. `cos_step_cumulative` is
+        SELF-REFERENTIAL — once a run turns, `W_prev - W_init` turns with it — and
+        measured POORLY: it stayed at +0.37..+0.53 straight through a collapse. It
+        is emitted anyway because it is free, not because it is informative.
+
+        The reference L_early is either `W(b) - W(a)` from `cos_ref_lora_paths`
+        (loaded once at setup) or this run's own `W_now - W_init` frozen after
+        `cos_ref_iterations` logged iterations. The frozen-own variant cannot
+        detect a run that had ALREADY turned before the freeze; that is what the
+        explicit-paths form is for.
+
+        MEMORY. Two device-resident snapshots (`_lora_prev_params`,
+        `_lora_prev_step`), overwritten in place of accumulating a history;
+        L_early lives on CPU (see _load_cos_ref_direction). Per-tensor transients
+        only — no flattened copy of the whole parameter vector is ever
+        materialised.
+
+        SYNCS. Every dot product and squared norm accumulates into ONE device
+        vector; there is a single sync at the end, matching
+        _compute_lora_delta_norm's pattern. No `.item()` per tensor.
+
+        ZERO-STEP ITERATIONS. When the weights did not move (the early-skip log
+        path, or an iteration whose every gradient window was dropped) the step is
+        the zero vector and every cosine is undefined. Returns `{}` AND leaves the
+        history untouched, so the next real step is still compared against the
+        last real step rather than against zero.
+
+        FIRST LOGGED ITERATION. Also returns `{}`: it seeds `_lora_prev_params`
+        and has no predecessor to difference against. Nothing is lost by that —
+        the only quantity that WOULD be defined there is `step_norm`, and at
+        iteration 1 of a fresh run `lora/weight_delta_norm` already IS
+        `||W_1 - W_init||`. Seeding from `_lora_init_params` instead would buy a
+        duplicate of that number at the cost of a second code path.
+        """
+        init = getattr(self, "_lora_init_params", None)
+        if not init:
+            return {}
+        with torch.no_grad():
+            prev = self._lora_prev_params
+            if not prev:
+                # First logged iteration: nothing to difference against yet. Seed
+                # the history and emit nothing (a curve gap, not a fake 1.0).
+                # Stored fp32 so the in-place `copy_` below is exact even if a
+                # future refactor leaves a trainable param in bf16.
+                self._lora_prev_params = {
+                    name: p.detach().float().clone()
+                    for name, p in self.model.named_parameters()
+                    if name in init
+                }
+                return {}
+
+            ref = self._lora_cos_ref
+            prev_step = self._lora_prev_step
+            # PASS 1 — read-only accumulation. Nothing is mutated here, so the
+            # zero-step early return below can leave the history intact.
+            # [ <s,s>, <s,sp>, <sp,sp>, <s,c>, <c,c>, <s,e>, <e,e> ]
+            acc = torch.zeros(7, device=self.device, dtype=torch.float32)
+            for name, p in self.model.named_parameters():
+                if name not in init:
+                    continue
+                pv = prev[name]
+                step = p.detach().float() - pv
+                cum = pv - init[name].float()
+                acc[0] += step.pow(2).sum()
+                acc[3] += (step * cum).sum()
+                acc[4] += cum.pow(2).sum()
+                sp = None if not prev_step else prev_step.get(name)
+                if sp is not None:
+                    acc[1] += (step * sp).sum()
+                    acc[2] += sp.pow(2).sum()
+                if ref is not None and name in ref:
+                    # Per-tensor H2D for the CPU-resident reference; the largest
+                    # LoRA tensor is a few hundred KB, so this never adds a
+                    # meaningful transient.
+                    e = ref[name].to(device=step.device, dtype=step.dtype)
+                    acc[5] += (step * e).sum()
+                    acc[6] += e.pow(2).sum()
+            (ss, ssp, spsp, sc, cc, se, ee) = acc.tolist()   # the single sync
+
+            out: dict = {}
+            if not (ss > 0.0) or not math.isfinite(ss):
+                # No move (or a non-finite parameter, which _apply_accumulated_grads
+                # is supposed to have prevented): report nothing and keep the
+                # history intact so the NEXT real step still has a predecessor.
+                return out
+            step_norm = math.sqrt(ss)
+            out["step_norm"] = step_norm
+
+            def _cos(dot: float, other_sq: float) -> "float | None":
+                if not (other_sq > 0.0) or not math.isfinite(other_sq):
+                    return None
+                c = dot / (step_norm * math.sqrt(other_sq))
+                if not math.isfinite(c):
+                    return None
+                # Clamp only the fp round-off overshoot past +-1.
+                return max(-1.0, min(1.0, c))
+
+            for key, dot, osq in (
+                ("cos_step_prev", ssp, spsp),
+                ("cos_step_cumulative", sc, cc),
+                ("cos_step_early", se, ee),
+            ):
+                c = _cos(dot, osq)
+                if c is not None:
+                    out[key] = c
+
+            # ── PASS 2: advance the history IN PLACE ──────────────────────────
+            # `copy_` into the existing buffers rather than rebinding fresh
+            # clones: rebinding would hold the old and new dicts simultaneously
+            # and blow the two-snapshot budget for the duration of the rebuild.
+            # `_lora_prev_step` is allocated exactly once (on the second logged
+            # iteration) and overwritten forever after.
+            first_step = prev_step is None
+            if first_step:
+                prev_step = {}
+                self._lora_prev_step = prev_step
+            for name, p in self.model.named_parameters():
+                if name not in init:
+                    continue
+                pv = prev[name]
+                step = p.detach().float() - pv
+                if first_step:
+                    prev_step[name] = step
+                else:
+                    prev_step[name].copy_(step)
+                # copy_, not add_(step): `pv + (w - pv)` is not guaranteed to be
+                # bitwise `w`, and the next iteration's step is differenced
+                # against this value.
+                pv.copy_(p.detach().float())
+            self._lora_cos_n_logged += 1
+
+            # Freeze the own-run reference once, if no explicit paths were given.
+            # `_lora_prev_params` was JUST refreshed to W_now, so differencing it
+            # against init needs no third snapshot. Moved to CPU for the reason in
+            # _load_cos_ref_direction.
+            if (
+                self._lora_cos_ref is None
+                and self.config.cos_ref_lora_paths is None
+                and self._lora_cos_n_logged >= self.config.cos_ref_iterations
+            ):
+                frozen = {
+                    name: (self._lora_prev_params[name].float()
+                           - init[name].float()).cpu()
+                    for name in init
+                }
+                if any(float(t.pow(2).sum()) > 0.0 for t in frozen.values()):
+                    self._lora_cos_ref = frozen
+                    # Span is n_logged + 1 iterations of motion, not n_logged:
+                    # the FIRST logged iteration only seeds _lora_prev_params and
+                    # returns before the counter advances. And `_of_run` is not
+                    # decoration -- setup() resets _lora_prev_params and the
+                    # counter, so on a RESUMED run this reference is
+                    # W_(resume+n+1) - W_resume, i.e. the run is scored against its
+                    # own POST-resume direction. Pass --cos-ref-lora-paths to pin a
+                    # reference from the pre-resume lineage instead.
+                    # No span number in the string: the span is n_logged + 1 in the
+                    # normal case (the first logged iteration seeds
+                    # _lora_prev_params and returns before the counter advances) but
+                    # n_logged when that first iteration made no weight change, and
+                    # the two are not distinguishable from here. Report the counter.
+                    self._lora_cos_ref_source = (
+                        f"frozen_after_{self._lora_cos_n_logged}"
+                        f"_logged_iters_of_run"
+                    )
+                    print(
+                        f"  cos_step_early reference frozen: W_now - W_init after "
+                        f"{self._lora_cos_n_logged} logged iteration(s)"
+                    )
+                # An all-zero cumulative delta means nothing has actually moved
+                # yet; leave the reference unset and retry next iteration rather
+                # than freezing a zero vector whose cosine is undefined forever.
+        return out
 
     def _save_checkpoint(self, iteration: int):
         """Save LoRA weights and optimizer state."""

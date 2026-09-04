@@ -1018,9 +1018,15 @@ def test_effective_clipfrac_aggregation_values():
           pos_dead.get("clipfrac_effective_neg") == 0.0,
           str(pos_dead.get("clipfrac_effective_neg")))
 
-    # The production callsite must pass (clip_eps_low, clip_eps_high) in that
+    # The production callsite must pass the LOW BOUND then clip_eps_high, in that
     # order. With the default 0.2/0.2 a swap is invisible, so force lo != hi.
-    seen_args: list[tuple[float, float]] = []
+    #
+    # The low argument is the per-row `rho_floor` TENSOR (see the rho_floor block
+    # in _grpo_update_inner: one tensor is shared by all five consumers of the
+    # lower bound so the loss and the clip metrics cannot desynchronise), and with
+    # clip_low_mse_coef == 0 every entry must equal the flat `1 - clip_eps_low`.
+    # `hi` stays the scalar epsilon.
+    seen_args: list = []
 
     def _spy(ratio, s1, s2, lo, hi):
         seen_args.append((lo, hi))
@@ -1032,9 +1038,16 @@ def test_effective_clipfrac_aggregation_values():
                        config_overrides=dict(clip_eps_low=0.08, clip_eps_high=0.4))
     finally:
         train_grpo.clip_killed_gradient = real_pred
-    check("production callsite passes (clip_eps_low, clip_eps_high) in order",
-          seen_args and all(a == (0.08, 0.4) for a in seen_args),
-          f"observed {sorted(set(seen_args))}")
+    check("production callsite passes (rho_floor, clip_eps_high) in order",
+          bool(seen_args) and all(
+              torch.is_tensor(lo) and bool((lo == 1 - 0.08).all()) and hi == 0.4
+              for lo, hi in seen_args
+          ),
+          f"observed {[(type(a).__name__, b) for a, b in seen_args[:3]]}")
+    check("... and the flat rho_floor is a genuine per-ROW tensor, not a scalar",
+          bool(seen_args) and all(a.dim() == 1 and a.numel() > 1
+                                  for a, _b in seen_args),
+          f"dims {[tuple(a.shape) for a, _ in seen_args[:3]]}")
 
 
 def test_diagnostic_failure_is_isolated():

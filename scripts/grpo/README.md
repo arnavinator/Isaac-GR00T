@@ -30,6 +30,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_smoothness.py` | CPU suite for the trajectory-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the derived sampler schedule, the last-step-differentiable rollout (exact value + gradient localized to the final step), the `compute_fm_log_prob` return contract, both instruments' jitter-invariance, the executed-chunk metrics, `smooth_ref.json` guard rejection **including instrument mismatch**, and `smooth_coef=0` bit-identity (stats, weights and RNG stream) through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
+| `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
 
 ---
 
@@ -1666,10 +1667,14 @@ rows by a live factor `k`, chosen so that reinforcement mass is
 
 ```
 N = alive erosion       = sum |row_loss| over negative-advantage rows still
-                          passing gradient (dead iff ratio < 1 - clip_eps_low)
+                          passing gradient (dead iff ratio < rho_floor_i, the
+                          row's own lower bound — flat at 1 - clip_eps_low
+                          unless clip_low_mse_coef > 0)
 D = alive reinforcement = sum |row_loss| over amplified positive rows still
                           passing gradient (dead iff ratio > 1 + clip_eps_high)
 k = clamp(target_ratio * N / D, 1.0, positive_advantage_weight_max)
+                          # lower clamp becomes target_ratio with
+                          # paws_k_floor_at_target=True
 ```
 
 Mass is measured on the **unweighted** row loss, so the estimate never feeds
@@ -1735,15 +1740,79 @@ there is no prior to stand on and the fallback is `1.0`; that combination
 measures much worse overall anyway (see "Gradient accumulation"). See
 "Checkpointing & Resuming → Resume" for the resume bug this design replaced.
 
+#### Flooring `k` at `target_ratio` (`paws_k_floor_at_target`)
+
+`paws_k_floor_at_target = False` (default) keeps the historical lower clamp of
+`1.0` on the **measured** branch:
+
+```
+k = clamp(target_ratio * N / D,  1.0 (default) | target_ratio (flag on),
+          positive_advantage_weight_max)
+```
+
+**Why.** A tighter lower clip (`clip_low_mse_coef > 0`) deliberately kills more
+negative rows, which shrinks `N`, which through `target_ratio · N/D` *lowers*
+`k`. So tightening the erosion brake would also weaken reinforcement — the
+opposite of the intent. Flooring at `target_ratio` removes only the "amplify
+*less* than target" case; it never amplifies more than the measurement asks for,
+because the `min(…, max)` cap is still applied afterwards.
+
+Measured: `N/D` sits at **1.04–1.06** on healthy iterations, so
+`target_ratio · N/D > target_ratio` and the floor is **inert** there; `N/D` falls
+to **0.66** during collapse, which is exactly where it binds.
+
+Two knife edges worth knowing:
+
+- At exactly `N/D == 1` the `D_iter + 1e-8` denominator puts the measured `k` a
+  part in 1e8 *below* `target_ratio`, so the floor binds by that much. Harmless,
+  but it means "inert" is a statement about `N/D > 1`, not `N/D ≥ 1`.
+- Validation rejects `paws_k_floor_at_target=True` with
+  `positive_advantage_weight_target_ratio < 1.0`: that would pin `k` *under* the
+  no-op point and force de-amplification, inverting the mechanism.
+
+The other two `k` branches are **untouched**, and each for its own reason:
+
+- The unmeasured prior (`D_iter == 0`) is already
+  `min(max(target_ratio, 1.0), max)` — it already tracks `target_ratio`, so with
+  `target_ratio ≥ 1.0` enforced there is nothing to change.
+- The `per_iteration_advantage_norm` fallback stays `k = 1.0` because that path
+  has **no prior to stand on** — the buffer-wide z-score breaks the minibatch
+  zero-mean identity that makes `N/D ≈ 1`. Flooring an unmeasured, unjustified
+  value at `target_ratio` would amplify on the strength of nothing.
+
 ---
+
+
+**Two guards on the flag.** `positive_advantage_weight_target_ratio` must be
+`≥ 1.0` (below the no-op point the floor would force de-amplification on every
+healthy iteration) **and** `≤ positive_advantage_weight_max`. The second is not
+cosmetic: `k = min(max(measured, target_ratio), max)`, so a target above the cap
+collapses the expression to the constant `max` for *every* measurement — the
+measurement-driven controller silently becomes a fixed amplifier, while the banner
+advertises an inverted interval (`clamped to [5, 2]`) as if it were a range.
+
+**`train/pos_adv_k_floor_binds_frac`** and **`train/pos_adv_k_cap_binds_frac`** give the
+fraction of MEASURED micro-batches whose `k` the floor / the cap moved. Read them before
+`k_min`/`k_max`: a `floor_frac` near 1 means `k_min` **is** the floor and carries no
+information about `N/D` — exactly the ambiguity they resolve.
+
+They replaced an earlier `pos_adv_weight_k_raw_min`, which had three defects. `clamp` is
+monotone, so `k_min == clamp(k_raw_min)` and a **cap**-bound minimum could never satisfy
+`k_raw_min < k_min` — the cap was structurally unreportable. It fired on default unfloored
+configs too, since the historical floor is still `1.0`. And `k_raw` is a *prefix* estimate,
+so a minimum over ~300 micro-batches selects the shortest, noisiest prefix and reads
+exactly `0.0` whenever the first trained micro-batch had no alive negative rows — a
+fabricated zero of exactly the kind this codebase avoids elsewhere.
 
 ### Clipped surrogate + KL
 
 ```
 ratio = (current_log_prob - ref_log_prob).exp()
 advantages = (A - A.mean()) / (A.std() + 1e-8)            # renorm per-batch
+# rho_floor is a [B] tensor, == 1 - clip_eps_low on every row at the default
+# clip_low_mse_coef = 0.0 (see "Per-row, MSE-referenced lower clip").
 surr1 = A * ratio
-surr2 = A * clamp(ratio, 1 - clip_eps_low, 1 + clip_eps_high)
+surr2 = A * clamp(ratio, min=rho_floor, max=1 + clip_eps_high)
 clip_loss = -min(surr1, surr2).mean()
 
 # Schulman k3 KL estimator (non-negative pointwise, symmetric gradient):
@@ -1794,6 +1863,257 @@ If ZERO minibatches commit a gradient step in an iteration (every batch
 non-finite, every window dropped, or every group dead), the iteration is
 treated as **skipped** and the resume checkpoint is saved under the last
 successfully-updated iter's name (see "Checkpointing").
+
+### Per-row, MSE-referenced lower clip (`clip_low_mse_coef`)
+
+`clip_low_mse_coef = 0.0` (default) is OFF and bit-identical to a flat
+`1 − clip_eps_low` floor on every row. `test_clip_floor.py` asserts the
+flags-off path's DETERMINISM and the additivity of the new keys; the
+bit-identity-vs-baseline check is an **out-of-tree differential** (recipe in that
+test's docstring) — it cannot live in-tree, because once this change is committed
+`HEAD` contains it.
+
+**Why a flat `clip_eps_low` is the wrong shape.** The importance ratio is
+`ρ = exp(MSE_ref − MSE_θ)`, and `MSE_θ ≥ 0`, so the whole reachable range is
+`ρ ≤ exp(MSE_ref)` — measured 1.002–1.03 against `1 + clip_eps_high = 1.2`.
+Consequences, both measured:
+
+- **Positive-advantage rows are never clipped.**
+  `train/clipfrac_effective_pos` is identically 0 in 69 of 69 logged
+  iterations. The negative branch is the only one with room to run, so the
+  lower clip is the *only* live brake in the objective.
+- **A flat epsilon grants wildly non-uniform MSE headroom inside ONE
+  iteration.** `clip_eps_low` is in log-ratio (nat) units while the quantity
+  that diverges is `MSE_θ`. At `clip_eps_low = 0.08` the allowed MSE inflation
+  spanned **261× at `ref_mse/p10` down to 2.1× at `ref_mse/max`** in a single
+  iteration.
+
+**The rule.** When `clip_low_mse_coef > 0`, each row gets
+
+```
+MSE_ref_i   = max(-ref_log_prob_i, 0)                        # clamped, see below
+budget_i    = min(clip_low_mse_coef * MSE_ref_i,
+                  |ln(1 - clip_eps_low)|)                    # nats
+rho_floor_i = exp(-budget_i)
+```
+
+so every row is allowed the same **relative** inflation, `1 + coef`, instead of
+the same absolute nat count.
+
+Three properties, all load-bearing:
+
+1. **`clip_eps_low` stays an absolute CEILING on the budget** (the `min`). The
+   mechanism can therefore only ever be *tighter* than today, never looser. That
+   is enforced, not merely implied: `exp(-(-log(1-eps)))` does **not** round-trip
+   to `1-eps` in fp32 (123 of 999 `eps` values land one ULP *below* it), so
+   `rho_floor` is `maximum(exp(-budget), 1-clip_eps_low)`, which also makes a
+   ceiling-pinned row's floor bitwise equal to the flags-off path's.
+   That is deliberate: `MSE_ref` **grows** as the field degrades (measured
+   0.0023 → 0.0297 over one run), so an uncapped `c · MSE_ref` budget would
+   *widen* the clip exactly when it needs to tighten.
+2. `MSE_ref` is clamped at `≥ 0` before use. It is `−MSE` upstream so a
+   positive `ref_log_prob` should be impossible; the clamp exists so an fp edge
+   case cannot put the floor **above** 1.0, which would clip every row that
+   failed to move.
+3. `coef == 0.0` is numerically identical to today, RNG stream and every
+   pre-existing TB scalar included.
+
+**One tensor, six consumers.** `1 − clip_eps_low` was read at six places, and
+if any of them disagreed with the loss then PAWS's alive-erosion mass `N` (hence
+`k`) and every clip metric would describe a different clip than the optimizer
+applied. So `_grpo_update_inner` materialises **exactly one** `[B]` tensor
+`rho_floor` immediately before the surrogate and hands that same object to all
+five; none of them consults `config.clip_eps_low` for its bound:
+
+| site | what it feeds | what breaks if it desynchronises |
+|---|---|---|
+| `surr2 = A · clamp(ρ, min=rho_floor, max=1+hi)` | the loss itself | — |
+| `alive_neg_mask = … & (ρ_det >= rho_floor)` | PAWS `N` → `k` | `N` counts rows the loss already clip-killed, inflating `k` |
+| `clipfrac = (ρ < rho_floor) \| (ρ > 1+hi)` | `train/clipfrac` | — |
+| `clip_killed_gradient(ρ, surr1, surr2, rho_floor, hi)` | `train/clipfrac_effective_{pos,neg}` | — |
+| `over_clip = (ρ < rho_floor) \| (ρ > 1+hi)` | `train/clipfrac_{fixed,jitter}_{pos,neg}` | — |
+
+`clip_killed_gradient` accepts `float | Tensor` for its low argument: a float is
+an *epsilon* (bound `1 − eps`, the legacy form every existing call site uses), a
+Tensor is the **bound itself**. Its four-case table is per row and holds for
+either form.
+
+`torch.clamp` with **both** bounds as tensors. Value-identical to the
+scalar-bound form (bitwise over 2e5 random rows × fp32/bf16/fp64, exact boundary
+values included) **and** gradient-identical to it, including at an exact tie.
+
+An earlier revision used `torch.maximum(torch.minimum(…))`, which is
+value-identical but **not** gradient-identical: at `ρ == bound`, `clamp` routes the
+full gradient to the selected branch while `maximum`/`minimum` split it 0.5/0.5,
+measuring `d(loss)/d(ρ) = −0.75` against clamp's `−1.00` for either advantage
+sign. The enclosing `torch.min` does *not* compensate — a differential test
+against the pre-change tree diverged in `grad_norm_max` and in the final weights
+on a batch containing boundary ratios, i.e. it broke the flags-off invariant.
+Ties are rare but reachable: `ρ` is fp32 (`fm_log_prob.py` accumulates in fp32),
+and a 4–8 fp32-ULP window of `log_ratio` maps exactly onto each bound (~6e-7 per
+row). Clamp also removes an order dependence — `max(min(x,hi),lo)` disagrees with
+clamp's `min(max(x,lo),hi)` whenever `lo > hi`, unreachable today given the `eps`
+validation but latent. Both bounds must be tensors: `torch.clamp` rejects a mixed
+`(Tensor min, Number max)` call.
+
+**Anchor rows** get the same formula — their `ref_log_prob` is a real
+measurement and they do pass through the surrogate, so they need an entry. It is
+inert for them: an anchor carries a constant *positive* advantage, and by the
+four-case table a positive row's `min()` always picks the unclamped branch below
+the lower bound. A tighter floor can move only the sign-agnostic
+`train/clipfrac`, which is a metric. Anchors are already excluded from the PAWS
+masses, so it cannot move `k` through them either.
+
+**`jitter/neg_clip_budget_used` keeps its flat `|ln(1 − clip_eps_low)|`
+denominator** so the curve stays comparable across runs; the coefficient does
+not change its meaning. Same for the new `pos_clip_budget_used`.
+
+**Pair it with `paws_k_floor_at_target`.** Killing more negative rows shrinks
+`N`, which under the current controller *lowers* `k` — so (A) alone tightens the
+erosion brake and weakens reinforcement at the same time. See "PAWS → Flooring
+`k` at `target_ratio`".
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+  --clip-low-mse-coef 8.0 --clip-eps-low 0.2 \
+  --positive-advantage-weight-scaling --paws-k-floor-at-target \
+  --positive-advantage-weight-target-ratio 1.75
+```
+
+The startup banner prints the resolved formula, the uniform inflation factor,
+the `MSE_ref` at which the ceiling starts binding, and the budget at two
+representative `MSE_ref` values (`train_grpo.MSE_REF_BANNER_PROBES`, which
+bracket the measured range) — so a coefficient large enough to pin every row to
+the ceiling, i.e. to silently revert to the flat clip, is visible in the first
+screen of output.
+
+### Per-row erosion-drift distribution (`drift/*`)
+
+Emitted every iteration, unconditionally — no flag, no cost worth measuring.
+**Pooled over every trained micro-batch** of the iteration, over
+**pre-renorm-negative advantage, non-anchor** rows.
+
+**Why.** Every `train/*` number is a mean over 266–336 micro-batches, so the
+per-**row** spread of erosion drift was completely unmeasured — and a lower-clip
+threshold calibrated from iteration means will clip far more rows than intended
+the moment `p90` is several times `p50`. These are the numbers
+`clip_low_mse_coef` should be picked from.
+
+**Why pooled, and not the first micro-batch** (which an earlier revision used):
+`_compute_ref_log_probs` runs *before* `_grpo_update`, so on the first trained
+micro-batch `n_updates == 0` and the weights **are** the reference weights —
+`log_ratio` is identically 0 for a fixed row and exactly `−gap` for a jittered
+one. The percentiles then read ~0 no matter how far the policy drifted, which is
+the opposite of what they exist to measure. (The sibling `jitter/*` block gates on
+`n_updates == 0` *deliberately*, for the opposite reason: it wants a drift-free
+measurement.) Pooling also means a first micro-batch holding no negative row no
+longer loses the family for the whole iteration — ~17 % of iterations at an
+80 %-positive mix.
+
+**Signed and one-sided.** The clip fires on `ratio < rho_floor`, i.e.
+`log_ratio < −budget`, so the quantity is `−log_ratio` (**positive = eroded
+downward**) tested against `+budget`. A row that drifted *up* shows as a negative
+value and is *not* counted over budget: for a negative-advantage row an upward
+move hits the **upper** bound, which by `clip_killed_gradient`'s four-case table
+leaves the row **alive**. An earlier revision compared `\|log_ratio\|` against the
+budget and over-reported 4× on a batch containing one up-drifted row.
+
+| Scalar | Meaning |
+|---|---|
+| `drift/neg_down_{p10,p50,p90,max}` | percentiles of per-row `−log_ratio` over that population, pooled across the iteration. Positive = eroded toward the floor; negative = drifted up. `torch.quantile`'s linear interpolation. |
+| `drift/neg_rows` | the surviving (finite) row count behind the pooled numbers — an **iteration** total, roughly `n_micro_batches × negative rows per batch`. |
+| `drift/budget_mean` | pooled mean of the per-row nat budget, so the percentiles can be read against the constraint without recomputing it. Not a threshold — the budget is per row. |
+| `drift/neg_frac_over_budget` | fraction of pooled rows past **their own** budget — the flat `\|ln(1−clip_eps_low)\|` when `clip_low_mse_coef == 0`, and `min(coef·MSE_ref_i, that ceiling)` when it is on (read back off `rho_floor`, one expression for both). Strict `>`: a row exactly at its floor is not clipped. The direct "how much erosion is this clip killing" readout. |
+| `drift/neg_frac_born_dead`, `drift/neg_born_rows` | the same fraction restricted to the **pre-step** micro-batches — those whose FORWARD ran before any `optimizer.step()` — captured at the forward, so it is all `gradient_accumulation_steps` of the first window (inferring it after the step drops the window-closing micro-batch, which cost 1 of every k) — where `θ == θ_ref` and "over budget" therefore means "**born** clip-dead". This is the tripwire the `clip_low_mse_coef` × `jitter_neg` config warning tells you to watch; it reads ~1.0 when the budget is below `gap_neg`. **Read the sample size with it**: the denominator is `neg_born_rows`, at most `gradient_accumulation_steps × mini_batch_size` rows (3–5 at the defaults, so the curve is quantized to `1/n`), and both keys are **absent** on any iteration whose first window held no negative signal row (~17 % at an 80 %-positive mix). |
+
+Non-finite rows are **dropped**, not counted — same policy as the
+`ratio_maxes` / `ratio_mins` accumulators, because `ratio = log_ratio.exp()` can
+overflow while the clipped loss stays finite. A poisoned micro-batch therefore
+shows up as a small `neg_rows` rather than a NaN curve.
+
+Ungated on `n_updates`, like `ref_mse/*` and `jitter/*`: the numbers come off a
+micro-batch that *trained*, so they survive an iteration whose gradient windows
+were all dropped — and a blown-up per-row drift is a likely *cause* of landing
+there. A micro-batch with no pre-renorm-negative signal rows emits **nothing**
+(a curve gap, not a fake 0).
+
+### Weight-step direction cosines (`lora/cos_step_*`)
+
+Emitted every iteration alongside the pre-existing `lora/weight_delta_norm`.
+`_compute_lora_step_cosines()` is called from the same two `_log_metrics` sites
+as `_compute_lora_delta_norm()`.
+
+| Scalar | Meaning |
+|---|---|
+| `lora/cos_step_early` | `cos(step_now, L_early)`. **This is the one to read.** Measured across 6 runs its minimum is −0.058 over 41 updates on the runs that stayed healthy, and it reaches **−0.49** and **−0.62** on the two that collapsed directionally — i.e. it turns negative before the success curve does. Emitted only when a reference is available. |
+| `lora/cos_step_prev` | `cos(step_now, step_prev)`. Step-to-step consistency; useful for telling a genuine direction change from per-iteration sampling noise. |
+| `lora/cos_step_cumulative` | `cos(step_now, W_prev − W_init)`. Emitted **because it is free, not because it is informative**: it is self-referential — once a run turns, `W_prev − W_init` turns with it — and measured POORLY, holding +0.37…+0.53 straight through a collapse. |
+| `lora/step_norm` | `‖step_now‖`, so a cosine can be read against the size of the move that produced it. |
+| `lora/cos_ref_source` | TB **text** summary (`global_step 0`), written once per distinct source: `"paths"`, `"frozen_after_N_logged_iters_of_run"`, or `"none"`. `M = N + 1`, because the first logged iteration only seeds the history and returns before the counter advances. `_of_run` is load-bearing: `setup()` resets the history, so on a **resumed** run the reference is `W_(resume+M) − W_resume` — the run is scored against its own *post-resume* direction. Pass `--cos-ref-lora-paths` to pin a reference from the pre-resume lineage. |
+
+**The reference `L_early`**, two forms:
+
+```
+cos_ref_lora_paths: tuple[str, str] | None = None   # (path_a, path_b); L_early = W(b) - W(a)
+cos_ref_iterations: int = 2                          # else freeze L_early = W_now - W_init
+                                                     # after N logged iterations
+```
+
+`cos_ref_lora_paths` points at two existing `iter_NNNN/` LoRA checkpoint dirs (or
+`lora_weights.pt` files) and is loaded ONCE at setup by a plain `torch.load` of
+the filtered state dict — deliberately *not* `load_lora_checkpoint`, which loads
+*into* the live model. Checkpoint keys are DiT-relative while
+`named_parameters()` is model-relative, so the prefix is derived by **module
+identity** (walking `named_modules()` until the object *is*
+`model.action_head.model`) rather than hardcoded. A key-set or per-key shape
+mismatch against the live trainable set, or a degenerate `W(b) == W(a)`, is a
+hard failure with an explanatory message: a silently-partial reference would make
+`cos_step_early` a cosine against a different subspace than the step lives in,
+which reads as a plausible number and is meaningless.
+
+**Why the frozen reference matters.** The in-run freeze scores a run against its
+*own* early direction, so it cannot detect a run that had already turned by
+iteration N. Pass `--cos-ref-lora-paths` from a known-good run's checkpoints for
+an external reference. `--cos-ref-iterations` must be `≥ 1`; a zero reference
+vector has no defined cosine.
+
+**Memory and syncs.** Two device-resident snapshots of `_lora_init_params`' size
+(~80 MB each at rank 16): `_lora_prev_params` (W at the previous logged
+iteration) and `_lora_prev_step`. Both are `copy_`-ed **in place** rather than
+rebound, so no history accumulates and no rebuild ever holds an old and a new
+copy at once. `L_early` lives on **CPU** — it is a frozen constant read once per
+~13 minutes of wall clock, so a per-tensor H2D copy costs nothing and keeps
+device-resident extra memory at exactly the budgeted two snapshots. Every dot
+product and squared norm accumulates into ONE device vector with a single sync at
+the end, matching `_compute_lora_delta_norm`'s pattern — no `.item()` per tensor.
+
+**Edges.** The first logged iteration and any zero-step iteration (the early-skip
+log path, or an iteration whose every gradient window was dropped) emit nothing
+AND leave the history untouched, so the next real step is still compared against
+the last real *step* rather than against zero. Nothing is lost at iteration 1:
+the only quantity that would be defined there is `step_norm`, and
+`lora/weight_delta_norm` already *is* `‖W_1 − W_init‖`.
+
+### Knobs and files: per-row clip floor, `k` floor, new diagnostics
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `clip_low_mse_coef` (`--clip-low-mse-coef`) | `0.0` = OFF | Per-row lower clip: `budget_i = min(coef·MSE_ref_i, \|ln(1−clip_eps_low)\|)`, `rho_floor_i = exp(−budget_i)`. Uniform *relative* MSE budget `1 + coef`. `clip_eps_low` remains an absolute ceiling, so it can only ever be tighter than the flat clip. |
+| `paws_k_floor_at_target` (`--paws-k-floor-at-target`) | `False` | Floor the MEASURED PAWS `k` at `positive_advantage_weight_target_ratio` instead of `1.0`. Requires `1.0 ≤ target_ratio < positive_advantage_weight_max`. Only consulted with `positive_advantage_weight_scaling=True`. |
+| `cos_ref_lora_paths` (`--cos-ref-lora-paths`) | `None` | `(path_a, path_b)` — two existing LoRA checkpoint dirs (or `lora_weights.pt` files). `L_early = W(b) − W(a)`, loaded once at setup. |
+| `cos_ref_iterations` (`--cos-ref-iterations`) | `2` | When `cos_ref_lora_paths` is unset, freeze `L_early = W_now − W_init` after this many logged iterations. Must be `≥ 1`. |
+
+New TB families: `drift/*` (9 scalars), `lora/cos_step_{prev,cumulative,early}`,
+`lora/step_norm`, `lora/cos_ref_source` (text), `jitter/pos_clip_budget_used`.
+All are pure additions and emit unconditionally where their inputs exist.
+
+| File | Change |
+|------|--------|
+| `grpo_config.py` | Adds `clip_low_mse_coef`, `paws_k_floor_at_target`, `cos_ref_lora_paths`, `cos_ref_iterations` + four `__post_init__` validations (`coef ≥ 0` and finite; the flag/`target_ratio ≥ 1.0` interaction; `cos_ref_iterations ≥ 1`; `cos_ref_lora_paths` a 2-tuple of existing paths, normalised to `tuple[str, str]`). |
+| `train_grpo.py` | `clip_killed_gradient` takes `float \| Tensor` for its low bound. `_grpo_update_inner` builds the single `rho_floor` tensor and threads it to all six consumers, applies the `k` floor, and pools per-row erosion travel over every trained micro-batch plus a pre-step-scoped born-dead fraction (returned as `_drift_diag`, carried onto the `n_updates == 0` path too). `_jitter_gap_diagnostics` hoists `lo_budget` and adds `pos_clip_budget_used`. New `_dit_param_prefix`, `_load_lora_state`, `_load_cos_ref_direction`, `_compute_lora_step_cosines`; `setup()` resolves `L_early`; `_log_metrics` takes `lora_cosines=` and emits `drift/*`, `lora/cos_*` and the provenance text (wandb mirrored). `train()` gains the two banner blocks; `MSE_REF_BANNER_PROBES` is the banner's `MSE_ref` probe pair. Class-level OFF defaults for the six `_lora_cos_*` attributes so `__new__`-built test trainers degrade instead of raising. |
+| `toy_train_grpo.py` | `_log_metrics` override forwards `lora_cosines`; banner prints `Clip low MSE c`. |
+| `test_clip_floor.py` | New CPU suite (see the Contents table). |
+| `test_jitter_metrics.py` | The `clip_killed_gradient` call-site spy now asserts the low argument is a per-ROW `rho_floor` tensor equal to `1 − clip_eps_low` (was: the float epsilon), with `clip_eps_high` still a scalar. |
 
 ### Gradient accumulation
 
@@ -2294,7 +2614,8 @@ torch RNG stream is unchanged versus runs recorded before this existed.
 | `jitter/jacobian_fro_sq` | the gap with the `E_k[(1−τ)²]·λ²` prefactor divided out, so it is comparable **across** `jitter_pos` settings. Two documented biases: it is `‖J‖²_F / D_valid` (the MSE is a per-valid-dim mean), and it reads high by `1 + ((√(1−λ²)−1)/λ)²` (+1.6% at λ=0.25, +7% at λ=0.50) because the true per-element perturbation variance is `(√(1−λ²)−1)² + λ²`. A comparable proxy, not an exact invariant. |
 | `jitter/gap_at_tau{k}`, `tau{k}_value` | per-τ profile over positive rows, `k` indexing `tau_centers`. Shows **where** along the denoising path the field is noise-sensitive; should fall as τ rises. `tau{k}_value` is the mean of the actual jittered τ, read back from the bf16 `timesteps` tensor, so it carries ~0.4% relative quantization versus the fp32 `tau_samples` on the chunks. |
 | `jitter/headroom_multiplier` | `(ref_mse/pos_mean + gap_pos) / ref_mse/pos_mean`. The second reading of the gap: without jitter `log ρ ≤ MSE_ref` caps reinforcement at ~0.01–0.05; with jitter the row starts at `ρ = e^-gap` with `MSE_ref + gap` of usable room, all of it usable because `clip_eps_low` cannot clip a positive row. ~1.0 means `jitter_pos` is doing nothing. Note the two terms differ in scope — `pos_mean` is an iteration-wide chunk mean, `gap_pos` a one-minibatch row mean. |
-| `jitter/neg_clip_budget_used` | `gap_neg / |log(1−clip_eps_low)|`. The hard ceiling on `jitter_neg`: → 1.0 means every negative row is born outside the clip and contributes no gradient. ~0.028 at `jitter_neg=0.05`; the wall is ≈0.30. This is the **only** place `clip_eps_low` interacts with jitter — it cannot clip a positive row. |
+| `jitter/neg_clip_budget_used` | `gap_neg / |log(1−clip_eps_low)|`. The hard ceiling on `jitter_neg`: → 1.0 means every negative row is born outside the clip and contributes no gradient. ~0.028 at `jitter_neg=0.05`; the wall is ≈0.30. This is the only place `clip_eps_low` interacts with jitter in a way that can KILL a row — it cannot clip a positive one. Denominator is the FLAT `clip_eps_low` budget even when `clip_low_mse_coef > 0`, so the curve stays comparable across runs. |
+| `jitter/pos_clip_budget_used` | `gap_pos / |log(1−clip_eps_low)|` — the same share on the positive side, on the **same flat denominator**. NOT a ceiling on `jitter_pos`: a positive row cannot die on the lower bound. It exists because only the harmless negative side used to be reported (1.9–3.1 %) while `gap_pos` silently ate **53–76 %** of the same budget, which is what makes the sign-agnostic `train/clipfrac` read near 1.0 while killing nothing. Read it as the explanation for an alarming-looking `clipfrac`; the real positive-side ceiling is `headroom_multiplier`. |
 | `jitter/gap_fixed_rows_selfcheck` | gap on paired-mode "fixed" rows. **Must read ~0** (≤1e-4); anything else means the fixed rows are not being fed the original ε. Absent in `jitter_paired=False`. |
 | `jitter/n_rows_pos`, `n_rows_neg` | row counts backing the two gaps — a **one-minibatch** count, not an iteration total. |
 | `ref_mse/{mean,p10,p50,p90,max}` | distribution of `MSE_ref = −ref_log_prob` over live chunks. Free (the values are already on the chunks). |
@@ -2769,6 +3090,16 @@ one where they are most needed.
 - `clip_eps_low` / `clip_eps_high` (both default 0.2) — asymmetric clip
   bounds; ratio clamped to `[1 - clip_eps_low, 1 + clip_eps_high]`. Each must
   be in `(0, 1)` (no ordering constraint between them).
+- `clip_low_mse_coef` (default `0.0` = **OFF**, bit-identical to a flat
+  `1 - clip_eps_low` floor). Makes the LOWER bound per-row and MSE-referenced:
+  `budget_i = min(coef · MSE_ref_i, |ln(1 - clip_eps_low)|)` nats,
+  `rho_floor_i = exp(-budget_i)`, so every row gets the same *relative* MSE
+  budget `1 + coef` instead of the same absolute nat count (which measured 261×
+  vs 2.1× allowed inflation across one iteration's rows). `clip_eps_low` stays an
+  absolute ceiling, so this can only ever be tighter, never looser (enforced by
+  snapping `rho_floor` up to the flat floor — see above). Must be
+  finite and `>= 0`. Pair with `paws_k_floor_at_target`. See "Per-row,
+  MSE-referenced lower clip".
 - `update_epochs` (default 2)
 - `mini_batch_size` (default 8 chunks)
 - `gradient_accumulation_steps` (default 1) — mini-batches accumulated per
@@ -2801,6 +3132,15 @@ one where they are most needed.
 - `anchor_max_row_frac` (default `1.0`) — cap on anchor chunks as a multiple of
   the signal chunk count; the compute knob and the strength knob at once. Waived
   when there are no signal chunks (an all-success iteration).
+- `paws_k_floor_at_target` (default `False`) — floor the MEASURED PAWS `k` at
+  `positive_advantage_weight_target_ratio` instead of at `1.0`. Removes only the
+  "amplify less than target" case, so it cannot over-amplify. Exists because a
+  tighter lower clip shrinks `N` and would otherwise *lower* `k`, weakening
+  reinforcement exactly as the erosion brake tightens. Inert while `N/D > 1`
+  (measured 1.04–1.06 when healthy); binds during collapse (measured 0.66).
+  Requires `target_ratio >= 1.0`; only consulted when
+  `positive_advantage_weight_scaling=True`. See "PAWS → Flooring `k` at
+  `target_ratio`".
 
 **Trajectory-roughness constraint** — see "Trajectory-Roughness Constraint" above.
 - `smooth_coef` (default `0.0` = **OFF**, bit-identical to a run without the
@@ -2852,6 +3192,15 @@ mismatch internally.
 **Logging**
 - TensorBoard writer always on; logs at `<checkpoint_dir>/tb_logs/`.
 - `use_wandb` + `wandb_project` + `wandb_run_name` for optional W&B.
+- `cos_ref_lora_paths` (default `None`) — `(path_a, path_b)`, two existing
+  `iter_NNNN/` LoRA checkpoint dirs (or `lora_weights.pt` files). Sets
+  `L_early = W(b) - W(a)`, the reference direction `lora/cos_step_early` is
+  measured against, loaded ONCE at setup. Validated at config construction: must
+  be a 2-tuple of existing paths. See "Weight-step direction cosines".
+- `cos_ref_iterations` (default `2`) — when `cos_ref_lora_paths` is unset, freeze
+  `L_early = W_now - W_init` after this many LOGGED iterations. Must be `>= 1`.
+  The own-run reference cannot detect a run that had already turned by then;
+  that is what the explicit-paths form is for.
 
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
 `train/{loss,clip_loss,kl_loss_last_iter,kl_loss_base_model,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
@@ -2866,6 +3215,23 @@ also `episode/scene_sr/<seed>` (one curve per pooled scene) and
 `episode/pool_pass`. `mean_log_ratio_abs`
 is the primary diagnostic for DPPO-style surrogates: large values mean
 the FM-MSE log-prob is noisy enough that most updates clip.
+
+Always-on diagnostic families added alongside the per-row clip floor (pure
+additions — emitted whatever the feature flags say):
+`drift/{neg_down_p10,p50,p90,max, neg_rows, budget_mean, neg_frac_over_budget,
+neg_frac_born_dead, neg_born_rows}` (the
+per-ROW erosion-drift distribution pooled over every trained micro-batch — the only
+view of the row spread that every `train/*` mean averages away, and what
+`clip_low_mse_coef` should be calibrated from),
+`lora/{cos_step_prev,cos_step_cumulative,cos_step_early,step_norm}` plus the
+`lora/cos_ref_source` text summary (**read `cos_step_early`**: it reached −0.49 /
+−0.62 on the two runs that collapsed directionally, while `cos_step_cumulative`
+held +0.37…+0.53 straight through), and
+`jitter/pos_clip_budget_used` (the positive side of the clip-budget share, on the
+same flat denominator as its negative sibling; measured 53–76 % against the
+negative side's 1.9–3.1 %, which is why `train/clipfrac` reads near 1.0 while
+killing nothing). See "Per-row erosion-drift distribution" and "Weight-step
+direction cosines".
 
 ---
 

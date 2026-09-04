@@ -149,6 +149,10 @@ logs_*/
 
 # General project data / artifacts
 episode_data/
+# Symlink to the ephemeral instance-store scratch dir, recreated by
+# ~/setup_scratch.sh after every VM stop/start. No trailing slash: git
+# matches "dir/" patterns against real directories only, never symlinks.
+grpo_data/grpo_episodes
 third_parties/
 *.rdb
 dump.rdb

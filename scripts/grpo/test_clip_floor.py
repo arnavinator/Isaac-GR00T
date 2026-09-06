@@ -378,12 +378,22 @@ def test_off_switch_determinism_and_additivity():
     check("drift/* is emitted with both flags off (pure addition)",
           bool(base.result.get("_drift_diag")),
           str(base.result.get("_drift_diag")))
-    check("drift/* carries all nine documented keys",
-          set(base.result["_drift_diag"]) == {
-              "neg_down_p10", "neg_down_p50", "neg_down_p90", "neg_down_max",
-              "neg_rows", "neg_frac_over_budget", "budget_mean",
-              "neg_frac_born_dead", "neg_born_rows"},
-          str(sorted(base.result["_drift_diag"])))
+    # REQUIRED keys are asserted exactly; the joint-structure keys are conditional
+    # (they need >= 2 rows and non-zero variance in both series, and this harness
+    # pins ref_log_prob = 0 so MSE_ref has no spread), so they are asserted as a
+    # SUBSET of the allowed set rather than required.
+    _dd_keys = set(base.result["_drift_diag"])
+    _required = {"neg_down_p10", "neg_down_p50", "neg_down_p90", "neg_down_max",
+                 "neg_rows", "neg_frac_over_budget", "budget_mean",
+                 "neg_frac_born_dead", "neg_born_rows",
+                 "neg_over_mseref_p50", "neg_over_mseref_p90",
+                 "neg_over_mseref_max"}
+    _optional = {"neg_mseref_top_decile", "neg_mseref_all",
+                 "neg_corr_drift_mseref"}
+    check("drift/* carries every REQUIRED key",
+          _required <= _dd_keys, str(sorted(_required - _dd_keys)))
+    check("... and emits nothing outside the documented set",
+          _dd_keys <= _required | _optional, str(sorted(_dd_keys - _required - _optional)))
 
     # Config defaults are the off state.
     c = GRPOConfig()
@@ -1947,6 +1957,67 @@ def test_ceiling_uses_clip_eps_low_not_high():
     check("... and is NOT what the clip_eps_high ceiling would give",
           not close(got, wrong, 1e-7), f"got={got!r} wrong={wrong!r}")
 
+
+def test_drift_joint_with_mse_ref():
+    """`neg_over_mseref_*` is drift per unit of the row's OWN MSE_ref.
+
+    This is exactly the quantity `clip_low_mse_coef` thresholds, so `p90` reads as
+    "the coefficient that leaves 90% of rows alone" — the whole point is that a
+    coefficient can be READ off a control run rather than inferred from marginals.
+    Also pins the joint-structure keys that say whether the runaway rows are the
+    well-fit or badly-fit ones.
+    """
+    print("\n[joint] drift-per-MSE_ref percentiles and the drift/MSE_ref joint")
+    lo_eps = 0.2
+    # Hand-built so every per-row ratio is known: (mse_ref, log_ratio) -> ratio
+    #   (0.010, -0.010) -> 1.0     (0.010, -0.020) -> 2.0
+    #   (0.020, -0.060) -> 3.0     (0.040, -0.160) -> 4.0
+    neg = [(0.010, -0.010), (0.010, -0.020), (0.020, -0.060), (0.040, -0.160)]
+    rows = [_Row(advantage=-1.0, mse_ref=m, log_ratio=lr) for m, lr in neg]
+    rows.append(_Row(advantage=+1.0, mse_ref=0.010, log_ratio=-0.001))
+    r = run_rows(rows, clip_low_mse_coef=0.0, clip_eps_low=lo_eps)
+    d = r.result["_drift_diag"]
+    ratios = sorted(-lr / m for m, lr in neg)          # [1, 2, 3, 4]
+    check("ratios are the hand-computed 1/2/3/4",
+          all(close(a, b, 1e-6) for a, b in zip(ratios, [1.0, 2.0, 3.0, 4.0])),
+          str(ratios))
+    check("neg_over_mseref_p50 matches an independent quantile",
+          close(d["neg_over_mseref_p50"], _quantile_linear(ratios, 0.5), 1e-5),
+          f"{d['neg_over_mseref_p50']} vs {_quantile_linear(ratios, 0.5)}")
+    check("neg_over_mseref_p90 matches",
+          close(d["neg_over_mseref_p90"], _quantile_linear(ratios, 0.9), 1e-5),
+          f"{d['neg_over_mseref_p90']} vs {_quantile_linear(ratios, 0.9)}")
+    check("neg_over_mseref_max == max ratio (4.0)",
+          close(d["neg_over_mseref_max"], 4.0, 1e-5),
+          str(d["neg_over_mseref_max"]))
+    # OPERATIONAL MEANING: a coefficient at p90 leaves ~90% of rows inside budget.
+    coef = d["neg_over_mseref_p90"]
+    n_over = sum(1 for m, lr in neg if -lr > coef * m)
+    check("a coef at p90 leaves all but the top row inside its budget",
+          n_over <= 1, f"{n_over} of {len(neg)} over budget at coef={coef:.3f}")
+    # JOINT: here drift and MSE_ref are positively correlated by construction, and
+    # the top-decile row is the HIGHEST MSE_ref -- the case where a per-row budget
+    # protects the runaway row and a flat budget would be tighter on it.
+    check("neg_corr_drift_mseref is positive on this construction",
+          d["neg_corr_drift_mseref"] > 0.5, str(d.get("neg_corr_drift_mseref")))
+    check("neg_mseref_top_decile exceeds the overall mean MSE_ref",
+          d["neg_mseref_top_decile"] > d["neg_mseref_all"],
+          f"{d.get('neg_mseref_top_decile')} vs {d.get('neg_mseref_all')}")
+    # And the opposite construction: drift ANTI-correlated with MSE_ref.
+    neg2 = [(0.040, -0.010), (0.020, -0.020), (0.010, -0.060), (0.010, -0.160)]
+    rows2 = [_Row(advantage=-1.0, mse_ref=m, log_ratio=lr) for m, lr in neg2]
+    rows2.append(_Row(advantage=+1.0, mse_ref=0.010, log_ratio=-0.001))
+    d2 = run_rows(rows2, clip_low_mse_coef=0.0,
+                  clip_eps_low=lo_eps).result["_drift_diag"]
+    check("anti-correlated construction gives a NEGATIVE correlation",
+          d2["neg_corr_drift_mseref"] < 0.0, str(d2.get("neg_corr_drift_mseref")))
+    check("... and the two constructions are far apart (the sign discriminates)",
+          d["neg_corr_drift_mseref"] - d2["neg_corr_drift_mseref"] > 1.0,
+          f"{d['neg_corr_drift_mseref']:.3f} vs {d2['neg_corr_drift_mseref']:.3f}")
+    check("... and its top-decile MSE_ref is BELOW the mean",
+          d2["neg_mseref_top_decile"] < d2["neg_mseref_all"],
+          f"{d2.get('neg_mseref_top_decile')} vs {d2.get('neg_mseref_all')}")
+
 if __name__ == "__main__":
     test_off_switch_determinism_and_additivity()
     test_snapup_at_a_nonexact_eps()
@@ -1964,6 +2035,7 @@ if __name__ == "__main__":
     test_paws_k_floor()
     test_monotone_in_coefficient()
     test_drift_diagnostics_values()
+    test_drift_joint_with_mse_ref()
     test_pos_clip_budget_used()
     test_lora_step_cosines()
     test_lora_cos_ref_from_paths()

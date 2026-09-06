@@ -3217,6 +3217,16 @@ class GRPOTrainer:
         # fine, so the non-finite filter runs once in the finalizer instead.
         drift_down: list = []          # per-row -log_ratio (positive = eroded)
         drift_budget: list = []        # per-row nat budget the loss enforced
+        # Per-row MSE_ref, kept ALONGSIDE the budget rather than derived from it:
+        # with clip_low_mse_coef == 0 the budget is the flat ceiling on every row,
+        # so MSE_ref is not recoverable from it. This is what turns the family from
+        # "how far did rows drift" into "how far did they drift RELATIVE TO their own
+        # MSE_ref" -- i.e. exactly the quantity clip_low_mse_coef thresholds, so the
+        # coefficient can be READ off a control run instead of inferred from
+        # marginals. It also answers whether the runaway rows are the well-fit or
+        # the badly-fit ones, which decides whether a per-row budget helps or hurts
+        # (a per-row budget gives high-MSE_ref rows MORE room).
+        drift_mseref: list = []
         # On-device counters, synced ONCE in the finalizer. Python ints here would
         # need an .item() per micro-batch, which is what the unconditional append
         # above exists to avoid — and on an iteration where every gradient window is
@@ -4762,10 +4772,12 @@ class GRPOTrainer:
                     )
                     _dr_down = (-log_ratio)[_dr_mask].float()
                     _dr_bud = (-torch.log(rho_floor))[_dr_mask].float()
+                    _dr_mr = (-ref_log_probs).clamp_min(0.0)[_dr_mask].float()
                     # Unconditional append, no `.any()` sync; filtered in the
                     # finalizer. Empty slices are harmless to torch.cat.
                     drift_down.append(_dr_down)
                     drift_budget.append(_dr_bud)
+                    drift_mseref.append(_dr_mr)
                     # At-birth counts: PRE-STEP micro-batches only. See the
                     # accumulator declaration for why the predicate is this and not
                     # `n_updates == 0` alone (which captures nothing at k=1) nor a
@@ -4995,9 +5007,12 @@ class GRPOTrainer:
             # non-finite ref_log_prob, which makes the whole micro-batch's loss
             # non-finite and drops it upstream — so this is a backstop, and
             # `neg_rows` is the surviving count.
-            fin = torch.isfinite(down) & torch.isfinite(bud)
+            mref = torch.cat(drift_mseref)
+            fin = (torch.isfinite(down) & torch.isfinite(bud)
+                   & torch.isfinite(mref))
             down = down[fin]
             bud = bud[fin]
+            mref = mref[fin]
             n = int(down.numel())
             if n == 0:
                 return None
@@ -5016,11 +5031,44 @@ class GRPOTrainer:
                 "neg_down_max": float(down.max()),
                 "neg_rows": n,
                 "neg_frac_over_budget": float((down > bud).float().mean()),
+                # DRIFT PER UNIT OF THE ROW'S OWN MSE_ref. `clip_low_mse_coef` is a
+                # threshold on exactly this ratio, so `neg_over_mseref_p90` reads
+                # directly as "the coefficient that would leave 90% of rows alone".
+                # Denominator clamped: a row with MSE_ref == 0 has a zero budget at
+                # any coefficient, so reporting +inf for it would poison the
+                # percentile rather than describe anything.
+                "neg_over_mseref_p50": float(
+                    torch.quantile(down / mref.clamp_min(1e-12), 0.5)
+                ),
+                "neg_over_mseref_p90": float(
+                    torch.quantile(down / mref.clamp_min(1e-12), 0.9)
+                ),
+                "neg_over_mseref_max": float(
+                    (down / mref.clamp_min(1e-12)).max()
+                ),
                 # Pooled mean of the per-row budget, so the percentiles above can
                 # be read against the constraint without recomputing it from the
                 # config. Not a threshold — the budget is per-row.
                 "budget_mean": float(bud.mean()),
             }
+            # JOINT structure of (drift, MSE_ref). Percentiles alone cannot say
+            # whether the runaway rows are the well-fit or badly-fit ones, and that
+            # decides whether a PER-ROW budget helps: coef * MSE_ref gives a
+            # high-MSE_ref row a proportionally larger budget, so if the tail is
+            # high-MSE_ref the per-row form protects exactly the wrong rows and a
+            # flat budget is better.
+            if n >= 2:
+                _thr = torch.quantile(down, 0.9)
+                _top = down >= _thr
+                if bool(_top.any()):
+                    out["neg_mseref_top_decile"] = float(mref[_top].mean())
+                    out["neg_mseref_all"] = float(mref.mean())
+                _ds, _ms = down.std(), mref.std()
+                if float(_ds) > 0.0 and float(_ms) > 0.0:
+                    out["neg_corr_drift_mseref"] = float(
+                        ((down - down.mean()) * (mref - mref.mean())).mean()
+                        / (_ds * _ms)
+                    )
             _bd_rows = int(drift_born_rows.item())      # the single sync
             if _bd_rows > 0:
                 # At theta == theta_ref, "over budget" == "born clip-dead". Absent
@@ -7193,6 +7241,16 @@ class GRPOTrainer:
         #   drift/budget_mean   = pooled mean of the per-row nat budget.
         #   drift/neg_frac_over_budget = pooled fraction past their own budget --
         #       "how much erosion is this clip killing".
+        #   drift/neg_over_mseref_p50/p90/max = drift per unit of the row's OWN
+        #       MSE_ref. `clip_low_mse_coef` is a threshold on exactly this ratio, so
+        #       p90 reads directly as "the coefficient that leaves 90% of rows
+        #       alone" -- pick the coefficient off a control run, do not infer it.
+        #   drift/neg_corr_drift_mseref, drift/neg_mseref_top_decile,
+        #   drift/neg_mseref_all = the JOINT structure. If the correlation is
+        #       positive and top_decile > all, the runaway rows are the BADLY-fit
+        #       ones, and a per-row budget (coef * MSE_ref) gives them MORE room --
+        #       a flat budget is then tighter where it matters. Negative correlation
+        #       is the reverse, and favours the per-row form.
         #   drift/neg_frac_born_dead, drift/neg_born_rows = the same fraction over
         #       PRE-STEP micro-batches only, where theta == theta_ref and therefore
         #       "over budget" == "born clip-dead". The born-dead tripwire.

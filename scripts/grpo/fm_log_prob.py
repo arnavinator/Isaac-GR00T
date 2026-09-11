@@ -156,19 +156,30 @@ def compute_fm_log_prob(
             bit-identical when jitter is disabled). The 4-D shape with leading
             K is required so each τ can use an independent ξ-jitter.
         return_per_tau: When True, ALSO return the un-averaged [K, B] per-τ
-            log-probs alongside the [B] mean. Intended for the once-per-iteration
-            jitter diagnostic in train_grpo._jitter_gap_diagnostics, which needs
-            the per-τ breakdown to fit
-                gap(τ) ≈ (1-τ)² · λ² · ‖∇_x v_θ‖²_F
-            i.e. to see WHERE along the denoising path the velocity field is
-            noise-sensitive — a single K-averaged number cannot show that.
+            log-probs alongside the [B] mean. Two callers:
+
+            * `train_grpo._jitter_gap_diagnostics` (once per iteration, under
+              `no_grad`) needs the per-τ breakdown to fit
+                  gap(τ) ≈ (1-τ)² · λ² · ‖∇_x v_θ‖²_F
+              i.e. to see WHERE along the denoising path the velocity field is
+              noise-sensitive — a single K-averaged number cannot show that.
+            * the gradient-decomposition probe
+              (`train_grpo._grad_probe_capture_jittered`, `grad_probe_every > 0`)
+              takes its JITTERED leg off the training forward's graph rather than
+              running a second jittered forward, and needs the un-averaged terms
+              so a τ SUBSET is takeable — and so that the identical subset can be
+              applied to the clean leg. Note this caller is NOT under `no_grad`:
+              the returned tensor carries the graph and is differentiated with
+              `torch.autograd.grad`, so the extra negation below must stay
+              differentiable (it does — nothing here detaches).
+
             Default False keeps the return type and the arithmetic
             bit-identical for every existing caller: the flag adds one Python
             `None` assignment on that path and nothing else. When True it does
             cost one extra elementwise negation per tau (`-per_sample_mse` is
             evaluated a second time rather than reusing the in-place `+=`
-            operand) — negligible, and the only callsite is a no_grad
-            diagnostic.
+            operand) — negligible either way, and on the probe's path the node it
+            adds is the one the measurement is taken from.
         smooth_dims: Optional 1-D LongTensor of action-dim column indices. When
             given (with `smooth_horizon`), the smoothness pass runs and reduces a
             trajectory to per-row roughness moments over

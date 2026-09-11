@@ -971,6 +971,83 @@ class GRPOConfig:
     # rather than basin width.
     per_chunk_gap_survey_size: int = 0
 
+    # ── GRADIENT-DECOMPOSITION PROBE (`gradprobe/*`; measurement only) ────────
+    #
+    # 0 = OFF (default), bit-identical to a run without it: no extra forwards, no
+    # `return_per_tau=True`, no `retain_graph=True`, no RNG consumed, no
+    # `gradprobe/*` curves, no banner line. N > 0 probes every Nth TRAINED
+    # micro-batch.
+    #
+    # WHAT IT MEASURES. On a positive-advantage row the loss minimises
+    # `MSE_theta(eps')` with `eps' = sqrt(1-lam^2) eps + lam xi`. In expectation
+    # over xi that single term is TWO gradients welded together:
+    #
+    #     d MSE_theta(eps')/d theta  =  d MSE_theta(eps)/d theta  +  lam^2 dP/dtheta
+    #                               =  g_R                       +  lam^2 g_P
+    #
+    # `g_R` is REINFORCEMENT (fit this successful chunk better at its OWN noise);
+    # `lam^2 g_P` is the Jacobian/HEADROOM term (the Jitter-GRPO regulariser).
+    # They share one coefficient, so their RATIO has never been tunable. The probe
+    # takes `g_jit` off the graph the training forward already built, runs ONE
+    # extra clean-eps forward for `g_R`, and forms `g_head = g_jit - g_R`, which
+    # IS `lam^2 g_P` exactly (no Taylor assumption). It then logs
+    # `R = ||g_head|| / ||g_R||` and `cos(g_R, g_head)`.
+    #
+    # WHY THOSE TWO NUMBERS. They decide three separate open questions:
+    #   * whether to add an AWR-on-success term, and at what coefficient
+    #     (`c ~= 0.95 (R - 1)` balances the blend);
+    #   * whether to instead LOWER `jitter_pos` (a NEGATIVE
+    #     `cos_reinforce_headroom` means the two components FIGHT, which argues
+    #     for shrinking the regulariser rather than adding a counterweight);
+    #   * what `positive_advantage_weight_target_ratio` is actually delivering —
+    #     PAWS balances `|A rho|` LOSS mass, but every positive row it amplifies
+    #     drags along a `lam^2 g_P` gradient component PAWS never measures.
+    # The prior "R ~= 14" estimate was `jitter/gap_pos / ref_mse/pos_mean`, a
+    # ratio of LOSS VALUES. It does NOT convert: `||grad MSE(eps)|| ~ 2 sqrt(MSE)
+    # ||grad_theta v||` while `||grad lam^2 P|| ~ 2 lam^2 sqrt(P) ||grad_theta
+    # grad_x v||`, and those second factors are different unlogged objects. R is
+    # genuinely unknown, plausibly anywhere in [1, 15].
+    #
+    # COST. One clean forward+backward on at most `grad_probe_max_rows` rows,
+    # i.e. ~+50% of ONE micro-batch. At ~300 micro-batches per iteration the
+    # per-iteration overhead is ~50/N %, so N = 15-30 buys 10-20 probes for
+    # 1.7-3.3% — the recommended range. The DISTRIBUTION of R is the deliverable
+    # (`ref_mse` spans p10 0.0013 to max 0.199 across rows, and R plausibly varies
+    # with it), so one probe per iteration is not enough.
+    grad_probe_every: int = 0
+
+    # Cap on the number of rows entering the probe's CLEAN-eps forward. This is
+    # the VRAM bound, and it is what makes the worst case independent of how many
+    # rows happen to be positive in a given micro-batch.
+    #
+    # Budget at the measured production peak (~21.5 GB of ~25.3 GB on an A10G at
+    # mini_batch_size=8, base after the training graph is freed ~9.7 GB, ~0.247 GB
+    # per (row, tau) at K=6):
+    #   * retained gradient vectors: 14,532,608 trainable fp32 params x 4 B =
+    #     58 MB each; at most `g_jit` and `g_R` coexist (`g_head` is formed IN
+    #     PLACE via `g_jit.sub_(g_R)`), so ~116 MB, under 0.5% of budget;
+    #   * `retain_graph=True` does not ENLARGE the training graph, it only delays
+    #     freeing it, so step 1 costs only the returned vector;
+    #   * the clean forward's activations are
+    #     `grad_probe_max_rows x |tau subset| x 0.247 GB` and they occur AFTER the
+    #     training graph is freed — at 4 rows and full K=6 that is ~5.9 GB, so
+    #     ~15.6 GB peak against the 21.5 GB the run already reaches.
+    # `vram/grad_probe_peak_delta` verifies this in production rather than
+    # trusting the arithmetic.
+    #
+    # Rows are the highest-|advantage| eligible ones, selected deterministically
+    # (sorted by pre-renorm |advantage| descending, ties broken by row index) so
+    # the sample is reproducible.
+    grad_probe_max_rows: int = 4
+
+    # 0 = use every tau in `tau_centers` (the default; the probe then measures
+    # exactly the quantity the loss uses). k > 0 uses the FIRST k centers,
+    # applied IDENTICALLY to both sides — the decomposition identity holds per
+    # tau, so a tau subset that differed between the jittered and clean legs
+    # would make `g_head` garbage rather than merely noisy. Lowering this is the
+    # second VRAM lever: the clean forward's activations scale linearly in it.
+    grad_probe_tau_subset: int = 0
+
     # Timestep centers (τ values) for FM log-prob evaluation during TRAINING ONLY.
     # This does NOT affect inference (action generation always uses exactly 4 Euler steps).
     # K = len(tau_centers) determines how many points along the noise→action interpolation
@@ -1203,6 +1280,40 @@ class GRPOConfig:
                     f"{_jname} must be in [0.0, 1.0), got {_jval}. "
                     f"Variance preservation requires λ < 1; use 0.0 to disable."
                 )
+
+        # ── Gradient-decomposition probe ─────────────────────────────────────
+        # Validated unconditionally, including at grad_probe_every == 0, for the
+        # same reason the smooth knobs are: a typo in a companion knob must
+        # surface at construction rather than the first time the probe is
+        # switched on. All three are hard failures — this is a diagnostic, so a
+        # silently-degraded reading is worse than not running it.
+        if self.grad_probe_every < 0:
+            raise ValueError(
+                f"grad_probe_every must be >= 0, got {self.grad_probe_every}. "
+                f"0 disables the probe (bit-identical to a run without it); "
+                f"N > 0 probes every Nth TRAINED micro-batch. A negative value "
+                f"would make `n_micro_batches % N` raise or, at -1, probe every "
+                f"single micro-batch at ~50% overhead."
+            )
+        if self.grad_probe_max_rows < 1:
+            raise ValueError(
+                f"grad_probe_max_rows must be >= 1, got "
+                f"{self.grad_probe_max_rows}. It caps the row count of the "
+                f"probe's clean-ε forward, which is the VRAM bound; 0 would "
+                f"select no rows and every probe would be skipped, producing an "
+                f"instrument that silently measures nothing."
+            )
+        if not (0 <= self.grad_probe_tau_subset <= len(self.tau_centers)):
+            raise ValueError(
+                f"grad_probe_tau_subset must be in "
+                f"[0, len(tau_centers)={len(self.tau_centers)}], got "
+                f"{self.grad_probe_tau_subset}. 0 means 'use every τ'; k > 0 "
+                f"uses the first k centers on BOTH legs of the decomposition. A "
+                f"value above K cannot be honoured — the jittered leg only has "
+                f"K per-τ terms — and clamping it silently would leave the two "
+                f"legs on different τ subsets, which makes g_head garbage rather "
+                f"than merely noisy."
+            )
 
         # ── Trajectory-roughness constraint ──────────────────────────────────
         # smooth_coef == 0.0 is the OFF switch and must stay a total no-op, so

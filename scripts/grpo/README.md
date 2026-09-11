@@ -32,6 +32,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
 | `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
 | `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
+| `test_grad_probe.py` | CPU suite for the gradient-decomposition probe (`grad_probe_every`), driving the real `_grpo_update_inner` plus the real `_grad_probe_capture_jittered` / `_grad_probe_finish` / `select_grad_probe_rows` / `aggregate_grad_probes`. Covers: off-switch bit-identity (stats, `p.grad`, weights, RNG stream, and a spy proving `torch.autograd.grad` is never called); the probe ON changing **nothing** about the training step (`autograd.grad` really does not accumulate); the decomposition identity `g_jit − g_R = λ²g_P` against a **hand-derived** closed form on a τ- and `noise_for_input`-sensitive analytic stand-in with a known Jacobian (a re-run of autograd would have agreed with a wrong derivation — this caught a missing `w0` factor); `R → 0` as `λ → 0` and monotonicity in `λ`; both legs sharing ε / τ / rows verbatim, with mutants that mismatch the τ **set** and the row **set** and must be detected; the τ-subset path applied to both legs; the row cap and deterministic tie-breaking; the paired-mode fixed-row exclusion pinned against the ~2× diluted alternative; the `jitter_neg > 0` guard on `g_erosion`; hand-computed percentiles/aggregation; skip, failure and cadence accounting; both legs running at the **same θ** at `gradient_accumulation_steps` 1 and 2; the four-way return unpack (roughness constraint × probe); TB emission incl. the `vram/` split and the non-finite drop; and the full config validation matrix. |
 
 ---
 
@@ -2874,6 +2875,158 @@ loss, the `clipfrac_effective_*` aggregation **values** (forced dead-patterns
 pin each bucket's denominator), and the θ ≡ θ_ref property functionally via
 AdamW's lazily-populated `optimizer.state`.
 
+### Splitting the jitter term into reinforcement + headroom (`gradprobe/*`)
+
+`grad_probe_every = 0` (default) is bit-identical to a run without this: no extra
+forwards, no `return_per_tau=True`, no `retain_graph=True`, no RNG consumed, no
+`gradprobe/*` curves, no banner line. Asserted — including `p.grad` and
+RNG-stream identity — in `test_grad_probe.py`.
+
+**What the instrument is for.** On a positive-advantage row the loss minimises
+`MSE_θ(ε′)` with `ε′ = √(1−λ²)ε + λξ`. Taking expectation over `ξ`, that single
+term is **two gradients welded together**:
+
+```
+∂MSE_θ(ε′)/∂θ  =  ∂MSE_θ(ε)/∂θ  +  λ²·∂P/∂θ   =   g_R  +  λ²·g_P
+```
+
+`g_R` is REINFORCEMENT (fit this successful chunk better at its own noise);
+`λ²·g_P` is the Jacobian/HEADROOM term the Jitter-GRPO regulariser adds. They
+share one coefficient, so their **ratio** has never been tunable. The probe
+measures it:
+
+| Step | How |
+|---|---|
+| `g_jit = ∇_θ MSE_θ(ε′)` | off the graph the training forward ALREADY built (`return_per_tau=True` gives the un-averaged `[K, B]` terms, so a τ subset is takeable) |
+| `g_R = ∇_θ MSE_θ(ε)` | ONE fresh clean-ε forward on ≤ `grad_probe_max_rows` rows |
+| `g_head = g_jit − g_R` | formed **in place** (`g_jit.sub_(g_R)`); this IS `λ²·g_P` exactly, no Taylor assumption |
+| `g_erosion` | the negative non-anchor rows of the SAME retained graph — **free**, and clean only when `jitter_neg == 0` |
+
+The headline numbers are `R = ‖g_head‖/‖g_R‖` and `cos(g_R, g_head)`. They decide
+three open questions: whether to add an AWR-on-success term and at what
+coefficient (`c ≈ 0.95(R−1)` balances the blend), whether to instead **lower**
+`jitter_pos` (a negative `cos_min` means the two components FIGHT, so a
+counterweight is the wrong fix), and what
+`positive_advantage_weight_target_ratio` is actually delivering — PAWS balances
+`|A·ρ|` LOSS mass, but every positive row it amplifies drags along a `λ²g_P`
+gradient component PAWS never measures.
+
+The earlier "R ≈ 14" figure was `jitter/gap_pos / ref_mse/pos_mean`, a ratio of
+**loss values** (median 13.6 over 21 iterations). It does not convert:
+`‖∇MSE_θ(ε)‖ ~ 2√MSE·‖∇_θ v‖` while `‖∇λ²P‖ ~ 2λ²√P·‖∇_θ∇_x v‖`, and those
+second factors are different unlogged objects. `R` was genuinely unknown,
+plausibly anywhere in `[1, 15]`; this is the only way to get it.
+
+**Sequencing — the whole reason it is affordable.** Three positions, none of them
+free choices:
+
+```
+_grad_probe_capture_jittered()   BEFORE loss.backward()   (needs that graph;
+                                 retain_graph=True only DELAYS the free, it does
+                                 not enlarge the graph, so this costs one 58 MB
+                                 vector and nothing else)
+loss.backward()                  frees the training graph
+_grad_probe_finish()             AFTER the free  → the two graphs never coexist
+                                 BEFORE the step → g_R is at the SAME θ as g_jit
+```
+
+Both halves of that sandwich are load-bearing. A post-step clean forward would
+fold one optimizer step of policy drift into `g_head`; a pre-backward clean
+forward would make peak VRAM the sum of two graphs. `test_grad_probe.py` reads
+the recorded θ off both legs and asserts they match, at
+`gradient_accumulation_steps` 1 **and** 2 (at `k=2` the step fires on the second
+micro-batch of each window, which is what an "after the window closes" placement
+would corrupt).
+
+**`torch.autograd.grad`, never `.backward()`.** `.backward()` accumulates into
+`p.grad`, which is the live gradient-accumulation buffer, so a probe on it would
+change the optimizer step the run takes — the instrument would alter what it
+measures. `autograd.grad` returns the gradients and leaves `.grad` untouched
+(`allow_unused=True`, with `None` slots materialised as zeros by
+`flatten_param_grads` so the two vectors stay subtractable).
+
+**VRAM budget**, against the measured ~21.5 GB of ~25.3 GB production peak on an
+A10G at `mini_batch_size=8` (~9.7 GB base once the training graph is freed,
+~0.247 GB per (row, τ) at K=6):
+
+| Item | Cost |
+|---|---|
+| retained gradient vectors | 14,532,608 trainable fp32 params × 4 B = **58 MB each**; at most `g_jit` + `g_R` coexist (`g_head` is in place, `g_erosion` is reduced to its norm immediately) → ~116 MB, < 0.5 % of budget |
+| `retain_graph=True` | 0 — it delays the free, it does not enlarge the graph |
+| clean forward activations | `grad_probe_max_rows × |τ subset| × 0.247 GB` = **~5.9 GB** at 4 rows / full K=6, and they land AFTER the training graph is freed → ~15.6 GB peak |
+
+`vram/grad_probe_peak_delta` reports the peak during the probe minus the peak the
+surrounding update had already reached, so the claim is **verified in production**
+rather than asserted here. `max_memory_allocated` is monotone within an
+iteration, so this reads `0.0` whenever the probe stayed under the training
+high-water mark — which is the expected outcome.
+
+**Cost and the recommended cadence.** One probe is one clean forward+backward on
+≤ 4 rows, i.e. ≈ +50 % of ONE micro-batch, so probing every Nth of ~300
+micro-batches costs ≈ `50/N` %. **Use `--grad-probe-every 15` to `30`** for 10–20
+probes per iteration at 1.7–3.3 % overhead. One probe per iteration is not
+enough: the DISTRIBUTION is the deliverable, since `ref_mse` spans p10 0.0013 to
+max 0.199 across rows and `R` plausibly varies with it.
+
+```bash
+# Production settings + the probe. Nothing about training changes.
+uv run python scripts/grpo/train_grpo.py \
+    --jitter-pos 0.25 --jitter-neg 0 --no-jitter-paired --update-epochs 4 \
+    --grad-probe-every 20 \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --num-iterations 40
+
+# Tighter VRAM (or a slower host): fewer rows and half the taus. Both legs get
+# the same subset, so the reading stays valid — it is just noisier.
+uv run python scripts/grpo/train_grpo.py \
+    --grad-probe-every 20 --grad-probe-max-rows 2 --grad-probe-tau-subset 3
+```
+
+| Scalar | Meaning |
+|---|---|
+| `gradprobe/R_{mean,p10,p50,p90,max}` | `‖λ²g_P‖ / ‖g_R‖`. Above 1 the regulariser dominates the term nominally doing reinforcement. |
+| `gradprobe/R_first`, `R_last` | first and last **successful** probe of the iteration. θ drifts across the ~300 micro-batches of an update; an `R` that MOVES means a fixed AWR coefficient is the wrong functional form. |
+| `gradprobe/cos_reinforce_headroom`, `cos_min` | `cos(g_R, g_head)`. The min is reported beside the mean because a near-zero mean is ambiguous between "consistently orthogonal" (harmless — they do different jobs) and "fighting on some rows" (not). Negative ⇒ lower `jitter_pos` rather than adding a counterweight. |
+| `gradprobe/g_reinforce_norm`, `g_headroom_norm`, `g_jit_norm`, `g_erosion_norm` | per-probe means of the four norms. All are **per-row-MEAN** gradients (the summed per-row loss is divided by its row count before `autograd.grad`), so they are comparable across micro-batches with different row counts. |
+| `gradprobe/reinforce_over_erosion` | `‖g_R‖ / ‖g_erosion‖` — the **first gradient-resolved** reinforcement-vs-erosion comparison. `pos_adv_realized_ratio` is a loss-mass ratio and cannot supply it: equal loss mass does not imply equal gradient norm, because the two sides' residuals multiply different Jacobians. Present only when `jitter_neg_is_zero == 1.0`. |
+| `gradprobe/jitter_neg_is_zero` | 1.0/0.0 provenance for the row above. At `jitter_neg > 0` a negative row carries its own Jacobian component, so the free erosion measurement is **omitted**, not mislabelled. |
+| `gradprobe/n_probes`, `n_skipped`, `n_failed` | sample accounting. A probe is SKIPPED when the micro-batch held < 2 positive non-anchor jitter rows, when `initial_noise` is absent (the clean leg would have to sample its own ε), or when any resulting norm is non-finite / `‖g_R‖ == 0`. `n_failed` counts probes that RAISED — the metric is lost, the iteration is not (an iteration carries ~13 minutes of collected simulation by then). |
+| `gradprobe/n_pos_rows_mean`, `n_neg_rows_mean`, `tau_subset_size` | what backed the readings. `n_pos_rows_mean` is the CAPPED count, so it saturates at `grad_probe_max_rows`. |
+| `vram/grad_probe_peak_delta` | GB the probe added to the iteration's high-water mark. `0.0` (absent) is the expected reading. **Subtract it from `vram/per_row` before extrapolating**: `per_row = (upd_peak − fixed) / mini_batch_size` reads the raw peak, so on a probed run it attributes the probe's transient to the rows and over-states the largest feasible `mini_batch_size`. This is the only pre-existing curve the probe perturbs, and this key is exactly the correction. |
+
+Everything routes through `_log_metrics`' `_emit`, so a non-finite scalar is
+dropped with a warning rather than poisoning wandb's chart autoscale. The family
+is emitted **outside** the `n_updates > 0` gate, like `jitter/*` and `drift/*`:
+the probes come off micro-batches that reached `backward()`, so they survive an
+iteration whose gradient windows were all dropped.
+
+**Two scoping decisions worth knowing.**
+
+- **Rows are the JITTERED positive non-anchor rows.** Under
+  `jitter_paired=True` half the entries are "fixed" rows whose `ε′` IS `ε`, so
+  their `g_head` contribution is identically zero and including them would report
+  **exactly half** the true `R`, with no other symptom. With jitter fully off the
+  clause is dropped and the probe correctly reads `R = 0` — a null reading, not a
+  bug, and the banner says so.
+- **Row selection is by PRE-renorm |advantage|**, descending, ties broken by row
+  index (`sorted`, not `torch.topk`, whose tie-breaking is not part of its
+  contract and differs across devices). Pre- rather than post-renorm because the
+  eligibility mask is pre-renorm-keyed: a row renorm flipped negative can carry a
+  large post-renorm |advantage| while actually being suppressed.
+
+**Resolution limit.** `R` is a ratio of two nearly-equal fp32 vectors' difference
+to one of them. When the probed row count differs from the micro-batch size the
+clean leg reduces a differently-shaped tensor, so `g_jit − g_R` carries ~1 fp32
+ULP even where the two are mathematically identical — measured `R ≈ 6e-8` at
+`λ = 0` on the CPU stand-in, and higher in production where the DiT activations
+are bf16. Read `R` below ~1e-3 as "indistinguishable from zero".
+
+| File | Change |
+|------|--------|
+| `grpo_config.py` | Adds `grad_probe_every: int = 0`, `grad_probe_max_rows: int = 4`, `grad_probe_tau_subset: int = 0` + three hard-fail range checks in `__post_init__` (validated unconditionally, so a companion-knob typo surfaces before the feature is switched on). |
+| `train_grpo.py` | Module-level `flatten_param_grads`, `select_grad_probe_rows`, `aggregate_grad_probes` (module-level so the tests exercise the real expressions). `GRPOTrainer._grad_probe_capture_jittered` / `_grad_probe_finish` are the two phases. `_grpo_update_inner` plans the probe before the forward (it selects `return_per_tau`), runs phase 1 before `backward()` and phase 2 after it, and reports via a `_grad_probe_stats()` closure on both the normal and early-return paths. `_log_metrics` emits `gradprobe/*` and splits one key to `vram/`. Startup banner when enabled. |
+| `test_grad_probe.py` | New CPU suite (see the Contents table). |
+
 ### Bit-identical guarantee with jitter off (both sides `0`)
 
 | Path | Behavior when jitter off |
@@ -3328,6 +3481,26 @@ one where they are most needed.
   coefficient. The ceiling is deliberately low; see the subsection for why 30 is not
   a safe default. Requires `0 < min ≤ max` and the starting value inside the range.
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
+- `grad_probe_every` (default `0` = **OFF**, bit-identical to a run without it:
+  no extra forwards, no `return_per_tau=True`, no `retain_graph=True`, no RNG
+  consumed, no `gradprobe/*` curves). `N > 0` probes every Nth **trained**
+  micro-batch, splitting the positive branch's single gradient into
+  reinforcement `g_R` and headroom `λ²g_P` and logging
+  `R = ‖λ²g_P‖/‖g_R‖` plus `cos(g_R, λ²g_P)`. **Recommended `15`–`30`** — 10–20
+  probes per iteration at ~300 micro-batches, for 1.7–3.3 % added compute. One
+  probe per iteration is not enough; the distribution is the deliverable. Must be
+  `>= 0`. See "Splitting the jitter term into reinforcement + headroom".
+- `grad_probe_max_rows` (default `4`) — cap on the rows entering the probe's
+  clean-ε forward. This is the VRAM bound (`rows × |τ subset| × ~0.247 GB`, on
+  top of the ~9.7 GB base left once the training graph is freed → ~15.6 GB peak
+  at the default, against the 21.5 GB the run already reaches). Rows are the
+  highest pre-renorm |advantage| eligible ones, selected deterministically. Must
+  be `>= 1`.
+- `grad_probe_tau_subset` (default `0` = every τ in `tau_centers`) — `k > 0` uses
+  the first `k` centers, applied **identically to both legs** (the decomposition
+  holds per τ, so a subset that differed between them would make `g_head`
+  garbage). The second VRAM lever: the clean forward's activations scale linearly
+  in it. Must satisfy `0 <= k <= len(tau_centers)`.
 - `balanced_minibatch_training` (default `True`) — balanced mini-batch
   sampling; see "Balanced Training" mechanism 1.
 - `dynamic_epoch_training` (default `False`) — tent-function epoch scaling;

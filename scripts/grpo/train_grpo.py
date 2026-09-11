@@ -241,6 +241,182 @@ def clip_killed_gradient(
     return clamp_moved & (surr2 <= surr1)
 
 
+# ══ Gradient-decomposition probe (`gradprobe/*`) ══════════════════════════════
+# Three module-level helpers rather than inlined blocks, for the same reason
+# `clip_killed_gradient` is module-level: the tests must exercise the real
+# expressions. A re-derived copy of the row selector or the percentile
+# aggregation would keep passing after the production one changed.
+
+
+def flatten_param_grads(
+    grads: "tuple | list", params: list
+) -> torch.Tensor:
+    """One flat fp32 vector from an `autograd.grad` result, ALWAYS full length.
+
+    `autograd.grad(..., allow_unused=True)` returns `None` for a parameter the
+    differentiated scalar did not touch. Those slots are materialised as zeros
+    HERE rather than dropped, because the probe subtracts two such vectors
+    (`g_jit - g_R`) and a dropped slot would silently shorten one of them —
+    yielding either a shape error or, worse, a subtraction that lines up the
+    wrong parameters against each other. Zeros are the mathematically correct
+    fill: an untouched parameter has zero derivative.
+
+    fp32 unconditionally. The trainable LoRA params are already upcast to fp32 in
+    `setup()`, so this is normally a no-op view-and-copy, but it must not be left
+    implicit: the whole measurement is a DIFFERENCE of two nearly-equal vectors,
+    and in bf16 (8 mantissa bits) `g_jit - g_R` would be dominated by rounding
+    for any small `R` — the same failure the fp32 MSE cast in `fm_log_prob.py`
+    exists to prevent, one level up.
+
+    Cost: 14,532,608 params x 4 B = 58 MB per returned vector. At most two
+    coexist (see `_grad_probe_finish`, which forms `g_head` in place).
+    """
+    parts = []
+    for g, p in zip(grads, params):
+        if g is None:
+            parts.append(
+                torch.zeros(p.numel(), device=p.device, dtype=torch.float32)
+            )
+        else:
+            parts.append(g.reshape(-1).to(torch.float32))
+    return torch.cat(parts)
+
+
+def select_grad_probe_rows(
+    eligible: list, weights: list, max_rows: int
+) -> list:
+    """The `max_rows` highest-weight eligible rows, DETERMINISTICALLY.
+
+    Args:
+        eligible: row indices (into the micro-batch) that qualify.
+        weights: the selection weight for each of those rows — the PRE-renorm
+            |advantage|. Pre- rather than post-renorm because the eligibility
+            mask itself is pre-renorm-keyed: a row that renorm flipped negative
+            can carry a large post-renorm |advantage| while actually being
+            SUPPRESSED, and selecting it as a "highest-advantage positive row"
+            would put a suppression row in a reinforcement measurement.
+        max_rows: `config.grad_probe_max_rows`.
+
+    Returns:
+        Row indices, ASCENDING. Ascending (rather than in selection order) so the
+        tensor gather below is in canonical order and two runs that select the
+        same set index it identically.
+
+    Deterministic by construction: `sorted` on the `(-weight, index)` key is a
+    total order, so ties (which are the COMMON case — under `jitter_paired=True`
+    a chunk's two copies share an advantage, and the balanced sampler duplicates
+    rows) break on the row index. `torch.topk` was rejected for exactly this: its
+    tie-breaking is not part of its contract and differs across devices, which
+    would make a reproducibility claim untrue on the one machine that matters.
+    """
+    ranked = sorted(zip(eligible, weights), key=lambda t: (-t[1], t[0]))
+    return sorted(idx for idx, _w in ranked[:max_rows])
+
+
+def aggregate_grad_probes(
+    records: list,
+    *,
+    tau_subset_size: int,
+    jitter_neg_is_zero: bool,
+    n_skipped: int,
+    n_failed: int,
+) -> dict:
+    """Collapse one iteration's per-probe records into the `gradprobe/*` dict.
+
+    Pure function of `records` (a list of dicts, one per SUCCESSFUL probe, in
+    micro-batch order) so the percentile arithmetic is unit-testable without a
+    trainer, a model or a backward pass.
+
+    THE DISTRIBUTION IS THE POINT, not a point estimate. `ref_mse` spans p10
+    0.0013 to max 0.199 across rows within a single iteration, and `R` plausibly
+    varies with it, so a single mean would hide whether the headroom term
+    dominates on the well-fit rows, the badly-fit ones, or uniformly. Hence
+    p10/p50/p90/max alongside the mean.
+
+    `R_first` / `R_last` are the within-iteration trend. theta drifts across the
+    ~300 micro-batches of an update, so an `R` that moves during the iteration
+    means a FIXED AWR coefficient is the wrong functional form — that is a
+    conclusion about the shape of the fix, which no single aggregate can carry.
+
+    `cos_min` is reported beside the mean cosine for the opposite reason: the
+    mean can sit near zero either because the two components are consistently
+    orthogonal (harmless — they simply do different jobs) or because they fight
+    on some rows and agree on others (not harmless). A negative `cos_min` says
+    the second, and argues for lowering `jitter_pos` rather than adding a
+    reinforcement term to counterweight it.
+
+    Returns `{}` when no probe succeeded, EXCEPT that the counters are still
+    reported so a systematically-skipping probe is visible as `n_probes == 0`
+    beside a non-zero `n_skipped` rather than as an absent metric family.
+    """
+    out: dict = {
+        "n_probes": len(records),
+        "n_skipped": n_skipped,
+        "tau_subset_size": tau_subset_size,
+        # 1.0/0.0 rather than a bool: `_emit` writes numerics only, and this is
+        # the PROVENANCE flag for `reinforce_over_erosion` — with jitter_neg > 0
+        # the negative rows carry their own Jacobian component, so the free
+        # erosion measurement is not clean and is omitted entirely. A reader
+        # seeing `reinforce_over_erosion` must be able to confirm from the same
+        # dashboard that it was taken under the clean condition.
+        "jitter_neg_is_zero": 1.0 if jitter_neg_is_zero else 0.0,
+    }
+    if n_failed:
+        out["n_failed"] = n_failed
+    if not records:
+        return out
+
+    def _mean(key: str) -> float:
+        vals = [r[key] for r in records if r.get(key) is not None]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    r_vals = np.array([r["R"] for r in records], dtype=np.float64)
+    out.update({
+        "g_reinforce_norm": _mean("g_reinforce_norm"),
+        "g_headroom_norm": _mean("g_headroom_norm"),
+        "g_jit_norm": _mean("g_jit_norm"),
+        "R_mean": float(r_vals.mean()),
+        # Linear interpolation (numpy's default), matching torch.quantile as used
+        # by `_drift_stats`, so the two families' percentiles are read the same
+        # way. At the recommended 10-20 probes/iteration p10 and p90 are
+        # interpolated between the two extreme samples — read them as tail
+        # indicators, not as precise quantiles.
+        "R_p10": float(np.percentile(r_vals, 10)),
+        "R_p50": float(np.percentile(r_vals, 50)),
+        "R_p90": float(np.percentile(r_vals, 90)),
+        "R_max": float(r_vals.max()),
+        # WITHIN-ITERATION TREND. Deliberately the first and last SUCCESSFUL
+        # probes, not the first and last micro-batches: a skipped probe measured
+        # nothing, so interpolating over it would invent a trend.
+        "R_first": float(records[0]["R"]),
+        "R_last": float(records[-1]["R"]),
+        "cos_reinforce_headroom": _mean("cos"),
+        "cos_min": float(min(r["cos"] for r in records)),
+        "n_pos_rows_mean": float(
+            np.mean([r["n_pos_rows"] for r in records])
+        ),
+    })
+    ero = [r for r in records if r.get("g_erosion_norm") is not None]
+    if ero:
+        out["g_erosion_norm"] = float(
+            np.mean([r["g_erosion_norm"] for r in ero])
+        )
+        out["n_neg_rows_mean"] = float(
+            np.mean([r["n_neg_rows"] for r in ero])
+        )
+        # THE first gradient-resolved reinforcement-vs-erosion comparison.
+        # `pos_adv_realized_ratio` is a LOSS-MASS ratio and cannot provide this:
+        # equal loss mass does not imply equal gradient norm, because the two
+        # sides' residuals multiply different Jacobians.
+        rvals = [
+            r["g_reinforce_norm"] / r["g_erosion_norm"]
+            for r in ero if r["g_erosion_norm"] > 0.0
+        ]
+        if rvals:
+            out["reinforce_over_erosion"] = float(np.mean(rvals))
+    return out
+
+
 class GRPOTrainer:
     """GRPO training loop for GR00T N1.6 DiT with LoRA.
 
@@ -840,6 +1016,41 @@ class GRPOTrainer:
                     f"matches vanilla at the same update_epochs; no `_fixed` "
                     f"branch metrics)"
                 )
+        if self.config.grad_probe_every > 0:
+            # Overhead model: one probe costs one clean forward+backward on
+            # `grad_probe_max_rows` rows x `tau subset` taus, against a training
+            # micro-batch of `mini_batch_size` rows x K taus (also fwd+bwd), so
+            # the per-probe share is the ratio of those (row x tau) products; one
+            # micro-batch in `grad_probe_every` is probed. At the recommended
+            # 15-30 with the shipped 4 rows / mb=8 / K=6 that is 1.7-3.3%.
+            _gp_k = (
+                self.config.grad_probe_tau_subset
+                or len(self.config.tau_centers)
+            )
+            _gp_cost = (
+                (self.config.grad_probe_max_rows * _gp_k)
+                / max(
+                    self.config.mini_batch_size * len(self.config.tau_centers), 1
+                )
+                / self.config.grad_probe_every
+            )
+            print(
+                f"  Gradient-decomposition probe: ON (every "
+                f"{self.config.grad_probe_every} trained micro-batch(es), "
+                f"<= {self.config.grad_probe_max_rows} row(s) in the clean-ε "
+                f"forward, τ subset {_gp_k}/{len(self.config.tau_centers)}) — "
+                f"~{100 * _gp_cost:.1f}% added compute; measures "
+                f"R = ‖λ²g_P‖/‖g_R‖ under gradprobe/*"
+            )
+            if self.config.jitter_pos == 0.0:
+                # Not an error — R == 0 is the CORRECT reading when there is no
+                # eps-jitter on the positive rows — but it is a surprising thing
+                # to discover from a flat zero curve three hours in.
+                print(
+                    "    NOTE: jitter_pos == 0, so the positive rows' ε′ IS ε and "
+                    "the headroom term is identically zero by construction. "
+                    "Expect R == 0; that is a null reading, not a bug."
+                )
         if self.config.include_anchor_groups:
             # Anchor groups reclassify all-success groups from dead to trainable.
             # The per-iteration consequences (a higher optimizer step count, and
@@ -1276,6 +1487,14 @@ class GRPOTrainer:
         in compute_fm_log_prob accumulates into one loss, so autograd retains
         activations for all K DiT passes at once. Halving tau_centers roughly
         halves per_row.
+
+        CAVEAT with `config.grad_probe_every > 0`: `peak` is the raw iteration
+        high-water mark, so the probe's clean-forward transient is attributed to
+        the ROWS and `per_row` reads HIGH. `vram/grad_probe_peak_delta` (emitted
+        by _log_metrics from the probe's own measurement) is the exact
+        correction — subtract it from `(peak - fixed)` before extrapolating a
+        larger mini_batch_size. It is the only pre-existing curve the probe
+        perturbs; at grad_probe_every == 0 nothing here changes.
         """
         if vram is None:
             return
@@ -3239,6 +3458,44 @@ class GRPOTrainer:
         # None when jitter is off, which leaves the jitter/* curves absent).
         jitter_diag: dict | None = None
 
+        # ── Gradient-decomposition probe (`gradprobe/*`) ──────────────────────
+        # OFF at config.grad_probe_every == 0: `gp_every` is 0, `gp_probe_this_mb`
+        # is never True, the fm forward is never asked for `return_per_tau`, no
+        # `retain_graph=True` is taken, no extra forward runs, and the result dict
+        # gains no keys. Bit-identical to a run without this feature.
+        #
+        # UNLIKE the jitter gap (one measurement per iteration, gated on
+        # `n_updates == 0`) this SAMPLES MANY micro-batches on purpose. The
+        # deliverable is the DISTRIBUTION of R and its within-iteration trend, and
+        # the marginal cost is one clean forward+backward on <= grad_probe_max_rows
+        # rows (~+50% of ONE micro-batch), so probing every Nth of ~300
+        # micro-batches costs ~50/N %.
+        gp_every = int(self.config.grad_probe_every)
+        gp_records: list = []          # one dict per SUCCESSFUL probe, in order
+        gp_n_skipped = 0               # planned but unusable (too few rows / non-finite)
+        gp_n_failed = 0                # raised; the metric is lost, the iteration is not
+        gp_peak_delta = 0.0            # max over probes of the VRAM high-water rise
+        # The parameter list, resolved ONCE. It must be the same list object (and
+        # therefore the same order) for every probe and every phase, or the flat
+        # vectors would not be subtractable. It is deliberately the SAME
+        # expression `_apply_accumulated_grads` clips over, so `gradprobe/*` norms
+        # and `train/grad_norm_*` are on one parameter set.
+        gp_params: list = (
+            [p for p in self.model.parameters() if p.requires_grad]
+            if gp_every > 0 else []
+        )
+        # 0 in config means "every tau". Resolved here rather than at each probe so
+        # the value reported in `tau_subset_size` is provably the one used.
+        gp_tau_sub = (
+            self.config.grad_probe_tau_subset
+            or len(self.config.tau_centers)
+        )
+        # Provenance for the FREE erosion measurement: only clean when a negative
+        # row's eps' is exactly eps, i.e. at jitter_neg == 0 (the production
+        # setting). Above that the negative rows carry their own Jacobian
+        # component, so the erosion leg is omitted rather than mislabelled.
+        gp_neg_clean = self.config.jitter_neg == 0.0
+
         # Once-per-iteration per-ROW erosion-drift distribution (`drift/*`).
         # Populated by POOLING every trained micro-batch's negative signal rows
         # across the whole iteration, plus at-birth counts over the PRE-STEP
@@ -3897,6 +4154,78 @@ class GRPOTrainer:
                 else:
                     noise_for_input = None
 
+                # ── Gradient-decomposition probe: PLAN ───────────────────────
+                # Decided HERE, before the forward, because it is what selects
+                # `return_per_tau` below — and because every input it needs is
+                # already in hand and still in the right frame: `ready_advantages`
+                # is PRE-renormalization at this point (the renorm block runs
+                # further down), which is the sign convention `lam_row` used to
+                # pick jitter_pos vs jitter_neg, so the rows selected here are
+                # exactly the rows carrying lambda = jitter_pos.
+                #
+                # CADENCE. `n_micro_batches` counts TRAINED micro-batches, so
+                # `n_micro_batches % N == 0` selects the 1st, (N+1)th, (2N+1)th …
+                # trained micro-batch. A micro-batch dropped by the non-finite
+                # guard never advances that counter, so the next one is probed
+                # instead and no probe slot is silently lost.
+                gp_probe_this_mb = False
+                gp_pos_idx = None
+                gp_neg_idx = None
+                if (gp_every > 0 and gp_params
+                        and (n_micro_batches % gp_every) == 0):
+                    # Rows the decomposition is DEFINED on: positive pre-renorm
+                    # advantage, non-anchor, and — when jitter is active —
+                    # actually JITTERED. That last clause is not cosmetic: under
+                    # `jitter_paired=True` half the entries are "fixed" rows whose
+                    # eps' IS eps, so their `g_head` contribution is identically
+                    # zero and including them would HALVE the reported R. Anchor
+                    # rows are a third class with no lambda at all.
+                    #
+                    # With jitter fully OFF the clause is dropped and the probe
+                    # runs on all positive non-anchor rows, where it correctly
+                    # reads R == 0 — a useful null reading, not a broken one.
+                    _gp_jit_active = (lam_pos > 0.0 or lam_neg > 0.0)
+                    _gp_pos_mask = (ready_advantages > 0) & ~anchor_row_mask
+                    if _gp_jit_active:
+                        _gp_pos_mask = _gp_pos_mask & torch.tensor(
+                            [m == "jitter" for m in ready_modes],
+                            device=self.device, dtype=torch.bool,
+                        )
+                    # One host sync per probed micro-batch, not per row. A probe
+                    # already costs a forward+backward, so this is noise.
+                    _gp_rows = _gp_pos_mask.nonzero(as_tuple=True)[0].tolist()
+                    _gp_w = ready_advantages.detach().abs()[
+                        _gp_pos_mask
+                    ].tolist()
+                    if len(_gp_rows) < 2 or ready_noise is None:
+                        # Fewer than 2 rows makes the row-mean gradient a
+                        # single-row reading with no averaging at all, and a
+                        # missing eps means compute_fm_log_prob would SAMPLE one
+                        # on the clean leg — a different eps (and RNG
+                        # consumption), so the difference would not be g_head.
+                        # Counted, not silently dropped.
+                        gp_n_skipped += 1
+                    else:
+                        gp_probe_this_mb = True
+                        gp_pos_idx = torch.tensor(
+                            select_grad_probe_rows(
+                                _gp_rows, _gp_w,
+                                self.config.grad_probe_max_rows,
+                            ),
+                            device=self.device, dtype=torch.long,
+                        )
+                        # Erosion rows: pre-renorm-negative, non-anchor. Mode is
+                        # irrelevant HERE because at jitter_neg == 0 a negative
+                        # row's eps' is exactly eps in BOTH modes — which is what
+                        # makes this measurement free. Uncapped: it adds no
+                        # forward, only one more autograd.grad over the graph that
+                        # already exists.
+                        if gp_neg_clean:
+                            gp_neg_idx = (
+                                ((~(ready_advantages > 0)) & ~anchor_row_mask)
+                                .nonzero(as_tuple=True)[0]
+                            )
+
                 # Only compute current model's log-prob (with gradient)
                 # `smooth_dims`/`smooth_horizon` are None unless the
                 # roughness constraint is on, in which case compute_fm_log_prob
@@ -3918,6 +4247,14 @@ class GRPOTrainer:
                     noise=ready_noise,
                     n_samples=len(self.config.tau_centers),
                     noise_for_input=noise_for_input,
+                    # The gradient-decomposition probe's JITTERED leg comes off
+                    # THIS graph — no second jittered forward — which is why it
+                    # needs the un-averaged [K, B] terms rather than the K-mean:
+                    # a tau SUBSET has to be takeable, and it must be the
+                    # identical subset the clean leg uses. False (the default) on
+                    # every unprobed micro-batch, so the arithmetic and the return
+                    # type are unchanged there.
+                    return_per_tau=gp_probe_this_mb,
                     smooth_dims=self._smooth_dims if self.smooth_active else None,
                     # During calibration the term never enters the loss, so its
                     # forward needs no autograd graph (~1/K of peak activation).
@@ -3929,12 +4266,27 @@ class GRPOTrainer:
                     ),
                     smooth_instrument=self.config.smooth_instrument,
                 )
-                if self.smooth_active:
+                # Return-contract unpack. compute_fm_log_prob appends extras in a
+                # FIXED order — per_tau first, then the smooth pair — so all four
+                # combinations are enumerated rather than length-sniffed. The
+                # `gp_probe_this_mb == False` branches are byte-for-byte the
+                # pre-probe code, which is what keeps `grad_probe_every=0`
+                # bit-identical.
+                gp_per_tau = None
+                if self.smooth_active and gp_probe_this_mb:
+                    (current_log_probs, gp_per_tau,
+                     (smooth_moments, endpoint_moments)) = fm_out
+                elif self.smooth_active:
                     current_log_probs, (smooth_moments, endpoint_moments) = fm_out
+                elif gp_probe_this_mb:
+                    current_log_probs, gp_per_tau = fm_out
+                    smooth_moments = None
+                    endpoint_moments = None
                 else:
                     current_log_probs = fm_out
                     smooth_moments = None
                     endpoint_moments = None
+
 
                 log_ratio = current_log_probs - ref_log_probs
                 ratio = log_ratio.exp()
@@ -4722,6 +5074,43 @@ class GRPOTrainer:
                     # snapshots and two different weightings.
                     Dw_iter += k_last * _d_mass
 
+                # ── Gradient-decomposition probe: PHASE 1 (pre-backward) ─────
+                # MUST run before `loss.backward()`, which frees the graph this
+                # needs. `retain_graph=True` inside only DELAYS that free; it does
+                # not enlarge the graph, so the only added memory is the returned
+                # 58 MB flat vector. `autograd.grad`, never `.backward()` — see
+                # the block comment on _grad_probe_capture_jittered.
+                gp_state = None
+                gp_peak_before = None
+                if gp_probe_this_mb and gp_per_tau is not None:
+                    gp_peak_before = (
+                        torch.cuda.max_memory_allocated(self.device)
+                        if torch.cuda.is_available() else None
+                    )
+                    try:
+                        gp_state = self._grad_probe_capture_jittered(
+                            per_tau=gp_per_tau,
+                            probe_params=gp_params,
+                            pos_idx=gp_pos_idx,
+                            neg_idx=gp_neg_idx,
+                            tau_sub=gp_tau_sub,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — diagnostic only
+                        # Same policy as _jitter_gap_diagnostics: an iteration
+                        # carries ~13 minutes of collected simulation by the time
+                        # it reaches here, so a diagnostic-only failure must cost
+                        # the metric, never the iteration. Note this handler is
+                        # BEFORE the backward, so training proceeds untouched.
+                        print(
+                            f"  WARNING: gradient-decomposition probe (phase 1) "
+                            f"failed ({type(exc).__name__}: {exc}) — skipping "
+                            f"this probe. Training is unaffected."
+                        )
+                        gp_state = None
+                        gp_n_failed += 1
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
                 # --- Backward pass (gradient accumulation window) ---
                 # zero_grad ONLY at the start of a window; otherwise this
                 # micro-batch's gradient would wipe its predecessors'. At
@@ -4741,6 +5130,58 @@ class GRPOTrainer:
                     loss.backward()
                 else:
                     (loss / accum_steps).backward()
+
+                # ── Gradient-decomposition probe: PHASE 2 (post-backward) ─────
+                # AFTER the backward above (the training graph is now freed, so
+                # the clean forward's activations do not stack on top of it) and
+                # BEFORE `_apply_accumulated_grads()` below (so `g_R` is measured
+                # at the SAME theta as `g_jit` — a post-step clean forward would
+                # fold one optimizer step of drift into `g_head`). Both halves of
+                # that sandwich are load-bearing; this is not a free position.
+                if gp_state is not None:
+                    try:
+                        gp_rec = self._grad_probe_finish(
+                            gp_state,
+                            probe_params=gp_params,
+                            ready_backbone=ready_backbone,
+                            ready_state_features=ready_state_features,
+                            ready_embodiment_id=ready_embodiment_id,
+                            ready_actions=ready_actions,
+                            ready_masks=ready_masks,
+                            ready_noise=ready_noise,
+                            timesteps=timesteps,
+                        )
+                        if gp_rec is None:
+                            gp_n_skipped += 1
+                        else:
+                            gp_records.append(gp_rec)
+                    except Exception as exc:  # noqa: BLE001 — diagnostic only
+                        print(
+                            f"  WARNING: gradient-decomposition probe (phase 2) "
+                            f"failed ({type(exc).__name__}: {exc}) — skipping "
+                            f"this probe. Training is unaffected."
+                        )
+                        gp_n_failed += 1
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    finally:
+                        # Release the 58 MB flat vector on every path, including
+                        # the exception one, before the next micro-batch's forward
+                        # starts allocating activations.
+                        gp_state = None
+                    if gp_peak_before is not None:
+                        # Peak DURING the probe minus the peak the surrounding
+                        # update had already reached. max_memory_allocated is
+                        # monotone within an iteration (reset once by
+                        # _vram_snapshot), so this reads 0.0 whenever the probe
+                        # stayed under the training high-water mark — which is the
+                        # claim the analytic budget makes, verified in production
+                        # instead of asserted here.
+                        gp_peak_delta = max(
+                            gp_peak_delta,
+                            (torch.cuda.max_memory_allocated(self.device)
+                             - gp_peak_before) / 1e9,
+                        )
                 accum_count += 1
 
                 if accum_count == accum_steps:
@@ -5156,6 +5597,43 @@ class GRPOTrainer:
                 out["neg_born_rows"] = _bd_rows
             return out
 
+        def _grad_probe_stats() -> dict | None:
+            """The `gradprobe/*` family, or None when the probe is off.
+
+            Beside `_drift_stats` / `_smooth_stats` and for the same reason: BOTH
+            the early-return path and the normal result dict need it, and a
+            duplicated aggregation would drift.
+
+            Reported on the early-return path too. Unlike the per-minibatch means
+            these readings come from micro-batches that actually reached
+            `backward()`, so they survive an iteration whose gradient windows were
+            all dropped — and a probe showing the headroom term dominating is a
+            plausible EXPLANATION for landing there.
+
+            The arithmetic lives in the module-level `aggregate_grad_probes` so the
+            percentiles are unit-testable without a model.
+
+            Wrapped by callers in try/except for the same reason `_drift_stats` is:
+            a diagnostic must cost the metric, not ~13 minutes of collected
+            simulation.
+            """
+            if gp_every <= 0:
+                return None
+            out = aggregate_grad_probes(
+                gp_records,
+                tau_subset_size=gp_tau_sub,
+                jitter_neg_is_zero=gp_neg_clean,
+                n_skipped=gp_n_skipped,
+                n_failed=gp_n_failed,
+            )
+            # Carried inside the family but RE-PREFIXED to `vram/` by
+            # _log_metrics, because it belongs beside the other VRAM curves the
+            # operator sizes mini_batch_size against — not beside the gradient
+            # ratios. One number, one TB tag.
+            if gp_peak_delta > 0.0:
+                out["_vram_peak_delta_gb"] = gp_peak_delta
+            return out
+
         def _smooth_stats() -> dict:
             """Trajectory-roughness metrics, or {} when the feature is off.
 
@@ -5307,6 +5785,17 @@ class GRPOTrainer:
                 _dd = None
             if _dd:
                 early["_drift_diag"] = _dd
+            # `gradprobe/*`, ungated on n_updates for the same reason: the probes
+            # come off micro-batches that reached backward(), so they survive an
+            # iteration whose windows were all dropped.
+            try:
+                _gp = _grad_probe_stats()
+            except Exception as _e:         # noqa: BLE001 - diagnostic only
+                print(f"  WARNING: gradprobe/* aggregation failed, "
+                      f"skipping: {_e}")
+                _gp = None
+            if _gp:
+                early["_grad_probe"] = _gp
             if n_rows_pos_total > 0:
                 early["clipfrac_effective_pos"] = (
                     clipfrac_eff_sum_pos / n_rows_pos_total
@@ -5574,6 +6063,18 @@ class GRPOTrainer:
             _dd = None
         if _dd:
             result["_drift_diag"] = _dd
+        # Gradient-decomposition probe. Own `gradprobe/` namespace for the same
+        # reason as `drift/`: these are per-PROBE aggregates over a subsample of
+        # micro-batches, not a per-mb mean over the whole iteration. Absent
+        # entirely at grad_probe_every == 0. try/except for the same reason as
+        # `drift/*` above.
+        try:
+            _gp = _grad_probe_stats()
+        except Exception as _e:            # noqa: BLE001 - diagnostic only
+            print(f"  WARNING: gradprobe/* aggregation failed, skipping: {_e}")
+            _gp = None
+        if _gp:
+            result["_grad_probe"] = _gp
         return result
 
     def _per_chunk_gap_survey(self, chunks: list) -> dict | None:
@@ -6003,6 +6504,246 @@ class GRPOTrainer:
                 gap_row[fixed_row_mask].mean().item()
             )
         return out
+
+    # ── Gradient-decomposition probe ─────────────────────────────────────────
+    #
+    # SEQUENCING IS THE WHOLE REASON THIS IS AFFORDABLE, and it is why the probe
+    # is TWO methods rather than one. Read them as a single measurement split
+    # around the training `backward()`:
+    #
+    #   _grad_probe_capture_jittered()   <-- BEFORE loss.backward()
+    #       Needs the graph the training forward ALREADY built, so it takes
+    #       `retain_graph=True`. Adds only the returned 58 MB vector: retaining a
+    #       graph does not ENLARGE it, it only delays freeing.
+    #
+    #   loss.backward()                       frees the training graph
+    #
+    #   _grad_probe_finish()             <-- AFTER loss.backward(), BEFORE step
+    #       Runs the fresh clean-eps forward. Placed after the free so the two
+    #       graphs never coexist (that would make peak VRAM their SUM), and
+    #       before `optimizer.step()` so `g_R` is measured at the SAME theta as
+    #       `g_jit` — a post-step clean forward would silently make `g_head` the
+    #       sum of the Jacobian term and one optimizer step of policy drift.
+    #
+    # NEITHER method may use `.backward()`. `.backward()` accumulates into
+    # `p.grad`, which is the live gradient-accumulation buffer
+    # (`_apply_accumulated_grads` / `accum_count`), so a probe on it would change
+    # the optimizer step the run takes — the instrument would alter what it
+    # measures. `torch.autograd.grad` returns the gradients and leaves `.grad`
+    # untouched; `test_grad_probe.py` asserts `p.grad` is bit-identical with the
+    # probe on and off.
+
+    def _grad_probe_capture_jittered(
+        self,
+        *,
+        per_tau: torch.Tensor,
+        probe_params: list,
+        pos_idx: torch.Tensor,
+        neg_idx: "torch.Tensor | None",
+        tau_sub: int,
+    ) -> dict:
+        """PHASE 1: `g_jit` (and the FREE `g_erosion`) off the TRAINING graph.
+
+        Must be called BEFORE the training `loss.backward()` — see the block
+        comment above.
+
+        Args:
+            per_tau: `[K, B]` un-averaged per-tau log-probs from the training
+                forward's `return_per_tau=True`, i.e. `-MSE_theta(eps')` per
+                (tau, row). Taken from the EXISTING graph so the jittered side
+                costs no second forward.
+            probe_params: the trainable parameter list, the SAME object every
+                phase and every probe uses, so the three flat vectors are in one
+                consistent order.
+            pos_idx: row indices of the probed positive rows (already capped and
+                sorted by `select_grad_probe_rows`).
+            neg_idx: rows for the free erosion measurement, or None when
+                `jitter_neg > 0` makes it unclean (see below).
+            tau_sub: how many leading taus to use. The SAME number is applied to
+                the clean leg in phase 2; the decomposition identity holds per
+                tau, so mixing subsets makes `g_head` garbage.
+
+        Returns:
+            The phase-1 state dict phase 2 consumes. Holds ONE 58 MB flat
+            gradient vector (`g_jit`), which phase 2 turns into `g_head` in
+            place.
+
+        THE EROSION SIDE IS FREE WHEN `jitter_neg == 0`. A negative row then has
+        `eps' = sqrt(1-0) eps + 0 xi = eps` EXACTLY, so this graph's value on
+        negative rows already IS the clean quantity and no extra forward is
+        needed at all. That is what makes this the first gradient-resolved
+        reinforcement-vs-erosion comparison — `pos_adv_realized_ratio` is a
+        loss-mass ratio and cannot supply it. The caller passes `neg_idx=None`
+        when `jitter_neg > 0`, because the negative rows then carry their own
+        Jacobian component and the free measurement would be mislabelled; the
+        `jitter_neg_is_zero` provenance flag travels with the metric either way.
+        """
+        # `-per_tau` is MSE. Per-ROW mean over the tau subset FIRST, then the mean
+        # over rows: the same two-step reduction the clean leg performs (where the
+        # tau mean is done inside compute_fm_log_prob and the row mean here), so
+        # the two scalars are the same functional of their respective forwards and
+        # their gradients subtract cleanly. Dividing the summed per-row loss by its
+        # row count — rather than summing — is what makes the norms comparable
+        # across micro-batches with different positive-row counts.
+        mse_pos = (-per_tau[:tau_sub])[:, pos_idx]        # [tau_sub, n_pos]
+        jit_scalar = mse_pos.mean(dim=0).mean()
+
+        # retain_graph=True on BOTH grad calls: the second one needs the graph the
+        # first would otherwise free, and the training `backward()` after them
+        # needs it too. It is `backward()` that finally frees it, exactly as
+        # before the probe existed.
+        g_jit = torch.autograd.grad(
+            jit_scalar, probe_params, retain_graph=True, allow_unused=True
+        )
+        flat_jit = flatten_param_grads(g_jit, probe_params)
+        del g_jit
+        state = {
+            "flat_jit": flat_jit,
+            "g_jit_norm": float(flat_jit.norm()),
+            "n_pos_rows": int(pos_idx.numel()),
+            "tau_sub": tau_sub,
+            "pos_idx": pos_idx,
+        }
+
+        if neg_idx is not None and int(neg_idx.numel()) > 0:
+            mse_neg = (-per_tau[:tau_sub])[:, neg_idx]
+            ero_scalar = mse_neg.mean(dim=0).mean()
+            g_ero = torch.autograd.grad(
+                ero_scalar, probe_params, retain_graph=True, allow_unused=True
+            )
+            # Reduced to its NORM immediately: the erosion side is only ever
+            # compared by magnitude (`reinforce_over_erosion`), never by
+            # direction, so keeping the vector would spend 58 MB on nothing. This
+            # is why the peak holds at most two flat vectors, not three.
+            state["g_erosion_norm"] = float(
+                flatten_param_grads(g_ero, probe_params).norm()
+            )
+            state["n_neg_rows"] = int(neg_idx.numel())
+            del g_ero
+        return state
+
+    def _grad_probe_finish(
+        self,
+        state: dict,
+        *,
+        probe_params: list,
+        ready_backbone,
+        ready_state_features,
+        ready_embodiment_id,
+        ready_actions,
+        ready_masks,
+        ready_noise,
+        timesteps,
+    ) -> "dict | None":
+        """PHASE 2: the clean-eps forward, `g_R`, and the per-probe record.
+
+        Must be called AFTER the training `loss.backward()` (so the training
+        graph is already freed) and BEFORE `optimizer.step()` (so theta still
+        matches phase 1). See the block comment above.
+
+        Everything that differs between the two legs is `noise_for_input`:
+
+          * `noise` is the SAME eps for both — passed here as `ready_noise[idx]`,
+            the very tensor the training forward used. It also fixes
+            `velocity_target = actions - eps` (`fm_log_prob.py:257`), which is
+            therefore at the ORIGINAL eps on both legs.
+          * `timesteps` is the SAME tau sample for both — `timesteps[:tau_sub]`
+            gathered on the probed rows, i.e. a literal slice of the training
+            pass's tensor, not a resample.
+          * `noise_for_input=None` here vs the training pass's jittered tensor.
+            That single difference is the entire content of `g_head`.
+
+        NO RNG IS CONSUMED. With both `timesteps` and `noise` supplied,
+        `compute_fm_log_prob` takes neither sampling branch (no `Beta.sample`, no
+        `randn_like`), and the DiT is in eval mode so LoRA dropout is inert. So
+        inserting this does not shift the global torch RNG stream and a run with
+        the probe on stays comparable to one recorded without it —
+        `test_grad_probe.py` asserts stream identity, as `test_smoothness.py`
+        does for `smooth_coef=0`.
+
+        `smooth_dims` / `smooth_horizon` are deliberately NOT forwarded: the
+        roughness instrument would add `num_inference_timesteps` more DiT
+        forwards to a diagnostic that has nothing to do with it, and its term is
+        not part of the quantity being decomposed.
+
+        Returns:
+            The per-probe record, or None when the reading is not usable (any
+            non-finite norm, or a zero reinforcement norm that would make `R`
+            undefined) — the caller counts that as a skip.
+        """
+        idx = state["pos_idx"]
+        tau_sub = state["tau_sub"]
+
+        # Row slicing, mirroring the `ready_indices` gather in
+        # _grpo_update_inner: the backbone dict's entries are sliced when they
+        # are indexable and passed through when they are not (masks can be None).
+        probe_backbone = {
+            k: v[idx] if v is not None and hasattr(v, "__getitem__") else v
+            for k, v in ready_backbone.items()
+        }
+        # `[:tau_sub]` FIRST, then the row gather, so the result is exactly the
+        # [tau_sub, n_probe] sub-block of the training tensor. `.contiguous()`
+        # because advanced indexing already copies but the slice-then-gather order
+        # is what makes the equality with `timesteps[:tau_sub][:, idx]` literal,
+        # and the test asserts that equality.
+        probe_timesteps = timesteps[:tau_sub][:, idx].contiguous()
+
+        clean_lp = compute_fm_log_prob(
+            action_head=self.model.action_head,
+            backbone_output=probe_backbone,
+            state_features=ready_state_features[idx],
+            embodiment_id=ready_embodiment_id[idx],
+            actions=ready_actions[idx],
+            action_mask=ready_masks[idx],
+            timesteps=probe_timesteps,
+            noise=ready_noise[idx],
+            n_samples=tau_sub,
+            # THE one difference between the two legs.
+            noise_for_input=None,
+        )
+        # `-log_prob` is MSE, already tau-averaged over the subset by
+        # compute_fm_log_prob (`log_probs_accumulated / n_samples` with
+        # n_samples == tau_sub). Row mean second, matching phase 1.
+        r_scalar = (-clean_lp).mean()
+        # No retain_graph: this graph has no further consumer, so it is freed
+        # here, immediately, before the norms are taken.
+        g_r = torch.autograd.grad(r_scalar, probe_params, allow_unused=True)
+        flat_r = flatten_param_grads(g_r, probe_params)
+        del g_r
+
+        r_norm = float(flat_r.norm())
+        # IN PLACE. `flat_jit` becomes `g_head` and the fourth 58 MB allocation
+        # never happens; `g_jit_norm` was already captured in phase 1, which is
+        # why destroying the vector here is safe.
+        flat_head = state["flat_jit"].sub_(flat_r)
+        head_norm = float(flat_head.norm())
+        cos = float(flat_head.dot(flat_r)) / (head_norm * r_norm) if (
+            head_norm > 0.0 and r_norm > 0.0
+        ) else 0.0
+
+        if not (
+            math.isfinite(r_norm)
+            and math.isfinite(head_norm)
+            and math.isfinite(state["g_jit_norm"])
+            and math.isfinite(cos)
+        ):
+            return None
+        if r_norm <= 0.0:
+            # `R = ||g_head|| / ||g_R||` is undefined. Reachable at LoRA init
+            # (lora_B == 0) and on a micro-batch whose positive rows are exactly
+            # fitted. A skip, not a 0 and not an inf.
+            return None
+
+        return {
+            "g_reinforce_norm": r_norm,
+            "g_headroom_norm": head_norm,
+            "g_jit_norm": state["g_jit_norm"],
+            "g_erosion_norm": state.get("g_erosion_norm"),
+            "R": head_norm / r_norm,
+            "cos": cos,
+            "n_pos_rows": state["n_pos_rows"],
+            "n_neg_rows": state.get("n_neg_rows", 0),
+        }
 
     def _min_expected_batches(
         self, entries: list[tuple[ActionChunk, str]], signal_mb_size: int
@@ -7343,6 +8084,49 @@ class GRPOTrainer:
         if update_stats and update_stats.get("_drift_diag"):
             _emit("drift", update_stats["_drift_diag"])
 
+        # ── Gradient-decomposition probe (`gradprobe/*`) ──────────────────────
+        # Ungated on n_updates for the same reason as the two blocks above: the
+        # probes come off micro-batches that reached backward(), so they survive
+        # an iteration whose gradient windows were all dropped.
+        #
+        # Reading guide — the two numbers this instrument exists for:
+        #   gradprobe/R_{mean,p10,p50,p90,max} = ||lam^2 g_P|| / ||g_R||, i.e. how
+        #       many times larger the HEADROOM (Jacobian) gradient is than the
+        #       REINFORCEMENT gradient inside the single positive-branch term that
+        #       carries both. The DISTRIBUTION is the deliverable: `ref_mse` spans
+        #       p10 0.0013 to max 0.199 across rows and R plausibly varies with it.
+        #       If R > 1, an AWR-on-success term at coefficient c ~= 0.95 (R - 1)
+        #       rebalances the blend; if R < 1 the regulariser is already the
+        #       minority partner and the answer is elsewhere.
+        #   gradprobe/R_first, R_last = the within-iteration trend. theta drifts
+        #       over the ~300 micro-batches of an update; an R that MOVES means a
+        #       fixed AWR coefficient is the wrong functional form.
+        #   gradprobe/cos_reinforce_headroom, cos_min = whether the two components
+        #       point the same way. NEGATIVE means they FIGHT, which argues for
+        #       LOWERING jitter_pos rather than adding a counterweight term. The
+        #       min is reported beside the mean because a near-zero mean is
+        #       ambiguous between "consistently orthogonal" (harmless) and
+        #       "fighting on some rows" (not).
+        #   gradprobe/reinforce_over_erosion = ||g_R|| / ||g_erosion||, the FIRST
+        #       gradient-resolved version of a comparison `pos_adv_realized_ratio`
+        #       can only make in loss mass. Present only when
+        #       `jitter_neg_is_zero == 1.0` — above jitter_neg = 0 the negative
+        #       rows carry their own Jacobian term and the free measurement would
+        #       be mislabelled.
+        #   gradprobe/n_probes, n_skipped, n_pos_rows_mean, n_neg_rows_mean,
+        #   tau_subset_size = the sample backing all of the above. A large
+        #       n_skipped against a small n_probes means the micro-batches mostly
+        #       held < 2 positive non-anchor jitter rows.
+        if update_stats and update_stats.get("_grad_probe"):
+            _gp_d = dict(update_stats["_grad_probe"])
+            # Re-prefixed to `vram/` so it sits beside the other memory curves the
+            # operator sizes mini_batch_size against. Popped first so it cannot
+            # also appear under `gradprobe/`.
+            _gp_vram = _gp_d.pop("_vram_peak_delta_gb", None)
+            if _gp_vram is not None:
+                _emit("vram", {"grad_probe_peak_delta": _gp_vram})
+            _emit("gradprobe", _gp_d)
+
         # Effective clipfrac. Ungated on n_updates for the same reason as the two
         # blocks above: it is populated by micro-batches that TRAINED, which
         # includes the iteration where every gradient window was then dropped —
@@ -7747,6 +8531,9 @@ class GRPOTrainer:
                                 "_jitter_diag",
                                 # Likewise nested; mirrored under drift/ below.
                                 "_drift_diag",
+                                # Likewise nested; mirrored under gradprobe/ (and
+                                # one key under vram/) below.
+                                "_grad_probe",
                                 # Excluded so the finite-filtered copies added
                                 # below are the ONLY source of these keys.
                                 # Without this exclusion the unfiltered value
@@ -7786,6 +8573,18 @@ class GRPOTrainer:
                             for k, v in update_stats["_drift_diag"].items()
                             if math.isfinite(v)
                         })
+                    # Mirror the TB-side gradprobe/* block, ungated for the same
+                    # reason. The VRAM key is split off to the `vram/` prefix
+                    # exactly as the TB side does, so the two backends do not
+                    # disagree on where a curve lives.
+                    if update_stats.get("_grad_probe"):
+                        for k, v in update_stats["_grad_probe"].items():
+                            if not math.isfinite(v):
+                                continue
+                            if k == "_vram_peak_delta_gb":
+                                log_dict["vram/grad_probe_peak_delta"] = v
+                            else:
+                                log_dict[f"gradprobe/{k}"] = v
                     # Effective clipfrac, also ungated (populated by any
                     # micro-batch that trained, including on a dropped-window
                     # iteration).

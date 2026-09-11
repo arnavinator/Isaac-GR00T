@@ -615,6 +615,148 @@ class GRPOConfig:
     # per-mb KL formula). Suggested starting value: same order as kl_coef_last_iter.
     kl_coef_base_model: float = 0.2
 
+    # ─── Adaptive base-model trust region (closed-loop kl_coef_base_model) ───
+    # WHY a controller rather than a bigger constant. `ref_mse/log_base_ratio_mean`
+    # (= ref_log_prob - base_log_prob, an on-policy KL(theta||base) estimate in
+    # loss-native nats) increases NET in all 10 archive runs that log it, and in
+    # most of them by a lot: runB 0 -> 0.302, arm1 0.018 -> 0.111, ref16 0 -> 0.193
+    # (peak, non-monotone mid-series), lr12e4 0 -> 0.272 (peak 0.292). Precisely: 6
+    # of the 10 are strictly monotone and 4 dip somewhere; the earlier claim of
+    # "monotone without exception" was wrong and is corrected here. What actually
+    # separates the runs is MAGNITUDE, not monotonicity. res11 is the only run that
+    # PLATEAUS at a high level with high SR (0.057 -> 0.070, net +0.012); full175's
+    # range is narrower still (0.0076) but it DEGRADED, which is the first hint that
+    # the level does not discriminate at all -- see the target note below.
+    #
+    # The k3 gradient is coef*(e^x - 1)*(-d lp/dtheta), i.e. a restoring force
+    # LINEAR in the drift x, against a surrogate per-row gradient of ~0.9. At the
+    # shipped coef 0.1 that is 0.20% authority at runB's ignition point
+    # (x = 0.0181) and only 2.9% even at x = 0.302 once the run is already dead.
+    # The mechanism has therefore never been tested. Precisely: every run
+    # that logs log_base_ratio_mean used coef 0.1, and across all 10 the peak
+    # authority reached is 2.90% (runB it14, where the run is already dead). The
+    # archive also holds runs at coef 0.25 and 0.5, but none of them log the
+    # quantity, so nothing above ~3% has ever been OBSERVED. Under-powered by
+    # ~100x, not 50x: 20% authority at runB's ignition drift of 0.0181 needs
+    # coef 10.09 against the shipped 0.1.
+    #
+    # A FIXED coefficient cannot fix that, because the coefficient needed for a
+    # constant authority moves 14x over one run: 20% authority needs coef 10.0 at
+    # x = 0.018 but coef 0.7 at x = 0.302. Structurally it is proportional control
+    # on a plant that is itself an integral, which leaves a steady-state offset.
+    # Adapting the coefficient adds integral action: it climbs until the drift
+    # stops GROWING, whatever the surrogate is pushing with. Same reason adaptive
+    # KL controllers exist in RLHF rather than fixed penalties.
+    #
+    # Requires kl_coef_base_model > 0: `compute_base` gates the base-model forward
+    # pass on the CONFIG value, so a zero there means log_base_ratio is never
+    # measured and the controller has no input.
+    kl_base_adaptive: bool = False
+
+    # Setpoint for ref_mse/log_base_ratio_mean, in nats. With the deadband below
+    # the controller holds the drift inside roughly
+    # [kl_base_deadband_lo * target, kl_base_deadband_hi * target] — so the TARGET
+    # is the centre of the band, not the level it settles at.
+    #
+    # *** THIS TARGET IS NOT CALIBRATED. *** Replaying the controller against all 10
+    # drift-logging runs and demanding a target that engages on every run that
+    # degraded while sparing every run that did not gives an EMPTY constraint set,
+    # by 38x: full175 degraded at drift 0.0076 while lr12e4 (the archive's biggest
+    # SR gainer, +0.50) thrived at 0.2925. Tested as a classifier over all 26
+    # iteration transitions, neither the level (AUC 0.317) nor its increment
+    # (AUC 0.358) predicts a subsequent >=0.15 SR drop -- both BELOW chance. The
+    # founding argument ("it grows in every run and nothing bounds it, so bounding
+    # it will help") conflates a thing that always happens with a thing that causes
+    # harm; a quantity that rises in the runs that SUCCEED cannot discriminate.
+    # 0.055 is an operating guess that beats 0.025, nothing more. See the README.
+    #
+    # CHOOSING IT — from a replay of the real controller against 3 of the 10 archive
+    # runs that log the drift, not from eyeballing levels. Two hard constraints:
+    #   * must ENGAGE on runB by it12 (its collapse): needs hi < 0.1042, i.e.
+    #     target < 0.0695. runB jumps 0.0295 (it11) -> 0.1042 (it12) with nothing
+    #     between, so any target in [0.0197, 0.0695] engages on exactly it12.
+    #   * must NOT crush the runs that actually LEARNED: res11 (highest sustained
+    #     SR in the corpus) operates entirely at drift 0.0572-0.0701 and ref16's
+    #     best-SR window at 0.058-0.064. Holding res11 needs hi >= 0.0701, i.e.
+    #     target >= 0.0467.
+    # That two-run window is [0.0467, 0.0695] and 0.055 sits inside it (not centred:
+    # the midpoint is 0.0581). Replayed: runB engages it12 -> coef 5 (the cap);
+    # res11 never engages (stays at the start value);
+    # ref16 engages only at it15, by which point its drift is 0.0985 -> 0.1928 and
+    # it IS dying, so that is a true positive.
+    #
+    # An earlier default of 0.025 was a REGRESSION and is recorded here so it is
+    # not reintroduced: it changed runB by exactly nothing (both engage at it12)
+    # while driving res11 and ref16 to the coefficient cap and pinning them there
+    # — i.e. all cost, no benefit, on the two healthiest runs in the archive.
+    #
+    # PER-HARNESS, and this does NOT transfer: pool runs degrade at drift levels
+    # where single-scene runs are thriving (arm1 declines from 0.0578 while res11
+    # holds SR 0.73 at 0.0572-0.0701). For a small pool, engaging before arm1's
+    # 0.0578 onset while leaving runB's healthy 0.0295 alone needs
+    # target in (0.0197, 0.0385) -> ~0.03. Use 0.03 for a K=4 pool and accept the
+    # risk it names: if a pool run needs to reach drift ~0.06 to learn the way the
+    # single-scene runs did, 0.03 forbids that. `kl_base_coef_max` is the hedge.
+    #
+    # x is measured on this iteration's own rollouts, which is num_groups scenes'
+    # worth of episodes REGARDLESS of scene_seed_pool_size, so the UNITS transfer
+    # when K changes. The healthy LEVEL does not — see the per-harness note above.
+    kl_base_target: float = 0.055
+
+    # Multiplicative step per iteration. 2.0 rather than the gentler 1.5 because
+    # the failure being prevented is fast: runB went 0.0181 -> 0.1042 in two
+    # iterations. From the recommended kl_coef_base_model=1.0 start, 2.0 reaches
+    # ~20% authority within ~3 engaged iterations; 1.5 would need ~6, by which
+    # point the archive says the run is gone. Over-correction is recoverable and
+    # visible in train/kl_base_coef; under-correction is not. Note "recoverable"
+    # means VISIBLE and bounded, not cheap: undoing a 4x over-correction takes ~45
+    # below-band iterations at relax 1.1 / patience 3, which exceeds a whole run.
+    # That asymmetry is why kl_base_coef_max defaults to 5 rather than 30.
+    kl_base_adapt_rate: float = 2.0
+
+    # Relax rate, and why it is NOT the same number. The danger is one-sided:
+    # over-braking costs learning (recoverable, and visible in train/kl_base_coef),
+    # under-braking costs the run. A symmetric controller is actively harmful here,
+    # because low drift is the NORMAL healthy state, not evidence of over-braking —
+    # replayed on runB's measured series a symmetric x2/÷2 controller spends the
+    # below-band iterations walking itself toward the floor, and is then several
+    # doublings behind when drift takes off at it12 (how many depends on the target,
+    # so no single count is quoted: at target 0.04 it is ten, at the default 0.055
+    # it is eight). So: tighten fast, relax timidly — and see
+    # `_update_kl_base_coef`, where relaxation is additionally floored at the
+    # STARTING coefficient so it can only ever undo prior tightening.
+    kl_base_relax_rate: float = 1.1
+
+    # Consecutive below-band iterations required before relaxing at all. Resets on
+    # any iteration at or above the band. This is the other half of the disarm fix:
+    # with patience 3, a run that sits healthily under the target simply HOLDS its
+    # coefficient instead of walking it toward the floor. Relaxation is then
+    # reserved for the case it exists for — a policy pinned so hard it has stopped
+    # moving for several iterations running.
+    kl_base_relax_patience: int = 3
+
+    # Deadband, as multiples of the target: tighten above hi*target, relax below
+    # lo*target, hold in between. A deadband (rather than proportional control on
+    # every step) keeps the coefficient piecewise-constant within a band, which
+    # makes the TB curve legible — you can see exactly which iterations the trust
+    # region was actually doing something.
+    kl_base_deadband_hi: float = 1.5
+    kl_base_deadband_lo: float = 0.5
+
+    # Clamp on the controlled coefficient. The floor keeps the base forward pass
+    # meaningful. The CEILING is deliberately low (5.0, not 30) because
+    # over-correction is not cheaply reversible: relaxation is /1.1 gated on 3
+    # consecutive below-band iterations, so walking the cap back down to the start
+    # takes 51 iterations against archive runs of 14-20 -- i.e. not recoverable inside
+    # a run. A cap of 5 bounds the worst case to ~30% of the
+    # surrogate's per-row gradient at the default target (~53% at drift 0.10) —
+    # real pushback that cannot freeze the policy outright. At 30 it reaches 131%,
+    # which the controller can reach in 3 tightenings and never walk back inside a
+    # run. Raise it only if you want a hard stop rather than a brake, and watch
+    # train/kl_base_coef_at_max.
+    kl_base_coef_min: float = 0.1
+    kl_base_coef_max: float = 5.0
+
     # Jitter-GRPO Jacobian regularizer strength, split by advantage sign:
     # jitter_pos applies to positive-advantage chunks ("good" chunks we
     # reinforce), jitter_neg to negative-advantage chunks ("bad" chunks we
@@ -1363,6 +1505,158 @@ class GRPOConfig:
                 f"turns PAWS from a controller into a fixed amplifier without "
                 f"warning. Raise positive_advantage_weight_max or lower the target."
             )
+
+        # Adaptive base-model trust region. Every check is a hard error: each
+        # failure mode below is otherwise SILENT — the run completes, the curves
+        # look plausible, and the trust region simply never engaged.
+        if self.kl_base_adaptive:
+            if self.kl_coef_base_model <= 0.0:
+                raise ValueError(
+                    f"kl_base_adaptive=True requires kl_coef_base_model > 0, got "
+                    f"{self.kl_coef_base_model}. `compute_base` gates the base-model "
+                    f"forward pass on the CONFIG value, so a zero there means "
+                    f"ref_mse/log_base_ratio_mean is never measured and the controller "
+                    f"has no input — it would hold its initial value for the whole run. "
+                    f"Set kl_coef_base_model to the STARTING coefficient (1.0 "
+                    f"recommended: ~6% authority at the default target, near-inert, "
+                    f"but only 2 doublings from useful)."
+                )
+            if (not (0.0 < self.kl_base_target <= 0.2)
+                    or not math.isfinite(self.kl_base_target)):
+                raise ValueError(
+                    f"kl_base_target must be finite and in (0.0, 0.2], got "
+                    f"{self.kl_base_target!r}. It is a setpoint for "
+                    f"ref_mse/log_base_ratio_mean in NATS, and the largest value that "
+                    f"quantity has ever reached anywhere in the archive is 0.302. An "
+                    f"upper bound is enforced because a plausible unit confusion "
+                    f"(entering a percentage, or 1.0 'meaning one nat') puts the band "
+                    f"top above every drift the system can produce, so the controller "
+                    f"never tightens — the exact silent disarm these checks exist to "
+                    f"prevent. 0.5 was the previous bound and was itself too loose: "
+                    f"its band top of 0.75 nats is 2.5x the largest drift the system "
+                    f"has ever produced, so --kl-base-target 0.5 (one character off "
+                    f"0.05) silently disabled the controller. The binding bound is "
+                    f"~0.2."
+                )
+            if (not isinstance(self.kl_base_relax_patience, int)
+                    or isinstance(self.kl_base_relax_patience, bool)):
+                raise ValueError(
+                    f"kl_base_relax_patience must be an int, got "
+                    f"{self.kl_base_relax_patience!r} "
+                    f"({type(self.kl_base_relax_patience).__name__}). It is a COUNT "
+                    f"of consecutive below-band iterations. A float nan or inf passes "
+                    f"every `< 1` test and makes `streak >= patience` permanently "
+                    f"unsatisfiable, silently killing the relax branch; a bool "
+                    f"silently means 1."
+                )
+            if self.kl_base_relax_patience < 1:
+                raise ValueError(
+                    f"kl_base_relax_patience must be >= 1, got "
+                    f"{self.kl_base_relax_patience}. It is the number of CONSECUTIVE "
+                    f"below-band iterations required before the coefficient is lowered; "
+                    f"0 would relax on a single quiet iteration, which is the disarm "
+                    f"this knob exists to prevent."
+                )
+            # Non-finite guards on EVERY numeric knob, not just the target. Each
+            # of these is silent otherwise: adapt_rate=nan makes the first tighten
+            # produce a NaN coefficient (Python's min/max propagate nan), which
+            # NaNs kl_loss_base_model and then the whole loss; deadband_hi=inf
+            # makes `lbr > hi` unsatisfiable so the controller never tightens at
+            # all; coef_max=inf removes the ceiling.
+            for _n, _v in (
+                ("kl_coef_base_model", self.kl_coef_base_model),
+                ("kl_base_adapt_rate", self.kl_base_adapt_rate),
+                ("kl_base_relax_rate", self.kl_base_relax_rate),
+                ("kl_base_deadband_hi", self.kl_base_deadband_hi),
+                ("kl_base_deadband_lo", self.kl_base_deadband_lo),
+                ("kl_base_coef_min", self.kl_base_coef_min),
+                ("kl_base_coef_max", self.kl_base_coef_max),
+            ):
+                if isinstance(_v, bool) or not math.isfinite(_v):
+                    raise ValueError(
+                        f"{_n} must be a finite non-bool number, got {_v!r}. "
+                        f"A non-finite value here "
+                        f"disables the controller silently rather than loudly: nan "
+                        f"propagates into the loss, inf makes the tighten branch "
+                        f"unreachable."
+                    )
+            if self.kl_base_adapt_rate <= 1.0:
+                raise ValueError(
+                    f"kl_base_adapt_rate must be > 1.0, got "
+                    f"{self.kl_base_adapt_rate}. It is a multiplicative step: the "
+                    f"coefficient is multiplied by it when drift is high and divided "
+                    f"by it when low. A value <= 1.0 inverts the controller and drives "
+                    f"it straight to the floor."
+                )
+            if self.kl_base_relax_rate <= 1.0 or self.kl_base_relax_rate > self.kl_base_adapt_rate:
+                raise ValueError(
+                    f"1.0 < kl_base_relax_rate <= kl_base_adapt_rate is required, got "
+                    f"relax={self.kl_base_relax_rate}, adapt={self.kl_base_adapt_rate}. "
+                    f"Relaxing at least as fast as tightening makes the controller "
+                    f"symmetric, and a symmetric controller disarms itself during the "
+                    f"quiet phase that precedes ignition — replayed on runB it1-it11 it "
+                    f"walks the coefficient toward the floor before the drift ever "
+                    f"moves."
+                )
+            if not (0.0 < self.kl_base_deadband_lo < 1.0 < self.kl_base_deadband_hi):
+                raise ValueError(
+                    f"kl_base_deadband_lo < 1.0 < kl_base_deadband_hi is required, got "
+                    f"lo={self.kl_base_deadband_lo}, hi={self.kl_base_deadband_hi}. The "
+                    f"band must straddle the target, or the controller either never "
+                    f"engages or engages in both directions at once. lo must also be "
+                    f"strictly POSITIVE: at lo <= 0 no finite drift is ever below the "
+                    f"band, so the relax branch is unreachable and there is no "
+                    f"recovery from an over-correction."
+                )
+            if not (0.0 < self.kl_base_coef_min <= self.kl_base_coef_max):
+                raise ValueError(
+                    f"0 < kl_base_coef_min <= kl_base_coef_max is required, got "
+                    f"min={self.kl_base_coef_min}, max={self.kl_base_coef_max}. A zero "
+                    f"floor would let the controller switch the base-model KL off "
+                    f"entirely and never recover, the relax branch being multiplicative."
+                )
+            if self.kl_coef_base_model >= self.kl_base_coef_max:
+                raise ValueError(
+                    f"kl_coef_base_model={self.kl_coef_base_model:g} is at or above "
+                    f"kl_base_coef_max={self.kl_base_coef_max:g}, which makes the "
+                    f"controller a PERMANENT NO-OP: tighten is capped at the start "
+                    f"value and relax is floored at it, so the coefficient can never "
+                    f"move. It would run to completion reporting kl_base_action=0 and "
+                    f"kl_base_coef_at_max=1.0 forever — which the README tells you "
+                    f"means the trust region is winning outright. Leave room for at "
+                    f"least one tighten: kl_coef_base_model * kl_base_adapt_rate <= "
+                    f"kl_base_coef_max."
+                )
+            if not (self.kl_base_coef_min <= self.kl_coef_base_model
+                    <= self.kl_base_coef_max):
+                raise ValueError(
+                    f"kl_coef_base_model={self.kl_coef_base_model} is the STARTING value "
+                    f"for the controller and must lie inside "
+                    f"[{self.kl_base_coef_min}, {self.kl_base_coef_max}]. Otherwise the "
+                    f"first clamp silently relocates it and the run's own config dump no "
+                    f"longer records where it started."
+                )
+
+            # The START coefficient is a separate knob with its own default (0.2),
+            # chosen long before this controller existed. Leaving it there is
+            # accepted by the clamp but starts ~5x below the recommendation and, at
+            # the archive's 0.1, sits ON the floor so the controller can only ever
+            # climb. Warn rather than error: a deliberate low start is a legitimate
+            # experiment, an accidental one is not.
+            if self.kl_coef_base_model < 0.5:
+                import warnings
+                warnings.warn(
+                    f"kl_base_adaptive=True with kl_coef_base_model="
+                    f"{self.kl_coef_base_model:g}, which is the STARTING coefficient "
+                    f"for the controller. Recommended start is 1.0 (near-inert, but "
+                    f"only 2 doublings from useful authority). At "
+                    f"{self.kl_coef_base_model:g} the controller needs "
+                    f"~{math.ceil(math.log(1.0 / self.kl_coef_base_model) / math.log(self.kl_base_adapt_rate)):d} "
+                    f"extra doublings to reach that point, and the archive says a run "
+                    f"can collapse in two iterations.",
+                    stacklevel=2,
+                )
+
 
         # Weight-step direction cosines. Both knobs are validated
         # unconditionally: the cosines are always emitted, so a bad value here is

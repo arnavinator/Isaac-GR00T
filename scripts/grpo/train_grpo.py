@@ -360,6 +360,23 @@ class GRPOTrainer:
         # left to gain there, no matter how the advantage is weighted.
         # None = the ref pass has not run this iteration (skipped iter).
         self._ref_mse_stats: dict | None = None
+        # Runtime base-model KL coefficient. Held SEPARATELY from the config
+        # rather than mutating config.kl_coef_base_model, because the config is
+        # dumped verbatim to TB as the run's provenance record — mutating it in
+        # place would make the dump report wherever the controller happened to
+        # end up rather than where the operator set it. Always defined so the
+        # `__new__`-built trainers in the CPU test suites degrade to the config
+        # value. Persisted into optimizer.pt and restored on resume: a resumed
+        # run's drift does NOT restart at 0, so re-seeding the coefficient to its
+        # initial value would hand the run back the un-braked regime that the
+        # controller had already climbed out of (the failure mode the removed
+        # PAWS cross-iteration EMA had).
+        self._kl_base_coef: float | None = None
+        # Consecutive below-band iterations; gates the relax branch (see
+        # _update_kl_base_coef). Deliberately NOT checkpointed: it is at most
+        # `kl_base_relax_patience` iterations of state, and resetting it on resume
+        # errs toward holding the coefficient, which is the safe direction.
+        self._kl_base_below_streak: int = 0
 
         # Per-chunk jitter-gap survey, refreshed per iteration by
         # _per_chunk_gap_survey and emitted as chunk_gap/*. None when
@@ -545,6 +562,14 @@ class GRPOTrainer:
             eps=1e-5,  # Same as grpo_cont.py line 230
         )
 
+        # Controller state recovered from the checkpoint, if any. Initialised
+        # OUTSIDE the resume branch: the restore block below runs unconditionally
+        # (a fresh adaptive run must still seed self._kl_base_coef), so binding
+        # this only on the resume path made a fresh --kl-base-adaptive run die
+        # with NameError inside setup(). Not caught by the CPU suites, which
+        # build the trainer via __new__ and never call setup().
+        _resumed_kl_base_coef = None
+
         # Load optimizer state if resuming
         if self.config.resume_from:
             opt_path = Path(self.config.resume_from) / "optimizer.pt"
@@ -559,6 +584,10 @@ class GRPOTrainer:
                 ):
                     saved = payload["optimizer_state"]
                     self._validate_optimizer_param_names(payload["param_names"])
+                    # Absent on checkpoints written before the controller existed,
+                    # and None on adaptive-off runs — both mean "no state", which
+                    # the restore block below reports rather than silently assuming.
+                    _resumed_kl_base_coef = payload.get("kl_base_coef")
                 else:
                     print(
                         "  WARNING: optimizer.pt was saved by an older trainer "
@@ -573,6 +602,10 @@ class GRPOTrainer:
                 print(f"  Optimizer state restored from {opt_path}")
             else:
                 print(f"  WARNING: No optimizer.pt found at {opt_path}, starting fresh optimizer")
+
+        # Restore the adaptive-KL controller. Extracted into a helper so the whole
+        # four-case resume matrix is reachable from a CPU test without setup().
+        self._restore_kl_base_coef(_resumed_kl_base_coef)
 
         print(f"  AdamW: lr={self.config.learning_rate}, wd={self.config.weight_decay}")
         print(f"  Trainable params in optimizer: {sum(p.numel() for p in trainable_params):,}")
@@ -686,6 +719,29 @@ class GRPOTrainer:
             f"base_model={self.config.kl_coef_base_model}"
             f"{' (disabled)' if self.config.kl_coef_base_model == 0.0 else ''}"
         )
+        if getattr(self.config, "kl_base_adaptive", False):
+            c = self.config
+            hi, lo = c.kl_base_deadband_hi * c.kl_base_target, c.kl_base_deadband_lo * c.kl_base_target
+            # Print the resolved BAND and the starting authority, not just the
+            # knobs: the target is the centre of a deadband, not the level the
+            # drift settles at, and "coefficient 1.0" means nothing to anyone
+            # without the fraction-of-surrogate-gradient it buys.
+            a0 = c.kl_coef_base_model * abs(math.exp(-c.kl_base_target) - 1.0) / 0.9
+            print(
+                f"  Adaptive base-model trust region: ON "
+                f"(target log_base_ratio={c.kl_base_target:g} nats, "
+                f"hold band [{lo:.4f}, {hi:.4f}])"
+            )
+            print(
+                f"    kl_coef_base_model starts {c.kl_coef_base_model:g}, x/÷ "
+                f"{c.kl_base_adapt_rate:g} per iteration, clamped to "
+                f"[{c.kl_base_coef_min:g}, {c.kl_base_coef_max:g}]"
+            )
+            print(
+                f"    authority at target ~ {100*a0:.1f}% of the surrogate's per-row "
+                f"gradient at the starting coefficient; "
+                f"{100*c.kl_base_coef_max*abs(math.exp(-c.kl_base_target)-1.0)/0.9:.0f}% at the cap"
+            )
         # Per-row MSE-referenced lower clip. The RESOLVED arithmetic is printed,
         # not just the coefficient: the knob is in units nobody has intuition for
         # (nats per nat of MSE_ref), so a mis-set value is only visible as the
@@ -968,6 +1024,12 @@ class GRPOTrainer:
             vram = self._vram_snapshot(reset_peak=True)
             phase2b_start = time.time()
             self._compute_ref_log_probs()
+            # Closed-loop base-model trust region. HERE because it needs
+            # _ref_mse_stats (set by the call above, at theta == theta_ref so the
+            # drift carries no contamination from this iteration's own update)
+            # and must land BEFORE _grpo_update reads the coefficient. No-op dict
+            # when kl_base_adaptive is off.
+            kl_base_diag = self._update_kl_base_coef()
             phase2b_time = time.time() - phase2b_start
             if vram is not None:
                 vram["ref_peak"] = (
@@ -1065,6 +1127,7 @@ class GRPOTrainer:
                 # per logged iteration — both here and on the early-skip path
                 # above (where the step is zero and it is a no-op by design).
                 lora_cosines=self._compute_lora_step_cosines(),
+                kl_base_diag=kl_base_diag,
             )
 
             collect_label = (
@@ -1115,6 +1178,14 @@ class GRPOTrainer:
             final_dir = Path(self.config.checkpoint_dir) / f"iter_{final_iter:04d}"
             if final_dir.exists():
                 print(f"Final save skipped: iter_{final_iter:04d}/ already exists.")
+                # ...but the adaptive-KL coefficient still needs writing, for the
+                # same reason _save_checkpoint_for_skipped_iter refreshes it: it
+                # advances on every iteration reaching phase 2b, including ones that
+                # fire no optimizer step, so it is NOT already on disk. At the
+                # default save_interval=2 this fires whenever the last iteration
+                # trained nothing and final_iter is odd — i.e. exactly the
+                # all-non-finite / all-windows-dropped symptom this feature brakes.
+                self._refresh_kl_base_coef_in_checkpoint(final_dir)
             else:
                 self._save_checkpoint(final_iter)
 
@@ -3081,7 +3152,11 @@ class GRPOTrainer:
         # Whether the base-model KL anchor is active this run. Cached locally
         # so the per-mb hot path skips the dict lookup. Drives the decision
         # to load base_log_probs and compute KL(base || current) below.
+        # `compute_base` stays on the CONFIG value: it gates the base-model forward
+        # pass, and gating that on the CONTROLLED value would let the controller
+        # switch off its own input. `kl_base_coef` is what weights the loss.
         compute_base = self.config.kl_coef_base_model > 0.0
+        kl_base_coef = self._kl_base_coef_now()
 
         # Per-branch row-level accumulators (Jitter-GRPO). Aggregated metrics
         # above stay per-mb so the jitter-off path produces bit-identical
@@ -4566,7 +4641,8 @@ class GRPOTrainer:
                     kl_per_row_base_model = (
                         inv_log_ratio_base.exp() - inv_log_ratio_base - 1.0
                     )
-                    kl_loss_base_model = self.config.kl_coef_base_model * (
+                    # Controlled coefficient, not config — see _kl_base_coef_now.
+                    kl_loss_base_model = kl_base_coef * (
                         kl_per_row_base_model.mean() if not anchors_in_play
                         else kl_per_row_base_model.sum() / loss_divisor
                     )
@@ -5423,7 +5499,7 @@ class GRPOTrainer:
             )
             if compute_base:
                 result["kl_loss_base_model_fixed"] = (
-                    self.config.kl_coef_base_model
+                    kl_base_coef
                     * (kl_per_row_sum_base_model_fixed / n_rows_fixed)
                 )
         if n_rows_jitter > 0:
@@ -5435,7 +5511,7 @@ class GRPOTrainer:
             )
             if compute_base:
                 result["kl_loss_base_model_jitter"] = (
-                    self.config.kl_coef_base_model
+                    kl_base_coef
                     * (kl_per_row_sum_base_model_jitter / n_rows_jitter)
                 )
         # Clipfrac split by advantage sign — each {branch}_{sign} bucket
@@ -6884,6 +6960,7 @@ class GRPOTrainer:
         phase_times=None,
         lora_delta_norm=None,
         lora_cosines=None,
+        kl_base_diag=None,
     ):
         """Log training metrics to TensorBoard and wandb."""
         if self.writer is None:
@@ -7221,6 +7298,15 @@ class GRPOTrainer:
         #   jitter/gap_fixed_rows_selfcheck = must be ~0 (paired mode only).
         if update_stats and update_stats.get("_jitter_diag"):
             _emit("jitter", update_stats["_jitter_diag"])
+
+        # Adaptive base-model trust region. Emitted OUTSIDE the n_updates > 0
+        # gate: the controller runs on the ref pass, so its reading is valid on
+        # an iteration whose update was then skipped or discarded — and a
+        # runaway drift is a likely reason for landing there. Empty dict when
+        # kl_base_adaptive is off, so no `train/kl_base_*` curve appears and the
+        # off path is byte-identical.
+        if kl_base_diag:
+            _emit("train", kl_base_diag)
 
         # Per-ROW erosion-drift distribution. Its own `drift/` prefix for the same
         # reason as `jitter/`: it is a pooled per-ROW distribution, not a
@@ -7604,6 +7690,18 @@ class GRPOTrainer:
                     log_dict["smooth/instrument"] = str(
                         self.config.smooth_instrument
                     )
+                # Mirror the TB-side train/kl_base_* block at the SAME gating the
+                # TB side uses — outside `if update_stats`, because the controller
+                # runs on the ref pass and its reading is valid on an iteration
+                # whose update was skipped or discarded. Nesting it under
+                # update_stats would make TB show the curves while wandb silently
+                # dropped them on exactly those iterations.
+                if kl_base_diag:
+                    log_dict.update({
+                        f"train/{k}": v
+                        for k, v in kl_base_diag.items()
+                        if math.isfinite(v)
+                    })
                 _ref_mse_w = getattr(self, "_ref_mse_stats", None)
                 if _ref_mse_w:
                     log_dict.update({
@@ -8768,6 +8866,208 @@ class GRPOTrainer:
                 # than freezing a zero vector whose cosine is undefined forever.
         return out
 
+    def _kl_base_coef_now(self) -> float:
+        """The base-model KL coefficient in force for THIS iteration.
+
+        With `kl_base_adaptive` off this is exactly `config.kl_coef_base_model`,
+        so every consumer is numerically unchanged. With it on, this is the
+        controlled value from `_update_kl_base_coef`.
+
+        Read this at every consumer rather than the config — a consumer that
+        reads the config directly would weight the loss with one coefficient and
+        report the metric with another, which is precisely the desynchronisation
+        that made `clipfrac_effective_neg` untrustworthy. The one deliberate
+        exception is the `compute_base` gate, which must stay on the CONFIG value:
+        gating the base forward pass on a controlled coefficient would let the
+        controller switch off its own input.
+        """
+        if not getattr(self.config, "kl_base_adaptive", False):
+            return self.config.kl_coef_base_model
+        cur = getattr(self, "_kl_base_coef", None)
+        return self.config.kl_coef_base_model if cur is None else cur
+
+    def _restore_kl_base_coef(self, resumed: "float | None"):
+        """Seed `_kl_base_coef` at setup, from a checkpoint value when present.
+
+        Keyed on the flag being ON now: resuming a NON-adaptive checkpoint into an
+        adaptive run legitimately starts the controller at the configured value, and
+        the message says so rather than leaving it to be inferred from the curve.
+
+        The restored value is CLAMPED to `[kl_base_coef_min, kl_base_coef_max]`.
+        Validation only bounds the CONFIG start, so without this a resume that
+        lowers `--kl-base-coef-max` (or raises the min) would weight the loss with a
+        coefficient outside the configured range — and the no-reading branch returns
+        before the controller's own clamp, so nothing downstream would correct it.
+        The clamp warns, because silently relocating a resumed coefficient would
+        make the run's own logs disagree with its config.
+        """
+        if not getattr(self.config, "kl_base_adaptive", False):
+            return
+        cfg = self.config
+        if resumed is not None:
+            val = float(resumed)
+            clamped = min(max(val, cfg.kl_base_coef_min), cfg.kl_base_coef_max)
+            if clamped != val:
+                print(
+                    f"  WARNING: resumed adaptive-KL coefficient {val:.4g} is outside "
+                    f"[{cfg.kl_base_coef_min:g}, {cfg.kl_base_coef_max:g}] and was "
+                    f"clamped to {clamped:.4g}. The clamp bounds only the CONFIG "
+                    f"start, so a resume that narrowed the range lands here."
+                )
+            self._kl_base_coef = clamped
+            print(f"  Adaptive KL: resumed kl_coef_base_model = {self._kl_base_coef:.4g}")
+        else:
+            self._kl_base_coef = float(cfg.kl_coef_base_model)
+            if cfg.resume_from:
+                print(
+                    f"  Adaptive KL: checkpoint carried no controller state; starting "
+                    f"at kl_coef_base_model = {self._kl_base_coef:.4g}. If this resume "
+                    f"continues an adaptive run, the coefficient has been reset and "
+                    f"the first iterations are under-braked."
+                )
+            else:
+                print(
+                    f"  Adaptive KL: starting at kl_coef_base_model = "
+                    f"{self._kl_base_coef:.4g}"
+                )
+
+    def _update_kl_base_coef(self) -> dict:
+        """Closed-loop controller on `ref_mse/log_base_ratio_mean`.
+
+        Called once per iteration AFTER `_compute_ref_log_probs` has set
+        `self._ref_mse_stats` (so the drift is measured at theta == theta_ref,
+        free of this iteration's own update) and BEFORE `_grpo_update` consumes
+        the coefficient.
+
+        Deadband control, deliberately not proportional-on-every-step: the
+        coefficient stays piecewise constant inside the band, so `train/kl_base_coef`
+        shows at a glance which iterations the trust region was actually doing
+        something. Multiplicative in both directions because the authority it buys
+        is multiplicative — the restoring coefficient is `coef * |e^x - 1|`.
+
+        Returns a dict of scalars for `_log_metrics`; empty when inactive.
+        """
+        if not getattr(self.config, "kl_base_adaptive", False):
+            return {}
+        cfg = self.config
+        if self._kl_base_coef is None:
+            self._kl_base_coef = float(cfg.kl_coef_base_model)
+        prev = self._kl_base_coef
+
+        stats = getattr(self, "_ref_mse_stats", None) or {}
+        lbr = stats.get("log_base_ratio_mean")
+        # No reading this iteration (no base pass, or every chunk filtered): HOLD.
+        # Not "relax" — an absent measurement is not evidence that drift is low,
+        # and the relax branch would walk the coefficient down to the floor over a
+        # few such iterations, silently disarming the controller.
+        if lbr is None or not math.isfinite(float(lbr)):
+            # Same key set as the normal path (plus the flag), so none of the
+            # train/kl_base_* series gaps on a hold iteration and they stay
+            # plottable as continuous curves.
+            return {
+                "kl_base_coef": prev,
+                "kl_base_action": 0.0,
+                "kl_base_below_streak": float(getattr(self, "_kl_base_below_streak", 0)),
+                # Carry the FULL key set, including these two: an earlier version
+                # omitted them and gapped exactly the two series you want on a hold
+                # iteration. lbr is unavailable by definition here, so it is
+                # reported as nan and _emit drops it — a gap in ONE series that is
+                # genuinely unmeasurable, not in the authority readout.
+                "kl_base_log_base_ratio": float("nan"),
+                # nan, NOT 0.0: a fabricated zero on the very iterations the
+                # retention term matters most would read as "no restoring force"
+                # when the force is simply unmeasured. _emit drops it with a
+                # warning, matching this file's leaves-a-gap-rather-than-a-fake-0
+                # policy elsewhere.
+                "kl_base_authority_frac": float("nan"),
+                "kl_base_coef_held_no_reading": 1.0,
+                "kl_base_coef_at_max": float(prev >= cfg.kl_base_coef_max),
+                "kl_base_coef_at_min": float(prev <= cfg.kl_base_coef_min),
+            }
+        lbr = float(lbr)
+
+        hi = cfg.kl_base_deadband_hi * cfg.kl_base_target
+        lo = cfg.kl_base_deadband_lo * cfg.kl_base_target
+        # ASYMMETRIC, with patience on the relax side. Low drift is the normal
+        # healthy state, NOT evidence of over-braking. A symmetric x2/÷2 controller
+        # replayed on runB's measured series spends every below-band iteration
+        # walking the coefficient toward the floor and is several doublings behind
+        # when the drift takes off at it12; how many depends on the target, so no
+        # single number is quoted here (at target 0.04 it is ten iterations reaching
+        # the 0.1 floor; at the default 0.055 it is eight). Tighten fast, relax
+        # timidly, and additionally floor the relax at the STARTING coefficient
+        # below, so relaxation can only ever undo prior tightening.
+        if lbr > hi:
+            new = prev * cfg.kl_base_adapt_rate
+            self._kl_base_below_streak = 0
+        elif lbr < lo:
+            self._kl_base_below_streak = getattr(self, "_kl_base_below_streak", 0) + 1
+            if self._kl_base_below_streak >= cfg.kl_base_relax_patience:
+                # Floor the relax at the STARTING coefficient, not at
+                # kl_base_coef_min. Relaxation exists to undo prior TIGHTENING; it
+                # has no business walking the coefficient below the baseline the
+                # operator chose. Without this floor the controller disarms itself
+                # on every fresh run: log_base_ratio reads exactly 0 at iteration 1
+                # (PEFT zero-inits lora_B, so iteration 1 IS the base policy), so a
+                # fresh run always starts below the band and immediately begins
+                # accumulating the streak. Replayed on runB's FULL it1-14 series
+                # that walked 1.0 -> 0.751 before the emergency at it12 — three
+                # relaxations under-braked, entirely self-inflicted. Patience alone
+                # only PACES the walk; it does not stop it.
+                # Floor at the STARTING coefficient, but never let this branch
+                # RAISE the coefficient: `min(start, prev)` handles a resumed run
+                # whose restored coefficient is BELOW the configured start (an
+                # operator raising kl_coef_base_model on resume is a plausible
+                # response to a drifting run). Without the min(), a quiet iteration
+                # would jump the coefficient UP to the start value and report it as
+                # a relaxation.
+                new = max(prev / cfg.kl_base_relax_rate,
+                          min(float(cfg.kl_coef_base_model), prev))
+                # Consume the streak so relaxation is paced by patience rather than
+                # compounding every iteration once the threshold is first crossed.
+                self._kl_base_below_streak = 0
+            else:
+                new = prev
+        else:
+            new = prev
+            self._kl_base_below_streak = 0
+        new = min(max(new, cfg.kl_base_coef_min), cfg.kl_base_coef_max)
+        # `action` is derived from the CLAMPED value, so it reports EFFECT and can
+        # never disagree with the coefficient the loss will use. Computing it inside
+        # the branches (the earlier form) reported 0 on any iteration where the
+        # shared clamp moved the coefficient — reachable without hand-editing, by
+        # lowering kl_base_coef_max on a resume: prev=8, above-band -> min(16,5)=5,
+        # the coefficient visibly steps 8->5 while action said "held".
+        action = 1.0 if new > prev else (-1.0 if new < prev else 0.0)
+
+        self._kl_base_coef = new
+        if prev != new:
+            print(
+                f"  KL trust region: log_base_ratio={lbr:.5f} vs band "
+                f"[{lo:.4f}, {hi:.4f}] -> kl_coef_base_model {prev:.4g} -> {new:.4g}"
+            )
+        # Authority estimate: the k3 restoring coefficient is coef*|e^x - 1|, and
+        # the surrogate's per-row gradient is |A|*rho ~ 0.9 with z-scored A and
+        # rho ~ 1. Reported as a FRACTION so it is comparable across runs, and
+        # because the absolute nats are not the quantity anyone can reason about.
+        return {
+            "kl_base_coef": new,
+            "kl_base_log_base_ratio": lbr,
+            "kl_base_action": action,
+            # exp(-lbr) overflows for lbr < -709.78. Unreachable in practice (the
+            # archive's most negative reading is -0.045) but this is a DIAGNOSTIC on
+            # the critical path, and letting it raise would discard a full iteration
+            # of collected simulation. Degrade to inf, which _emit then drops.
+            "kl_base_authority_frac": (
+                new * abs(math.exp(-lbr) - 1.0) / 0.9
+                if -700.0 < lbr < 700.0 else float("inf")
+            ),
+            "kl_base_coef_at_max": float(new >= cfg.kl_base_coef_max),
+            "kl_base_coef_at_min": float(new <= cfg.kl_base_coef_min),
+            "kl_base_below_streak": float(self._kl_base_below_streak),
+            "kl_base_coef_held_no_reading": 0.0,
+        }
+
     def _save_checkpoint(self, iteration: int):
         """Save LoRA weights and optimizer state."""
         ckpt_dir = Path(self.config.checkpoint_dir) / f"iter_{iteration:04d}"
@@ -8782,6 +9082,12 @@ class GRPOTrainer:
             {
                 "optimizer_state": self.optimizer.state_dict(),
                 "param_names": self._lora_param_names,
+                # Controller state. A resumed run's drift does NOT restart at 0,
+                # so re-seeding the coefficient to its config value would hand the
+                # run back the un-braked regime the controller had climbed out of.
+                # None when kl_base_adaptive is off, so an older checkpoint (no key)
+                # and a non-adaptive one are indistinguishable and both correct.
+                "kl_base_coef": getattr(self, "_kl_base_coef", None),
             },
             ckpt_dir / "optimizer.pt",
         )
@@ -8803,8 +9109,17 @@ class GRPOTrainer:
             seen (frac = 1 - (last_updated)/num_iterations), since LR is
             recomputed per-iter from the loop counter.
           - If the dir already exists (e.g., the previous successful iter
-            was a save_interval boundary), skip the write — the on-disk
-            state is already exactly what we'd be saving.
+            was a save_interval boundary), skip the WEIGHT/optimizer write —
+            the on-disk state is already exactly what we'd be saving.
+
+        The one exception is the adaptive-KL coefficient. It advances on EVERY
+        iteration that reaches phase 2b, including ones that fire no optimizer
+        step, so unlike the weights and the AdamW moments it is NOT already on
+        disk. Skipping the write wholesale silently discarded it: iter 10 saves,
+        iters 11-12 tighten 1.0 -> 2.0 -> 4.0 but update nothing and both early-
+        return, and a resume from iter_0010/ restores 1.0 — handing the run back
+        exactly the under-braked regime this feature exists to prevent. So the
+        early-return path now refreshes just that one field in place.
         """
         target = self._last_updated_iteration
         if target <= 0:
@@ -8819,8 +9134,64 @@ class GRPOTrainer:
                 f"  Skip checkpoint at iter {iteration}: iter_{target:04d}/ "
                 f"already exists (resume from there to retry iter {target + 1})."
             )
+            self._refresh_kl_base_coef_in_checkpoint(ckpt_dir)
             return
         self._save_checkpoint(target)
+
+    def _refresh_kl_base_coef_in_checkpoint(self, ckpt_dir: Path):
+        """Rewrite ONLY `kl_base_coef` inside an existing `optimizer.pt`.
+
+        See `_save_checkpoint_for_skipped_iter`: the controller advances on
+        iterations that write no checkpoint, so an existing dir can hold a stale
+        coefficient even though its weights and moments are current. Load, patch
+        the one key, write back. No-op when the feature is off, when there is no
+        controller state yet, or when the file is missing/unreadable — a
+        diagnostic-state refresh must never be able to abort a run or corrupt a
+        resume point, so every failure degrades to a warning.
+        """
+        if not getattr(self.config, "kl_base_adaptive", False):
+            return
+        if getattr(self, "_kl_base_coef", None) is None:
+            return
+        opt_path = ckpt_dir / "optimizer.pt"
+        if not opt_path.exists():
+            return
+        try:
+            payload = torch.load(opt_path, map_location="cpu")
+            if not isinstance(payload, dict) or "optimizer_state" not in payload:
+                # Legacy raw-state_dict checkpoint: no dict to patch, and
+                # rewrapping it here would change the format under a resume that
+                # expects the legacy shape. Leave it alone and say so.
+                print(
+                    "  NOTE: optimizer.pt is in the legacy format; adaptive-KL "
+                    "coefficient not refreshed. A resume from this dir will restart "
+                    f"the controller at kl_coef_base_model="
+                    f"{self.config.kl_coef_base_model:g}."
+                )
+                return
+            if payload.get("kl_base_coef") == self._kl_base_coef:
+                return
+            payload["kl_base_coef"] = self._kl_base_coef
+            # ATOMIC: torch.save truncates in place, so an interrupt mid-write leaves
+            # a stub (measured: 1.34 MB -> 11 bytes on an injected ENOSPC) and the
+            # next --resume-from dies on a zip-read error. Write beside it and rename;
+            # os.replace is atomic within a filesystem, so the resume point is either
+            # the old payload or the new one, never a fragment.
+            tmp_path = opt_path.with_suffix(".pt.tmp")
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, opt_path)
+            print(
+                f"  Refreshed adaptive-KL coefficient in {opt_path.parent.name}/: "
+                f"{self._kl_base_coef:.4g}"
+            )
+        except Exception as e:  # noqa: BLE001 - never abort a run over a diagnostic
+            print(f"  WARNING: could not refresh adaptive-KL coefficient: {e}")
+            # The temp file is the only thing that can be left behind now, and it is
+            # never read. Remove it so a later run does not inherit a stale stub.
+            try:
+                (ckpt_dir / "optimizer.pt.tmp").unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

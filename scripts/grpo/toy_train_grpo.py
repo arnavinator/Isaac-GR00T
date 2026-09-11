@@ -498,6 +498,7 @@ class ToyGRPOTrainer(GRPOTrainer):
         phase_times=None,
         lora_delta_norm=None,
         lora_cosines=None,
+        kl_base_diag=None,
     ):
         """Extend parent logging with per-seed success rates.
 
@@ -521,7 +522,7 @@ class ToyGRPOTrainer(GRPOTrainer):
         super()._log_metrics(
             iteration, stats, update_stats, lr, iter_time, skip_reason,
             phase_times=phase_times, lora_delta_norm=lora_delta_norm,
-            lora_cosines=lora_cosines,
+            lora_cosines=lora_cosines, kl_base_diag=kl_base_diag,
         )
         if self.writer is None:
             return

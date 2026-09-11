@@ -31,6 +31,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
 | `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
+| `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
 
 ---
 
@@ -106,8 +107,27 @@ Each `iter_NNNN/` checkpoint dir contains:
 ```
 iter_NNNN/
   lora_weights.pt   # filtered LoRA-only state dict (~80 MB at rank=16)
-  optimizer.pt      # only needed for resuming training; ignored for inference
+  optimizer.pt      # optimizer state + param names + kl_base_coef;
+                    # only needed for resuming training, ignored for inference
 ```
+
+`optimizer.pt` also carries the adaptive-KL controller's coefficient
+(`kl_base_coef`, `None` when the feature is off). The four resume cases:
+
+| resuming | into | result |
+|---|---|---|
+| adaptive checkpoint | adaptive run | coefficient restored |
+| pre-feature checkpoint (no key) | adaptive run | starts at `kl_coef_base_model`, prints a warning |
+| — (fresh, `resume_from=None`) | adaptive run | starts at `kl_coef_base_model`, no warning |
+| adaptive checkpoint | **non**-adaptive run | ignored; and the next `_save_checkpoint` writes `None`, so an adaptive → non-adaptive → adaptive chain **silently discards** the coefficient |
+
+`_kl_base_below_streak` is deliberately NOT persisted — it is at most
+`kl_base_relax_patience` iterations of state, and resetting it on resume errs toward
+holding the coefficient, which is the safe direction. `_save_checkpoint_for_skipped_iter`
+early-returns when the target dir already exists, which is correct for weights and AdamW
+moments but NOT for the coefficient (it advances on every iteration reaching phase 2b,
+including ones that fire no optimizer step), so that path calls
+`_refresh_kl_base_coef_in_checkpoint` to patch just that one key in place.
 
 There are two supported inference paths: a **server-client benchmark** (drop
 into the existing denoising-lab eval pipeline) and an **in-process notebook**
@@ -1824,10 +1844,17 @@ kl_loss_last_iter = kl_coef_last_iter * (inv.exp() - inv - 1).mean()
 # iter inside the same no_grad pass that produces ref_log_prob, with
 # `with disabled_adapters(model.action_head.model)`.
 inv_base = base_log_prob - current_log_prob
-kl_loss_base_model = kl_coef_base_model * (inv_base.exp() - inv_base - 1).mean()
+kl_loss_base_model = _kl_base_coef_now() * (inv_base.exp() - inv_base - 1).mean()
 
 loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
 ```
+
+`_kl_base_coef_now()` is `config.kl_coef_base_model` unless
+`kl_base_adaptive=True`, in which case it is the controlled value — see "Adaptive
+base-model trust region" below. **`compute_base` still gates on the CONFIG value**
+(`compute_base = self.config.kl_coef_base_model > 0.0`): it decides whether the
+base-model forward pass runs at all, and gating that on the controlled value would
+let the controller switch off its own input.
 
 When anchor rows are present in the minibatch, all three `.mean()`s become
 `.sum() / signal_mb_size` (a constant, not the realized row count) — see
@@ -1863,6 +1890,161 @@ If ZERO minibatches commit a gradient step in an iteration (every batch
 non-finite, every window dropped, or every group dead), the iteration is
 treated as **skipped** and the resume checkpoint is saved under the last
 successfully-updated iter's name (see "Checkpointing").
+
+### Adaptive base-model trust region (`kl_base_adaptive`)
+
+`kl_base_adaptive = False` (default) is OFF and bit-identical to HEAD: the
+controller returns an empty dict, no `train/kl_base_*` curve is emitted, and no RNG
+is consumed. The off-switch claim is an
+out-of-tree differential (materialize HEAD with `git show HEAD:scripts/grpo/<f>` and
+drive `test_grad_accum.run_update` on both trees); `test_kl_base_adaptive.py` covers the
+in-tree half — no emission, no state touched, `_kl_base_coef_now()` falling back to the
+config value.
+
+**The problem.** `ref_mse/log_base_ratio_mean` (= `ref_log_prob − base_log_prob`, an
+on-policy KL(θ‖base) estimate in loss-native nats) increases NET in all 10 archive
+runs that log it — runB 0 → 0.302, arm1 0.018 → 0.111, ref16 0 → 0.193, lr12e4
+0 → 0.272 — and nothing bounds it. 6 of the 10 are strictly monotone and 4 dip; the
+discriminator is MAGNITUDE, not monotonicity, and `res11` alone stays inside a narrow
+band (0.057 → 0.070, net +0.012) while also being the most stable and highest-SR run
+measured. Unlike `lora/weight_delta_norm` this quantity is **continuous across every
+resume** (arm1 it10 = 0.01809 vs runB it10 = 0.01808), so it is globally comparable
+across the whole archive.
+
+The k3 gradient is `coef·(e^x − 1)·(−∂lp/∂θ)`, i.e. a restoring force **linear** in
+the drift `x`, against a surrogate per-row gradient of ≈0.9. At the shipped
+`kl_coef_base_model = 0.1` that is **0.20 %** authority at runB's ignition point
+(x = 0.0181) and 2.9 % even at x = 0.302 once the run is dead. Every run that logs
+the quantity used coef 0.1 and the archive-wide peak is 2.90 %, so the mechanism has
+never been tested — under-powered by ~100× (20 % authority at ignition needs
+coef 10.09).
+
+**Why a controller and not a bigger constant.** The coefficient needed for constant
+authority moves **14×** within one run: 20 % needs coef 10.0 at x = 0.018 but coef 0.7
+at x = 0.302. Structurally a fixed coefficient is proportional control on a plant that
+is itself an integral, which leaves a steady-state offset. Adapting it adds integral
+action: the coefficient climbs until the drift stops *growing*, whatever the surrogate
+pushes with. Same reason adaptive-KL controllers exist in RLHF rather than fixed
+penalties.
+
+**The law.** Deadband on `log_base_ratio_mean` against `kl_base_target`, deliberately
+**asymmetric**:
+
+| condition | action |
+|---|---|
+| `lbr > deadband_hi · target` | `coef ×= kl_base_adapt_rate`, clamped at `coef_max`; streak reset |
+| `deadband_lo · target ≤ lbr ≤ deadband_hi · target` | hold; streak reset |
+| `lbr < deadband_lo · target` | streak += 1; on reaching `kl_base_relax_patience`, `coef /= kl_base_relax_rate` **floored at the STARTING coefficient**, streak consumed |
+| no / non-finite reading | **hold** (never relax), flagged `kl_base_coef_held_no_reading` |
+
+Three properties, each of which fixed a real bug:
+
+- **Asymmetric, and relaxation is floored at the start value.** Low drift is the
+  normal healthy state, *not* evidence of over-braking. A symmetric ×2/÷2 controller
+  disarms itself: `log_base_ratio_mean` reads exactly **0** at iteration 1 (PEFT
+  zero-inits `lora_B`, so iteration 1 IS the base policy), so a fresh run always
+  starts below the band and immediately accumulates the streak. Replayed on runB it
+  entered the emergency several doublings under-braked. Patience alone only *paces*
+  the walk; the floor is what stops it.
+- **A missing reading holds.** An absent measurement is not evidence that drift is
+  low; relaxing on it would walk the coefficient down over a few iterations.
+- **The relax branch can never RAISE the coefficient** (`max(prev/relax,
+  min(start, prev))`) — otherwise a resumed run whose restored coefficient is below a
+  raised `kl_coef_base_model` would jump *up* on a quiet iteration and report it as a
+  relaxation.
+
+**Ordering.** Called in `train()` **after** `_compute_ref_log_probs()` (so the drift is
+measured at θ ≡ θ_ref, free of this iteration's own update) and **before**
+`_grpo_update()` (which captures the coefficient once per iteration). It sits inside
+the Phase-2b timing window, so `time/ref_logprob_seconds` nominally covers it —
+negligible against a multi-minute phase.
+
+**`kl_base_target` CANNOT be calibrated from the archive, and this is the honest state of the evidence.** Replaying the real controller against all 10 drift-logging runs
+and asking for a target that (a) engages on every run that degraded and (b) spares
+every run that did not, the constraint set is **empty by 38×**:
+
+| run | outcome | drift at the decisive iteration | implied bound |
+|---|---|---|---|
+| `full175` | degraded .583 → .333 | **0.0076** | target < 0.0051 |
+| `arm1` | declined .688 → .458 | 0.0578 | target < 0.0386 |
+| `CONTROL_r9` | collapsed .646 → .354 | 0.0875 | target < 0.0583 |
+| `res11` | never degraded, best SR | max 0.0701 | target ≥ 0.0467 |
+| `mse0.8_r13` | declined | max 0.0846 | target ≥ 0.0564 |
+| `lr12e4` | **+0.50 SR, the biggest gainer** | max 0.2925 | target ≥ 0.1950 |
+
+`full175` degraded at drift 0.0076 while `lr12e4` thrived at 0.2925 — a **38× overlap**
+between the healthy and degrading ranges. Worse, tested as a classifier over all 26
+iteration transitions in the corpus, neither the level nor its increment predicts a
+subsequent ≥0.15 SR drop:
+
+| predictor | AUC |
+|---|---|
+| `log_base_ratio_mean` level | **0.317** |
+| its per-iteration increment | **0.358** |
+
+Both are *below* chance (0.5). With 6 positives the CI is wide enough not to refute the
+mechanism, but the archive provides **no evidence for it**. The original rationale — "it
+grows in every run and nothing bounds it, therefore bounding it will help" — conflates
+a thing that always happens with a thing that causes harm; something that rises in the
+runs that *succeed* cannot discriminate.
+
+So **0.055 is an operating guess, not a derivation.** It is chosen only to sit inside
+the two-run window [0.0467, 0.0695] that spares `res11` and still engages on runB's
+it12 collapse, and three of the other seven runs contradict it. An earlier default of
+0.025 was strictly worse — it changed runB by exactly nothing while driving `res11` and
+`ref16` to the cap and pinning them there — but "better than 0.025" is the only claim
+0.055 supports.
+
+**Treat this feature as speculative until the readout is fixed.** Success is currently
+measured on the very 48 episodes the update consumes, with a 0.094 difference-SE and a
+period-3 scene sawtooth; a frozen-weights baseline and a pass-complete paired statistic
+are prerequisites for telling whether bounding drift does anything at all.
+
+**This does NOT transfer across harnesses.** Pool runs degrade at drift levels where
+single-scene runs thrive: arm1 declines from 0.0578 while `res11` holds SR 0.73 at
+0.0572–0.0701. For a small pool, engaging before arm1's onset while leaving runB's
+healthy 0.0295 alone needs target ∈ (0.0197, 0.0385) → **~0.03 for a K=4 pool**, with
+the named risk that if a pool run needs to reach ~0.06 to learn the way the
+single-scene runs did, 0.03 forbids it. `kl_base_coef_max` is the hedge.
+
+`lbr` is measured on this iteration's own rollouts, which is `num_groups` scenes'
+worth of episodes **regardless of `scene_seed_pool_size`** — so the UNITS transfer when
+K changes; the healthy LEVEL does not.
+
+**`kl_base_coef_max` defaults to 5, not 30.** Over-correction is visible but not cheap:
+relaxation is ÷1.1 gated on 3 consecutive below-band iterations, so walking the cap back
+down to the start takes **51 iterations**, against archive runs of 14–20 — i.e. not
+recoverable inside a run. A cap of 5 bounds the worst case to **~30 %** authority at the
+default target (~53 % at drift 0.10) — real pushback that cannot freeze the policy. At 30
+it reaches **178 %**, reachable in 3 tightenings. Watch `train/kl_base_coef_at_max`; the
+startup banner prints both figures for the resolved config, and the banner is the
+authority if it ever disagrees with this file.
+
+**Expect a floor, not a gain.** `res11` held SR 0.73 by barely moving. A working trust
+region plausibly converts "collapse" into "flat" — that is the floor this establishes,
+not its ceiling. Pair it with something that supplies upside.
+
+**Known limitation.** `_summarize_ref_mse` is called with **signal chunks only**, so
+with `include_anchor_groups=True` at high success an all-anchor iteration leaves
+`_ref_mse_stats = None` and the controller HOLDS — precisely when the retention term is
+most load-bearing. It is flagged, not silent.
+
+**Persistence.** `optimizer.pt` carries `kl_base_coef`; see "Checkpointing & Resuming".
+
+#### CLI usage
+
+```bash
+# Recommended: start at 1.0 (~6% authority at the default target — near-inert, but only 2 doublings
+# from useful). Leaving kl_coef_base_model at its 0.2 default warns.
+uv run python scripts/grpo/train_grpo.py \
+    --kl-base-adaptive --kl-coef-base-model 1.0
+
+# K=4 pool: tighter target, per the per-harness note above.
+uv run python scripts/grpo/train_grpo.py \
+    --kl-base-adaptive --kl-coef-base-model 1.0 --kl-base-target 0.03 \
+    --scene-seed-pool-size 4 --scene-seed-pool-base 105067 \
+    --num-groups 4 --max-groups 4 --min-alive-groups 0
+```
 
 ### Per-row, MSE-referenced lower clip (`clip_low_mse_coef`)
 
@@ -2624,6 +2806,13 @@ torch RNG stream is unchanged versus runs recorded before this existed.
 | `ref_mse/pos_mean`, `neg_mean` | split by advantage sign. `pos_mean` is the reinforcement headroom on successful chunks; it decaying toward 0 while success rate plateaus **is** positive-branch saturation, since the FM loss is least-squares so the gradient is `∝ residual`. |
 | `ref_mse/ratio_ceiling_{mean,max}` | `exp(MSE_ref)` — the analytic ceiling on the importance ratio, since `log ρ = MSE_ref − MSE_θ` and `MSE_θ ≥ 0`. Compare against `1 + clip_eps_high`: the per-iteration console line prints REACHABLE / UNREACHABLE. |
 | `ref_mse/log_base_ratio_{mean,p10,min}` | `ref_log_prob − base_log_prob` = cumulative drift of the adapted field from the pretrained one, in MSE units and unscaled by any coefficient (unlike `kl_loss_base_model`). Positive = fits the sampled action better than base. Emitted only when `kl_coef_base_model > 0`. |
+| `train/kl_base_coef` | The controlled `kl_coef_base_model` in force this iteration. The headline curve: piecewise-constant by design, so every step is an action. Emitted only when `kl_base_adaptive=True`. |
+| `train/kl_base_log_base_ratio` | The controller's input, i.e. `ref_mse/log_base_ratio_mean` echoed beside its setpoint. `nan` (and so dropped by `_emit`) on a no-reading iteration, which is the one series that genuinely cannot be filled. |
+| `train/kl_base_action` | `+1` tightened, `−1` relaxed, `0` held. **Effect-based, not intent-based**: a coefficient pinned at `kl_base_coef_max` reports `0`, not `+1`. |
+| `train/kl_base_authority_frac` | `coef·\|e^{−lbr}−1\| / 0.9` — the k3 restoring gradient as a fraction of the surrogate's per-row gradient. The `0.9` is a hard-coded stand-in for `mean\|A\|·ρ`, i.e. a constant, not a measurement. This is the number to reason about; the raw coefficient is not interpretable alone. |
+| `train/kl_base_below_streak` | Consecutive below-band iterations. Sawtooths 1,2,0 during a healthy run that sits under the band — expected, and harmless because relaxation is floored at the starting coefficient. |
+| `train/kl_base_coef_{at_max,at_min}` | Clamp indicators. `at_max` sustained means the trust region is winning outright and the policy is being held rather than trained. |
+| `train/kl_base_coef_held_no_reading` | 1.0 when the iteration had no finite drift reading and the coefficient was HELD. See the all-anchor limitation in "Adaptive base-model trust region". |
 
 `ref_mse/*` and `jitter/*` are emitted **outside** the `n_updates > 0` gate:
 both are measured before any optimizer step, so they stay valid on an iteration
@@ -3114,6 +3303,30 @@ one where they are most needed.
 - `kl_coef_base_model` (default 0.2) — KL anchor to the pretrained DiT
   (LoRA disabled). Bounds cumulative drift from the base policy. 0.0 disables
   the term entirely (no extra forward pass per iter, no per-mb KL formula).
+  **With `kl_base_adaptive=True` this becomes the STARTING value** for the
+  controller and the floor that relaxation cannot go below; 1.0 is recommended and
+  a value < 0.5 warns.
+- `kl_base_adaptive` (default `False` = OFF, bit-identical to a run without it) —
+  closed-loop control of `kl_coef_base_model` on `ref_mse/log_base_ratio_mean`.
+  See "Adaptive base-model trust region". Requires `kl_coef_base_model > 0`.
+- `kl_base_target` (default **0.055**) — setpoint in nats. The archive-derived viable
+  window is [0.0467, 0.0695]; use **~0.03 for a small pool** (per-harness, see the
+  subsection). Validated to (0.0, 0.5]: an upper bound is enforced because a unit
+  confusion puts the band above every drift the system can produce, silently
+  disabling the tighten branch.
+- `kl_base_adapt_rate` (default 2.0) — multiplicative tighten step. Must be > 1.0.
+- `kl_base_relax_rate` (default 1.1) — multiplicative relax step. Must satisfy
+  `1.0 < relax ≤ adapt`; relaxing at least as fast as tightening makes the controller
+  symmetric, which self-disarms during the quiet phase before ignition.
+- `kl_base_relax_patience` (default 3) — consecutive below-band iterations required
+  before relaxing at all; any in-band or above-band iteration resets the streak. Must
+  be an `int ≥ 1` (a float `nan`/`inf` would pass every `< 1` test and make the relax
+  branch permanently unreachable).
+- `kl_base_deadband_{hi,lo}` (defaults 1.5 / 0.5) — band edges as multiples of the
+  target. Must satisfy `lo < 1.0 < hi`.
+- `kl_base_coef_{min,max}` (defaults 0.1 / **5.0**) — clamp on the controlled
+  coefficient. The ceiling is deliberately low; see the subsection for why 30 is not
+  a safe default. Requires `0 < min ≤ max` and the starting value inside the range.
 - `tau_centers` (default `[0.0, 0.25, 0.35, 0.5, 0.6, 0.75]`)
 - `balanced_minibatch_training` (default `True`) — balanced mini-batch
   sampling; see "Balanced Training" mechanism 1.
@@ -3205,6 +3418,7 @@ mismatch internally.
   that is what the explicit-paths form is for.
 
 Logged scalars include `episode/{success_rate,mean_reward,std_reward}`,
+`train/kl_base_*` (only when `kl_base_adaptive=True`),
 `train/{loss,clip_loss,kl_loss_last_iter,kl_loss_base_model,clipfrac,mean_ratio,mean_log_ratio_abs,n_skipped_nonfinite}`,
 `train/{n_updates,n_micro_batches}` (optimizer steps vs trained mini-batches —
 these differ under gradient accumulation),

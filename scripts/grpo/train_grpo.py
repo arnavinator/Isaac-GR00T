@@ -780,6 +780,14 @@ class GRPOTrainer:
                 self._validate_optimizer_state(saved)
                 self.optimizer.load_state_dict(saved)
                 print(f"  Optimizer state restored from {opt_path}")
+                # load_state_dict REPLACES param_groups with the checkpoint's,
+                # keeping only 'params' — so betas/eps/weight_decay from the
+                # checkpoint silently override the CLI. (lr escapes this because
+                # the annealing line re-sets it every iteration.) Before these
+                # were config knobs the restore was a no-op; now resuming with
+                # --adam-eps 1e-8 into a pre-knob checkpoint would quietly train
+                # at 1e-5, i.e. in the wrong REGIME. Re-apply config and say so.
+                self._reapply_optimizer_hyperparams(announce=True)
             else:
                 print(f"  WARNING: No optimizer.pt found at {opt_path}, starting fresh optimizer")
 
@@ -787,7 +795,12 @@ class GRPOTrainer:
         # four-case resume matrix is reachable from a CPU test without setup().
         self._restore_kl_base_coef(_resumed_kl_base_coef)
 
-        print(f"  AdamW: lr={self.config.learning_rate}, wd={self.config.weight_decay}")
+        print(
+            f"  AdamW: lr={self.config.learning_rate}, "
+            f"wd={self.config.weight_decay}, "
+            f"betas=({self.config.adam_beta1}, {self.config.adam_beta2}), "
+            f"eps={self.config.adam_eps:g}"
+        )
         print(f"  Trainable params in optimizer: {sum(p.numel() for p in trainable_params):,}")
 
         # --- Step 3b: Trajectory-roughness constraint (no-op when smooth_coef==0) ---
@@ -2604,6 +2617,35 @@ class GRPOTrainer:
                     f"pin peft/torch versions across save and load, or restart "
                     f"training from scratch."
                 )
+
+    def _reapply_optimizer_hyperparams(self, announce: bool = False) -> dict:
+        """Force config's betas/eps/weight_decay back onto the param groups.
+
+        `Optimizer.load_state_dict` replaces `param_groups` wholesale with the
+        checkpoint's, keeping only `params`, so a resume silently adopts the
+        SAVED hyperparameters. `lr` is immune (the annealing line re-sets it every
+        iteration); betas, eps and weight_decay are not. Returns the values that
+        were overridden, so a caller (or a test) can see what the checkpoint held.
+        """
+        want = {
+            "betas": (self.config.adam_beta1, self.config.adam_beta2),
+            "eps": self.config.adam_eps,
+            "weight_decay": self.config.weight_decay,
+        }
+        overridden = {}
+        for group in self.optimizer.param_groups:
+            for key, value in want.items():
+                if group.get(key) != value:
+                    overridden.setdefault(key, group.get(key))
+                    group[key] = value
+        if announce and overridden:
+            print(
+                "  Optimizer hyperparameters from the checkpoint OVERRIDDEN by "
+                "config: " + ", ".join(
+                    f"{k} {old!r} -> {want[k]!r}" for k, old in overridden.items()
+                )
+            )
+        return overridden
 
     def _validate_optimizer_state(self, saved: dict) -> None:
         """Verify a saved optimizer state_dict matches the current optimizer's param layout.

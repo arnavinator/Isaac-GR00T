@@ -6,11 +6,12 @@ grpo_cont.py line 230). They are now config fields so they land in the
 TensorBoard `config` dump and are tunable from the CLI.
 
 What is covered:
-  A. DEFAULT BIT-IDENTITY. The shipped defaults must equal the previously
-     hard-coded `(0.9, 0.999)` / `1e-5` exactly, so an unchanged CLI reproduces
-     every run recorded before the knobs existed. Asserted on the raw values AND
-     through a real `optim.AdamW` built from a default config, because the second
-     is what actually decides whether prior runs reproduce.
+  A. DEFAULTS AND REPRODUCIBILITY. The shipped defaults are the NORMALISED
+     regime (`eps=1e-8`, `beta2=0.99`) — deliberately NOT the pre-knob values, so
+     they are pinned to make a change visible. What must still hold is that the
+     pre-knob optimizer stays exactly REACHABLE: `--adam-eps 1e-5
+     --adam-beta2 0.999` has to rebuild it bit for bit, checked on a real
+     `optim.AdamW` param_group rather than on the dataclass.
   B. VALIDATION MATRIX. Every rejected value, including the two that would
      otherwise run to completion while silently not training: `beta1 == 1.0`
      (momentum never leaves its zero init -> zero step forever) and
@@ -31,6 +32,14 @@ What is covered:
      `eps >> sqrt(v_hat)` the step is ~proportional to the gradient, and at
      `eps << sqrt(v_hat)` it is ~gradient-magnitude invariant), and that
      `weight_decay=1e-5` is numerically inert at the shipped learning rates.
+
+  F. THE RESUME CLOBBER. `Optimizer.load_state_dict` replaces `param_groups`
+     wholesale, so a resume silently adopts the CHECKPOINT's betas/eps/weight_decay
+     (lr escapes, being re-set by the annealing line each iteration). Covers the
+     hazard itself against this torch version, then the real
+     `_reapply_optimizer_hyperparams` fix: values restored, the override reported,
+     lr and the AdamW moment state untouched, idempotence, and source-level
+     wiring that the re-apply runs AFTER the load.
 
 CPU only, no model, no GPU. Conventions follow `test_grad_accum.py`.
 """
@@ -76,30 +85,40 @@ def raises(**kw) -> bool:
 # A. Default bit-identity with the previously hard-coded values
 # ---------------------------------------------------------------------------
 
-def test_defaults_bit_identical():
-    print("\nA. defaults reproduce the previously hard-coded optimizer")
+def test_defaults_and_reproducibility():
+    print("\nA. defaults, and reproducibility of pre-knob runs")
     c = cfg()
+    # Defaults are the NORMALISED regime (deliberate). Pin them so a change is
+    # visible, and pin the two facts that make them self-consistent.
     check("adam_beta1 default is 0.9", c.adam_beta1 == 0.9, repr(c.adam_beta1))
-    check("adam_beta2 default is 0.999", c.adam_beta2 == 0.999, repr(c.adam_beta2))
-    check("adam_eps default is 1e-5", c.adam_eps == 1e-5, repr(c.adam_eps))
+    check("adam_eps default is 1e-8 (normalised regime)", c.adam_eps == 1e-8,
+          repr(c.adam_eps))
+    check("adam_beta2 default is 0.99, not 0.999 — v must track a "
+          "non-stationary gradient inside a ~1000-step run",
+          c.adam_beta2 == 0.99, repr(c.adam_beta2))
+    check("the default pair does NOT trip the regime warning",
+          not any("NORMALISED regime" in m for m in _warnings_for()))
 
-    # The claim that matters is about the OPTIMIZER, not the dataclass: build one
-    # the way setup() does and compare its param_group against a literal AdamW
-    # constructed with the old hard-coded arguments.
+    # Pre-knob runs are no longer the default, so what has to hold is that they
+    # remain exactly REACHABLE: --adam-eps 1e-5 --adam-beta2 0.999 must rebuild
+    # the previously hard-coded optimizer bit for bit.
+    legacy = cfg(adam_eps=1e-5, adam_beta2=0.999, adam_beta1=0.9)
     p = torch.nn.Parameter(torch.zeros(3))
-    new = optim.AdamW(
+    rebuilt = optim.AdamW(
         [p],
-        lr=c.learning_rate,
-        weight_decay=c.weight_decay,
-        betas=(c.adam_beta1, c.adam_beta2),
-        eps=c.adam_eps,
+        lr=legacy.learning_rate,
+        weight_decay=legacy.weight_decay,
+        betas=(legacy.adam_beta1, legacy.adam_beta2),
+        eps=legacy.adam_eps,
     )
-    old = optim.AdamW([p], lr=c.learning_rate, weight_decay=c.weight_decay, eps=1e-5)
+    hardcoded = optim.AdamW(
+        [p], lr=legacy.learning_rate, weight_decay=legacy.weight_decay, eps=1e-5
+    )
     keys = ("lr", "betas", "eps", "weight_decay")
     check(
-        "config-built AdamW param_group == old hard-coded one",
-        all(new.param_groups[0][k] == old.param_groups[0][k] for k in keys),
-        f"{[(k, new.param_groups[0][k], old.param_groups[0][k]) for k in keys]}",
+        "--adam-eps 1e-5 --adam-beta2 0.999 reproduces the old hard-coded AdamW",
+        all(rebuilt.param_groups[0][k] == hardcoded.param_groups[0][k] for k in keys),
+        f"{[(k, rebuilt.param_groups[0][k], hardcoded.param_groups[0][k]) for k in keys]}",
     )
 
 
@@ -167,7 +186,7 @@ def _warnings_for(**kw):
 
 def test_regime_warning():
     print("\nC. eps/beta2 regime warning")
-    msgs = _warnings_for(adam_eps=1e-8)
+    msgs = _warnings_for(adam_eps=1e-8, adam_beta2=0.999)
     hit = [m for m in msgs if "NORMALISED regime" in m]
     check("eps=1e-8 with beta2=0.999 warns", len(hit) == 1, f"{len(hit)} of {len(msgs)}")
     if hit:
@@ -185,12 +204,14 @@ def test_regime_warning():
           not any("NORMALISED regime" in m for m in _warnings_for()))
     # Boundary: the gate is `eps < 1e-6`, so exactly 1e-6 must NOT warn.
     check("eps == 1e-6 does not warn (strict inequality)",
-          not any("NORMALISED regime" in m for m in _warnings_for(adam_eps=1e-6)))
+          not any("NORMALISED regime" in m for m in _warnings_for(
+              adam_eps=1e-6, adam_beta2=0.999)))
     check("eps = 9e-7 does warn",
-          any("NORMALISED regime" in m for m in _warnings_for(adam_eps=9e-7)))
+          any("NORMALISED regime" in m for m in _warnings_for(
+              adam_eps=9e-7, adam_beta2=0.999)))
     # It must be a warning, not an error — the combination is a real experiment.
     try:
-        cfg(adam_eps=1e-8)
+        cfg(adam_eps=1e-8, adam_beta2=0.999)
         check("eps=1e-8 warns but does NOT raise", True)
     except ValueError as e:
         check("eps=1e-8 warns but does NOT raise", False, str(e)[:70])
@@ -281,12 +302,72 @@ def test_eps_regime_arithmetic():
           over_run < 1e-4, f"total={over_run:.3e} vs weight_delta_norm ~0.7")
 
 
+# ---------------------------------------------------------------------------
+# F. The resume clobber: load_state_dict replaces param_groups
+# ---------------------------------------------------------------------------
+
+def test_resume_clobber():
+    print("\nF. resume must not adopt the checkpoint's betas/eps")
+
+    # First, prove the hazard is real in this torch version, so the fix below is
+    # anchored to observed behaviour rather than to a reading of the docs.
+    q = torch.nn.Parameter(torch.zeros(3))
+    old = optim.AdamW([q], lr=1e-4, betas=(0.9, 0.999), eps=1e-5, weight_decay=1e-3)
+    new_ = optim.AdamW([q], lr=1e-4, betas=(0.9, 0.99), eps=1e-8, weight_decay=1e-5)
+    new_.load_state_dict(old.state_dict())
+    g = new_.param_groups[0]
+    check("torch's load_state_dict DOES clobber betas/eps/weight_decay",
+          (g["betas"], g["eps"], g["weight_decay"]) == ((0.9, 0.999), 1e-5, 1e-3),
+          f"{g['betas']} {g['eps']} {g['weight_decay']}")
+    check("...but NOT lr, which the annealing line re-sets each iteration",
+          g["lr"] == 1e-4, repr(g["lr"]))
+
+    # Now the real fix, driven through the actual method on a __new__ trainer (no
+    # setup(), no model, no GPU) with a stand-in optimizer.
+    from train_grpo import GRPOTrainer
+    t = GRPOTrainer.__new__(GRPOTrainer)
+    t.config = cfg(adam_beta1=0.9, adam_beta2=0.99, adam_eps=1e-8, weight_decay=1e-5)
+    t.optimizer = optim.AdamW([q], lr=1e-4, betas=(0.9, 0.99), eps=1e-8,
+                              weight_decay=1e-5)
+    t.optimizer.load_state_dict(old.state_dict())          # simulate the resume
+    overridden = t._reapply_optimizer_hyperparams()
+    g = t.optimizer.param_groups[0]
+    check("_reapply restores config betas", g["betas"] == (0.9, 0.99), repr(g["betas"]))
+    check("_reapply restores config eps", g["eps"] == 1e-8, repr(g["eps"]))
+    check("_reapply restores config weight_decay", g["weight_decay"] == 1e-5,
+          repr(g["weight_decay"]))
+    check("_reapply reports what the checkpoint held",
+          overridden == {"betas": (0.9, 0.999), "eps": 1e-5, "weight_decay": 1e-3},
+          repr(overridden))
+    check("_reapply leaves lr alone", g["lr"] == 1e-4, repr(g["lr"]))
+    # Idempotent, and silent when nothing differs — so a fresh (non-resume) run
+    # and a matched-checkpoint resume both report no override.
+    check("_reapply is a no-op the second time", t._reapply_optimizer_hyperparams() == {})
+
+    # AdamW state (exp_avg / exp_avg_sq / step) must survive the re-apply — the
+    # whole point of resuming is to keep the moments.
+    check("optimizer .state is untouched by _reapply",
+          t.optimizer.state_dict()["state"] == old.state_dict()["state"])
+
+    # Wiring: the re-apply must be called AFTER load_state_dict in setup().
+    src = (Path(__file__).parent / "train_grpo.py").read_text()
+    i_load = src.find("self.optimizer.load_state_dict(saved)")
+    i_fix = src.find("self._reapply_optimizer_hyperparams(announce=True)")
+    check("setup() calls _reapply after load_state_dict",
+          i_load != -1 and i_fix != -1 and i_fix > i_load, f"{i_load} {i_fix}")
+    check("the two are in the same resume block (within 800 chars)",
+          i_fix - i_load < 800, str(i_fix - i_load))
+    check("the AdamW banner prints betas and eps, not just lr/wd",
+          "eps={self.config.adam_eps:g}" in src)
+
+
 if __name__ == "__main__":
-    test_defaults_bit_identical()
+    test_defaults_and_reproducibility()
     test_validation_matrix()
     test_regime_warning()
     test_setup_wiring()
     test_eps_regime_arithmetic()
+    test_resume_clobber()
 
     print()
     if _failures:

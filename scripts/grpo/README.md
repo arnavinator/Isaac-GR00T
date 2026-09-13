@@ -1621,6 +1621,43 @@ fewer rows.
   summary line is printed on every iteration the filter is on, cut count and
   all.
 
+**How much this actually does depends on where the policy's bottleneck is.**
+Every number in this section is measured on one collection (`iter_0001`, 50-chunk
+episodes, 43 failures of which 41 closed on **nothing**), and that is a policy
+whose bottleneck is the grasp. It does not generalize as far as the precision of
+those figures suggests. A later 60-chunk run on the same task measured:
+
+| | reference `iter_0001` | later run, iters 1-2 |
+|---|---|---|
+| failures with a detected close→reopen | 43/43 (100%) | 18/27 and 14/21 (both 67%) |
+| failure chunks dropped at N=3 | 52.2% | 20.9% |
+| onset position | chunk 15–27 of 50 | ~38 of 60 |
+| dominant undetected cause | — | grasped the mug, held to truncation, never placed |
+
+Nothing is wrong in that second column. Once a policy starts reliably closing on
+the *mug* rather than on nothing, its failures move from "missed grasp, then
+meander" to "grasped, never placed" — and a grasp-and-hold failure has no
+post-reopen tail to trim, so the filter correctly leaves it whole. **Expect the
+drop rate to fall and the detection rate to sit well below 1.0 as the policy
+improves**; treat a detection rate near 0.65–0.70 with a grasp-and-hold majority
+as healthy, not as drift. What would be unhealthy is `n_post_reopen_implausible`
+going non-zero, or `post_reopen_kept_len_min` collapsing toward
+`post_reopen_min_train_chunks`.
+
+Two consequences worth planning around:
+
+- **Do not size `--update-epochs` from the 52% figure.** The step-budget
+  compensation below is proportional to the row reduction you actually get. At a
+  20.9% failure-chunk drop, total rows fall by ~10-15% and steps fall by about
+  that much, not by half. Read `episode/num_train_chunks` against
+  `episode/num_chunks` before compensating.
+- **Resist extending the filter to grasp-and-hold failures.** They have long
+  uninformative-looking tails too, but the justification for cutting the
+  post-reopen meander was that those rows sit a median 32 cm from any state a
+  success visits. A hold-and-fail-to-place episode is doing the transport phase
+  near where a successful place happens, so its rows *are* contrastive against
+  the successes. Cutting them would delete real signal.
+
 **What changes in a training run.** Dropping ~48% of rows is not only a credit
 reassignment — it changes the shape of the iteration:
 

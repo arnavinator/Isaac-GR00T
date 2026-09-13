@@ -1062,6 +1062,50 @@ class GRPOTrainer:
                 f"{' — KL-only' if self.config.anchor_advantage == 0.0 else ''}, "
                 f"row budget={self.config.anchor_max_row_frac:g}× signal rows)"
             )
+        if self.config.post_reopen_keep_chunks is not None:
+            # Truncation of failing episodes silently halves the row count on
+            # CoffeeServeMug, so it is worth one banner line — a run whose
+            # chunk counts look wrong should not require reading the config
+            # dump to find out this was on. The width thresholds are printed
+            # because they are the part that does NOT transfer across
+            # embodiments (see README "Post-reopen truncation").
+            print(
+                f"  Post-reopen truncation: ON "
+                f"(keep {self.config.post_reopen_keep_chunks} chunk(s) from the "
+                f"reopen ONSET; failing episodes only; width close<"
+                f"{self.config.post_reopen_close_width:g} / open>"
+                f"{self.config.post_reopen_open_width:g} / onset margin "
+                f"{self.config.post_reopen_onset_margin:g} / dwell "
+                f"{self.config.post_reopen_min_closed_chunks} on "
+                f"'{self.config.post_reopen_state_key}')"
+            )
+            # The dominant operational effect, and the one nothing else surfaces:
+            # the balanced sampler sizes an epoch as ceil(live_rows/mb_size), so
+            # dropping roughly half the rows halves the optimizer steps per
+            # iteration at an unchanged learning rate.
+            print(
+                f"    NOTE: this drops ~half the failure rows, which HALVES the "
+                f"optimizer steps per iteration (ceil(live_rows/"
+                f"{self.config.mini_batch_size}) x {self.config.update_epochs} "
+                f"epochs) at an unchanged LR. Consider --update-epochs "
+                f"{self.config.update_epochs * 2} to restore the step budget; "
+                f"watch train/n_updates."
+            )
+            if self.config.include_anchor_groups:
+                print(
+                    "    NOTE: anchor groups are ON. Anchor rows are never "
+                    "truncated while failure rows are, so truncation both "
+                    "shrinks the anchor row budget's signal denominator and "
+                    "halves the anchor:erosion weight ratio. Re-derive "
+                    "--anchor-advantage (~2x) before trusting this pairing."
+                )
+            if self.config.init_state_npz_path is not None:
+                print(
+                    "    NOTE: init_state_npz_path is set. If that saved state "
+                    "has the gripper CLOSED, no episode will show the "
+                    "open->closed transition the detector needs and the filter "
+                    "will be inert — watch episode/n_post_reopen_detected."
+                )
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
 
         for iteration in range(self._start_iteration, self.config.num_iterations + 1):
@@ -1140,6 +1184,7 @@ class GRPOTrainer:
                 anchor_advantage=self.config.anchor_advantage,
                 include_anchor_groups=self.config.include_anchor_groups,
                 anchor_max_row_frac=self.config.anchor_max_row_frac,
+                post_reopen_filter=self.config.build_post_reopen_filter(),
             )
             stats = self.buffer.stats()
             phase2_time = time.time() - phase2_start
@@ -4292,7 +4337,7 @@ class GRPOTrainer:
                 ratio = log_ratio.exp()
 
                 # --- Advantage renormalization ---
-                # After the A_episode/num_chunks division in _build_chunks, per-chunk
+                # After the A_episode/num_train_chunks division in _build_chunks, per-chunk
                 # advantages have small, heterogeneous magnitudes (varying with
                 # episode length). Re-normalizing stabilizes gradient scale across
                 # iterations and keeps the effective clip threshold meaningful
@@ -7764,6 +7809,70 @@ class GRPOTrainer:
                     iteration,
                 )
 
+            # Post-reopen truncation of failing episodes. Gated on the feature so
+            # an unfiltered run's episode/* key set is exactly what it was before
+            # the feature existed.
+            #
+            # Read n_post_reopen_DETECTED — not episodes_cut — against the
+            # failure count, which is (1 - success_rate) * num_episodes. That
+            # ratio is the detector's hit rate; if it falls well below 1.0 the
+            # width thresholds have drifted off the policy's actual gripper
+            # behavior and the filter is quietly doing less than it claims.
+            # episodes_cut is NOT a hit rate: an episode whose reopen lands
+            # within keep_chunks of the end is detected and correctly left
+            # whole, so this counter falls as the policy learns to hold its
+            # grasp longer even though nothing is wrong.
+            if self.config.post_reopen_keep_chunks is not None:
+                self.writer.add_scalar(
+                    "episode/n_post_reopen_episodes_cut",
+                    stats.get("n_post_reopen_episodes_cut", 0), iteration,
+                )
+                self.writer.add_scalar(
+                    "episode/n_post_reopen_detected",
+                    stats.get("n_post_reopen_detected", 0), iteration,
+                )
+                # > 0 means some episode's gripper state could not be read at
+                # all (corrupt / NaN); those episodes were kept whole.
+                self.writer.add_scalar(
+                    "episode/n_post_reopen_errors",
+                    stats.get("n_post_reopen_errors", 0), iteration,
+                )
+                self.writer.add_scalar(
+                    "episode/n_post_reopen_chunks_dropped",
+                    stats.get("n_post_reopen_chunks_dropped", 0), iteration,
+                )
+                self.writer.add_scalar(
+                    "episode/num_train_chunks",
+                    stats.get("num_train_chunks", 0), iteration,
+                )
+                # > 0 means a truncation was refused as implausible, i.e. the
+                # detector latched onto something that is not the grasp. Neither
+                # counter above can see that: `detected` reads a perfect hit
+                # rate in exactly that case.
+                self.writer.add_scalar(
+                    "episode/n_post_reopen_implausible",
+                    stats.get("n_post_reopen_implausible", 0), iteration,
+                )
+                # Retained-length spread across the episodes actually cut. The
+                # update's renorm flattens per-row magnitudes, so an episode's
+                # realized gradient mass ends up proportional to its retained
+                # length — a widening spread means near-misses are suppressed
+                # harder than clean whiffs.
+                for _k in ("min", "median", "max"):
+                    self.writer.add_scalar(
+                        f"episode/post_reopen_kept_len_{_k}",
+                        stats.get(f"post_reopen_kept_len_{_k}", 0), iteration,
+                    )
+
+            # Raw collected chunk count. Emitted UNCONDITIONALLY: it is a
+            # collection statistic with no dependence on any feature, and it is
+            # the only thing episode/num_train_chunks can be read against — with
+            # it gated, a filtered run could not be compared to a baseline in TB
+            # at all, since episode/n_signal_chunks is itself gated on anchors.
+            self.writer.add_scalar(
+                "episode/num_chunks", stats.get("num_chunks", 0), iteration,
+            )
+
             # Advantage signal availability (already in buffer.stats() but
             # previously not surfaced to TB). pct_positive_advantage near 0.5 is
             # healthy; far off means the group-relative normalization is failing.
@@ -8411,6 +8520,21 @@ class GRPOTrainer:
                         for _k in ("n_anchor_groups", "n_anchor_episodes",
                                    "n_anchor_episodes_dropped",
                                    "n_signal_chunks", "n_anchor_chunks"):
+                            log_dict.pop(_k, None)
+                    if self.config.post_reopen_keep_chunks is None:
+                        # Same rule for the post-reopen counters: stats()
+                        # reports them unconditionally, the TB side gates them,
+                        # so drop them here to keep the two dashboards' key sets
+                        # identical and an unfiltered run's key set unchanged.
+                        for _k in ("n_post_reopen_episodes_cut",
+                                   "n_post_reopen_chunks_dropped",
+                                   "n_post_reopen_detected",
+                                   "n_post_reopen_errors",
+                                   "n_post_reopen_implausible",
+                                   "post_reopen_kept_len_min",
+                                   "post_reopen_kept_len_median",
+                                   "post_reopen_kept_len_max",
+                                   "num_train_chunks"):
                             log_dict.pop(_k, None)
                     # per_scene_success is the one NON-SCALAR entry stats()
                     # returns ({env_seed: (n_success, n_total)}), so it is popped

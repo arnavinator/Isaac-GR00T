@@ -23,6 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`), production sampler schedule (`inference_schedule`) and the last-step-differentiable chunk rollout (`_smooth_chunk_rollout`) the roughness constraint measures. |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `smoothness.py` | Trajectory-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, the continuous-action-dim selector and `build_key_dim_span`. Model-free and fully unit-testable. The 4-step chunk rollout lives in `fm_log_prob._smooth_chunk_rollout` (it needs the DiT); the hinge lives in `train_grpo._grpo_update_inner`. |
+| `gripper_release.py` | Post-reopen truncation primitives: `PostReopenFilter`, `gripper_widths`, `close_cross_indices`, `reopen_onset_index`, `post_reopen_detect`. Model-free and sim-free; detects the close→reopen of a failed grasp from the measured `gripper_qpos` — and the ONSET of that reopen, by walking back down the rising edge — so `episode_buffer` can trim the meander that follows. See README "Post-reopen truncation". |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
@@ -30,6 +31,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_smoothness.py` | CPU suite for the trajectory-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the derived sampler schedule, the last-step-differentiable rollout (exact value + gradient localized to the final step), the `compute_fm_log_prob` return contract, both instruments' jitter-invariance, the executed-chunk metrics, `smooth_ref.json` guard rejection **including instrument mismatch**, and `smooth_coef=0` bit-identity (stats, weights and RNG stream) through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
+| `test_gripper_release.py` | CPU suite for the post-reopen truncation: width extraction (state horizon, flat shape, custom key, eight guards incl. NaN/inf, (0,2), (1,2,2) and non-numeric); the hysteresis state machine on both edges incl. strictness at each threshold, the in-band no-op, the never-closed and never-reopened cases and the first-cycle-only rule; the ONSET walk — rising-edge base, floor-relative margin, the `close_idx < onset <= cross_idx` invariant over 3k+ exhaustive traces, mid-hold blip rejection (`episode_0039` / `episode_0044` shapes), the monotonicity guard against a high plateau touching the crossing, and invariance over the threshold box and the margin plateau; `keep_chunks` counting from the onset and overruns being no-ops; the sign-convention / unit-mismatch guard; the `PostReopenFilter` and `GRPOConfig` validation matrices (incl. the four tuning knobs being a hard error while the feature is off, and `onset_margin ≥ open_width − close_width`); and, through the real `compute_advantages` / `_build_chunks`, off-switch bit-identity, successes and anchors left whole, `Σ A_chunk == A_ep` plus the group zero-sum surviving, the per-row magnification being exactly `num_chunks / num_train_chunks`, idempotence + self-clearing (no stale chunk memo), dead groups staying dead, and the anchor row budget seeing truncated signal counts. The `ITER_0001` / `ITER_0001_CROSS` fixtures pin all 48 real episodes' onset AND crossing (so a regression collapsing the two is caught by name) plus the N → dropped-fraction curve; when that collection is on disk the suite re-derives both from the raw `.npz` and re-runs the 19-threshold-pair and margin-plateau invariance on real widths. |
 | `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
 | `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
 | `test_grad_probe.py` | CPU suite for the gradient-decomposition probe (`grad_probe_every`), driving the real `_grpo_update_inner` plus the real `_grad_probe_capture_jittered` / `_grad_probe_finish` / `select_grad_probe_rows` / `aggregate_grad_probes`. Covers: off-switch bit-identity (stats, `p.grad`, weights, RNG stream, and a spy proving `torch.autograd.grad` is never called); the probe ON changing **nothing** about the training step (`autograd.grad` really does not accumulate); the decomposition identity `g_jit − g_R = λ²g_P` against a **hand-derived** closed form on a τ- and `noise_for_input`-sensitive analytic stand-in with a known Jacobian (a re-run of autograd would have agreed with a wrong derivation — this caught a missing `w0` factor); `R → 0` as `λ → 0` and monotonicity in `λ`; both legs sharing ε / τ / rows verbatim, with mutants that mismatch the τ **set** and the row **set** and must be detected; the τ-subset path applied to both legs; the row cap and deterministic tie-breaking; the paired-mode fixed-row exclusion pinned against the ~2× diluted alternative; the `jitter_neg > 0` guard on `g_erosion`; hand-computed percentiles/aggregation; skip, failure and cadence accounting; both legs running at the **same θ** at `gradient_accumulation_steps` 1 and 2; the four-way return unpack (roughness constraint × probe); TB emission incl. the `vram/` split and the non-finite drop; and the full config validation matrix. |
@@ -1350,6 +1352,325 @@ uv run python scripts/grpo/train_grpo.py \
 rather than a silent no-op. The startup banner prints
 `Anchor groups: ON (advantage=…, row budget=…× signal rows)`, plus a NOTE when
 a positive advantage is combined with per-minibatch renorm.
+
+### Post-reopen truncation (`post_reopen_keep_chunks`)
+
+Anchor groups address *which episodes* contribute. This addresses *which chunks
+of a failing episode* contribute.
+
+On a grasp-and-place task a failure has a stereotyped shape: approach, close the
+gripper (usually on nothing), reopen a few chunks later, then fly the arm away
+and meander until truncation. Under the `A_ep / num_chunks` split that meander
+absorbs a large share of the episode's negative gradient weight — and it is a
+*consequence* of the failure, not its cause. Worse, no success in the group
+exhibits it at all (successes terminate on the place), so it is the single most
+discriminative difference between the group's positive and negative rollouts.
+The update is being told, loudly, "don't fly away after a failed grasp."
+
+`post_reopen_keep_chunks = N` truncates each **failing** episode to
+`onset_idx + N` chunks. Everything *before* the onset — the whole approach and
+the closed phase — is always kept.
+
+```bash
+uv run python scripts/grpo/train_grpo.py \
+    --env-names robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --post-reopen-keep-chunks 3
+```
+
+**The detector.** Everything runs on the **measured** gripper width
+`w = gripper_qpos[0] - gripper_qpos[1]`, not on the commanded
+`action.gripper_close`: the measurement is what physically happened, it covers a
+close on the mug and a close on nothing identically (no need to tell them
+apart), and it is unaffected by a noisy gripper channel — on this data 113
+chunks command a gripper value that is not even constant across their own
+executed substeps, so "the chunk the command flipped in" is not as crisp a
+quantity as it sounds. Three stages:
+
+1. **Close** — a three-state machine, and both states before CLOSED matter.
+   Nothing is detected until the gripper has been observed **open**, because a
+   close is a *transition*, not a state: if an episode begins mid-grasp the
+   transition was never observed and there is no close event to find. CLOSED
+   then latches only after `post_reopen_min_closed_chunks` (default 3)
+   **consecutive** sub-threshold samples — hysteresis guards against chatter
+   *inside* the band but does nothing about a single-sample excursion straight
+   through it, and this signal carries ~6 mm one-sample blips. Without either
+   guard a lone transient dip, or an episode that starts closed, latches and the
+   next open sample reads as the reopen, truncating to `keep_chunks + 1` chunks
+   and discarding the whole failed grasp. Both are free on the reference data:
+   every episode starts at 0.0793, real closed phases run 7–25 chunks, and no
+   episode contains a sub-threshold run shorter than 3. Both fail
+   **conservatively** — an undetected close means no truncation, visible as
+   `episode/n_post_reopen_detected` falling.
+2. **Crossing** — that exit index. Unambiguously open, but **0–2 chunks late**
+   (1 on 36 of the 43 measured failures): the fingers take about a control chunk
+   to travel, so by the time the width clears the open threshold the reopen is
+   already underway.
+3. **Onset** — walk *backward* from the crossing down the contiguous rising
+   edge, while the width is both above `floor + post_reopen_onset_margin`
+   (`floor` = the minimum width during the closed phase, so the test adapts to a
+   close on nothing at ~0.001 and a close on the mug at ~0.020 alike) **and**
+   strictly below its successor. The first chunk of that edge is the onset — the
+   first observation in which the gripper has measurably begun to open. This is
+   what `N` is timed from.
+
+Why walk backward rather than scan forward for the first rise: the closed phase
+contains isolated upward blips (`episode_0039` reads 0.007 mid-hold between
+0.001 samples; `episode_0044` reads 0.007 then falls back to 0.003). A forward
+scan fires on those. Anchoring at a confirmed crossing means only the rising
+edge that actually reaches the open state is ever traversed. The
+`w[o-1] < w[o]` term additionally bounds the walk when a closed phase sets its
+floor early and then holds *above* `floor + margin` right up to the release. It
+changes no onset on any of the 48 real episodes at any margin inside the plateau
+below (1 onset moves at margin 0.002, 3 at 0.0015 and under), so "free" is a
+statement about the plateau, not about the term.
+
+Its known cost: a **stepped release** — open partway, hold, open fully — is
+indistinguishable in the width trace from "hold the object, then release", so
+the walk stops at the top step and reports the onset late by the plateau length.
+Two physically identical traces differing only by measurement noise on the
+plateau can disagree by several chunks. No rule on the width alone separates the
+two shapes, and the error is in the conservative direction (a late onset keeps
+*more* chunks), so it is accepted rather than fixed.
+
+`N` counts **from the onset chunk itself**: `N=3` keeps `onset`…`onset+2`;
+`N=0` drops the onset chunk too. `None` (default) disables the feature and is
+bit-identical to the pre-feature behavior.
+
+A truncation that would leave fewer than `post_reopen_min_train_chunks` (default
+5) chunks is **refused** — the episode is kept whole and counted on
+`episode/n_post_reopen_implausible`. The approach phase alone is ~13 chunks here,
+so a handful of retained chunks means the detector latched onto something that is
+not the grasp. This is a secondary backstop; the two state-machine guards above
+are what actually prevent the known failure modes, and neither counter can see
+one on its own (`detected` reads a perfect hit rate in exactly that case).
+
+**Calibration** (measured on `iter_0001`, CoffeeServeMug, 48 episodes / 43
+failures / 4 groups × 12, `max_episode_steps=400` → 50 chunks). Width over all
+2321 chunks is cleanly trimodal:
+
+| steady-state width | meaning | share |
+|---|---|---|
+| ~0.000 – 0.004 m | closed on **nothing** (missed grasp) | 41 of 43 failures, by closed-phase floor |
+| ~0.017 – 0.025 m | closed **on the mug** (real grasp) | 3 of 5 successes (one holds at 0.010, one drops the mug to 0.001) |
+| ~0.055 – 0.080 m | open (0.080 = fully open) | the bulk |
+
+94.7% of all 2321 chunks fall in those three bands; the other 5.3% are
+transitions, so do not read the table as covering every sample. Of the 26 chunks
+in [0.028, 0.042) — the region that could trouble `close_below` — every one is a
+transient (the close chunk, the chunk before it, or onset−1/onset/onset+1), so
+the hysteresis machine is unaffected.
+
+`post_reopen_close_width=0.035` sits between the widest real grasp (0.025) and
+the narrowest approach-phase squeeze seen while the gripper was still commanded
+open (0.0424, taking "commanded open" as `gripper_close[0] <= 0.5` on the first
+*executed* substep; under the stricter "no close in any of the 8 executed
+substeps" reading the narrowest is 0.0551, so the valley is at least that wide).
+`post_reopen_open_width=0.055` sits below the open cluster.
+
+The onset is far more threshold-robust than the crossing it derives from: over
+close ∈ [0.030, 0.050] × open ∈ [0.050, 0.070] (19 pairs) the **onset is
+identical on all 48 episodes**, while the crossing moves ±1 on several. It is
+anchored to the base of the rising edge, the steepest part of the signal.
+
+`post_reopen_onset_margin=0.004` sits in a measured plateau: every value in
+**[0.0025, 0.0055]** gives bit-identical onsets on all 43 failures. Below it the
+walk follows a blip into the edge (one chunk early on `episode_0044` at 0.002,
+8 failures moving at 0.0015); above it, 4 failures stop a chunk short on the
+shallow part of the edge. Counting successes
+too the plateau narrows to [0.004, 0.005] — one success holds the mug with
+0.019 → 0.023 → 0.025 wobble straddling the margin — which is why the default is
+0.004 rather than 0.003. **Re-derive all three from your own width histogram
+before using this on another embodiment**; they are specific to the PandaOmron
+parallel-jaw gripper's 0.08 m stroke.
+
+**Choosing N.** The onset lands at chunk 15–27 (median 20) of 50 for 42 of the
+43 failures, so roughly half of every failing episode is post-reopen. Credit in
+a policy-gradient update attaches to a chunk's **action**, so the quantity that
+decides the cut is the EEF motion each retained chunk's action produces:
+
+| chunk | motion its action produces | share of failures > 5 cm | observation at its start, from the onset |
+|---|---|---|---|
+| approach phase (before the close) | 0.005 m/chunk (median) | — | — |
+| onset+0 | 0.021 m | 33% | 0.000 m |
+| onset+1 | 0.017 m | 29% | 0.021 m |
+| onset+2 | 0.029 m | 21% | 0.031 m |
+| **onset+3** | **0.082 m** | **74%** | 0.045 m |
+| onset+4 | 0.096 m | 83% | 0.104 m |
+| onset+5 | 0.097 m | 86% | 0.188 m |
+| onset+8 | 0.064 m | — | 0.289 m (plateau ≈ 0.7) |
+
+For three chunks the actions stay local; at onset+3 the median jumps 2.8× and
+the share of failures making a >5 cm move goes 21% → 74%. And **1 of 43 failures
+ever re-commands a close after the reopen** (that one at +23), so there is no
+recovery attempt to preserve. **N=3 is the recommended value**: it retains the
+failed grasp and the hover and cuts from the first ballistic command.
+
+The last column is the same episodes read one chunk later — chunk onset+3 is
+still *observed* at the grasp site even though its action leaves. If you prefer
+that framing, N=4 is defensible; the cost difference is 1.9 points. Note also
+that the medians hide real spread: a third of failures are already moving >5 cm
+at the onset chunk itself, so for those even N=0 retains a retreat chunk.
+
+What that costs, on `iter_0001`:
+
+| N | failure chunks dropped | % of failure chunks | % of all chunks |
+|---|---|---|---|
+| 0 | 1251 / 2150 | 58.2% | 53.9% |
+| **3** | **1123 / 2150** | **52.2%** | **48.4%** |
+| 4 | 1081 / 2150 | 50.3% | 46.6% |
+| 5 | 1039 / 2150 | 48.3% | 44.8% |
+| 6 | 997 / 2150 | 46.4% | 43.0% |
+| 8 | 913 / 2150 | 42.5% | 39.3% |
+| 10 | 829 / 2150 | 38.6% | 35.7% |
+| 20 | 409 / 2150 | 19.0% | 17.6% |
+| 30 | 45 / 2150 | 2.1% | 1.9% |
+
+N=5–7 is the conservative band; above ~21 the feature is barely doing anything.
+Per-group, N=3 takes the negative:positive **chunk** ratio from 6.8–19.6× down
+to 3.4–9.8×. Collection cost is unchanged (the episodes are still rolled out in
+full) — the saving is in the ref pass and every update epoch, which see ~48%
+fewer rows.
+
+**Invariants and edge cases.**
+
+- **Successes are never truncated.** Their "reopen" *is* the release that
+  completes the task, so the same detector would amputate exactly the chunks
+  that earn the positive advantage. Anchor groups are all-success by
+  construction, so they are never touched either.
+- **`Σ A_chunk = A_ep` is preserved in the buffer.** `_build_chunks` divides by
+  `num_train_chunks`, not `num_chunks`, so the within-group `Σ A = 0` invariant
+  holds and a truncated episode carries the *same* total advantage on fewer
+  rows — each row magnified by `num_chunks / num_train_chunks` (measured 2.09×
+  at N=3: per-row `|A|` for failures goes 0.00642 → 0.01345, while
+  `Σ|A_pos| = Σ|A_neg| = 13.808` in both). Dividing by the raw length instead
+  would shrink cut episodes' weight and rebalance the update toward whichever
+  failures happened not to be cut.
+- **That magnification does not reach the optimizer under the defaults.**
+  `balanced_minibatch_training=True` pins each minibatch at 4 positive / 4
+  negative rows, and `per_iteration_advantage_norm=False` then z-scores the
+  batch (`train_grpo.py:4401-4405`). Centering forces `Σz_pos = −Σz_neg`, so
+  the row entering the surrogate is **±0.892 with the filter off and ±0.898
+  with it on** — measured over 16k sampled batches through the exact shipped
+  expression, zero sign flips either way. (Note `torch.Tensor.std()` defaults to
+  `correction=1`; computing this with numpy's ddof=0 inflates both figures by
+  `sqrt(8/7)` to ±0.954/±0.960.)
+  The divisor choice is still correct (it holds the buffer invariant, and it
+  does reach the loss under `per_iteration_advantage_norm=True`), but do not
+  expect the concentration to show up as larger gradients on the default path.
+- **What the renorm leaves behind is a row-count weighting.** With per-row
+  magnitudes flattened, an episode's realized gradient mass becomes
+  proportional to its *retained row count*. Filter off, every failing episode
+  has exactly 50 rows, so mass is uniform (CV 0.000, max/min 1.00). Filter on,
+  kept lengths span 18–50 (CV 0.207, max/min 2.78) — and kept length tracks how
+  long the gripper stayed closed, so an episode that **held the grasp longer is
+  suppressed harder**. On `iter_0001` that is only the 2 of 43 failures that
+  closed on the mug rather than on nothing (median kept 38.5 vs 23.0), but the
+  direction is backwards from what you want and it grows as real grasps become
+  common.
+- **A failure that never reopens is kept whole** — "grasped it and never let
+  go", which has no meander to trim. So is one that never closes, and one whose
+  retained window already runs past the end of the episode.
+- **The onset can never be the close chunk itself**, so the closing motion can
+  never be mistaken for the opening one.
+- **Only the first close→reopen cycle is used.** A retry is vanishingly rare
+  (1/43) and lands far outside any sane N.
+- **The anchor row budget's denominator is the truncated signal count**, so the
+  same `anchor_max_row_frac` admits strictly fewer anchor rows than it used to.
+  At the default 1.0 on the test fixture that is the difference between two
+  admitted anchor episodes and one — size the two knobs together.
+- **A mismatched sign convention, state key or unit raises**, as does a NaN
+  width. If the width never exceeds `post_reopen_open_width` over an episode,
+  the state machine would pin in CLOSED from chunk 0 and turn the whole feature
+  into a silent no-op, so that case is an error instead; a NaN would make every
+  comparison False with the same result. Likewise setting any of the four
+  tuning knobs while `post_reopen_keep_chunks is None` (the values would never
+  be read), or an `onset_margin ≥ open_width − close_width` — 0.020 at the
+  defaults; note the bound is the *band*, not `open_width`, which would admit
+  0.0549 and collapse all 43 measured failures onto the crossing. That bound is
+  a sanity check, not a guarantee: it rules out the region where the walk
+  provably cannot move for any physical floor, but a value inside it can still
+  collapse the onset on a given episode (0.0199 does so on 18 of 43), and a
+  negative floor can escape it. Only the measured plateau speaks to a dataset.
+- **`init_state_npz_path` warns.** Every episode then starts from the same saved
+  sim state; if that state has the gripper closed, no episode shows the
+  open→closed transition the detector needs and the filter is inert for the whole
+  run. Not an error — a branch point *before* the grasp is a legitimate pairing —
+  and it is now visible rather than destructive, since the detector refuses to
+  latch without an observed open.
+- **A per-episode failure does not abort the run; a misconfiguration does.**
+  A corrupt or NaN gripper state is counted (`episode/n_post_reopen_errors`),
+  warned, and that episode kept whole — aborting would let one anomalous
+  episode, possibly in an all-fail group whose rows never reach the model,
+  discard a whole iteration's collection. The two cases are told apart by
+  probing **every** episode with non-empty states, successes included: a wrong
+  state key or mirrored sign breaks successes exactly as it breaks failures, so
+  the run aborts only when not one episode in the buffer could be read.
+  Counting errors against the failing episodes alone would abort whenever a
+  single bad episode happened to be the iteration's only failure — which gets
+  *more* likely as the policy improves — and one zero-chunk episode (which
+  short-circuits before the state key is read) would mask a total
+  misconfiguration as one warning per iteration.
+- **Three shapes are silent no-ops** and no guard can catch them, because none
+  is distinguishable from a legitimately un-trimmable episode: a **gentler
+  close** that never dips below `close_width`, a **partial release** that never
+  rises above `open_width`, and a close still held at the last chunk. Watch
+  `episode/n_post_reopen_detected` against the failure count. A fourth — a
+  `keep_chunks` larger than any episode — is invisible to *both* counters
+  (`detected` reads a perfect hit rate while nothing is cut), which is why the
+  summary line is printed on every iteration the filter is on, cut count and
+  all.
+
+**What changes in a training run.** Dropping ~48% of rows is not only a credit
+reassignment — it changes the shape of the iteration:
+
+- **Optimizer steps halve, and nothing compensates.** The balanced sampler sets
+  `n_batches = ceil(live_rows / mini_batch_size)` (`train_grpo.py:7185`), so at
+  the defaults (`mini_batch_size=8`, `update_epochs=2`) an `iter_0001`-shaped
+  iteration goes from **582 steps to 300** (0.515×). The learning rate is
+  per-iteration with no scheduler compensation, and dynamic epochs are
+  episode-keyed so they do not react. **Raise `--update-epochs` to 4** to
+  recover a comparable step budget, or accept ~half the policy movement per
+  iteration and raise `--num-iterations`. The ratio self-heals as success rises
+  (≈0.52 at 10% success, ≈0.69 at 50%, ≈0.83 at 75%), so plan to drop back once
+  success clears ~40%. Note the GPU update cost falls by the same ~48%, so
+  steps *per GPU-hour* are unchanged — but sim collection cost is unchanged, so
+  **sim cost per optimizer step roughly doubles.**
+- **Positive rows are repeated half as often.** Positives cycle with
+  replacement; each of the 171 positive rows is seen 13.6×/iteration with the
+  filter off and 7.0× with it on. Less overfitting pressure on the same handful
+  of success episodes — a genuine benefit.
+- **The balanced sampler's role-flip point moves earlier.** Which class gets
+  oversampled with replacement flips when the natural positive-row fraction
+  crosses `balanced_minibatch_positive_adv_ratio` (0.5). Removing negative rows
+  moves that crossing to a substantially lower episode success rate. Past it the
+  *failure* rows are the ones cycled with replacement; `--balanced-minibatch-positive-adv-ratio-dynamic`
+  is the knob that damps it and is off by default.
+- **Do not pair with the Layer-2 anchor recipe unchanged.** Beyond the budget
+  denominator noted above, anchor rows are not truncated while failure rows are,
+  so doubling the failures' per-row advantage halves the anchor:erosion weight
+  ratio. Re-derive `anchor_advantage` (roughly 2×) before combining them.
+- **Enable it on a fresh run, not mid-run** — especially with
+  `--kl-base-adaptive`, whose controller input is averaged over the buffer's
+  rows, so the row-population change alone steps it.
+
+**New TB scalars** (emitted only when the feature is on, so an unfiltered run's
+`episode/*` key set is unchanged):
+
+| scalar | meaning |
+|---|---|
+| `episode/n_post_reopen_detected` | Failing episodes in which the reopen was **found**. Against the iteration's failure count — `(1 − success_rate) × num_episodes` — this is the detector's hit rate. Well below 1.0 means the width thresholds have drifted off the policy's actual gripper behavior and the filter is quietly doing less than it claims. This is the metric to watch. |
+| `episode/n_post_reopen_episodes_cut` | Failing episodes actually **truncated**. NOT a hit rate: an episode whose onset lands within `keep_chunks` of the end is detected and correctly left whole, so this falls as the policy learns to hold its grasp longer even though nothing is wrong. On `iter_0001` it is 42/43 at N=3 and 19/43 at N=30. |
+| `episode/n_post_reopen_errors` | Episodes whose gripper state could not be read (corrupt / NaN). Failing ones among them are kept whole and the run continues; if *no* episode in the buffer can be read, `compute_advantages` raises instead, because that is a misconfiguration rather than bad data. |
+| `episode/n_post_reopen_implausible` | Truncations **refused** because the retained prefix would have fallen below `post_reopen_min_train_chunks`. Non-zero means the detector latched onto something that is not the grasp — the only counter that can see that. |
+| `episode/post_reopen_kept_len_{min,median,max}` | Spread of the retained lengths across the episodes actually cut. The metric for the row-count reweighting: since the update's renorm flattens per-row magnitudes, an episode's realized gradient mass ends up proportional to its retained length, and retained length tracks how long the gripper stayed closed. A widening spread means near-misses are being suppressed harder than clean whiffs. |
+| `episode/n_post_reopen_chunks_dropped` | Rows removed. |
+| `episode/num_train_chunks` / `episode/num_chunks` | Rows that reach the update, and the raw collected count. Both are emitted only when the feature is on, so the unfiltered key set is unchanged and `num_train_chunks` always has something to be read against. Expect the ratio ≈0.52 at low success, drifting **up** as success rises. A ratio *falling* over a run means the policy is releasing earlier, which cuts more rows, which cuts optimizer steps — the one self-reinforcing failure mode here. |
+| `train/n_updates` | Confirms the step budget. ~300/iteration at `update_epochs=2`, ~600 at 4. |
+
+Covered by `test_gripper_release.py`, whose `ITER_0001` fixture pins the
+`(success, num_chunks, reopen_idx)` triple of all 48 real episodes and the
+N → dropped-fraction curve above; when that collection is present on disk the
+suite re-derives the fixture from the raw `.npz` rather than trusting it.
 
 ### FM log-prob surrogate
 

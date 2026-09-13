@@ -16,10 +16,20 @@ Usage:
 from dataclasses import dataclass, field
 from typing import Optional
 
+import dataclasses
 import math
 
 from lora_dit import DEFAULT_LORA_TARGET_MODULES
 from smoothness import SMOOTH_INSTRUMENTS
+from gripper_release import (
+    DEFAULT_CLOSE_BELOW,
+    DEFAULT_MIN_CLOSED_CHUNKS,
+    DEFAULT_MIN_TRAIN_CHUNKS,
+    DEFAULT_ONSET_MARGIN,
+    DEFAULT_OPEN_ABOVE,
+    GRIPPER_STATE_KEY,
+    PostReopenFilter,
+)
 
 
 @dataclass
@@ -530,6 +540,117 @@ class GRPOConfig:
     # gradient (the per-minibatch quota is proportional and may be fractional,
     # so this holds for pools smaller than one row per minibatch too).
     anchor_max_row_frac: float = 1.0
+
+    # ---------------------------------------------------------------------
+    # Post-reopen truncation of FAILING episodes (gripper_release.py)
+    # ---------------------------------------------------------------------
+    # On a grasp-and-place task a failure has a stereotyped shape: approach,
+    # close the gripper (usually on nothing), reopen a few chunks later, then
+    # fly the arm away and meander until truncation. Under the
+    # `A_ep / num_chunks` split that tail carries a large share of the episode's
+    # negative gradient weight — measured on CoffeeServeMug iter_0001, the
+    # reopen onset lands at chunk 15-27 of 50 for 42 of the 43 failures (the
+    # exception grasps the mug and never places it), so about HALF of every
+    # failing episode
+    # is retreat-and-park. That half is a CONSEQUENCE of the failure rather than
+    # its cause, and no success in the group exhibits it at all (successes
+    # terminate on the place), so the clearest contrast the update can find
+    # becomes "failures fly away at the end" — true, useless, and it dilutes
+    # the credit on the approach and the failed grasp that actually caused it.
+    #
+    # post_reopen_keep_chunks = N truncates each FAILING episode to
+    # `onset_idx + N` chunks, where onset_idx is the first chunk in which the
+    # gripper has MEASURABLY BEGUN to open. That is NOT the chunk where the
+    # width clears post_reopen_open_width — the fingers take about a control
+    # chunk to travel, so that crossing is 0-2 chunks late (1 on 36 of the 43
+    # measured failures). The onset is recovered by walking backward from the
+    # crossing down the rising edge; see gripper_release.reopen_onset_index.
+    # N counts from the onset chunk itself: N=3 keeps onset..onset+2 and drops
+    # the rest; N=0 drops the onset chunk too. Everything BEFORE the onset is
+    # always kept. Successes are never touched (their reopen is the release that
+    # completes the task), and anchor groups are all-success by construction.
+    #
+    # None (default) = DISABLED and bit-identical to the pre-feature behavior:
+    # no episode is truncated, no gripper state is read, no TB series is added.
+    #
+    # Choosing N. Measured over the 43 failures in CoffeeServeMug iter_0001.
+    # Credit in a policy-gradient update attaches to a chunk's ACTION, so the
+    # relevant quantity is the EEF motion each retained chunk's action produces:
+    # 0.021 / 0.017 / 0.029 m at onset+0/+1/+2, then 0.082 at +3 and 0.096 at
+    # +4. The share of failures whose chunk moves more than 5 cm jumps from 21%
+    # at +2 to 74% at +3. (For scale, the approach phase — everything strictly
+    # before the close — runs at a median 0.005 m/chunk.) Only 1 of 43 failures
+    # ever re-commands a close after the reopen, at +23, so there is no recovery
+    # attempt to preserve. N=3 is the break point: it keeps the failed grasp and
+    # the hover and cuts from the first ballistic command. It drops 52.2% of
+    # failure chunks / 48.4% of all chunks on that iteration.
+    #
+    # The OBSERVATION at the start of each chunk tells a one-chunk-later story
+    # (0.000 / 0.021 / 0.031 / 0.045 m from the onset at +0..+3, then 0.104 at
+    # +4), so N=4 is defensible if you prefer to keep every chunk that is still
+    # observed at the grasp site. The cost difference is small: N=4 drops 50.3%
+    # / 46.6%. N=5-7 is the conservative band (48.3% / 44.8% down to 44.4% /
+    # 41.1%); above ~N=21 the feature is doing almost nothing (<19%).
+    #
+    # Operational consequence, easy to miss: the balanced sampler sizes an epoch
+    # as ceil(live_rows / mini_batch_size), so dropping ~48% of rows HALVES the
+    # optimizer steps per iteration (582 -> 300 at the defaults on an
+    # iter_0001-shaped iteration) with no LR compensation. Raise update_epochs
+    # to 4 to restore a comparable step budget. See README "What changes in a
+    # training run".
+    post_reopen_keep_chunks: int | None = None
+
+    # Hysteresis thresholds on the measured gripper width
+    # (`gripper_qpos[0] - gripper_qpos[1]`, metres). Defaults are calibrated for
+    # the PandaOmron parallel-jaw gripper, whose steady-state widths over
+    # iter_0001 are cleanly trimodal: ~0.000-0.004 closed on nothing,
+    # ~0.017-0.025 closed on the mug, ~0.055-0.080 open (94.7% of all 2321
+    # chunks; the rest are transitions). 0.035 sits between the widest real
+    # grasp (0.025) and the narrowest approach-phase squeeze seen while the
+    # gripper was still commanded open (0.0424), and 0.055 sits below the open
+    # cluster. Because the ONSET is anchored to the base of the rising edge
+    # rather than to the crossing, it is insensitive to both: over close in
+    # [0.030, 0.050] x open in [0.050, 0.070] (19 pairs) the onset is identical
+    # on all 48 episodes while the crossing moves at 14 of the 19 PAIRS
+    # (affecting 9 of the 48 episodes). RE-DERIVE BOTH
+    # from your own width histogram before using this on another embodiment.
+    post_reopen_close_width: float = DEFAULT_CLOSE_BELOW
+    post_reopen_open_width: float = DEFAULT_OPEN_ABOVE
+
+    # How far above the closed-phase floor the width must rise before a chunk
+    # counts as already-opening, in metres. Adapts to the grasp: the floor is
+    # the minimum width during the closed phase, ~0.001 for a close on nothing
+    # and ~0.020 for a close on the mug. 0.004 sits in a measured plateau —
+    # every value in [0.0025, 0.0055] gives bit-identical onsets on all 43
+    # FAILURES (the only episodes truncated). Below it the backward walk follows
+    # a blip into the edge (one chunk early on episode_0044 at 0.002); above it,
+    # 4 failures stop one chunk short on the shallow part of the rising edge.
+    # Counting successes too the plateau narrows to [0.004, 0.005] — one success
+    # holds the mug with wobble that straddles the margin — which is why the
+    # default is 0.004 rather than 0.003. Must be < open_width - close_width, or
+    # no chunk could ever clear floor + margin.
+    post_reopen_onset_margin: float = DEFAULT_ONSET_MARGIN
+
+    # State modality key holding the two finger joint positions.
+    post_reopen_state_key: str = GRIPPER_STATE_KEY
+
+    # Consecutive sub-close_width chunks required before the detector accepts a
+    # close. A close is a DWELL, not a single sample: without this a lone
+    # transient dip through the band latches the state machine and the next open
+    # sample is read as the reopen, truncating the episode to keep_chunks + 1
+    # chunks and discarding the failed grasp entirely. Real closed phases run
+    # >= 7 chunks on the reference data, which contains no sub-threshold run
+    # shorter than 3, so the default is free there.
+    post_reopen_min_closed_chunks: int = DEFAULT_MIN_CLOSED_CHUNKS
+
+    # Implausibility floor on the retained prefix, in chunks. A truncation that
+    # would leave fewer than this many chunks is REFUSED (the episode is kept
+    # whole) and reported on episode/n_post_reopen_implausible — the approach
+    # phase alone is ~13 chunks on the reference data, so a handful of retained
+    # chunks means the detector latched onto something that is not the grasp.
+    # Secondary defense: the two state-machine guards above are what actually
+    # prevent the known failure modes. 0 disables the floor.
+    post_reopen_min_train_chunks: int = DEFAULT_MIN_TRAIN_CHUNKS
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
     # If we collected 200 action chunks and mini_batch_size=10, then we will do 20 grad updates per epoch
@@ -1161,6 +1282,28 @@ class GRPOConfig:
     cos_ref_lora_paths: Optional[tuple[str, str]] = None
     cos_ref_iterations: int = 2
 
+    def build_post_reopen_filter(self) -> "PostReopenFilter | None":
+        """The PostReopenFilter for this config, or None when disabled.
+
+        Rebuilt on each call rather than cached on the instance: GRPOConfig is a
+        plain (mutable) dataclass, and a cached object would keep applying the
+        thresholds the config had at construction after a caller edited one —
+        toy_train_grpo.py mutates config fields between collections, so this is
+        a live pattern in this codebase, not a hypothetical. The object is three
+        floats and a string; building it every iteration costs nothing.
+        """
+        if self.post_reopen_keep_chunks is None:
+            return None
+        return PostReopenFilter(
+            keep_chunks=self.post_reopen_keep_chunks,
+            close_below=self.post_reopen_close_width,
+            open_above=self.post_reopen_open_width,
+            onset_margin=self.post_reopen_onset_margin,
+            min_closed_chunks=self.post_reopen_min_closed_chunks,
+            min_train_chunks=self.post_reopen_min_train_chunks,
+            state_key=self.post_reopen_state_key,
+        )
+
     def __post_init__(self):
         """Validate config invariants at construction time.
 
@@ -1436,6 +1579,66 @@ class GRPOConfig:
                 f"anchor rows to budget and the value is never read. (Mirrors "
                 f"the same check on anchor_advantage.)"
             )
+
+        # Post-reopen truncation. Every check below is a hard error rather than
+        # a warning for the same reason the scene-pool checks are: each failure
+        # mode is otherwise SILENT — the run completes, the curves look
+        # plausible, and the filter either does nothing or cuts the wrong thing,
+        # with nothing in the logs distinguishing that from success. The
+        # keep_chunks / width checks live in PostReopenFilter.__post_init__ so
+        # the primitives are validated whether they are reached through the
+        # config or directly; build the object here so a bad value fails at
+        # config construction rather than at the end of the first collection.
+        if self.post_reopen_keep_chunks is not None:
+            self.build_post_reopen_filter()
+            # A warning, not an error: a branch point BEFORE the grasp is a
+            # perfectly good use of both knobs. But if the saved state has the
+            # gripper CLOSED, no episode ever shows the open->closed transition
+            # the detector requires, so the filter is inert for the whole run.
+            # That is now detectable (episode/n_post_reopen_detected reads 0
+            # rather than mis-truncating, since close_cross_indices refuses to
+            # latch without an observed open) — it just needs saying up front.
+            if self.init_state_npz_path is not None:
+                import warnings  # local, matching this file's convention
+
+                warnings.warn(
+                    "post_reopen_keep_chunks is set together with "
+                    "init_state_npz_path. Every episode then starts from the "
+                    "same saved sim state; if that state has the gripper CLOSED "
+                    "the detector never sees an open->closed transition and the "
+                    "filter is inert for the entire run. Watch "
+                    "episode/n_post_reopen_detected — it will read 0.",
+                    stacklevel=2,
+                )
+        else:
+            # The tuning knobs are read ONLY through the filter object, so
+            # setting one while the feature is off changes nothing at all. That
+            # is the classic "I turned it on" / "no I didn't" bug, and the
+            # non-default value is the evidence the operator thought they had.
+            #
+            # The defaults are read back from the dataclass fields rather than
+            # repeated here. Repeating them means a future retune of a field
+            # default makes a plain GRPOConfig() raise this error at
+            # construction — every entry point dead, blaming the operator for a
+            # value they never set.
+            _defaults = {f.name: f.default for f in dataclasses.fields(self)}
+            for name in (
+                "post_reopen_close_width",
+                "post_reopen_open_width",
+                "post_reopen_onset_margin",
+                "post_reopen_min_closed_chunks",
+                "post_reopen_min_train_chunks",
+                "post_reopen_state_key",
+            ):
+                value, default = getattr(self, name), _defaults[name]
+                if value != default:
+                    raise ValueError(
+                        f"{name}={value!r} was set but "
+                        f"post_reopen_keep_chunks is None, which disables the "
+                        f"post-reopen filter entirely — the value would never be "
+                        f"read. Set --post-reopen-keep-chunks N to enable it, or "
+                        f"leave {name} at its default {default!r}."
+                    )
 
         # The clipped surrogate clamps the importance ratio to
         # [1 - clip_eps_low, 1 + clip_eps_high]. Each epsilon must lie in the

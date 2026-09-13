@@ -2661,12 +2661,23 @@ All are pure additions and emit unconditionally where their inputs exist.
 
 ### AdamW betas / eps — and which regime this run is in
 
-`adam_beta1` (0.9), `adam_beta2` (0.999) and `adam_eps` (1e-5) were hard-coded at
-the `optim.AdamW(...)` construction site; they are now config fields. **Defaults
-are bit-identical**, so an unchanged CLI reproduces every run recorded before the
-knobs existed. The point of surfacing them is partly that they now land in the
-TensorBoard `config` dump — a run's own artifacts previously did not record the
-optimizer it used.
+`adam_beta1`, `adam_beta2` and `adam_eps` were hard-coded at the
+`optim.AdamW(...)` construction site (`(0.9, 0.999)` / `1e-5`); they are now config
+fields, and they land in the TensorBoard `config` dump — a run's own artifacts
+previously did not record the optimizer it used.
+
+**Shipped defaults are `beta1=0.9`, `beta2=0.99`, `eps=1e-8` — the NORMALISED
+regime, not the pre-knob values.** To reproduce a run recorded before the knobs
+existed, pass `--adam-eps 1e-5 --adam-beta2 0.999` explicitly.
+
+**Resuming re-applies config over the checkpoint.** `Optimizer.load_state_dict`
+replaces `param_groups` wholesale, keeping only `params`, so a resume would
+otherwise silently adopt the *checkpoint's* betas/eps/weight_decay — meaning
+`--adam-eps 1e-8` into a pre-knob checkpoint would quietly train at `1e-5`, in the
+wrong regime. `lr` escapes this because the annealing line re-sets it every
+iteration. `_reapply_optimizer_hyperparams` forces config back on after the load
+and prints what the checkpoint held; the AdamW moment state (`exp_avg`,
+`exp_avg_sq`, `step`) is untouched.
 
 PyTorch AdamW is `θ -= lr · m̂ / (√v̂ + ε)`. **ε is added to `√v̂`, outside the
 sqrt** — which is what makes `adam_eps` a regime switch here rather than a

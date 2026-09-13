@@ -1195,23 +1195,26 @@ class GRPOConfig:
 
     # ─── AdamW betas / eps ───────────────────────────────────────────────────
     #
-    # Defaults are BIT-IDENTICAL to the values these were hard-coded at (PyTorch
-    # default betas; eps from grpo_cont.py:230), so an unchanged CLI reproduces
-    # prior runs. Surfaced so they reach the TB `config` dump.
+    # Defaults are the NORMALISED regime (eps below per-coordinate sqrt(v_hat)).
+    # To reproduce runs recorded before these were config knobs, pass
+    # `--adam-eps 1e-5 --adam-beta2 0.999` (the old hard-coded values: PyTorch
+    # default betas, eps from grpo_cont.py:230).
     #
     # eps is a REGIME SWITCH here, not a numerical guard: AdamW is
     # `theta -= lr * m_hat / (sqrt(v_hat) + eps)`, and per-coordinate sqrt(v_hat)
-    # (~||g||/sqrt(14.5M) = 1.0e-6 to 5.0e-6 across arms) sits BELOW eps=1e-5. So
-    # the step is ~`lr * m_hat / eps`, proportional to the gradient. Consequences:
-    #   * jitter_pos moves ||g|| 3.8x, so at fixed lr a lam change silently moves
-    #     the step size too — a lam ablation must co-adjust lr to hold
-    #     lora/step_norm fixed, or it is confounded.
-    #   * adam_beta2 is nearly INERT at eps=1e-5, and only matters below ~1e-6.
-    #
-    # eps=1e-8 removes that confound but is NOT a default: expect ~10x larger
-    # steps (recalibrate lr down, measuring lora/step_norm) and a qualitative
-    # change in WHICH params move. Lower adam_beta2 to 0.99 with it. Full
-    # rationale, numbers and the beta1 argument: README "AdamW betas / eps".
+    # is ~||g||/sqrt(14.5M) = 1.0e-6 to 5.0e-6 across arms.
+    #   * At eps=1e-5 the floor dominates, so the step is ~`lr * m_hat / eps`,
+    #     PROPORTIONAL to the gradient. jitter_pos moves ||g|| 3.8x, so a lam
+    #     change silently moves the step size too — a lam ablation there must
+    #     co-adjust lr to hold lora/step_norm fixed, or it is confounded. And
+    #     adam_beta2 is nearly INERT, since sqrt(v_hat) barely enters.
+    #   * At eps=1e-8 the step is gradient-magnitude invariant (~lr per
+    #     coordinate, SNR-weighted), which removes that confound — but it is ~10x
+    #     LARGER at the same lr, so recalibrate lr against lora/step_norm, and it
+    #     activates the small-magnitude coordinates the floor was holding still.
+    #     Keep adam_beta2 at 0.99 here: at 0.999 (a 1000-step memory, ~24
+    #     iterations) v never leaves warmup within a run.
+    # Full rationale, numbers and the beta1 argument: README "AdamW betas / eps".
     adam_eps: float = 1e-8
     adam_beta2: float = 0.99
 

@@ -1212,8 +1212,8 @@ class GRPOConfig:
     # steps (recalibrate lr down, measuring lora/step_norm) and a qualitative
     # change in WHICH params move. Lower adam_beta2 to 0.99 with it. Full
     # rationale, numbers and the beta1 argument: README "AdamW betas / eps".
-    adam_eps: float = 1e-5
-    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+    adam_beta2: float = 0.99
 
     # Momentum. 0.9 is a 10-step memory against ~42 optimizer steps/iter, so `m`
     # averages ~24% of an iteration. Raising it (0.95 = 20 steps, 0.98 = 50) is the

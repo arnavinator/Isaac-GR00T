@@ -35,6 +35,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
 | `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
 | `test_grad_probe.py` | CPU suite for the gradient-decomposition probe (`grad_probe_every`), driving the real `_grpo_update_inner` plus the real `_grad_probe_capture_jittered` / `_grad_probe_finish` / `select_grad_probe_rows` / `aggregate_grad_probes`. Covers: off-switch bit-identity (stats, `p.grad`, weights, RNG stream, and a spy proving `torch.autograd.grad` is never called); the probe ON changing **nothing** about the training step (`autograd.grad` really does not accumulate); the decomposition identity `g_jit − g_R = λ²g_P` against a **hand-derived** closed form on a τ- and `noise_for_input`-sensitive analytic stand-in with a known Jacobian (a re-run of autograd would have agreed with a wrong derivation — this caught a missing `w0` factor); `R → 0` as `λ → 0` and monotonicity in `λ`; both legs sharing ε / τ / rows verbatim, with mutants that mismatch the τ **set** and the row **set** and must be detected; the τ-subset path applied to both legs; the row cap and deterministic tie-breaking; the paired-mode fixed-row exclusion pinned against the ~2× diluted alternative; the `jitter_neg > 0` guard on `g_erosion`; hand-computed percentiles/aggregation; skip, failure and cadence accounting; both legs running at the **same θ** at `gradient_accumulation_steps` 1 and 2; the four-way return unpack (roughness constraint × probe); TB emission incl. the `vram/` split and the non-finite drop; and the full config validation matrix. |
+| `test_adam_knobs.py` | CPU suite for the surfaced AdamW knobs (`adam_beta1`, `adam_beta2`, `adam_eps`). Covers: default bit-identity with the previously hard-coded `(0.9, 0.999)` / `1e-5`, asserted on a real `optim.AdamW` `param_group` rather than the dataclass; the validation matrix including the two values that otherwise train silently and wrongly (`beta1 == 1.0` → zero step forever, `beta2 == 1.0` → denominator collapses to `adam_eps`) and `beta == 0.0` which must be **accepted** as the momentum-off ablation; both edges of the eps/beta2 regime warning incl. the strict `< 1e-6` boundary and that it warns rather than raises; a source-level wiring check on `setup()` (unreachable from a `__new__` harness) plus that exactly one `optim.AdamW(` remains; and the two arithmetic claims the `adam_eps` doc rests on, measured against a real AdamW step — a 3.8× gradient gives a >3× step at `eps=1e-5` but <1.1× at `eps=1e-8`, and the eps drop inflates the step ~10×. |
 
 ---
 
@@ -2620,6 +2621,103 @@ All are pure additions and emit unconditionally where their inputs exist.
 | `toy_train_grpo.py` | `_log_metrics` override forwards `lora_cosines`; banner prints `Clip low MSE c`. |
 | `test_clip_floor.py` | New CPU suite (see the Contents table). |
 | `test_jitter_metrics.py` | The `clip_killed_gradient` call-site spy now asserts the low argument is a per-ROW `rho_floor` tensor equal to `1 − clip_eps_low` (was: the float epsilon), with `clip_eps_high` still a scalar. |
+
+### AdamW betas / eps — and which regime this run is in
+
+`adam_beta1` (0.9), `adam_beta2` (0.999) and `adam_eps` (1e-5) were hard-coded at
+the `optim.AdamW(...)` construction site; they are now config fields. **Defaults
+are bit-identical**, so an unchanged CLI reproduces every run recorded before the
+knobs existed. The point of surfacing them is partly that they now land in the
+TensorBoard `config` dump — a run's own artifacts previously did not record the
+optimizer it used.
+
+PyTorch AdamW is `θ -= lr · m̂ / (√v̂ + ε)`. **ε is added to `√v̂`, outside the
+sqrt** — which is what makes `adam_eps` a regime switch here rather than a
+numerical guard.
+
+**Which regime.** Per-coordinate `√v̂` is on the order of `‖g‖ / √n_trainable`,
+with `n_trainable = 14,532,608` (√ = 3812):
+
+| arm | `train/grad_norm_mean` | per-coord `√v̂` | `eps / √v̂` |
+|---|---|---|---|
+| `jitter_pos=0.125` | 0.0038 | 1.0e-6 | **10×** |
+| `jitter_pos=0.25` | 0.0067 | 1.8e-6 | 5.7× |
+| `jitter_pos=0.35` | 0.0143 | 3.8e-6 | 2.7× |
+| `overfit_step10_v5` | 0.019 | 5.0e-6 | 2.0× |
+
+So at the shipped `eps=1e-5` the **ε floor dominates the denominator** for the
+bulk of coordinates and the step is ≈ `lr · m̂ / ε` — closer to SGD+momentum than
+to normalised Adam. (Those are RMS figures over a heavy-tailed distribution:
+`lora_B` is zero-initialised, so `∂L/∂A = 0` at step 1 and the A/B scales differ.
+A high-gradient tail is already in the normalised regime; the bulk is not.)
+
+Two consequences that matter for **reading the experiment log**, not just for
+tuning:
+
+1. **Gradient magnitude is not normalised away.** `jitter_pos` moves `‖g‖` by
+   3.8× across the arms above — via the FM residual, since the FM loss is
+   least-squares so `grad ∝ residual` — so at fixed `learning_rate` a λ change
+   silently changes the **step size** too. A λ ablation that does not co-adjust
+   `lr` to hold `lora/step_norm` fixed is confounded, and at least one recorded
+   pair (`jitter_pos` 0.125 at `lr` 5.9e-5 vs 1.2e-4) is.
+2. **`adam_beta2` is nearly inert at `eps=1e-5`.** `√v̂` barely enters the
+   denominator, so changing β₂ alone does almost nothing. It becomes load-bearing
+   only once ε is lowered below `√v̂`.
+
+**On lowering ε.** `eps=1e-8` makes the step gradient-magnitude invariant
+(bounded by ~`lr` per coordinate, SNR-weighted through `m̂/√v̂`), which removes
+confound (1). It is **not a bug fix and not obviously an improvement**: `eps=1e-5`
+is the deliberate RL convention (CleanRL's PPO, the original baselines) precisely
+*because* policy-gradient noise makes the normalised regime amplify low-magnitude
+coordinates, and the in-tree value traces to `grpo_cont.py:230`. Expect two
+things:
+
+- **A ~10× larger aggregate step at the same `lr`.** In the ε regime
+  `‖step‖ = (lr/ε)·‖m̂‖` ≈ 0.046; normalised, `‖step‖ ≈ lr·√n_eff` ≈ 0.46.
+  Recalibrate `lr` **down** ~10×, and **measure** the factor (one
+  `resume_from_collected_data` update, read `lora/step_norm`) rather than assuming
+  it — the heavy tail means the realised factor is smaller than the median-
+  coordinate estimate.
+- **A qualitative change in *which* parameters move.** The 10× does not come from
+  scaling the existing step; it comes from **activating the millions of
+  small-magnitude coordinates the ε floor was holding still**. That floor is a de
+  facto trust region over 14.5M parameters driven by a gradient whose
+  step-to-step coherence (`lora/cos_step_prev`) is only 0.45–0.87. Treat it as a
+  one-variable experiment, not a new default.
+
+**If you lower ε, also lower β₂.** β₂ = 0.999 is a 1000-step memory ≈ 24
+iterations at ~42 optimizer steps/iter, so `t_eff = (1−β₂ᵗ)/(1−β₂)` reaches only
+~650 by iteration 25 — the **entire run** sits inside `v`'s warmup, and `v` lags a
+non-stationary gradient scale (one arm's `ref_mse/pos_mean` grew 4× over six
+iterations, which `v` would trail by the whole run). β₂ = 0.99 is a 100-step
+memory (~2.4 iterations) at the cost of steady-state `√v̂` noise 2.2% → 7.1%; for
+a ~1000-step non-stationary objective that is the better trade. Bias correction
+removes the *bias* from step 1 either way — what warms up is only the variance of
+the estimate (11% at it1, 6.5% at it3). `__post_init__` emits a
+`warnings.warn` (not an error) for `adam_eps < 1e-6` with `adam_beta2 >= 0.999`.
+
+**β₁ is the cheaper lever on incoherence, because it does not leave the ε
+regime.** 0.9 is a 10-step memory against ~42 optimizer steps per iteration, so
+`m` averages only ~24% of an iteration. When the measured pathology is low
+coherence, more temporal averaging raises per-step SNR for free — the same thing a
+larger `gradient_accumulation_steps` buys, without the compute. 0.95 = 20 steps,
+0.98 = 50 steps. The interaction with the ε regime is favourable: there the step
+is ≈ proportional to `m̂`, and raising β₁ grows `m̂` on **coherent** directions
+while leaving incoherent ones near zero — so it amplifies the consistent
+component specifically, rather than scaling everything the way `lr` does. Costs:
+lag (slower response to a genuine change in the gradient) and a larger effective
+step, so watch `lora/step_norm` and drop `lr` if it overshoots.
+
+**Two neighbours worth knowing are inert.** `weight_decay = 1e-5` is decoupled
+(`θ -= lr·wd·θ`), i.e. 1.2e-9 per step per unit of θ at `lr` 1.2e-4 — ~1.3e-6
+total relative shrinkage over a 25-iteration run, against the ~0.7
+`lora/weight_delta_norm` those steps produce. It is not regularising anything.
+And `max_grad_norm = 0.5` never binds: measured `train/grad_norm_mean` is
+0.0038–0.019 (26–130× below the bound) with `train/n_nonfinite_grad_steps` and
+`train/n_skipped_nonfinite` at 0 throughout. Do not read a slow run as
+gradient-clipped.
+
+Covered by `test_adam_knobs.py`.
 
 ### Gradient accumulation
 

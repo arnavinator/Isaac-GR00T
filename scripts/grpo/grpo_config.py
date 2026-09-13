@@ -1187,11 +1187,47 @@ class GRPOConfig:
     # RL gradients are noisier, so we need smaller steps
     learning_rate: float = 3e-5
 
-    # AdamW weight decay (L2 regularization on LoRA weights)
+    # AdamW weight decay. MEASURED INERT: decoupled decay is
+    # `theta -= lr * wd * theta`, i.e. ~1.3e-6 total relative shrinkage over a
+    # 25-iter run at lr=1.2e-4, against a ~0.7 lora/weight_delta_norm. Raising it
+    # by ~1e4 is the point at which it starts to do anything.
     weight_decay: float = 1e-5
+
+    # ─── AdamW betas / eps ───────────────────────────────────────────────────
+    #
+    # Defaults are BIT-IDENTICAL to the values these were hard-coded at (PyTorch
+    # default betas; eps from grpo_cont.py:230), so an unchanged CLI reproduces
+    # prior runs. Surfaced so they reach the TB `config` dump.
+    #
+    # eps is a REGIME SWITCH here, not a numerical guard: AdamW is
+    # `theta -= lr * m_hat / (sqrt(v_hat) + eps)`, and per-coordinate sqrt(v_hat)
+    # (~||g||/sqrt(14.5M) = 1.0e-6 to 5.0e-6 across arms) sits BELOW eps=1e-5. So
+    # the step is ~`lr * m_hat / eps`, proportional to the gradient. Consequences:
+    #   * jitter_pos moves ||g|| 3.8x, so at fixed lr a lam change silently moves
+    #     the step size too — a lam ablation must co-adjust lr to hold
+    #     lora/step_norm fixed, or it is confounded.
+    #   * adam_beta2 is nearly INERT at eps=1e-5, and only matters below ~1e-6.
+    #
+    # eps=1e-8 removes that confound but is NOT a default: expect ~10x larger
+    # steps (recalibrate lr down, measuring lora/step_norm) and a qualitative
+    # change in WHICH params move. Lower adam_beta2 to 0.99 with it. Full
+    # rationale, numbers and the beta1 argument: README "AdamW betas / eps".
+    adam_eps: float = 1e-5
+    adam_beta2: float = 0.999
+
+    # Momentum. 0.9 is a 10-step memory against ~42 optimizer steps/iter, so `m`
+    # averages ~24% of an iteration. Raising it (0.95 = 20 steps, 0.98 = 50) is the
+    # cheapest lever on low lora/cos_step_prev: inside the eps regime the step is
+    # ~proportional to m_hat, so more momentum amplifies COHERENT directions while
+    # leaving incoherent ones near zero. Costs lag and a larger effective step.
+    adam_beta1: float = 0.9
 
     # Maximum gradient norm for clipping (prevents explosion from rare high-advantage samples)
     # Same role as grpo_cont.py's args.max_grad_norm = 0.5
+    #
+    # NEVER BINDS at observed scales: train/grad_norm_mean is 0.0038-0.019, 26-130x
+    # below, with zero non-finite steps. A backstop, not an active constraint —
+    # do not read a slow run as gradient-clipped.
     max_grad_norm: float = 0.5
 
     # ─── Training Loop ───────────────────────────────────────────────────────
@@ -2283,3 +2319,45 @@ class GRPOConfig:
                     f"if you want pass-aligned iteration blocks.",
                     stacklevel=3,
                 )
+
+        # ─── AdamW betas / eps ───────────────────────────────────────────────
+        #
+        # Hard errors, not clamps: beta == 1.0 in particular runs to completion
+        # while silently not training (beta1=1.0 freezes m at its zero init -> zero
+        # step forever; beta2=1.0 collapses the denominator to adam_eps).
+        for name, value in (
+            ("adam_beta1", self.adam_beta1),
+            ("adam_beta2", self.adam_beta2),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if not (0.0 <= value < 1.0):
+                raise ValueError(
+                    f"{name} must satisfy 0.0 <= {name} < 1.0, got {value}. At "
+                    f"exactly 1.0 the moment never updates from its zero "
+                    f"initialisation and the run trains to completion without "
+                    f"raising."
+                )
+        if not math.isfinite(self.adam_eps) or self.adam_eps <= 0.0:
+            raise ValueError(
+                f"adam_eps must be finite and > 0, got {self.adam_eps!r} — it is "
+                f"the additive floor on sqrt(v_hat), and at 0 a coordinate whose "
+                f"gradient has been zero all run divides 0/0."
+            )
+        # Warn, not error: a legitimate experiment, but one that changes the
+        # optimizer's regime and needs an lr recalibration to be interpretable.
+        if self.adam_eps < 1e-6 and self.adam_beta2 >= 0.999:
+            import warnings
+            warnings.warn(
+                f"adam_eps={self.adam_eps:g} puts AdamW in the NORMALISED regime "
+                f"(below the ~1e-6 per-coordinate sqrt(v_hat) at these gradient "
+                f"scales), where sqrt(v_hat) becomes the denominator — but "
+                f"adam_beta2={self.adam_beta2} is a "
+                f"{1.0 / (1.0 - self.adam_beta2):.0f}-step memory (~"
+                f"{1.0 / (1.0 - self.adam_beta2) / 40:.0f} iterations at ~40 "
+                f"steps/iter), so v never leaves warmup and lags the "
+                f"non-stationary gradient scale. Consider adam_beta2=0.99. Also "
+                f"expect a ~10x larger step at the same learning_rate: "
+                f"recalibrate lr against lora/step_norm first.",
+                stacklevel=3,
+            )

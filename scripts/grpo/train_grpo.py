@@ -731,11 +731,15 @@ class GRPOTrainer:
         self._lora_param_names = [n for n, _ in named_trainable]
         trainable_params = [p for _, p in named_trainable]
 
+        # betas/eps from config; defaults are bit-identical to the previously
+        # hard-coded (0.9, 0.999) / 1e-5. adam_eps is a regime switch here, not a
+        # numerical guard — see GRPOConfig.adam_eps.
         self.optimizer = optim.AdamW(
             trainable_params,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
-            eps=1e-5,  # Same as grpo_cont.py line 230
+            betas=(self.config.adam_beta1, self.config.adam_beta2),
+            eps=self.config.adam_eps,
         )
 
         # Controller state recovered from the checkpoint, if any. Initialised

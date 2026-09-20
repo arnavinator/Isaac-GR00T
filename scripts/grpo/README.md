@@ -1889,6 +1889,42 @@ All are pure additions and emit unconditionally where their inputs exist.
 | `test_clip_floor.py` | New CPU suite (see the Contents table). |
 | `test_jitter_metrics.py` | The `clip_killed_gradient` call-site spy now asserts the low argument is a per-ROW `rho_floor` tensor equal to `1 − clip_eps_low` (was: the float epsilon), with `clip_eps_high` still a scalar. |
 
+### `grad_share/*` — where the loss wants the update, vs. where AdamW sends it
+
+Eight TB scalars, one per `lora_target_modules` entry, giving each module type's
+**percent of the iteration's LoRA gradient energy** (`Σ‖g‖²`, energy-weighted
+across the iteration's optimizer steps, then normalised). They sum to **100 every
+iteration by construction** — normalised by their own sum, over a group map that
+`setup()` asserts is exhaustive (and rejects duplicate targets), because a
+silently-unmatched param would leave the curves summing to less than 100.
+
+**Why it is worth a curve.** The gradient and the applied step disagree by orders
+of magnitude, and nothing else in the metric set shows it. `proj_out_1` +
+`proj_out_2` are **0.79 %** of the 14.5 M trainable params but carried **93.5 %**
+of gradient energy on one measured arm — they sit after `norm_out` (a non-affine
+`LayerNorm`, so the 32 blocks' output scale is deleted before the head acts) and
+`proj_out_1` is the only LoRA weight on the timestep-conditioning path. `eps`
+decides whether the step follows per-coordinate gradient magnitude or coordinate
+**count**, and at 99.2 %/0.8 % those answers differ enormously: on measured arms
+the head's share of the applied step was 33 % at `eps=1e-5` and 0.7 % at
+`eps=1e-8`, from 93.5 % and 8.6 % of the gradient respectively. Read it alongside
+`train/grad_norm_mean` (total magnitude), `lora/step_norm` (how far the weights
+moved) and the "AdamW betas / eps" section below (which regime you are in).
+
+**Reading it.** `grad_share` is a *diagnostic of the loss*, not of the optimizer —
+it says nothing on its own about whether the step is well spent. A single
+module type dominating is normal; what matters is whether the *step* follows it.
+Note `lora/weight_delta_norm` is NOT comparable across an `eps` change (it counts
+raw A/B factors, which include LoRA's gauge freedom `A→GA, B→BG⁻¹`); for
+cross-run drift use `ref_mse/log_base_ratio_mean`.
+
+**Cost.** One fused `_foreach_norm` + `index_add` per optimizer step — a second
+read of the already-resident ~58 MB gradient, ~60 µs, against a ~1770 s
+iteration. Exactly one host sync per iteration. Taken BEFORE `clip_grad_norm_`
+(which rescales `.grad` in place) and committed only on steps that actually
+reach the weights, so dropped windows cannot skew the allocation. Absent — a
+curve gap, not a fake 0 — on an iteration where `n_updates == 0`.
+
 ### AdamW betas / eps — and which regime this run is in
 
 `adam_beta1`, `adam_beta2` and `adam_eps` were hard-coded at the

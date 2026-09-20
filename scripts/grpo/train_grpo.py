@@ -466,6 +466,15 @@ class GRPOTrainer:
     _lora_cos_n_logged = 0        # iterations whose step was non-zero
     _lora_cos_ref_logged = False  # one-shot latch for the TB text summary
 
+    # Same contract as the three snapshots above, for grad_share/*: the CPU test
+    # harnesses construct via __new__ and skip setup(), so _grpo_update_inner
+    # must allocate a zero-width accumulator rather than raise AttributeError.
+    # An empty group list degrades to "no curves" end to end: _foreach_norm is
+    # skipped, the accumulator is 0-width, and _grad_share_stats() returns {}.
+    _lora_grad_group_names = ()
+    _lora_grad_groups = ()
+    _lora_grad_group_idx = None
+
     def __init__(self, config: GRPOConfig):
         """Initialize the GRPO trainer.
 
@@ -688,6 +697,62 @@ class GRPOTrainer:
             for name, p in self.model.named_parameters()
             if p.requires_grad
         }
+
+        # Per-module-type gradient allocation (grad_share/* in _log_metrics).
+        # Groups are the config's lora_target_modules, so the curves follow the
+        # target list rather than a hard-coded copy of it. Built once here; the
+        # per-step reduction reuses these lists (see _lora_grad_group_sq).
+        #
+        # EXHAUSTIVE BY CONTRACT: every trainable param must land in exactly one
+        # group, because the shares are normalised by their own sum and are read
+        # as "% of this iteration's gradient energy". An unmatched param would
+        # silently leave the 8 curves summing to < 100%, so an unmatched one
+        # raises here rather than at the first log call.
+        self._lora_grad_group_names = list(self.config.lora_target_modules)
+        # A DUPLICATE target would silently break the contract: the matcher's
+        # first-hit rule sends every tensor to the first copy, leaving the second
+        # at 0.0, and the name-keyed share dict then collapses the pair last-wins
+        # — so the curve count drops AND the remainder no longer sums to 100.
+        # PEFT normalises target_modules to a set, so a duplicate is already
+        # meaningless for training and rejecting it costs nothing.
+        _dupes = {
+            t for t in self._lora_grad_group_names
+            if self._lora_grad_group_names.count(t) > 1
+        }
+        if _dupes:
+            raise RuntimeError(
+                f"grad_share/*: lora_target_modules contains duplicate(s) "
+                f"{sorted(_dupes)}; the shares would not sum to 100%."
+            )
+        # Longest-first so a target that is a suffix of another cannot shadow it.
+        _ranked = sorted(
+            enumerate(self._lora_grad_group_names), key=lambda kv: -len(kv[1])
+        )
+        self._lora_grad_groups = []
+        _unmatched = []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # "...<module>.lora_A.default.weight" -> "...<module>"
+            path = re.sub(r"\.lora_[AB]\.[^.]+\.weight$", "", name)
+            gi = next(
+                (i for i, t in _ranked if path == t or path.endswith("." + t)), None
+            )
+            if gi is None:
+                _unmatched.append(name)
+            else:
+                self._lora_grad_groups.append((p, gi))
+        if _unmatched:
+            raise RuntimeError(
+                f"grad_share/*: {len(_unmatched)} trainable param(s) matched none "
+                f"of lora_target_modules={self._lora_grad_group_names}, so the "
+                f"shares would not sum to 100%. First few: {_unmatched[:5]}"
+            )
+        self._lora_grad_group_idx = torch.tensor(
+            [gi for _, gi in self._lora_grad_groups],
+            device=self.device,
+            dtype=torch.long,
+        )
 
         # Weight-step direction cosines (lora/cos_step_*). Resolve the frozen
         # early reference L_early NOW so a bad --cos-ref-lora-paths fails here
@@ -3372,6 +3437,15 @@ class GRPOTrainer:
         # stay per-minibatch. Expect grad_norm_* to read lower at k > 1: that's
         # noise cancelling between micro-batches, not weaker signal.
         grad_norms: list[float] = []
+        # Per-module-type gradient energy, accumulated on-device across the
+        # iteration's optimizer steps and normalised once at the end into
+        # grad_share/* (percent, summing to 100 by construction). Populated on
+        # exactly the steps that append to grad_norms, so dropped windows
+        # (zero / non-finite gradient) cannot skew the allocation.
+        grad_group_sq = torch.zeros(
+            len(self._lora_grad_group_names), device=self.device, dtype=torch.float32
+        )
+        grad_group_steps = 0
         ratio_maxes: list[float] = []
         ratio_mins: list[float] = []
         # n_updates counts REAL optimizer.step() calls; n_micro_batches counts
@@ -3868,6 +3942,11 @@ class GRPOTrainer:
             """
             nonlocal accum_count, n_updates, n_nonfinite_grad_steps
             nonlocal n_zero_grad_steps
+            nonlocal grad_group_sq, grad_group_steps
+
+            # Per-module-type gradient energy, read BEFORE the in-place clip
+            # below. Held aside and committed only on the real-step path.
+            group_sq = self._lora_grad_group_sq()
 
             # Gradient clipping. clip_grad_norm_ returns the TOTAL norm
             # of the gradient vector BEFORE clipping — capture it for
@@ -3950,6 +4029,8 @@ class GRPOTrainer:
                 return
 
             grad_norms.append(gnorm)
+            grad_group_sq += group_sq
+            grad_group_steps += 1
             self.optimizer.step()
             n_updates += 1
             accum_count = 0
@@ -5725,6 +5806,33 @@ class GRPOTrainer:
                 out["_vram_peak_delta_gb"] = gp_peak_delta
             return out
 
+        def _grad_share_stats() -> dict:
+            """Per-module-type % of this iteration's gradient energy, or {}.
+
+            UNLIKE _smooth_stats() this is NOT reported on the early-return
+            path, and deliberately so: `grad_group_steps` is incremented on
+            exactly the branch that increments `n_updates`, so the two are always
+            equal, and the early return is gated on `n_updates == 0`. There is no
+            allocation to report on an iteration where no step reached the
+            weights — the key is simply absent (a curve gap, not a fake 0).
+
+            Normalising on the host in Python float (not on-device fp32) is what
+            makes the emitted curves sum to 100 to within fp32 storage error.
+            Costs exactly one host sync per iteration.
+            """
+            if grad_group_steps == 0:
+                return {}
+            vals = grad_group_sq.tolist()        # the single sync
+            total = sum(vals)
+            if not (total > 0.0) or not math.isfinite(total):
+                return {}
+            return {
+                "grad_share": {
+                    n: 100.0 * v / total
+                    for n, v in zip(self._lora_grad_group_names, vals)
+                }
+            }
+
         def _smooth_stats() -> dict:
             """Trajectory-roughness metrics, or {} when the feature is off.
 
@@ -5947,6 +6055,14 @@ class GRPOTrainer:
             "n_zero_grad_steps": n_zero_grad_steps,
             "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
+            # Per-module-type share of this iteration's gradient ENERGY, in
+            # percent. ENERGY-weighted (sum the squares over steps, then
+            # normalise) rather than a mean of per-step shares, so it reads as
+            # "of all gradient energy this iter, what fraction was in group X".
+            # Normalised by its own sum, so the curves sum to exactly 100 every
+            # iteration. Absent (a curve gap, not a fake 0) when no step landed
+            # or the gradient was identically zero.
+            **_grad_share_stats(),
             "ratio_max": float(np.max(ratio_maxes)) if ratio_maxes else 1.0,
             "ratio_min": float(np.min(ratio_mins)) if ratio_mins else 1.0,
             "actual_epochs": actual_num_epochs,
@@ -8359,6 +8475,17 @@ class GRPOTrainer:
                 update_stats.get("grad_norm_max", 0),
                 iteration,
             )
+            # Per-module-type gradient ALLOCATION, percent, one curve per
+            # lora_target_modules entry. The curves sum to 100 every iteration
+            # by construction, so this reads directly as where the loss wants
+            # the update to go — which is NOT where AdamW sends it. eps decides
+            # whether the applied step follows per-coordinate gradient magnitude
+            # or coordinate COUNT, and the 99.2%/0.8% param split between the
+            # transformer blocks and proj_out_{1,2} makes those two answers
+            # differ by orders of magnitude. Compare against lora/step_norm and
+            # train/grad_norm_mean; see README "AdamW betas / eps".
+            for _g, _v in update_stats.get("grad_share", {}).items():
+                self.writer.add_scalar(f"grad_share/{_g}", _v, iteration)
             # Ratio distribution tails. With mean_ratio≈1 and modest
             # clipfrac, large ratio_max/small ratio_min reveal outlier
             # minibatches doing all the clipping work.
@@ -8704,6 +8831,13 @@ class GRPOTrainer:
                                 # Likewise nested; mirrored under gradprobe/ (and
                                 # one key under vram/) below.
                                 "_grad_probe",
+                                # Likewise nested; mirrored as grad_share/<group>
+                                # below. Without this exclusion wandb would also
+                                # receive train/grad_share as a dict and expand
+                                # it into 8 extra dotted sub-series, so the
+                                # "exactly 8 curves" contract would hold on TB
+                                # but not on wandb.
+                                "grad_share",
                                 # Excluded so the finite-filtered copies added
                                 # below are the ONLY source of these keys.
                                 # Without this exclusion the unfiltered value
@@ -8777,6 +8911,11 @@ class GRPOTrainer:
                     })
                 if lora_delta_norm is not None:
                     log_dict["lora/weight_delta_norm"] = lora_delta_norm
+                if update_stats is not None:
+                    log_dict.update({
+                        f"grad_share/{g}": v
+                        for g, v in update_stats.get("grad_share", {}).items()
+                    })
                 if lora_cosines:
                     log_dict.update({
                         f"lora/{k}": v
@@ -9515,6 +9654,47 @@ class GRPOTrainer:
             "smooth_calib_rows": self._smooth_calib_rows,
             "smooth_hf_ref": float(self._smooth_hf_ref),
         }
+
+    def _lora_grad_group_sq(self) -> torch.Tensor:
+        """Per-module-type sum of squares of the accumulated LoRA gradient.
+
+        Returns a [n_groups] fp32 DEVICE tensor — no `.item()`, so calling this
+        once per optimizer step costs no host sync. Caller accumulates across
+        steps and syncs once at the end of the iteration.
+
+        Must be called BEFORE `clip_grad_norm_`, which rescales `.grad` in place:
+        at observed scales the clip never binds (see GRPOConfig.max_grad_norm) so
+        the numbers would be identical either way, but reading pre-clip makes the
+        metric correct regardless of whether it starts binding later.
+
+        One fused `_foreach_norm` over ~388 tensors plus an index_add. That is a
+        SECOND full read of the ~58 MB gradient each step — `clip_grad_norm_`
+        already runs `_foreach_norm` over the same list but does not expose the
+        per-tensor norms, and reusing them would mean reimplementing the clip.
+        ~60 us of bandwidth per step against a ~1770 s iteration, so the
+        duplication is not worth removing. Params whose `.grad` is None (nothing
+        backwarded into them this window) are skipped rather than counted as
+        zero; `grads`/`idx` stay an order-preserving filtered subsequence of
+        `_lora_grad_groups`, so equal length implies nothing was filtered and the
+        cached index tensor is elementwise correct.
+        """
+        out = torch.zeros(
+            len(self._lora_grad_group_names), device=self.device, dtype=torch.float32
+        )
+        grads, idx = [], []
+        for p, gi in self._lora_grad_groups:
+            if p.grad is not None:
+                grads.append(p.grad)
+                idx.append(gi)
+        if not grads:
+            return out
+        sq = torch.stack(torch._foreach_norm(grads)).to(torch.float32).pow(2)
+        gidx = (
+            self._lora_grad_group_idx
+            if len(grads) == len(self._lora_grad_groups)
+            else torch.tensor(idx, device=self.device, dtype=torch.long)
+        )
+        return out.index_add_(0, gidx, sq)
 
     def _compute_lora_delta_norm(self) -> float:
         """L2 norm of (current trainable params − snapshot taken at setup time).

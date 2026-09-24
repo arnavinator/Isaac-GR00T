@@ -36,6 +36,9 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
 | `test_grad_probe.py` | CPU suite for the gradient-decomposition probe (`grad_probe_every`), driving the real `_grpo_update_inner` plus the real `_grad_probe_capture_jittered` / `_grad_probe_finish` / `select_grad_probe_rows` / `aggregate_grad_probes`. Covers: off-switch bit-identity (stats, `p.grad`, weights, RNG stream, and a spy proving `torch.autograd.grad` is never called); the probe ON changing **nothing** about the training step (`autograd.grad` really does not accumulate); the decomposition identity `g_jit − g_R = λ²g_P` against a **hand-derived** closed form on a τ- and `noise_for_input`-sensitive analytic stand-in with a known Jacobian (a re-run of autograd would have agreed with a wrong derivation — this caught a missing `w0` factor); `R → 0` as `λ → 0` and monotonicity in `λ`; both legs sharing ε / τ / rows verbatim, with mutants that mismatch the τ **set** and the row **set** and must be detected; the τ-subset path applied to both legs; the row cap and deterministic tie-breaking; the paired-mode fixed-row exclusion pinned against the ~2× diluted alternative; the `jitter_neg > 0` guard on `g_erosion`; hand-computed percentiles/aggregation; skip, failure and cadence accounting; both legs running at the **same θ** at `gradient_accumulation_steps` 1 and 2; the four-way return unpack (roughness constraint × probe); TB emission incl. the `vram/` split and the non-finite drop; and the full config validation matrix. |
 | `test_adam_knobs.py` | CPU suite for the surfaced AdamW knobs (`adam_beta1`, `adam_beta2`, `adam_eps`). Covers: default bit-identity with the previously hard-coded `(0.9, 0.999)` / `1e-5`, asserted on a real `optim.AdamW` `param_group` rather than the dataclass; the validation matrix including the two values that otherwise train silently and wrongly (`beta1 == 1.0` → zero step forever, `beta2 == 1.0` → denominator collapses to `adam_eps`) and `beta == 0.0` which must be **accepted** as the momentum-off ablation; both edges of the eps/beta2 regime warning incl. the strict `< 1e-6` boundary and that it warns rather than raises; a source-level wiring check on `setup()` (unreachable from a `__new__` harness) plus that exactly one `optim.AdamW(` remains; and the two arithmetic claims the `adam_eps` doc rests on, measured against a real AdamW step — a 3.8× gradient gives a >3× step at `eps=1e-5` but <1.1× at `eps=1e-8`, and the eps drop inflates the step ~10×. |
+| `calibrate_vel_anchor.py` | Step 1 of the velocity-anchor experiment: one update-only trial of `train_grpo.py` per `vel_anchor_coef` on a cached iteration, then the first update's shrink / cosine against coef 0 (exact rank-2r trace trick, no dense ΔW), guards, and log-interpolated sweep suggestions. See README "Velocity anchor". |
+| `test_vel_anchor.py` | CPU suite for `vel_anchor_coef`: the REAL `compute_fm_log_prob` on a stub head holding a real PEFT LoRA layer (off-path contract, D == 0 at the anchor, D against an independent LoRA-formula hand computation for both anchor kinds and jittered inputs, identical current/anchor inputs, finite-difference gradient, adapters restored after an exception, `functional_call` leaving the live model and saved checkpoint untouched, masking, split parts, no RNG, every struct combination), then the real `_grpo_update_inner` / ref pass / jitter diagnostics / `_setup_vel_anchor` / `_log_metrics` / `train()`: loss composition incl. the anchor-row divisor, coef-0 identity, accumulation, the non-finite guard, the force-balance probe against direct gradients with the step bit-identical, every metric, `jac_part_pos`, anchor loading, the first-micro-batch check, config validation, resume, and `stop_after_iterations`. |
+| `test_calibrate_vel_anchor.py` | CPU suite for `calibrate_vel_anchor.py`: trace-trick norm/cosine vs dense (fresh and relative to a start), interpolation incl. the non-monotone warning and brackets, `--dry-run` command construction parsed back through tyro into `GRPOConfig`, and the cached-episode guard on synthetic TB event files. |
 
 ---
 
@@ -1437,6 +1440,7 @@ inv_base = base_log_prob - current_log_prob
 kl_loss_base_model = _kl_base_coef_now() * (inv_base.exp() - inv_base - 1).mean()
 
 loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
+# + vel_anchor_coef * D when vel_anchor_coef > 0 — see "Velocity anchor".
 ```
 
 `_kl_base_coef_now()` is `config.kl_coef_base_model` unless
@@ -1635,6 +1639,117 @@ uv run python scripts/grpo/train_grpo.py \
     --scene-seed-pool-size 4 --scene-seed-pool-base 105067 \
     --num-groups 4 --max-groups 4 --min-alive-groups 0
 ```
+
+### Velocity anchor (`vel_anchor_coef`)
+
+`vel_anchor_coef = 0.0` (default) is OFF and bit-identical to the tree before it:
+no extra forward, no RNG draw, no `vel_anchor/*` curve. The off claim was checked as an
+out-of-tree differential against HEAD (recipe in `test_vel_anchor.py`'s docstring);
+`test_vel_anchor.py` test 13 is the in-tree half.
+
+**What it adds.**
+
+```
+D_row = mean_k  mean_valid  (v_theta(x_k) - v_anchor(x_k))^2     # per row, fp32
+loss += vel_anchor_coef * (D.mean()            # no anchor rows in play
+                           | D.sum() / signal_mb_size)   # anchor rows in play (as KL)
+```
+
+- `x_k` are the **training forward's own DiT inputs** for the K `tau_centers` samples,
+  including the jittered `x'_k` on jittered rows (the positive rows at `jitter_neg = 0`).
+  The anchor forward runs inside the same K-loop at the identical input, under
+  `torch.no_grad()`.
+- `v_anchor` is the **base DiT** (`vel_anchor_path = None`, LoRA disabled through
+  `disabled_adapters`), or a **frozen LoRA checkpoint** (`vel_anchor_path = iter_NNNN/` or
+  `lora_weights.pt`). A checkpoint is loaded once at setup through `_load_lora_state`,
+  which hard-fails on key or shape mismatch. It is held as a plain attribute (~58 MB),
+  never a module parameter, and evaluated through `torch.func.functional_call`. Only the
+  A/B tensors are swapped, so the anchor uses THIS run's `lora_alpha`/`lora_rank`.
+  Checkpoints do not store them, so an anchor saved under a different alpha at the same
+  rank passes every check (same limitation as `--resume-from`).
+- There is no PAWS weighting: D is not advantage-keyed. Anchor rows are included, on the
+  same constant divisor as the KL terms.
+
+**Why not the KL knobs.**
+
+1. **Jitter bias.** Both k3 terms compare the *jittered* current log-prob against the
+   *clean* reference/base log-prob on positive rows, so at `jitter_pos = 0.125` they
+   measure the jitter gap (~0.0155 nats) rather than drift. At iteration 1 (θ = base), the
+   plam-0.125 run logs `kl_loss_base_model == kl_loss_last_iter == 7.17e-6`, which is
+   gap²/2 × positive fraction × 0.1. Raising the coefficients under jitter adds Jacobian
+   contraction instead of a brake.
+2. **Wrong direction even with matched inputs.** The k3 term sees one scalar per row,
+   `x = MSE_θ − MSE_anchor`. Its gradient is `(eˣ − 1)·∇MSE_θ`, a rescaled copy of the
+   row's own FM gradient, which acts like an advantage offset. It never points from v_θ
+   toward v_anchor, and at small drift its pull scales with θ's tiny self-consistency
+   residual. `∇D = 2·(v_θ − v_anchor)·∂v_θ/∂θ` is a linear restoring force in every output
+   direction, with a unique minimum at the anchor. It is also the path-space (Girsanov)
+   KL of a flow policy, up to the noise scale.
+
+**Interpretation caveat.** At jittered inputs D also anchors the velocity's
+*input-sensitivity*, which is exactly what `jitter_pos` shrinks. A holding arm therefore
+means "drift held **and** plam's cumulative effect damped". `vel_anchor/jac_part_pos`
+measures the second part.
+
+**Metrics** (all absent when off):
+
+| Metric | When | Read it as |
+|---|---|---|
+| `vel_anchor/start_mean`, `start_pos`, `start_neg`, `start_p90` | ref pass: clean inputs, start-of-iteration weights, signal chunks | **The drift readout.** A proper squared distance, unlike `ref_mse/log_base_ratio_mean = ‖δ‖² − 2⟨r_θ, δ⟩`. It levels off in a holding arm. p90 catches a tail of runaway rows. |
+| `vel_anchor/start_gripper_frac` | ref pass | Pooled share of D in the gripper column (uniform ≈ 1/12). Rising in a declining arm means gripper weighting is the next knob. Absent while every D is 0 (0/0), i.e. iteration 1 of a fresh base-anchor run. |
+| `vel_anchor/start_exec_frac` | ref pass | Pooled share in the executed steps 0..`n_action_steps`−1. If drift piles into the never-executed steps, masking them from the policy-gradient term is the follow-up. Absent while every D is 0, like the gripper share. |
+| `vel_anchor/train_mean` | update, all trained rows | What the penalty acts on, jittered inputs included. |
+| `vel_anchor/train_last_epoch_mean` | update, final epoch | End-of-update distance, i.e. how far one update pushes before the pull catches up. |
+| `vel_anchor/loss` | update | `coef × reduced D`, averaged over trained micro-batches. |
+| `vel_anchor/grad_ratio`, `grad_cos` | `grad_probe_every` cadence (every Nth trained micro-batch, jitter rows not required) | `‖∇penalty‖ / ‖∇clip_loss‖` and their cosine, pre-Adam, via `torch.autograd.grad` (so `.grad` and the step are untouched), averaged over probes with a non-zero penalty gradient (a probe still AT the anchor, D = 0, is skipped by both). ≪ 0.1 means inert; ≫ 1 means close to frozen. cos < 0 means the penalty is resisting where GRPO wants to go. |
+| `vel_anchor/jac_part_pos` | jitter-gap diagnostics (start of iteration) | Positive rows' D(x′) − D(x) at the same weights and taus: the part of the penalty that resists plam rather than drift. Absent when jitter is off (the diagnostics do not run); exactly 0 at `jitter_pos = 0` with `jitter_neg > 0`. |
+| `vel_anchor/coef` | every iteration | The coefficient in force. |
+| `vel_anchor/source` (text) | once | `base` or the checkpoint path. |
+
+**First-micro-batch check.** When the anchor equals the starting weights (a fresh run
+with the base anchor, or `vel_anchor_path` = the resume checkpoint), the first
+micro-batch must read `max D < 1e-5`, or setup's anchor mapping is wrong and the run
+raises. This check is one-shot. A non-finite D is left to the non-finite guard (that
+micro-batch is dropped) and the check stays armed for the next one.
+
+**Smoke test (GPU host).** On a fresh base-anchor run, iteration 1's `start_*` read 0 and
+the two `start_*_frac` are absent by construction (D ≡ 0 before any step), so run it for
+two iterations before judging that every metric is written.
+
+**Cost (estimates, not yet measured).** Training adds K no-grad anchor forwards per
+micro-batch (~+30–35% update time). The ref pass adds K per batch (~+100 s per
+iteration). The force balance costs two extra `autograd.grad` backwards per probed
+micro-batch (~+5% at cadence 20).
+
+**`stop_after_iterations`.** This exits after N iterations *of this invocation*, through
+the normal save path, while the LR still follows `num_iterations`. A 1-iteration trial
+therefore trains at exactly the LR that iteration would get in the full run.
+
+**Calibration (`calibrate_vel_anchor.py`).** Run one update-only trial per coefficient on
+a cached iteration, then read the shrink and turn of the first update against coef 0:
+
+```bash
+.venv/bin/python scripts/grpo/calibrate_vel_anchor.py \
+    --coefs 0 0.1 1 10 100 --targets 0.05 0.15 0.35 \
+    --out-dir grpo_data/vel_anchor_calib -- <train_grpo.py args for A's config>
+# --dry-run prints the commands; --analyze-only re-reads finished trials. Trial dirs must
+# not exist yet (a leftover one would be reused silently), so use a fresh --out-dir.
+```
+
+- **What each trial adds.** Each trial appends `--vel-anchor-coef c
+  --stop-after-iterations 1 --resume-from-collected-data --checkpoint-dir
+  <out>/coef_<c>` after the verbatim passthrough (tyro is last-wins). Any `--resume-from`
+  / `--vel-anchor-path` in the passthrough are kept.
+- **What it measures.** `‖ΔW‖` of the effective update `(α/r)(B@A)` relative to the start
+  weights, computed exactly at rank 2r with no dense product. It also reports the cosine
+  with the coef-0 update, `vel_anchor/train_last_epoch_mean` and `vel_anchor/grad_ratio`.
+- **Suggestions.** c_lo / c_mid / c_hi come from log-interpolating shrink(c) at the
+  targets. A target outside the measured range is reported as a bracket, never
+  extrapolated.
+- **Guards.** The run hard-fails if the trials did not load identical cached episodes
+  (same `episode/success_rate` and `episode/num_chunks` at the trained step). It warns
+  when shrink is non-monotone.
+- **Output.** A table on stdout and `calib_summary.json`.
 
 ### Per-row, MSE-referenced lower clip (`clip_low_mse_coef`)
 

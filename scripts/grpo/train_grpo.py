@@ -55,6 +55,7 @@ from fm_log_prob import (
     inference_schedule,
     _sample_jittered_timesteps,
     TAU_JITTER_STD,
+    VelAnchor,
 )
 from smoothness import (
     pooled_hf,
@@ -152,6 +153,12 @@ _POS_SCALE_EPS = 1e-8
 # mechanism to the flat clip it replaces. Banner-only; nothing reads these in the
 # training path.
 MSE_REF_BANNER_PROBES = (0.0023, 0.0297)
+
+# Velocity anchor. The action key whose column(s) vel_anchor/start_gripper_frac
+# reports, and the bound the first micro-batch's D must stay under when the
+# anchor equals the starting weights (catches anchor key-mapping bugs).
+VEL_ANCHOR_GRIPPER_KEY = "gripper_close"
+VEL_ANCHOR_START_TOL = 1e-5
 
 
 def is_anchor_row(chunk, include_anchor_groups: bool) -> bool:
@@ -474,6 +481,15 @@ class GRPOTrainer:
     _lora_grad_group_names = ()
     _lora_grad_groups = ()
     _lora_grad_group_idx = None
+
+    # ── Velocity anchor (vel_anchor_coef): OFF-state class defaults ──────────
+    # Same reason as above: __new__-built harnesses skip setup().
+    _vel_anchor = None                  # VelAnchor, built by _setup_vel_anchor
+    _vel_anchor_split = None            # (gripper cols | None, n_exec | None)
+    _vel_anchor_equals_start = False    # arms the first-micro-batch D ~ 0 check
+    _vel_anchor_source = None           # "base" | checkpoint path
+    _vel_anchor_source_logged = False
+    _vel_anchor_start_stats = None      # ref-pass vel_anchor/start_*, per iter
 
     def __init__(self, config: GRPOConfig):
         """Initialize the GRPO trainer.
@@ -871,6 +887,11 @@ class GRPOTrainer:
         # --- Step 3b: Trajectory-roughness constraint (no-op when smooth_coef==0) ---
         self._setup_smoothness()
 
+        # --- Step 3c: Velocity anchor (no-op when vel_anchor_coef == 0) ---
+        # After the resume load, so "anchor == start weights" is judged against
+        # the weights the first micro-batch will actually run with.
+        self._setup_vel_anchor()
+
         # --- Step 4: Setup logging ---
         print("\n[4/4] Setting up logging...")
         if self.config.use_wandb:
@@ -1190,6 +1211,23 @@ class GRPOTrainer:
                 )
         print(f"  Estimated time: ~{self.config.num_iterations * 5 / 60:.1f} hours")
 
+        # stop_after_iterations counts loop passes of THIS invocation (skipped
+        # iterations included); the LR schedule still spans num_iterations.
+        stop_after = getattr(self.config, "stop_after_iterations", None)
+        n_iters_run = 0
+
+        def _stop_now() -> bool:
+            nonlocal n_iters_run
+            n_iters_run += 1
+            if stop_after is not None and n_iters_run >= stop_after:
+                print(
+                    f"\n  stop_after_iterations={stop_after}: stopping after "
+                    f"iteration {self.iteration} (LR schedule spans "
+                    f"num_iterations={self.config.num_iterations})."
+                )
+                return True
+            return False
+
         for iteration in range(self._start_iteration, self.config.num_iterations + 1):
             self.iteration = iteration
             iter_start = time.time()
@@ -1215,6 +1253,7 @@ class GRPOTrainer:
             # previous iteration's numbers at this step.
             self._ref_mse_stats = None
             self._chunk_gap_stats = None
+            self._vel_anchor_start_stats = None
 
             # --- Select task for this iteration (round-robin across env_names) ---
             # Each iteration focuses on ONE task and collects all num_groups for it.
@@ -1294,6 +1333,8 @@ class GRPOTrainer:
             #     exactly the "trust region never covers the solved states" gap
             #     Layer 1 exists to close, and the coefficient defaults to 0.2, so
             #     skipping here would defeat the documented Layer-1 recipe.
+            #   - vel_anchor_coef > 0: same reason — D is non-zero once LoRA has
+            #     moved away from the anchor, so it pulls back on solved states.
             # KL(ref || current) alone does NOT qualify: its gradient is zero at
             # the start of the update and only re-anchors drift this same update
             # introduced, so a step would apply little but weight decay and
@@ -1306,6 +1347,7 @@ class GRPOTrainer:
                     and (
                         self.config.anchor_advantage > 0.0
                         or self.config.kl_coef_base_model > 0.0
+                        or getattr(self.config, "vel_anchor_coef", 0.0) > 0.0
                     )
                 )
             ):
@@ -1347,6 +1389,8 @@ class GRPOTrainer:
                 # weights and optimizer moments are unchanged from then).
                 if iteration % self.config.save_interval == 0:
                     self._save_checkpoint_for_skipped_iter(iteration)
+                if _stop_now():
+                    break
                 continue
 
             # ═══ Phase 2b: Pre-compute reference log-probs ═══
@@ -1500,6 +1544,9 @@ class GRPOTrainer:
                     self._save_checkpoint(iteration)
                 else:
                     self._save_checkpoint_for_skipped_iter(iteration)
+
+            if _stop_now():
+                break
 
         print("\n" + "=" * 60)
         print("Training complete!")
@@ -2878,6 +2925,10 @@ class GRPOTrainer:
 
         n_computed = 0
         compute_base = self.config.kl_coef_base_model > 0.0
+        # Velocity anchor: the current-policy call ALSO measures D at clean
+        # inputs and start-of-iteration weights (vel_anchor/start_*).
+        vel_on = self._vel_anchor_active()
+        vel_rows: list = []   # (chunk, D, gripper part | None, exec part | None)
         with self._model_lock, torch.no_grad():
             for start in range(0, len(chunks), batch_size):
                 batch = chunks[start:start + batch_size]
@@ -2904,7 +2955,7 @@ class GRPOTrainer:
                 )  # [K, B]
 
                 # Compute log-probs using current model (= reference before update)
-                ref_lp = compute_fm_log_prob(
+                _ref_kw = dict(
                     action_head=self.model.action_head,
                     backbone_output=batch_data["backbone_output"],
                     state_features=batch_data["state_features"],
@@ -2915,6 +2966,28 @@ class GRPOTrainer:
                     noise=batch_data["initial_noise"],
                     n_samples=K,
                 )
+                if vel_on:
+                    _ref_res = compute_fm_log_prob(
+                        **_ref_kw,
+                        vel_anchor=self._vel_anchor,
+                        vel_anchor_split=self._vel_anchor_split,
+                        return_struct=True,
+                    )
+                    ref_lp = _ref_res.log_probs
+                    _vd = _ref_res.anchor_dist.float().cpu()
+                    _vs = _ref_res.anchor_split
+                    _vg = (_vs.gripper.float().cpu()
+                           if _vs is not None and _vs.gripper is not None else None)
+                    _ve = (_vs.exec.float().cpu()
+                           if _vs is not None and _vs.exec is not None else None)
+                    for i, chunk in enumerate(valid_batch):
+                        vel_rows.append((
+                            chunk, float(_vd[i]),
+                            float(_vg[i]) if _vg is not None else None,
+                            float(_ve[i]) if _ve is not None else None,
+                        ))
+                else:
+                    ref_lp = compute_fm_log_prob(**_ref_kw)
 
                 # Optionally compute BASE-MODEL log-prob with LoRA adapters
                 # disabled — same (τ, ε), same cached backbone features (the
@@ -2966,6 +3039,11 @@ class GRPOTrainer:
         # only — an anchor row is neither "good" nor "bad" relative to its group.
         signal_chunks = [c for c in chunks if not is_anchor_row(c, use_anchors)]
         self._ref_mse_stats = self._summarize_ref_mse(signal_chunks, compute_base)
+        if vel_on:
+            _sig_ids = {id(c) for c in signal_chunks}
+            self._vel_anchor_start_stats = self._summarize_vel_anchor_start(
+                [r for r in vel_rows if id(r[0]) in _sig_ids]
+            )
         # Per-chunk gap survey (Stage 1). Runs HERE because it needs ref_log_prob,
         # tau_samples and the cached encoded features all in place — which is
         # exactly the state at the end of this pass — and because measuring at
@@ -3097,6 +3175,34 @@ class GRPOTrainer:
             f"{'REACHABLE' if stats['ratio_ceiling_max'] > 1 + self.config.clip_eps_high else 'UNREACHABLE'})"
         )
         return stats
+
+    def _summarize_vel_anchor_start(self, rows: list) -> dict | None:
+        """vel_anchor/start_*: D at clean inputs and start-of-iteration weights.
+
+        `rows` are signal chunks' (chunk, D, gripper part, exec part). The two
+        fractions are pooled (sum part / sum D), so near-zero rows cannot
+        dominate; absent when every D is 0 (e.g. a fresh run's base anchor).
+        """
+        rows = [r for r in rows if math.isfinite(r[1])]
+        if not rows:
+            return None
+        d = np.array([r[1] for r in rows], dtype=np.float64)
+        pos = np.array([r[0].advantage > 0 for r in rows], dtype=bool)
+        out = {
+            "start_mean": float(d.mean()),
+            "start_p90": float(np.percentile(d, 90)),
+        }
+        if pos.any():
+            out["start_pos"] = float(d[pos].mean())
+        if (~pos).any():
+            out["start_neg"] = float(d[~pos].mean())
+        total = float(d.sum())
+        if total > 0.0:
+            for key, idx in (("start_gripper_frac", 2), ("start_exec_frac", 3)):
+                parts = [r[idx] for r in rows]
+                if all(p is not None and math.isfinite(p) for p in parts):
+                    out[key] = float(sum(parts)) / total
+        return out
 
     def _cache_encoded_features(self, valid_batch, batch_data):
         """Store per-chunk slices of the batched backbone/state output onto
@@ -3541,6 +3647,19 @@ class GRPOTrainer:
         # switch off its own input. `kl_base_coef` is what weights the loss.
         compute_base = self.config.kl_coef_base_model > 0.0
         kl_base_coef = self._kl_base_coef_now()
+
+        # Velocity anchor (config.vel_anchor_coef). None when off, which leaves
+        # every call, loss term and metric below exactly as it was.
+        vel_anchor = self._vel_anchor if self._vel_anchor_active() else None
+        vel_coef = float(getattr(self.config, "vel_anchor_coef", 0.0))
+        vel_train_sum = 0.0        # sum of per-row D over trained rows
+        vel_train_rows = 0
+        vel_last_sum = 0.0         # same, final epoch only
+        vel_last_rows = 0
+        vel_loss_sum = 0.0         # sum of the penalty term over trained mbs
+        vel_fb_ratios: list = []   # force balance: ||g_pen|| / ||g_clip||
+        vel_fb_coses: list = []    # force balance: cos(g_pen, g_clip)
+        vel_jac_part_pos = None    # from _jitter_gap_diagnostics
 
         # Per-branch row-level accumulators (Jitter-GRPO). Aggregated metrics
         # above stay per-mb so the jitter-off path produces bit-identical
@@ -4306,7 +4425,13 @@ class GRPOTrainer:
                                 pos_adv_mask=(ready_advantages > 0) & ~anchor_row_mask,
                                 fixed_row_mask=(~jitter_mask_dev) & ~anchor_row_mask,
                                 jitter_row_mask=jitter_mask_dev & ~anchor_row_mask,
+                                vel_anchor=vel_anchor,
                             )
+                            # Belongs to the vel_anchor/ family, not jitter/.
+                            if "_vel_anchor_jac_part_pos" in jitter_diag:
+                                vel_jac_part_pos = jitter_diag.pop(
+                                    "_vel_anchor_jac_part_pos"
+                                )
                         except Exception as exc:  # noqa: BLE001
                             print(
                                 f"  WARNING: jitter gap diagnostics failed "
@@ -4398,6 +4523,14 @@ class GRPOTrainer:
                                 .nonzero(as_tuple=True)[0]
                             )
 
+                # Velocity-anchor force balance: same cadence as the probe above
+                # (trained micro-batches), but on EVERY such micro-batch — it
+                # needs no jitter rows, only the two loss terms' gradients.
+                vel_fb_this_mb = (
+                    vel_anchor is not None and gp_every > 0 and bool(gp_params)
+                    and (n_micro_batches % gp_every) == 0
+                )
+
                 # Only compute current model's log-prob (with gradient)
                 # `smooth_dims`/`smooth_horizon` are None unless the
                 # roughness constraint is on, in which case compute_fm_log_prob
@@ -4408,7 +4541,7 @@ class GRPOTrainer:
                 # activations) for the chunk instrument. They are not taken from
                 # the K-loop, whose velocity is contaminated by the eps-jitter.
                 # See the block after the K-loop in fm_log_prob.py.
-                fm_out = compute_fm_log_prob(
+                _fm_kw = dict(
                     action_head=self.model.action_head,
                     backbone_output=ready_backbone,
                     state_features=ready_state_features,
@@ -4438,26 +4571,57 @@ class GRPOTrainer:
                     ),
                     smooth_instrument=self.config.smooth_instrument,
                 )
-                # Return-contract unpack. compute_fm_log_prob appends extras in a
-                # FIXED order — per_tau first, then the smooth pair — so all four
-                # combinations are enumerated rather than length-sniffed. The
-                # `gp_probe_this_mb == False` branches are byte-for-byte the
-                # pre-probe code, which is what keeps `grad_probe_every=0`
-                # bit-identical.
-                gp_per_tau = None
-                if self.smooth_active and gp_probe_this_mb:
-                    (current_log_probs, gp_per_tau,
-                     (smooth_moments, endpoint_moments)) = fm_out
-                elif self.smooth_active:
-                    current_log_probs, (smooth_moments, endpoint_moments) = fm_out
-                elif gp_probe_this_mb:
-                    current_log_probs, gp_per_tau = fm_out
-                    smooth_moments = None
-                    endpoint_moments = None
+                vel_d_row = None
+                if vel_anchor is not None:
+                    # Struct return: D [B] rides along, at the same inputs.
+                    _fm_res = compute_fm_log_prob(
+                        **_fm_kw, vel_anchor=vel_anchor, return_struct=True
+                    )
+                    current_log_probs = _fm_res.log_probs
+                    gp_per_tau = _fm_res.per_tau if gp_probe_this_mb else None
+                    smooth_moments, endpoint_moments = (
+                        _fm_res.smooth if _fm_res.smooth is not None
+                        else (None, None)
+                    )
+                    vel_d_row = _fm_res.anchor_dist
+                    # Anchor == start weights: D must be ~0 before any step. A
+                    # non-finite reading is left to the guard below (the
+                    # micro-batch is dropped) and the check stays armed.
+                    if self._vel_anchor_equals_start and n_updates == 0:
+                        _d0 = float(vel_d_row.detach().abs().max())
+                        if math.isfinite(_d0):
+                            self._vel_anchor_equals_start = False
+                            if not _d0 < VEL_ANCHOR_START_TOL:
+                                raise RuntimeError(
+                                    f"vel_anchor: the anchor equals the "
+                                    f"starting weights, yet the first "
+                                    f"micro-batch reads max D = {_d0:.3e} >= "
+                                    f"{VEL_ANCHOR_START_TOL:g}. The anchor "
+                                    f"forward is not evaluating the same field "
+                                    f"(key mapping / adapter toggle bug)."
+                                )
                 else:
-                    current_log_probs = fm_out
-                    smooth_moments = None
-                    endpoint_moments = None
+                    fm_out = compute_fm_log_prob(**_fm_kw)
+                    # Return-contract unpack. compute_fm_log_prob appends extras
+                    # in a FIXED order — per_tau first, then the smooth pair — so
+                    # all four combinations are enumerated rather than
+                    # length-sniffed. The `gp_probe_this_mb == False` branches
+                    # are byte-for-byte the pre-probe code, which is what keeps
+                    # `grad_probe_every=0` bit-identical.
+                    gp_per_tau = None
+                    if self.smooth_active and gp_probe_this_mb:
+                        (current_log_probs, gp_per_tau,
+                         (smooth_moments, endpoint_moments)) = fm_out
+                    elif self.smooth_active:
+                        current_log_probs, (smooth_moments, endpoint_moments) = fm_out
+                    elif gp_probe_this_mb:
+                        current_log_probs, gp_per_tau = fm_out
+                        smooth_moments = None
+                        endpoint_moments = None
+                    else:
+                        current_log_probs = fm_out
+                        smooth_moments = None
+                        endpoint_moments = None
 
 
                 log_ratio = current_log_probs - ref_log_probs
@@ -5176,8 +5340,20 @@ class GRPOTrainer:
                         (), device=self.device, dtype=torch.float32
                     )
 
+                # --- Velocity anchor: coef * D, reduced like the KL terms ---
+                # No PAWS weighting: D is not advantage-keyed. Anchor rows are
+                # included, on the same constant divisor.
+                vel_anchor_loss = None
+                if vel_d_row is not None:
+                    vel_anchor_loss = vel_coef * (
+                        vel_d_row.mean() if not anchors_in_play
+                        else vel_d_row.sum() / loss_divisor
+                    )
+
                 # --- Total loss ---
                 loss = clip_loss + kl_loss_last_iter + kl_loss_base_model
+                if vel_anchor_loss is not None:
+                    loss = loss + vel_anchor_loss
                 if smooth_loss is not None:
                     loss = loss + smooth_loss
 
@@ -5245,6 +5421,48 @@ class GRPOTrainer:
                     # this micro-batch, so k_last * D_iter / N_iter would mix two
                     # snapshots and two different weightings.
                     Dw_iter += k_last * _d_mass
+
+                # ── Velocity-anchor force balance (pre-backward) ──────────────
+                # ||grad penalty|| / ||grad clip_loss|| and their cosine, pre-Adam.
+                # autograd.grad, never .backward(): `.grad` is the accumulation
+                # buffer, so the step must be bit-identical with this on or off.
+                # Before the grad probe, so its vectors are freed by then and
+                # vram/grad_probe_peak_delta still measures only that probe.
+                if vel_fb_this_mb and vel_anchor_loss is not None:
+                    try:
+                        _f_pen = flatten_param_grads(torch.autograd.grad(
+                            vel_anchor_loss, gp_params,
+                            retain_graph=True, allow_unused=True,
+                        ), gp_params)
+                        if clip_loss.requires_grad:
+                            _f_clip = flatten_param_grads(torch.autograd.grad(
+                                clip_loss, gp_params,
+                                retain_graph=True, allow_unused=True,
+                            ), gp_params)
+                        else:
+                            _f_clip = torch.zeros_like(_f_pen)
+                        _n_pen = float(_f_pen.norm())
+                        _n_clip = float(_f_clip.norm())
+                        # Both means over one population: a probe still AT the
+                        # anchor (D == 0, zero penalty gradient) has no cosine,
+                        # so it is left out of the ratio too.
+                        if (_n_clip > 0.0 and _n_pen > 0.0
+                                and math.isfinite(_n_clip)
+                                and math.isfinite(_n_pen)):
+                            vel_fb_ratios.append(_n_pen / _n_clip)
+                            vel_fb_coses.append(
+                                float(torch.dot(_f_pen, _f_clip))
+                                / (_n_pen * _n_clip)
+                            )
+                        del _f_pen, _f_clip
+                    except Exception as exc:  # noqa: BLE001 — diagnostic only
+                        print(
+                            f"  WARNING: vel_anchor force-balance probe failed "
+                            f"({type(exc).__name__}: {exc}) — skipping it. "
+                            f"Training is unaffected."
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                 # ── Gradient-decomposition probe: PHASE 1 (pre-backward) ─────
                 # MUST run before `loss.backward()`, which frees the graph this
@@ -5389,6 +5607,18 @@ class GRPOTrainer:
                     total_kl_last_iter += kl_loss_last_iter.item()
                     if compute_base:
                         total_kl_base_model += kl_loss_base_model.item()
+                    if vel_anchor_loss is not None:
+                        # Trained micro-batches only (past the non-finite guard).
+                        vel_loss_sum += vel_anchor_loss.item()
+                        _vd = vel_d_row.detach().float()
+                        _vfin = torch.isfinite(_vd)
+                        _vsum = float(_vd[_vfin].sum())
+                        _vn = int(_vfin.sum())
+                        vel_train_sum += _vsum
+                        vel_train_rows += _vn
+                        if epoch == actual_num_epochs - 1:
+                            vel_last_sum += _vsum
+                            vel_last_rows += _vn
                     total_ratio += ratio.mean().item()
                     # log_ratio magnitude is the primary diagnostic for DPPO-style
                     # FM log-prob surrogates: large values mean the MSE-based
@@ -5917,6 +6147,30 @@ class GRPOTrainer:
                 out["smooth_hinge_mbs"] = smooth_hinge_mbs
             return out
 
+        def _vel_anchor_stats() -> dict:
+            """vel_anchor/* training-side metrics under `_vel_anchor`, or {} off.
+
+            Beside _smooth_stats() and for the same reason: both return paths
+            need it. D comes off micro-batches that trained, so it survives an
+            iteration whose windows were all dropped.
+            """
+            if vel_anchor is None:
+                return {}
+            out = {}
+            if vel_train_rows > 0:
+                out["train_mean"] = vel_train_sum / vel_train_rows
+            if vel_last_rows > 0:
+                out["train_last_epoch_mean"] = vel_last_sum / vel_last_rows
+            if n_micro_batches > 0:
+                out["loss"] = vel_loss_sum / n_micro_batches
+            if vel_fb_ratios:
+                out["grad_ratio"] = float(np.mean(vel_fb_ratios))
+            if vel_fb_coses:
+                out["grad_cos"] = float(np.mean(vel_fb_coses))
+            if vel_jac_part_pos is not None:
+                out["jac_part_pos"] = vel_jac_part_pos
+            return {"_vel_anchor": out} if out else {}
+
         if n_updates == 0:
             early: dict = {}
             if n_skipped_nonfinite:
@@ -5966,6 +6220,7 @@ class GRPOTrainer:
             # path explicitly; unlike ref_mse/* they do not live on an instance
             # attribute that _log_metrics can read independently.
             early.update(_smooth_stats())
+            early.update(_vel_anchor_stats())
             if jitter_diag:
                 early["_jitter_diag"] = jitter_diag
             # Same reasoning as the effective clipfracs below: `drift/*` comes off
@@ -6052,6 +6307,8 @@ class GRPOTrainer:
             # per-advantage-sign split: the term is one POOLED scalar per minibatch,
             # so a per-sign split is not definable.
             **_smooth_stats(),
+            # Velocity anchor (`_vel_anchor`, emitted as vel_anchor/*). Absent off.
+            **_vel_anchor_stats(),
             "n_zero_grad_steps": n_zero_grad_steps,
             "grad_norm_mean": float(np.mean(grad_norms)) if grad_norms else 0.0,
             "grad_norm_max": float(np.max(grad_norms)) if grad_norms else 0.0,
@@ -6489,6 +6746,7 @@ class GRPOTrainer:
         pos_adv_mask,
         fixed_row_mask,
         jitter_row_mask,
+        vel_anchor=None,
     ) -> dict:
         """Measure the fixed-vs-jitter FM-loss gap directly, once per iteration.
 
@@ -6579,12 +6837,25 @@ class GRPOTrainer:
             # noise_for_input=None => DiT input is the original eps for EVERY
             # row, including rows tagged "jitter". This is the clean reference
             # leg and it is what makes the gap a pure input-perturbation effect.
-            _, lp_clean = compute_fm_log_prob(
-                **common, noise_for_input=None, return_per_tau=True
-            )  # [K, B]
-            _, lp_jit = compute_fm_log_prob(
-                **common, noise_for_input=noise_for_input, return_per_tau=True
-            )  # [K, B]
+            if vel_anchor is None:
+                _, lp_clean = compute_fm_log_prob(
+                    **common, noise_for_input=None, return_per_tau=True
+                )  # [K, B]
+                _, lp_jit = compute_fm_log_prob(
+                    **common, noise_for_input=noise_for_input, return_per_tau=True
+                )  # [K, B]
+                vd_clean = vd_jit = None
+            else:
+                # Same two legs, also returning the K-resolved anchor distance
+                # so vel_anchor/jac_part_pos pairs rows and taus with the gap.
+                _anc = dict(vel_anchor=vel_anchor, vel_anchor_per_tau=True,
+                            return_struct=True, return_per_tau=True)
+                _rc = compute_fm_log_prob(**common, noise_for_input=None, **_anc)
+                _rj = compute_fm_log_prob(
+                    **common, noise_for_input=noise_for_input, **_anc
+                )
+                lp_clean, lp_jit = _rc.per_tau, _rj.per_tau          # [K, B]
+                vd_clean, vd_jit = _rc.anchor_dist, _rj.anchor_dist  # [K, B]
 
         # log_prob = -MSE, so (clean - jittered) = MSE_jittered - MSE_clean = gap.
         # Non-negative in expectation; individual rows can go slightly negative
@@ -6688,6 +6959,11 @@ class GRPOTrainer:
                 out["headroom_multiplier"] = (ref_pos + gap_pos) / ref_pos
                 out["headroom_ref_only"] = ref_pos
                 out["headroom_with_jitter"] = ref_pos + gap_pos
+            # Share of the positive rows' anchor distance that is the jitter
+            # (input-sensitivity) part: D(x') - D(x), same rows, taus, weights.
+            if vd_clean is not None:
+                _jac = (vd_jit.float() - vd_clean.float()).mean(dim=0)   # [B]
+                out["_vel_anchor_jac_part_pos"] = float(_jac[jp].mean().item())
         if n_jn > 0:
             out["gap_neg"] = float(gap_row[jn].mean().item())
             out["n_rows_neg"] = n_jn
@@ -8398,6 +8674,24 @@ class GRPOTrainer:
                 _emit("vram", {"grad_probe_peak_delta": _gp_vram})
             _emit("gradprobe", _gp_d)
 
+        # ── Velocity anchor (`vel_anchor/*`) ─────────────────────────────────
+        # Ungated on n_updates: start_* is measured on the ref pass (theta ==
+        # theta_ref) and the train-side values come off trained micro-batches.
+        # Absent entirely when vel_anchor_coef == 0. See README "Velocity anchor".
+        if float(getattr(self.config, "vel_anchor_coef", 0.0)) > 0.0:
+            _va = {"coef": float(self.config.vel_anchor_coef)}
+            _va.update(getattr(self, "_vel_anchor_start_stats", None) or {})
+            if update_stats and update_stats.get("_vel_anchor"):
+                _va.update(update_stats["_vel_anchor"])
+            _emit("vel_anchor", _va)
+            if not self._vel_anchor_source_logged and self._vel_anchor_source:
+                self.writer.add_text(
+                    "vel_anchor/source",
+                    f"vel_anchor anchor = {self._vel_anchor_source}",
+                    global_step=0,
+                )
+                self._vel_anchor_source_logged = True
+
         # Effective clipfrac. Ungated on n_updates for the same reason as the two
         # blocks above: it is populated by micro-batches that TRAINED, which
         # includes the iteration where every gradient window was then dropped —
@@ -8783,6 +9077,18 @@ class GRPOTrainer:
                         for k, v in kl_base_diag.items()
                         if math.isfinite(v)
                     })
+                # Velocity anchor: coef + ref-pass start_*, ungated like TB. The
+                # source rides along as a string, as smooth/instrument does.
+                if float(getattr(self.config, "vel_anchor_coef", 0.0)) > 0.0:
+                    log_dict["vel_anchor/coef"] = float(self.config.vel_anchor_coef)
+                    if self._vel_anchor_source:
+                        log_dict["vel_anchor/source"] = str(self._vel_anchor_source)
+                    log_dict.update({
+                        f"vel_anchor/{k}": v
+                        for k, v in (getattr(self, "_vel_anchor_start_stats", None)
+                                     or {}).items()
+                        if math.isfinite(v)
+                    })
                 _ref_mse_w = getattr(self, "_ref_mse_stats", None)
                 if _ref_mse_w:
                     log_dict.update({
@@ -8831,6 +9137,8 @@ class GRPOTrainer:
                                 # Likewise nested; mirrored under gradprobe/ (and
                                 # one key under vram/) below.
                                 "_grad_probe",
+                                # Likewise nested; mirrored under vel_anchor/.
+                                "_vel_anchor",
                                 # Likewise nested; mirrored as grad_share/<group>
                                 # below. Without this exclusion wandb would also
                                 # receive train/grad_share as a dict and expand
@@ -8889,6 +9197,14 @@ class GRPOTrainer:
                                 log_dict["vram/grad_probe_peak_delta"] = v
                             else:
                                 log_dict[f"gradprobe/{k}"] = v
+                    # Mirror the TB-side vel_anchor/* block (train-side half; the
+                    # coef / start_* / source half is added above, ungated).
+                    if update_stats.get("_vel_anchor"):
+                        log_dict.update({
+                            f"vel_anchor/{k}": v
+                            for k, v in update_stats["_vel_anchor"].items()
+                            if math.isfinite(v)
+                        })
                     # Effective clipfrac, also ungated (populated by any
                     # micro-batch that trained, including on a dropped-window
                     # iteration).
@@ -9729,6 +10045,119 @@ class GRPOTrainer:
                     total_sq = total_sq + delta.pow(2).sum()
         return float(total_sq.sqrt().item())
 
+    # ── Velocity anchor (vel_anchor_coef) ─────────────────────────────────────
+
+    def _vel_anchor_active(self) -> bool:
+        """Whether the velocity anchor is ON. Raises if on but never built."""
+        if float(getattr(self.config, "vel_anchor_coef", 0.0)) <= 0.0:
+            return False
+        if self._vel_anchor is None:
+            raise RuntimeError(
+                "vel_anchor_coef > 0 but no anchor was built (_setup_vel_anchor "
+                "never ran). Refusing to train with a silently inert penalty."
+            )
+        return True
+
+    def _setup_vel_anchor(self):
+        """Build the velocity anchor (config.vel_anchor_coef). No-op when off.
+
+        Base: nothing to load. Path: the checkpoint's LoRA tensors, DiT-relative,
+        fp32 on device and frozen, held as a plain attribute so neither
+        state_dict() nor save_lora_checkpoint can pick them up.
+        """
+        self._vel_anchor = None
+        self._vel_anchor_split = None
+        self._vel_anchor_equals_start = False
+        self._vel_anchor_source = None
+        self._vel_anchor_source_logged = False
+        self._vel_anchor_start_stats = None
+        coef = float(self.config.vel_anchor_coef)
+        if coef <= 0.0:
+            return
+        live = {n: p for n, p in self.model.named_parameters() if p.requires_grad}
+        path = self.config.vel_anchor_path
+        if path is None:
+            self._vel_anchor = VelAnchor(kind="base")
+            self._vel_anchor_source = "base"
+            # delta W = B @ A, so all-zero B factors (PEFT's init) == the base.
+            self._vel_anchor_equals_start = all(
+                bool((p.detach() == 0).all())
+                for n, p in live.items() if ".lora_B." in n
+            )
+        else:
+            prefix = self._dit_param_prefix()
+            loaded = self._load_lora_state(path, label="vel_anchor_path")
+            params = {}
+            for name, t in loaded.items():
+                if not name.startswith(prefix):
+                    raise RuntimeError(
+                        f"vel_anchor_path: trainable param {name!r} is outside "
+                        f"the DiT (prefix {prefix!r}); cannot build a DiT anchor."
+                    )
+                params[name[len(prefix):]] = t.detach().to(
+                    device=self.device, dtype=torch.float32, copy=True
+                )
+            self._vel_anchor = VelAnchor(kind="params", params=params)
+            self._vel_anchor_source = str(path)
+            self._vel_anchor_equals_start = all(
+                torch.equal(params[n[len(prefix):]], p.detach())
+                for n, p in live.items()
+            )
+        self._vel_anchor_split = self._resolve_vel_anchor_split()
+        _grip, _n_exec = self._vel_anchor_split
+        print(
+            f"\n  Velocity anchor: ON (vel_anchor_coef={coef:g}, anchor="
+            f"{'base [LoRA disabled]' if path is None else path}); anchor == "
+            f"start weights: {self._vel_anchor_equals_start}"
+            f"{' -> first micro-batch must read D < 1e-5' if self._vel_anchor_equals_start else ''}"
+        )
+        print(
+            f"    start_* split: gripper cols {_grip}, executed steps "
+            f"{'0..' + str(_n_exec - 1) if _n_exec else None}"
+        )
+
+    def _resolve_vel_anchor_split(self) -> tuple:
+        """(gripper columns | None, n_exec | None) for vel_anchor/start_*_frac.
+
+        Walks the checkpoint's action layout as _setup_smoothness does and
+        cross-checks it against the FM action mask. Diagnostic only: anything
+        unresolvable drops that fraction, never the run.
+        """
+        try:
+            from gr00t.data.embodiment_tags import EmbodimentTag
+            from grpo_server import compute_action_mask
+            from smoothness import build_key_dim_span
+
+            tag = EmbodimentTag[self.config.embodiment_tag]
+            acfg = self.processor.get_modality_configs()[tag.value]["action"]
+            norm = self.processor.state_action_processor.norm_params[tag.value]["action"]
+            keys = list(acfg.modality_keys)
+            key_dims = {
+                k: int(norm[k]["dim"].item() if hasattr(norm[k]["dim"], "item")
+                       else norm[k]["dim"])
+                for k in keys
+            }
+            horizon = len(acfg.delta_indices)
+            span = build_key_dim_span(keys, key_dims, target_key=VEL_ANCHOR_GRIPPER_KEY)
+            mask = compute_action_mask(self._smooth_mask_probe())
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            print(
+                f"  WARNING: vel_anchor split unresolved ({type(exc).__name__}: "
+                f"{exc}); vel_anchor/start_gripper_frac and start_exec_frac "
+                f"will not be emitted."
+            )
+            return (None, None)
+        valid_cols = mask.any(axis=0)
+        mask_h = int(mask.any(axis=1).sum())
+        grip = tuple(span) if span and all(bool(valid_cols[c]) for c in span) else None
+        if span and grip is None:
+            print(
+                f"  WARNING: gripper columns {span} fall outside the FM action "
+                f"mask; vel_anchor/start_gripper_frac will not be emitted."
+            )
+        n_exec = min(int(self.config.n_action_steps), int(horizon), mask_h)
+        return (grip, n_exec if n_exec >= 1 else None)
+
     # ── Weight-step direction cosines (lora/cos_step_*) ──────────────────────
 
     def _dit_param_prefix(self) -> str:
@@ -9751,12 +10180,15 @@ class GRPOTrainer:
             "cannot map LoRA checkpoint keys onto trainable parameter names."
         )
 
-    def _load_lora_state(self, path: "str | Path") -> dict:
+    def _load_lora_state(
+        self, path: "str | Path", label: str = "cos_ref_lora_paths entry"
+    ) -> dict:
         """Trainable-param-name → tensor for one LoRA checkpoint, on CPU.
 
         Accepts either an `iter_NNNN/` directory or a `lora_weights.pt` file, and
         returns keys in the SAME namespace as `_lora_init_params` (model-relative
         `named_parameters()` names) so the two can be differenced tensor-by-tensor.
+        `label` names the config field in error messages.
 
         A plain `torch.load` of the filtered state dict rather than
         `load_lora_checkpoint`: that function LOADS INTO the live model, which is
@@ -9772,7 +10204,7 @@ class GRPOTrainer:
         pt = path if path.is_file() else path / "lora_weights.pt"
         if not pt.is_file():
             raise RuntimeError(
-                f"cos_ref_lora_paths entry {path} holds no lora_weights.pt "
+                f"{label} {path} holds no lora_weights.pt "
                 f"(looked at {pt}). Point at an iter_NNNN/ checkpoint directory "
                 f"written by _save_checkpoint, or at the .pt file itself."
             )

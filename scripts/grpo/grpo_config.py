@@ -878,6 +878,18 @@ class GRPOConfig:
     kl_base_coef_min: float = 0.1
     kl_base_coef_max: float = 5.0
 
+    # ─── Velocity anchor (`vel_anchor_coef`) ─────────────────────────────────
+    # loss += vel_anchor_coef * D, D = masked mean over tau and valid action
+    # elements of (v_theta(x) - v_anchor(x))^2 at the training forward's own
+    # inputs (jittered x' on jittered rows), reduced like the KL terms. A linear
+    # restoring force toward the anchor in every output direction — unlike the
+    # k3 KL terms, which see only per-row MSE differences (and, under jitter_pos,
+    # the jitter gap). 0.0 = OFF, bit-identical. README "Velocity anchor".
+    vel_anchor_coef: float = 0.0
+    # None -> anchor to the base DiT (LoRA disabled). Else an iter_NNNN/ dir or
+    # lora_weights.pt, held frozen on device (~58 MB) as the anchor.
+    vel_anchor_path: Optional[str] = None
+
     # Jitter-GRPO Jacobian regularizer strength, split by advantage sign:
     # jitter_pos applies to positive-advantage chunks ("good" chunks we
     # reinforce), jitter_neg to negative-advantage chunks ("bad" chunks we
@@ -1237,6 +1249,11 @@ class GRPOConfig:
 
     # Total number of collect-train iterations
     num_iterations: int = 200
+
+    # Exit after this many iterations OF THIS INVOCATION (normal save path),
+    # leaving the LR schedule defined by num_iterations. None = run to the end.
+    # For calibration trials: 1 iteration at the LR of iteration N of a longer run.
+    stop_after_iterations: Optional[int] = None
 
     # Resume from a previous checkpoint directory (e.g., "/tmp/grpo_checkpoints/iter_0050").
     # If set, loads LoRA weights + optimizer state and continues from that iteration.
@@ -2363,4 +2380,46 @@ class GRPOConfig:
                 f"expect a ~10x larger step at the same learning_rate: "
                 f"recalibrate lr against lora/step_norm first.",
                 stacklevel=3,
+            )
+
+        # ─── Velocity anchor / stop_after_iterations ─────────────────────────
+        # bool is an int subclass, so True would otherwise pass as 1.0 / 1.
+        if isinstance(self.vel_anchor_coef, bool) or not isinstance(
+            self.vel_anchor_coef, (int, float)
+        ):
+            raise ValueError(
+                f"vel_anchor_coef must be a number, got {self.vel_anchor_coef!r}"
+            )
+        if not math.isfinite(self.vel_anchor_coef) or self.vel_anchor_coef < 0.0:
+            raise ValueError(
+                f"vel_anchor_coef must be finite and >= 0 (0 = off), got "
+                f"{self.vel_anchor_coef!r}"
+            )
+        if self.vel_anchor_path is not None:
+            self.vel_anchor_path = str(self.vel_anchor_path)
+            from pathlib import Path as _VaPath
+            _vp = _VaPath(self.vel_anchor_path)
+            _pt = _vp if _vp.is_file() else _vp / "lora_weights.pt"
+            if not _pt.is_file():
+                raise ValueError(
+                    f"vel_anchor_path {self.vel_anchor_path!r} holds no "
+                    f"lora_weights.pt (looked at {_pt}). Pass an iter_NNNN/ "
+                    f"checkpoint dir or the .pt file; it is loaded at setup, "
+                    f"after the multi-minute model load."
+                )
+            if self.vel_anchor_coef == 0.0:
+                import warnings
+                warnings.warn(
+                    f"vel_anchor_path={self.vel_anchor_path!r} is set but "
+                    f"vel_anchor_coef == 0, so the anchor is inert (never loaded).",
+                    stacklevel=3,
+                )
+        if self.stop_after_iterations is not None and (
+            isinstance(self.stop_after_iterations, bool)
+            or not isinstance(self.stop_after_iterations, int)
+            or self.stop_after_iterations < 1
+        ):
+            raise ValueError(
+                f"stop_after_iterations must be None or an int >= 1, got "
+                f"{self.stop_after_iterations!r}"
             )

@@ -28,12 +28,15 @@ Key design decisions:
 """
 
 import contextlib
+import dataclasses
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta
 
+from lora_dit import disabled_adapters
 from smoothness import SMOOTH_INSTRUMENTS, roughness_moments
 
 # Std of the Gaussian jitter applied to each tau center. Named rather than left as
@@ -48,6 +51,55 @@ TAU_JITTER_STD = 0.02
 # `grpo_config` can validate against it without importing this model-facing
 # module; it is imported above so callers of `compute_fm_log_prob` need not
 # learn a second module name.
+
+VEL_ANCHOR_KINDS = ("base", "params")
+
+
+@dataclasses.dataclass(frozen=True)
+class VelAnchor:
+    """Reference velocity field for the `vel_anchor_coef` penalty.
+
+    kind="base": the DiT with every LoRA adapter disabled.
+    kind="params": the live DiT evaluated with `params` (DiT-relative LoRA
+    tensor names, e.g. a frozen checkpoint) via `torch.func.functional_call`.
+    """
+    kind: str
+    params: Optional[dict] = None
+
+    def __post_init__(self):
+        if self.kind not in VEL_ANCHOR_KINDS:
+            raise ValueError(
+                f"VelAnchor.kind must be one of {VEL_ANCHOR_KINDS}, got {self.kind!r}"
+            )
+        if (self.kind == "params") != (self.params is not None):
+            raise ValueError(
+                "VelAnchor: params must be given iff kind == 'params' "
+                f"(kind={self.kind!r}, params={'set' if self.params else None})"
+            )
+
+
+class AnchorSplit(NamedTuple):
+    """Parts of `anchor_dist`, same normalisation (so part / dist = share).
+
+    `gripper`: gripper column(s) only; `exec`: action steps < n_exec only.
+    Either is None when its index was not given.
+    """
+    gripper: Optional[torch.Tensor]
+    exec: Optional[torch.Tensor]
+
+
+class FMLogProbResult(NamedTuple):
+    """`compute_fm_log_prob(..., return_struct=True)`. Unrequested fields are None.
+
+    per_tau: [K, B] log-probs. smooth: (moments, endpoint_moments).
+    anchor_dist: [B] squared velocity distance to the anchor ([K, B] under
+    `vel_anchor_per_tau`). anchor_split: `AnchorSplit` of that distance.
+    """
+    log_probs: torch.Tensor
+    per_tau: Optional[torch.Tensor]
+    smooth: Optional[tuple]
+    anchor_dist: Optional[torch.Tensor]
+    anchor_split: Optional[AnchorSplit]
 
 
 def inference_schedule(action_head: nn.Module) -> tuple[list[float], float]:
@@ -117,7 +169,11 @@ def compute_fm_log_prob(
     smooth_horizon: int | None = None,
     smooth_no_grad: bool = False,
     smooth_instrument: str = "chunk",
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    vel_anchor: "VelAnchor | None" = None,
+    vel_anchor_split: "tuple | None" = None,
+    vel_anchor_per_tau: bool = False,
+    return_struct: bool = False,
+) -> "torch.Tensor | tuple[torch.Tensor, ...] | FMLogProbResult":
     """Compute FM log-probability surrogate for a batch of action chunks.
 
     This mirrors the forward() method of Gr00tN1d6ActionHead (gr00t_n1d6.py:149-257)
@@ -222,6 +278,16 @@ def compute_fm_log_prob(
             base. The 4-step chunk's HF correlates with path jerk at rho = +0.98
             overall and +0.96 over the late iterations. Same (1,-2,1) operator;
             different trajectory.
+        vel_anchor: Optional `VelAnchor`. For every tau, ALSO runs one no-grad
+            anchor forward at the SAME DiT input as the current forward and
+            accumulates the masked mean of (v_theta - v_anchor)^2, normalised
+            per row like the MSE and averaged over K. Requires return_struct.
+        vel_anchor_split: Optional (gripper_col(s), n_exec_steps); either may be
+            None. Adds the gripper-column and executed-step parts of the
+            anchor distance (diagnostic, no graph).
+        vel_anchor_per_tau: Return the anchor distance K-resolved ([K, B]).
+        return_struct: Return an `FMLogProbResult` instead of the positional
+            contract below (which is unchanged when this is False).
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
@@ -343,14 +409,69 @@ def compute_fm_log_prob(
             )
         smooth_dims = smooth_dims.to(device=device)
 
-    def _dit_velocity(noisy_trajectory, t):
+    # --- Velocity anchor (vel_anchor_coef) bookkeeping ---
+    if vel_anchor is None:
+        if vel_anchor_split is not None or vel_anchor_per_tau:
+            raise ValueError("vel_anchor_split / vel_anchor_per_tau require vel_anchor")
+    else:
+        if not isinstance(vel_anchor, VelAnchor):
+            raise TypeError(
+                f"vel_anchor must be a VelAnchor, got {type(vel_anchor).__name__}"
+            )
+        if not return_struct:
+            raise ValueError(
+                "vel_anchor requires return_struct=True: the positional return "
+                "contract has no slot for anchor_dist."
+            )
+    anc_grip_cols = None
+    anc_n_exec = None
+    if vel_anchor_split is not None:
+        _grip, _n_exec = vel_anchor_split
+        if _grip is not None:
+            _cols = [int(c) for c in _grip] if hasattr(_grip, "__len__") else [int(_grip)]
+            if not _cols or not all(0 <= c < actions.shape[2] for c in _cols):
+                raise ValueError(
+                    f"vel_anchor_split gripper column(s) {_cols} must be non-empty "
+                    f"and inside the action dim {actions.shape[2]}"
+                )
+            anc_grip_cols = torch.tensor(_cols, dtype=torch.long, device=device)
+        if _n_exec is not None:
+            anc_n_exec = int(_n_exec)
+            if not (1 <= anc_n_exec <= actions.shape[1]):
+                raise ValueError(
+                    f"vel_anchor_split n_exec_steps={anc_n_exec} must lie in "
+                    f"[1, {actions.shape[1]}]"
+                )
+    anchor_acc = (
+        torch.zeros(B, device=device, dtype=torch.float32)
+        if vel_anchor is not None else None
+    )
+    anchor_per_tau: list[torch.Tensor] | None = [] if vel_anchor_per_tau else None
+    anchor_grip_acc = (
+        torch.zeros(B, device=device, dtype=torch.float32)
+        if anc_grip_cols is not None else None
+    )
+    anchor_exec_acc = (
+        torch.zeros(B, device=device, dtype=torch.float32)
+        if anc_n_exec is not None else None
+    )
+
+    def _dit_velocity(noisy_trajectory, t, dit_params=None):
         """One DiT forward -> pred_velocity.
 
         Factored so the roughness pass can reuse it verbatim rather than
         duplicating the call signature -- BOTH instruments go through it: the
         endpoint calls it once at tau=0, the chunk calls it once per Euler step
-        via `_smooth_chunk_rollout`.
+        via `_smooth_chunk_rollout`. `dit_params` (DiT-relative names) swaps in
+        other LoRA tensors for this call only, via `functional_call`.
         """
+        if dit_params is None:
+            dit = action_head.model
+        else:
+            def dit(**kw):
+                return torch.func.functional_call(
+                    action_head.model, dit_params, args=(), kwargs=kw
+                )
         num_timestep_buckets = action_head.num_timestep_buckets
         t_discretized = (t * num_timestep_buckets).long()
 
@@ -373,7 +494,7 @@ def compute_fm_log_prob(
             # cross-attention masks are built from
             # `image_mask & backbone_attention_mask` internally (dit.py:322-323).
             # We pass it anyway for parity with the pretraining forward.
-            model_output, _ = action_head.model(
+            model_output, _ = dit(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=_backbone_attn_mask,
@@ -383,7 +504,7 @@ def compute_fm_log_prob(
                 backbone_attention_mask=_backbone_attn_mask,
             )
         else:
-            model_output, _ = action_head.model(
+            model_output, _ = dit(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embeds,
                 encoder_attention_mask=_backbone_attn_mask,
@@ -392,6 +513,14 @@ def compute_fm_log_prob(
             )
         pred = action_head.action_decoder(model_output, embodiment_id)
         return pred[:, -actions.shape[1]:]
+
+    def _anchor_velocity(noisy_trajectory, t):
+        """v_anchor at the SAME DiT input as the current forward, no graph."""
+        with torch.no_grad():
+            if vel_anchor.kind == "base":
+                with disabled_adapters(action_head.model):
+                    return _dit_velocity(noisy_trajectory, t)
+            return _dit_velocity(noisy_trajectory, t, dit_params=vel_anchor.params)
 
     for k in range(n_samples):
         # --- Sample or use pre-specified timestep ---
@@ -438,6 +567,30 @@ def compute_fm_log_prob(
         log_probs_accumulated += -per_sample_mse  # already fp32
         if per_tau_log_probs is not None:
             per_tau_log_probs.append(-per_sample_mse)
+
+        # --- Velocity anchor: masked mean of (v_theta - v_anchor)^2 per row ---
+        # Same DiT input (jittered x' included) and the same per-row
+        # normalisation as the MSE. The gradient flows through pred_v_f32 only.
+        if vel_anchor is not None:
+            v_anchor_f32 = _anchor_velocity(noisy_trajectory, t).float()
+            sq_anchor = (pred_v_f32 - v_anchor_f32).pow(2) * mask_f32
+            valid_f32 = valid_elements_per_sample.float()
+            d_k = sq_anchor.sum(dim=(1, 2)) / valid_f32
+            anchor_acc = anchor_acc + d_k
+            if anchor_per_tau is not None:
+                anchor_per_tau.append(d_k)
+            if anchor_grip_acc is not None or anchor_exec_acc is not None:
+                with torch.no_grad():
+                    sq_det = sq_anchor.detach()
+                    if anchor_grip_acc is not None:
+                        anchor_grip_acc += (
+                            sq_det.index_select(2, anc_grip_cols).sum(dim=(1, 2))
+                            / valid_f32
+                        )
+                    if anchor_exec_acc is not None:
+                        anchor_exec_acc += (
+                            sq_det[:, :anc_n_exec].sum(dim=(1, 2)) / valid_f32
+                        )
 
     # ── Roughness instrument: dedicated CLEAN forward(s) with the ORIGINAL eps ──
     # Deliberately NOT taken from the K-loop. Under Jitter-GRPO the K-loop's DiT
@@ -520,6 +673,31 @@ def compute_fm_log_prob(
 
     # Average across K timestep samples
     log_probs = log_probs_accumulated / n_samples
+
+    if return_struct:
+        anchor_dist = None
+        anchor_split = None
+        if vel_anchor is not None:
+            anchor_dist = (
+                torch.stack(anchor_per_tau, dim=0) if anchor_per_tau is not None
+                else anchor_acc / n_samples
+            )
+            if anchor_grip_acc is not None or anchor_exec_acc is not None:
+                anchor_split = AnchorSplit(
+                    gripper=(anchor_grip_acc / n_samples
+                             if anchor_grip_acc is not None else None),
+                    exec=(anchor_exec_acc / n_samples
+                          if anchor_exec_acc is not None else None),
+                )
+        return FMLogProbResult(
+            log_probs=log_probs,
+            per_tau=(torch.stack(per_tau_log_probs, dim=0)
+                     if per_tau_log_probs is not None else None),
+            smooth=((smooth_moments, endpoint_moments)
+                    if smooth_moments is not None else None),
+            anchor_dist=anchor_dist,
+            anchor_split=anchor_split,
+        )
 
     # Extras are appended in a fixed order so every existing caller's unpacking
     # keeps working: per_tau first (pre-existing), then the smooth pair.

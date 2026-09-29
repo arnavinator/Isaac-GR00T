@@ -371,6 +371,13 @@ class GRPOConfig:
     # coupling: a chunk's effective advantage no longer depends on its batchmates.
     per_iteration_advantage_norm: bool = False
 
+    # Divide each SIGNAL group's `r - mean` by a fixed 0.5 (the largest population
+    # std of a [0, 1] reward) instead of the group's own std, so nearly-solved and
+    # nearly-failed groups are not up-weighted. Dead/anchor classification and
+    # anchor_advantage are unchanged. False (default) = bit-identical.
+    # See README "Fixed group-advantage scale".
+    group_advantage_fixed_std: bool = False
+
     # When True, scale up the per-row clip loss on group-good rows by a live
     # factor k that balances alive positive/negative loss mass (see train_grpo).
     # False (default) = no weighting, bit-identical to current. Positives are
@@ -515,7 +522,8 @@ class GRPOConfig:
     # this one combination), so it is configured directly rather than derived at
     # runtime; recompute it if you change group_size. For scale: at G=12 a
     # balanced 6/12 group's successes sit at ±0.96 and the weakest signal row
-    # that exists at all is ±0.29.
+    # that exists at all is ±0.29 (±1.00 and ±0.17 under group_advantage_fixed_std,
+    # which uses the same σ_fixed, so this value needs no change there).
     #
     # Deliberately NOT tied to the running success rate: the estimator wants the
     # anchor to fade as success climbs, while the negative-mass asymmetry wants
@@ -2380,6 +2388,14 @@ class GRPOConfig:
                 f"expect a ~10x larger step at the same learning_rate: "
                 f"recalibrate lr against lora/step_norm first.",
                 stacklevel=3,
+            )
+
+        # ─── Fixed group-advantage scale ─────────────────────────────────────
+        # A switch, not a value: 0.5 here would pass as truthy but not set 0.5.
+        if not isinstance(self.group_advantage_fixed_std, bool):
+            raise ValueError(
+                f"group_advantage_fixed_std is an on/off switch (the scale is "
+                f"fixed at 0.5), got {self.group_advantage_fixed_std!r}"
             )
 
         # ─── Velocity anchor / stop_after_iterations ─────────────────────────

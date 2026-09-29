@@ -39,6 +39,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `calibrate_vel_anchor.py` | Step 1 of the velocity-anchor experiment: one update-only trial of `train_grpo.py` per `vel_anchor_coef` on a cached iteration, then the first update's shrink / cosine against coef 0 (exact rank-2r trace trick, no dense ΔW), guards, and log-interpolated sweep suggestions. See README "Velocity anchor". |
 | `test_vel_anchor.py` | CPU suite for `vel_anchor_coef`: the REAL `compute_fm_log_prob` on a stub head holding a real PEFT LoRA layer (off-path contract, D == 0 at the anchor, D against an independent LoRA-formula hand computation for both anchor kinds and jittered inputs, identical current/anchor inputs, finite-difference gradient, adapters restored after an exception, `functional_call` leaving the live model and saved checkpoint untouched, masking, split parts, no RNG, every struct combination), then the real `_grpo_update_inner` / ref pass / jitter diagnostics / `_setup_vel_anchor` / `_log_metrics` / `train()`: loss composition incl. the anchor-row divisor, coef-0 identity, accumulation, the non-finite guard, the force-balance probe against direct gradients with the step bit-identical, every metric, `jac_part_pos`, anchor loading, the first-micro-batch check, config validation, resume, and `stop_after_iterations`. |
 | `test_calibrate_vel_anchor.py` | CPU suite for `calibrate_vel_anchor.py`: trace-trick norm/cosine vs dense (fresh and relative to a start), interpolation incl. the non-monotone warning and brackets, `--dry-run` command construction parsed back through tyro into `GRPOConfig`, and the cached-episode guard on synthetic TB event files. |
+| `test_group_adv_fixed_std.py` | CPU suite for `group_advantage_fixed_std`: off-path bit-identity with the group-std formula (and against the pre-change module), exact fixed-scale values, zero sum / sign / bounds, unchanged dead/anchor classification and counters, the per-chunk split incl. post-reopen truncation, the chunk memo on re-entry, argument and config validation, the tyro flag, and the `train()` call site. |
 
 ---
 
@@ -532,6 +533,7 @@ the only Phase 1 curve with data. Covered by `test_phase_timing_logs.py`.
 reward = float(success)                                  # sparse binary (1.0 on success)
 scaled = reward / num_steps * max_episode_steps          # faster = better (currently DISABLED)
 A_episode = (reward - group_mean) / (group_std + 1e-8)   # PER GROUP
+#   group_advantage_fixed_std: (reward - group_mean) / 0.5 on signal groups
 A_chunk = A_episode / num_chunks_in_episode
 ```
 
@@ -556,8 +558,45 @@ identical) or at least `1/sqrt(G)`, which is 3500× the threshold at G=8, so the
 
 By default degenerate groups are **dead**: their chunks are filtered out before
 any forward pass (see "Minibatch construction"). `include_anchor_groups`
-reclassifies the all-success half as **anchor** groups instead — see the next
-section.
+reclassifies the all-success half as **anchor** groups instead — see "Anchor
+groups" below.
+
+### Fixed group-advantage scale (`group_advantage_fixed_std`)
+
+`group_advantage_fixed_std = False` (default) is bit-identical. `True` changes one
+line of the per-group step: signal groups divide `reward − group_mean` by a fixed
+`0.5` (`FIXED_GROUP_ADV_STD`, the largest population std of a [0, 1] reward, i.e. a
+50/50 split) instead of their own std.
+
+**Why.** Dividing by the group's own std up-weights groups whose outcomes are
+nearly all the same. At G = 12 a lone failure in an 11/12 group gets −3.18, against
+−0.96 for a failure in a 6/12 group, so near-solved scenes dominate the batch
+through one or two failed episodes.
+
+| Group | Own std: success / failure | Fixed 0.5: success / failure |
+|---|---|---|
+| 1/12 | +3.18 / −0.29 | +1.83 / −0.17 |
+| 6/12 | +0.96 / −0.96 | +1.00 / −1.00 |
+| 10/12 | +0.43 / −2.14 | +0.33 / −1.67 |
+| 11/12 | +0.29 / −3.18 | +0.17 / −1.83 |
+
+- The ratio **within** a group is unchanged; the zero-sum baseline sets it. What
+  changes is each group's total weight: it becomes proportional to the group's
+  outcome variance `p(1 − p)` instead of its std.
+- Balanced groups keep today's scale (±1.00 vs ±0.96), and `anchor_advantage` stays
+  calibrated: its pseudo-count derivation (see "Anchor groups") already divides by
+  `σ_fixed = 0.5`.
+- Balanced groups actually gain a little weight: the group std is ddof=1, and a
+  balanced group's ddof=1 std exceeds 0.5 for every finite G (0.522 at G = 12, so
+  +4.5%). The effect is larger in small groups (+15% at G = 4, +41% for a 1/2 group),
+  which only occur when a collection ends mid-group.
+- **Unchanged:** the dead/anchor classification (still the group std), anchor rows,
+  the per-chunk split, and the within-group zero sum. So the buffer mean stays 0
+  and `per_iteration_advantage_norm` still preserves every sign.
+- Pairs with `per_iteration_advantage_norm = True`, which then applies one global
+  scale per iteration. Under the per-minibatch default each minibatch is still
+  rescaled, but the relative weights inside it follow the fixed scale.
+- Tests: `test_group_adv_fixed_std.py`.
 
 ### Anchor groups
 
@@ -614,6 +653,10 @@ max Bernoulli std, ≈ the std of a balanced G/2 group) this is `2/(G+2)`:
 | 8 | **0.200** | ±0.935 | ±0.354 |
 | 12 | **0.143** | ±0.957 | ±0.289 |
 | 16 | 0.111 | ±0.968 | ±0.250 |
+
+Under `group_advantage_fixed_std` the balanced column is ±1.000 and the weakest
+row is `2/G` (0.250 / 0.167 / 0.125). `anchor_advantage` needs no change there:
+its σ_fixed is the same 0.5.
 
 Those comparisons are at the **episode** level (`A_episode`), which is where the
 value is set. What a row contributes also passes through `÷ num_chunks` and the

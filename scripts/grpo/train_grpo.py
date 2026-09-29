@@ -82,7 +82,7 @@ SMOOTH_MIN_ROWS_PER_MB = 4
 # looks perfectly plausible. Warn rather than override: the scale is the
 # operator's to choose, and a deliberate sweep must not be second-guessed.
 SMOOTH_RECOMMENDED_SCALE = {"chunk": 15.0, "endpoint": 4.0}
-from episode_buffer import EpisodeBuffer, ActionChunk
+from episode_buffer import EpisodeBuffer, ActionChunk, FIXED_GROUP_ADV_STD
 
 
 # Canonical iter directory name pattern: 'iter_<ASCII digits>'.
@@ -1306,6 +1306,8 @@ class GRPOTrainer:
                 include_anchor_groups=self.config.include_anchor_groups,
                 anchor_max_row_frac=self.config.anchor_max_row_frac,
                 post_reopen_filter=self.config.build_post_reopen_filter(),
+                fixed_std=(FIXED_GROUP_ADV_STD
+                           if self.config.group_advantage_fixed_std else None),
             )
             stats = self.buffer.stats()
             phase2_time = time.time() - phase2_start

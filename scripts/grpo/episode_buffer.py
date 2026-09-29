@@ -9,6 +9,7 @@ The advantage computation directly mirrors grpo_cont.py lines 325-364:
     means = final_group_reward.mean(dim=1, keepdim=True)
     stds  = final_group_reward.std(dim=1, keepdim=True)
     advantages = (final_group_reward - means) / (stds + 1e-8)
+(GRPOConfig.group_advantage_fixed_std swaps `stds` for a fixed 0.5 on signal groups.)
 
 Key difference from grpo_cont.py:
 - grpo_cont.py computes per-step rewards, then discounts them into a trajectory reward
@@ -27,6 +28,7 @@ Key difference from grpo_cont.py:
   follows. See gripper_release.py and README "Post-reopen truncation".
 """
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -35,6 +37,11 @@ import numpy as np
 import torch
 
 from gripper_release import PostReopenFilter, post_reopen_detect
+
+# Divisor for signal-group advantages under GRPOConfig.group_advantage_fixed_std:
+# the largest POPULATION std of a [0, 1] reward (a 50/50 split). The ddof=1 group
+# std of a balanced group is slightly larger. anchor_advantage assumes this scale.
+FIXED_GROUP_ADV_STD = 0.5
 
 
 @dataclass
@@ -386,6 +393,7 @@ class EpisodeBuffer:
         include_anchor_groups: bool = False,
         anchor_max_row_frac: float = 1.0,
         post_reopen_filter: PostReopenFilter | None = None,
+        fixed_std: float | None = None,
     ) -> np.ndarray:
         """Compute group-relative advantages for all episodes (one per episode).
 
@@ -403,7 +411,8 @@ class EpisodeBuffer:
         currently DISABLED; see the block comment for the ablation rationale.
 
         Groups are classified three ways (see README "Anchor groups"):
-          - SIGNAL (0 < k < G): group-relative z-score, formula untouched.
+          - SIGNAL (0 < k < G): group-relative z-score, formula untouched
+            (with fixed_std: `r - mean` over that constant instead).
           - ANCHOR (k == G): all-success. `std_r == 0` makes the group-mean
             baseline give exactly 0, so with include_anchor_groups these get a
             constant `anchor_advantage` instead and are marked `is_anchor`.
@@ -428,11 +437,24 @@ class EpisodeBuffer:
                 its gripper reopens (see _apply_post_reopen_filter). None
                 (default) leaves every episode at its full length, which is
                 bit-identical to the pre-feature behavior.
+            fixed_std: When set, SIGNAL groups divide `r - mean` by this
+                constant instead of their own std (FIXED_GROUP_ADV_STD under
+                group_advantage_fixed_std). Classification still uses the
+                group std. None (default) is bit-identical.
 
         Returns:
             advantages: [num_episodes] array of per-episode advantages (signal
             groups group-relative normalized, anchor groups constant).
         """
+        if fixed_std is not None and (
+            isinstance(fixed_std, bool)
+            or not isinstance(fixed_std, (int, float))
+            or not math.isfinite(fixed_std)
+            or fixed_std <= 0.0
+        ):
+            raise ValueError(
+                f"fixed_std must be None or a finite number > 0, got {fixed_std!r}"
+            )
         # Any previously-built chunk list is now stale: it carries the old
         # advantages and is_anchor flags. Drop the memo so _build_chunks rebuilds
         # from the values computed here. Without this, a second call with a
@@ -500,6 +522,7 @@ class EpisodeBuffer:
         # Same formula as grpo_cont.py line 364, applied per group:
         #   advantages[g] = (rewards[g] - rewards[g].mean()) / (rewards[g].std() + 1e-8)
         # NOTE: Use ddof=1 (Bessel's correction) to match PyTorch's tensor.std()
+        # fixed_std replaces only the SIGNAL-group divisor, never the std test below.
         self.advantages = np.zeros_like(rewards)
 
         # Identify unique groups
@@ -546,7 +569,8 @@ class EpisodeBuffer:
                         self.advantages[mask] = 0.0
                         n_dead += 1
                 else:
-                    self.advantages[mask] = (group_rewards - mean_r) / std_r
+                    scale = std_r if fixed_std is None else fixed_std
+                    self.advantages[mask] = (group_rewards - mean_r) / scale
 
         self._n_groups = int(len(unique_groups))
         self._resolve_anchor_groups(

@@ -353,6 +353,13 @@ class GRPOConfig:
     # that field.
     clip_low_mse_coef: float = 0.0
 
+    # Leave the never-executed chunk steps (n_action_steps..horizon-1, 8 of 16
+    # at the defaults) out of the policy-gradient term: the clipped surrogate's
+    # ratio covers steps 0..n_action_steps-1 only, on both the ref and current
+    # side. KL, vel-anchor and smoothness terms stay full-horizon. False = OFF,
+    # bit-identical. README "Executed-step loss mask".
+    mask_loss_with_n_action_steps: bool = False
+
     # Number of optimization epochs over collected data per each iteration
     # each epoch shuffles all action chunks from data collection
     # for each iter in num_iterations, we do a grad update (update_epochs * (total action chunks // mini_batch_size))
@@ -1823,6 +1830,19 @@ class GRPOConfig:
                     f"reads ~1.0 when this has bitten.",
                     stacklevel=2,
                 )
+
+        # Executed-step loss mask. Checked only when ON, so a disabled config is
+        # untouched. n_action_steps < 1 would leave the surrogate no step to score.
+        if self.mask_loss_with_n_action_steps and (
+            isinstance(self.n_action_steps, bool)
+            or not isinstance(self.n_action_steps, int)
+            or self.n_action_steps < 1
+        ):
+            raise ValueError(
+                f"mask_loss_with_n_action_steps=True requires n_action_steps to be "
+                f"an int >= 1, got {self.n_action_steps!r}: the surrogate is "
+                f"scored on steps 0..n_action_steps-1, so there would be none."
+            )
 
         # Dynamic positive-advantage weighting bounds (only meaningful when
         # positive_advantage_weight_scaling=True, but validated unconditionally

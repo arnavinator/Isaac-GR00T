@@ -112,6 +112,10 @@ class ActionChunk:
     # contribution accordingly.
     base_log_prob: float | None = None
 
+    # ref_log_prob over the executed steps 0..n_action_steps-1 only. Set by the
+    # ref pass when GRPOConfig.mask_loss_with_n_action_steps is on, else None.
+    ref_log_prob_exec: float | None = None
+
     # Timestep samples used for ref_log_prob computation (reused during training)
     tau_samples: np.ndarray | None = None  # (K,) float32
 

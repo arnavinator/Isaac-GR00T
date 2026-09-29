@@ -1061,17 +1061,31 @@ class GRPOTrainer:
             # which no config-time check can see.
             if self.config.jitter_neg > 0.0:
                 _gap_est = 0.9 * self.config.jitter_neg ** 2
+                # Under the executed-step mask the budget reads the prefix MSE_ref.
+                _p10_key = (
+                    "ref_mse/exec_p10"
+                    if getattr(self.config, "mask_loss_with_n_action_steps", False)
+                    else "ref_mse/p10"
+                )
                 print(
                     f"    negative rows are born at rho=exp(-gap_neg), gap_neg ~= "
                     f"{_gap_est:.5f} (est. from jitter_neg={self.config.jitter_neg:g}); "
                     f"rows with MSE_ref < {_gap_est / _coef:.5f} start clip-DEAD "
-                    f"-- compare against ref_mse/p10"
+                    f"-- compare against {_p10_key}"
                 )
             else:
                 print(
                     "    jitter_neg=0 -> negative rows are born at rho=1 exactly; "
                     "no row can start clip-dead"
                 )
+        if getattr(self.config, "mask_loss_with_n_action_steps", False):
+            _n_exec = self.config.n_action_steps
+            print(
+                f"  Executed-step loss mask: ON — the clipped surrogate's ratio "
+                f"(and rho_floor, PAWS, clip metrics, drift/*, gradprobe/*) covers "
+                f"action steps 0..{_n_exec - 1} (n_action_steps={_n_exec}); KL, "
+                f"vel-anchor and smoothness terms stay full-horizon"
+            )
         if (
             self.config.paws_k_floor_at_target
             and self.config.positive_advantage_weight_scaling
@@ -2931,6 +2945,9 @@ class GRPOTrainer:
         # inputs and start-of-iteration weights (vel_anchor/start_*).
         vel_on = self._vel_anchor_active()
         vel_rows: list = []   # (chunk, D, gripper part | None, exec part | None)
+        # mask_loss_with_n_action_steps: the same call ALSO returns the
+        # executed-prefix log-prob, the reference side of the surrogate's ratio.
+        exec_steps = self._exec_steps()
         with self._model_lock, torch.no_grad():
             for start in range(0, len(chunks), batch_size):
                 batch = chunks[start:start + batch_size]
@@ -2968,26 +2985,41 @@ class GRPOTrainer:
                     noise=batch_data["initial_noise"],
                     n_samples=K,
                 )
+                _ref_struct_kw: dict = {}
                 if vel_on:
-                    _ref_res = compute_fm_log_prob(
-                        **_ref_kw,
+                    _ref_struct_kw.update(
                         vel_anchor=self._vel_anchor,
                         vel_anchor_split=self._vel_anchor_split,
-                        return_struct=True,
+                    )
+                if exec_steps is not None:
+                    _ref_struct_kw["n_exec_steps"] = exec_steps
+                ref_lp_exec = None
+                if _ref_struct_kw:
+                    _ref_res = compute_fm_log_prob(
+                        **_ref_kw, **_ref_struct_kw, return_struct=True,
                     )
                     ref_lp = _ref_res.log_probs
-                    _vd = _ref_res.anchor_dist.float().cpu()
-                    _vs = _ref_res.anchor_split
-                    _vg = (_vs.gripper.float().cpu()
-                           if _vs is not None and _vs.gripper is not None else None)
-                    _ve = (_vs.exec.float().cpu()
-                           if _vs is not None and _vs.exec is not None else None)
-                    for i, chunk in enumerate(valid_batch):
-                        vel_rows.append((
-                            chunk, float(_vd[i]),
-                            float(_vg[i]) if _vg is not None else None,
-                            float(_ve[i]) if _ve is not None else None,
-                        ))
+                    ref_lp_exec = _ref_res.exec_log_probs
+                    if exec_steps is not None and ref_lp_exec is None:
+                        raise RuntimeError(
+                            "n_exec_steps was requested but compute_fm_log_prob "
+                            "returned no exec_log_probs."
+                        )
+                    if vel_on:
+                        _vd = _ref_res.anchor_dist.float().cpu()
+                        _vs = _ref_res.anchor_split
+                        _vg = (_vs.gripper.float().cpu()
+                               if _vs is not None and _vs.gripper is not None
+                               else None)
+                        _ve = (_vs.exec.float().cpu()
+                               if _vs is not None and _vs.exec is not None
+                               else None)
+                        for i, chunk in enumerate(valid_batch):
+                            vel_rows.append((
+                                chunk, float(_vd[i]),
+                                float(_vg[i]) if _vg is not None else None,
+                                float(_ve[i]) if _ve is not None else None,
+                            ))
                 else:
                     ref_lp = compute_fm_log_prob(**_ref_kw)
 
@@ -3024,6 +3056,9 @@ class GRPOTrainer:
                 for i, chunk in enumerate(valid_batch):
                     chunk.ref_log_prob = ref_lp[i].item()
                     chunk.tau_samples = tau_cpu[:, i].astype(np.float32)
+                if ref_lp_exec is not None:
+                    for i, chunk in enumerate(valid_batch):
+                        chunk.ref_log_prob_exec = ref_lp_exec[i].item()
                 if compute_base:
                     for i, chunk in enumerate(valid_batch):
                         chunk.base_log_prob = base_lp[i].item()
@@ -3176,7 +3211,63 @@ class GRPOTrainer:
             f"(clip_eps_high={self.config.clip_eps_high} → "
             f"{'REACHABLE' if stats['ratio_ceiling_max'] > 1 + self.config.clip_eps_high else 'UNREACHABLE'})"
         )
+        stats.update(self._summarize_ref_mse_exec(chunks))
         return stats
+
+    def _summarize_ref_mse_exec(self, chunks: list) -> dict:
+        """ref_mse/exec_* under mask_loss_with_n_action_steps, else {}.
+
+        The surrogate's ratio then covers the executed prefix, so its ceiling is
+        exp(MSE_ref_exec), not exp(MSE_ref). exec_share is the pooled fraction of
+        the reference FM residual energy that sits on the executed steps.
+        """
+        n_exec = self._exec_steps()
+        if n_exec is None:
+            return {}
+        rows = [
+            c for c in chunks
+            if c.ref_log_prob is not None
+            and getattr(c, "ref_log_prob_exec", None) is not None
+        ]
+        if not rows:
+            return {}
+        mse_e = np.array([-c.ref_log_prob_exec for c in rows], dtype=np.float64)
+        out = {
+            "exec_mean": float(mse_e.mean()),
+            "exec_p10": float(np.percentile(mse_e, 10)),
+            "exec_p90": float(np.percentile(mse_e, 90)),
+            "exec_ratio_ceiling_max": float(np.exp(mse_e.max())),
+        }
+        pos = np.array([c.advantage > 0 for c in rows], dtype=bool)
+        if pos.any():
+            out["exec_pos_mean"] = float(mse_e[pos].mean())
+        if (~pos).any():
+            out["exec_neg_mean"] = float(mse_e[~pos].mean())
+        masks = [getattr(c, "action_mask", None) for c in rows]
+        inert = False
+        if all(isinstance(m, np.ndarray) and m.ndim == 2 for m in masks):
+            n_full = np.array([float(m.sum()) for m in masks], dtype=np.float64)
+            n_ex = np.array([float(m[:n_exec].sum()) for m in masks], dtype=np.float64)
+            mse_f = np.array([-c.ref_log_prob for c in rows], dtype=np.float64)
+            den = float((mse_f * n_full).sum())
+            if den > 0.0:
+                out["exec_share"] = float((mse_e * n_ex).sum()) / den
+            inert = bool((n_ex == n_full).all())
+        print(
+            f"  MSE_ref over executed steps 0..{n_exec - 1}: "
+            f"mean={out['exec_mean']:.5f} → surrogate ratio ceiling "
+            f"max={out['exec_ratio_ceiling_max']:.4f} "
+            f"({'REACHABLE' if out['exec_ratio_ceiling_max'] > 1 + self.config.clip_eps_high else 'UNREACHABLE'}); "
+            f"executed share of residual energy "
+            f"{out.get('exec_share', float('nan')):.3f}"
+        )
+        if inert:
+            print(
+                f"  NOTE: n_action_steps={n_exec} covers every valid action step, "
+                f"so mask_loss_with_n_action_steps has no effect (beyond fp32 "
+                f"rounding in the gradient)."
+            )
+        return out
 
     def _summarize_vel_anchor_start(self, rows: list) -> dict | None:
         """vel_anchor/start_*: D at clean inputs and start-of-iteration weights.
@@ -3649,6 +3740,10 @@ class GRPOTrainer:
         # switch off its own input. `kl_base_coef` is what weights the loss.
         compute_base = self.config.kl_coef_base_model > 0.0
         kl_base_coef = self._kl_base_coef_now()
+        # mask_loss_with_n_action_steps: the surrogate's ratio (and every clip
+        # consumer) uses the executed-prefix log-probs; the KL terms keep the
+        # full-horizon pair. None when off, which leaves every line below as-is.
+        exec_steps = self._exec_steps()
 
         # Velocity anchor (config.vel_anchor_coef). None when off, which leaves
         # every call, loss term and metric below exactly as it was.
@@ -4227,6 +4322,8 @@ class GRPOTrainer:
                     i for i, c in enumerate(valid_batch)
                     if c.ref_log_prob is not None and c.tau_samples is not None
                     and (not compute_base or c.base_log_prob is not None)
+                    and (exec_steps is None
+                         or getattr(c, "ref_log_prob_exec", None) is not None)
                 ]
                 if not ready_indices:
                     continue
@@ -4292,6 +4389,16 @@ class GRPOTrainer:
                     [c.ref_log_prob for c in ready_batch],
                     device=self.device, dtype=torch.float32,
                 )
+                # Reference side of the SURROGATE's ratio (and of rho_floor's /
+                # drift's MSE_ref): the executed-prefix log-prob when the mask is
+                # on, else the same tensor object.
+                if exec_steps is not None:
+                    pg_ref_log_probs = torch.tensor(
+                        [c.ref_log_prob_exec for c in ready_batch],
+                        device=self.device, dtype=torch.float32,
+                    )
+                else:
+                    pg_ref_log_probs = ref_log_probs
                 # Pre-load base_log_probs only when the base-model anchor is
                 # active. Skipping the tensor allocation when disabled keeps
                 # the vanilla path unchanged.
@@ -4574,34 +4681,55 @@ class GRPOTrainer:
                     smooth_instrument=self.config.smooth_instrument,
                 )
                 vel_d_row = None
+                exec_log_probs = None
+                _fm_struct_kw: dict = {}
                 if vel_anchor is not None:
-                    # Struct return: D [B] rides along, at the same inputs.
+                    _fm_struct_kw["vel_anchor"] = vel_anchor
+                if exec_steps is not None:
+                    _fm_struct_kw["n_exec_steps"] = exec_steps
+                if _fm_struct_kw:
+                    # Struct return: D [B] and/or the executed-prefix log-prob
+                    # ride along, from the same forwards.
                     _fm_res = compute_fm_log_prob(
-                        **_fm_kw, vel_anchor=vel_anchor, return_struct=True
+                        **_fm_kw, **_fm_struct_kw, return_struct=True
                     )
                     current_log_probs = _fm_res.log_probs
-                    gp_per_tau = _fm_res.per_tau if gp_probe_this_mb else None
+                    exec_log_probs = _fm_res.exec_log_probs
+                    if exec_steps is not None and exec_log_probs is None:
+                        raise RuntimeError(
+                            "n_exec_steps was requested but compute_fm_log_prob "
+                            "returned no exec_log_probs."
+                        )
+                    # The probe decomposes the surrogate's own FM term: the
+                    # executed-prefix one when the mask is on.
+                    gp_per_tau = (
+                        (_fm_res.per_tau if exec_steps is None
+                         else _fm_res.exec_per_tau)
+                        if gp_probe_this_mb else None
+                    )
                     smooth_moments, endpoint_moments = (
                         _fm_res.smooth if _fm_res.smooth is not None
                         else (None, None)
                     )
-                    vel_d_row = _fm_res.anchor_dist
-                    # Anchor == start weights: D must be ~0 before any step. A
-                    # non-finite reading is left to the guard below (the
-                    # micro-batch is dropped) and the check stays armed.
-                    if self._vel_anchor_equals_start and n_updates == 0:
-                        _d0 = float(vel_d_row.detach().abs().max())
-                        if math.isfinite(_d0):
-                            self._vel_anchor_equals_start = False
-                            if not _d0 < VEL_ANCHOR_START_TOL:
-                                raise RuntimeError(
-                                    f"vel_anchor: the anchor equals the "
-                                    f"starting weights, yet the first "
-                                    f"micro-batch reads max D = {_d0:.3e} >= "
-                                    f"{VEL_ANCHOR_START_TOL:g}. The anchor "
-                                    f"forward is not evaluating the same field "
-                                    f"(key mapping / adapter toggle bug)."
-                                )
+                    if vel_anchor is not None:
+                        vel_d_row = _fm_res.anchor_dist
+                        # Anchor == start weights: D must be ~0 before any step.
+                        # A non-finite reading is left to the guard below (the
+                        # micro-batch is dropped) and the check stays armed.
+                        if self._vel_anchor_equals_start and n_updates == 0:
+                            _d0 = float(vel_d_row.detach().abs().max())
+                            if math.isfinite(_d0):
+                                self._vel_anchor_equals_start = False
+                                if not _d0 < VEL_ANCHOR_START_TOL:
+                                    raise RuntimeError(
+                                        f"vel_anchor: the anchor equals the "
+                                        f"starting weights, yet the first "
+                                        f"micro-batch reads max D = {_d0:.3e} >= "
+                                        f"{VEL_ANCHOR_START_TOL:g}. The anchor "
+                                        f"forward is not evaluating the same "
+                                        f"field (key mapping / adapter toggle "
+                                        f"bug)."
+                                    )
                 else:
                     fm_out = compute_fm_log_prob(**_fm_kw)
                     # Return-contract unpack. compute_fm_log_prob appends extras
@@ -4626,7 +4754,13 @@ class GRPOTrainer:
                         endpoint_moments = None
 
 
-                log_ratio = current_log_probs - ref_log_probs
+                # The surrogate's ratio: the executed-prefix pair under
+                # mask_loss_with_n_action_steps, else the full-horizon pair (the
+                # same tensors the KL terms use).
+                pg_log_probs = (
+                    exec_log_probs if exec_steps is not None else current_log_probs
+                )
+                log_ratio = pg_log_probs - pg_ref_log_probs
                 ratio = log_ratio.exp()
 
                 # --- Advantage renormalization ---
@@ -4844,7 +4978,9 @@ class GRPOTrainer:
                 _flat_floor = 1 - self.config.clip_eps_low
                 if self.config.clip_low_mse_coef > 0.0:
                     with torch.no_grad():
-                        _mse_ref = (-ref_log_probs).clamp_min(0.0)
+                        # The surrogate ratio's own MSE_ref (executed prefix
+                        # under mask_loss_with_n_action_steps).
+                        _mse_ref = (-pg_ref_log_probs).clamp_min(0.0)
                         _budget = (
                             self.config.clip_low_mse_coef * _mse_ref
                         ).clamp_max(-math.log(max(_flat_floor, 1e-12)))
@@ -5318,8 +5454,10 @@ class GRPOTrainer:
                 # Per-row tensors are kept around (not just the mean) so the
                 # per-branch fixed/jitter accumulator below can split each
                 # term separately. Both terms use loss_divisor for the same
-                # additive-anchor reason as clip_loss above.
-                inv_log_ratio = ref_log_probs - current_log_probs  # = -log_ratio
+                # additive-anchor reason as clip_loss above. Full-horizon even
+                # under mask_loss_with_n_action_steps (only the surrogate is
+                # masked), so this is -log_ratio only when the mask is off.
+                inv_log_ratio = ref_log_probs - current_log_probs
                 kl_per_row_last_iter = inv_log_ratio.exp() - inv_log_ratio - 1.0
                 kl_loss_last_iter = self.config.kl_coef_last_iter * (
                     kl_per_row_last_iter.mean() if not anchors_in_play
@@ -5693,7 +5831,7 @@ class GRPOTrainer:
                     )
                     _dr_down = (-log_ratio)[_dr_mask].float()
                     _dr_bud = (-torch.log(rho_floor))[_dr_mask].float()
-                    _dr_mr = (-ref_log_probs).clamp_min(0.0)[_dr_mask].float()
+                    _dr_mr = (-pg_ref_log_probs).clamp_min(0.0)[_dr_mask].float()
                     # Unconditional append, no `.any()` sync; filtered in the
                     # finalizer. Empty slices are harmless to torch.cat.
                     drift_down.append(_dr_down)
@@ -7173,7 +7311,7 @@ class GRPOTrainer:
         # and the test asserts that equality.
         probe_timesteps = timesteps[:tau_sub][:, idx].contiguous()
 
-        clean_lp = compute_fm_log_prob(
+        _clean_kw = dict(
             action_head=self.model.action_head,
             backbone_output=probe_backbone,
             state_features=ready_state_features[idx],
@@ -7186,6 +7324,15 @@ class GRPOTrainer:
             # THE one difference between the two legs.
             noise_for_input=None,
         )
+        n_exec = self._exec_steps()
+        if n_exec is None:
+            clean_lp = compute_fm_log_prob(**_clean_kw)
+        else:
+            # mask_loss_with_n_action_steps: phase 1 took the executed-prefix
+            # per-tau terms, so this leg must score the same prefix.
+            clean_lp = compute_fm_log_prob(
+                **_clean_kw, n_exec_steps=n_exec, return_struct=True
+            ).exec_log_probs
         # `-log_prob` is MSE, already tau-averaged over the subset by
         # compute_fm_log_prob (`log_probs_accumulated / n_samples` with
         # n_samples == tau_sub). Row mean second, matching phase 1.
@@ -10046,6 +10193,17 @@ class GRPOTrainer:
                     delta = p.detach().float() - self._lora_init_params[name].float()
                     total_sq = total_sq + delta.pow(2).sum()
         return float(total_sq.sqrt().item())
+
+    # ── Executed-step loss mask (mask_loss_with_n_action_steps) ───────────────
+
+    def _exec_steps(self) -> "int | None":
+        """n_action_steps under mask_loss_with_n_action_steps, else None (off).
+
+        getattr: the CPU harnesses build trainers with SimpleNamespace configs.
+        """
+        if not getattr(self.config, "mask_loss_with_n_action_steps", False):
+            return None
+        return int(self.config.n_action_steps)
 
     # ── Velocity anchor (vel_anchor_coef) ─────────────────────────────────────
 

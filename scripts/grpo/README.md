@@ -40,6 +40,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_vel_anchor.py` | CPU suite for `vel_anchor_coef`: the REAL `compute_fm_log_prob` on a stub head holding a real PEFT LoRA layer (off-path contract, D == 0 at the anchor, D against an independent LoRA-formula hand computation for both anchor kinds and jittered inputs, identical current/anchor inputs, finite-difference gradient, adapters restored after an exception, `functional_call` leaving the live model and saved checkpoint untouched, masking, split parts, no RNG, every struct combination), then the real `_grpo_update_inner` / ref pass / jitter diagnostics / `_setup_vel_anchor` / `_log_metrics` / `train()`: loss composition incl. the anchor-row divisor, coef-0 identity, accumulation, the non-finite guard, the force-balance probe against direct gradients with the step bit-identical, every metric, `jac_part_pos`, anchor loading, the first-micro-batch check, config validation, resume, and `stop_after_iterations`. |
 | `test_calibrate_vel_anchor.py` | CPU suite for `calibrate_vel_anchor.py`: trace-trick norm/cosine vs dense (fresh and relative to a start), interpolation incl. the non-monotone warning and brackets, `--dry-run` command construction parsed back through tyro into `GRPOConfig`, and the cached-episode guard on synthetic TB event files. |
 | `test_group_adv_fixed_std.py` | CPU suite for `group_advantage_fixed_std`: off-path bit-identity with the group-std formula (and against the pre-change module), exact fixed-scale values, zero sum / sign / bounds, unchanged dead/anchor classification and counters, the per-chunk split incl. post-reopen truncation, the chunk memo on re-entry, argument and config validation, the tyro flag, and the `train()` call site. |
+| `test_exec_step_mask.py` | CPU suite for `mask_loss_with_n_action_steps`: the REAL `compute_fm_log_prob` on a stub DiT with one weight row per action step (hand-formula values, exactly-zero gradient on unexecuted steps, bitwise equality when the prefix covers the valid horizon, validation, no RNG), then the real ref pass / `_grpo_update_inner` / probe / `_log_metrics` / banner: surrogate on the executed pair and KL on the full pair, zero step gradient on unexecuted steps, `rho_floor` / `drift/*` on the executed MSE_ref, the ready filter, `ref_mse/exec_*`, config validation, and composition with accumulation, anchors, jitter, PAWS, the balanced sampler, base KL, the velocity anchor, smoothness and the grad probe. |
 
 ---
 
@@ -1464,6 +1465,7 @@ fabricated zero of exactly the kind this codebase avoids elsewhere.
 
 ```
 ratio = (current_log_prob - ref_log_prob).exp()
+# Executed steps only under mask_loss_with_n_action_steps — see "Executed-step loss mask".
 advantages = (A - A.mean()) / (A.std() + 1e-8)            # renorm per-batch
 # rho_floor is a [B] tensor, == 1 - clip_eps_low on every row at the default
 # clip_low_mse_coef = 0.0 (see "Per-row, MSE-referenced lower clip").
@@ -1527,6 +1529,86 @@ If ZERO minibatches commit a gradient step in an iteration (every batch
 non-finite, every window dropped, or every group dead), the iteration is
 treated as **skipped** and the resume checkpoint is saved under the last
 successfully-updated iter's name (see "Checkpointing").
+
+### Executed-step loss mask (`mask_loss_with_n_action_steps`)
+
+`mask_loss_with_n_action_steps = False` (default) is OFF and bit-identical to the
+tree before it: `compute_fm_log_prob` gets no new argument, nothing is stored on
+the chunks, no `ref_mse/exec_*` curve appears and no banner line is printed. The
+off claim was checked as an out-of-tree differential against HEAD (recipe in
+`test_exec_step_mask.py`'s docstring). Test [T1] is the in-tree half.
+
+**Why.** The DiT predicts a 16-step chunk, but `MultiStepWrapper` plays only steps
+`0..n_action_steps-1` (8 at the default) and discards the rest. The FM surrogate
+scored all 16 steps, so every row's advantage also pushed on 8 actions that never
+ran. With the flag on, the policy-gradient term scores only the executed steps. If
+the discarded steps carry no reward signal, that removes up to half of each row's
+gradient noise.
+
+**What changes.**
+
+```
+lp_exec = -mean_k [ sum_{h < n} mask * (v_theta - (a - eps))^2  /  sum_{h < n} mask ]
+ratio   = exp(lp_exec_theta - lp_exec_ref)          # the clipped surrogate's ratio
+```
+
+- It is the existing masked MSE with `action_mask` zeroed at steps
+  `h >= n_action_steps` and normalised by that mask's own valid count. It is still
+  a per-element mean, so `clip_eps_*` keep their units.
+- Both sides of the ratio use it. The ref pass stores `chunk.ref_log_prob_exec`
+  beside `ref_log_prob`, from the same forwards. The cost is one extra masked
+  reduction per tau, with no extra DiT forward.
+- Every consumer of the surrogate's ratio follows the executed pair:
+  - `rho_floor`, including `clip_low_mse_coef`'s MSE_ref
+  - the PAWS masses
+  - `train/clipfrac*`, `mean_ratio*`, `ratio_max/min` and `mean_log_ratio_abs*`
+  - `drift/*` and `mean_ratio_anchor`
+  - both legs of `gradprobe/*`
+- These stay full-horizon:
+  - both KL terms, the velocity anchor's `D` and the roughness constraint
+  - the field diagnostics: `ref_mse/*` (apart from the new `exec_*` keys),
+    `jitter/*`, `chunk_gap/*` and `vel_anchor/start_*`
+
+  So the discarded steps are still regularised by those terms, and they still
+  enter the DiT input as denoising context for the executed ones. The `jitter/*`
+  shares that relate a gap to the clip (`neg_clip_budget_used`,
+  `pos_clip_budget_used`, `headroom_*`) therefore describe the full-horizon clip.
+  Under the flag, read `drift/neg_frac_born_dead` for the born-dead check.
+
+| Metric (flag on only) | Read it as |
+|---|---|
+| `ref_mse/exec_mean`, `exec_p10`, `exec_p90`, `exec_pos_mean`, `exec_neg_mean` | MSE_ref over the executed steps. This is the MSE_ref that `clip_low_mse_coef` budgets against, so the banner's born-dead threshold points at `exec_p10`. |
+| `ref_mse/exec_ratio_ceiling_max` | `exp(max MSE_ref_exec)`: the surrogate's ratio ceiling under the mask. The full-horizon `ratio_ceiling_*` no longer bounds it. |
+| `ref_mse/exec_share` | Pooled share of the reference FM residual energy on the executed steps. Compare it against their share of the valid elements, `n_action_steps / horizon` (0.5 at the defaults). A lower reading means the discarded steps carried more than their share of the residual, and so of each row's gradient. |
+
+**Caveats.**
+
+- The mask uses `config.n_action_steps`, the value passed to the collector. A
+  cached collection made at a different `n_action_steps`
+  (`resume_from_collected_data`) goes undetected, because the npz does not record
+  it.
+- An episode's final chunk can stop early: at the substep that succeeded, or when
+  the step budget runs out. The mask still scores steps `0..n_action_steps-1` on
+  that one chunk.
+- With `n_action_steps >=` the valid horizon the mask has no effect beyond fp32
+  rounding in the gradient, and the ref pass prints a NOTE saying so.
+- With the flag on, the `train/*` ratio curves describe the executed-step ratio,
+  so they cannot be compared directly with a flag-off run.
+- The surrogate's per-row gradient changes size relative to the full-horizon KL
+  and anchor terms. Relative to the full-horizon version it is scaled by
+  `2‖g_exec‖ / ‖g_exec + g_unexec‖` at the defaults:
+  - 1 when the two halves' gradients agree;
+  - 2 when the discarded steps were already fit;
+  - more than 2 when the two halves oppose each other.
+
+  So it is not a fixed rescale of `kl_coef_*` or `vel_anchor_coef`.
+- The config-time `clip_low_mse_coef` warnings (inert ceiling, born-dead) use a
+  full-horizon calibration, `ref_mse/mean ≈ 0.004`. Under the flag, check them
+  against `ref_mse/exec_mean`.
+
+```bash
+uv run python scripts/grpo/train_grpo.py --mask-loss-with-n-action-steps --n-action-steps 8
+```
 
 ### Adaptive base-model trust region (`kl_base_adaptive`)
 
@@ -1740,7 +1822,7 @@ measures the second part.
 |---|---|---|
 | `vel_anchor/start_mean`, `start_pos`, `start_neg`, `start_p90` | ref pass: clean inputs, start-of-iteration weights, signal chunks | **The drift readout.** A proper squared distance, unlike `ref_mse/log_base_ratio_mean = ‖δ‖² − 2⟨r_θ, δ⟩`. It levels off in a holding arm. p90 catches a tail of runaway rows. |
 | `vel_anchor/start_gripper_frac` | ref pass | Pooled share of D in the gripper column (uniform ≈ 1/12). Rising in a declining arm means gripper weighting is the next knob. Absent while every D is 0 (0/0), i.e. iteration 1 of a fresh base-anchor run. |
-| `vel_anchor/start_exec_frac` | ref pass | Pooled share in the executed steps 0..`n_action_steps`−1. If drift piles into the never-executed steps, masking them from the policy-gradient term is the follow-up. Absent while every D is 0, like the gripper share. |
+| `vel_anchor/start_exec_frac` | ref pass | Pooled share in the executed steps 0..`n_action_steps`−1. If drift piles into the never-executed steps, `mask_loss_with_n_action_steps` masks them from the policy-gradient term (see "Executed-step loss mask"). Absent while every D is 0, like the gripper share. |
 | `vel_anchor/train_mean` | update, all trained rows | What the penalty acts on, jittered inputs included. |
 | `vel_anchor/train_last_epoch_mean` | update, final epoch | End-of-update distance, i.e. how far one update pushes before the pull catches up. |
 | `vel_anchor/loss` | update | `coef × reduced D`, averaged over trained micro-batches. |

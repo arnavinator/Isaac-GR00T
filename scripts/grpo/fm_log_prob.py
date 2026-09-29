@@ -94,12 +94,16 @@ class FMLogProbResult(NamedTuple):
     per_tau: [K, B] log-probs. smooth: (moments, endpoint_moments).
     anchor_dist: [B] squared velocity distance to the anchor ([K, B] under
     `vel_anchor_per_tau`). anchor_split: `AnchorSplit` of that distance.
+    exec_log_probs / exec_per_tau: log_probs / per_tau restricted to the first
+    `n_exec_steps` action steps.
     """
     log_probs: torch.Tensor
     per_tau: Optional[torch.Tensor]
     smooth: Optional[tuple]
     anchor_dist: Optional[torch.Tensor]
     anchor_split: Optional[AnchorSplit]
+    exec_log_probs: Optional[torch.Tensor] = None
+    exec_per_tau: Optional[torch.Tensor] = None
 
 
 def inference_schedule(action_head: nn.Module) -> tuple[list[float], float]:
@@ -172,6 +176,7 @@ def compute_fm_log_prob(
     vel_anchor: "VelAnchor | None" = None,
     vel_anchor_split: "tuple | None" = None,
     vel_anchor_per_tau: bool = False,
+    n_exec_steps: int | None = None,
     return_struct: bool = False,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...] | FMLogProbResult":
     """Compute FM log-probability surrogate for a batch of action chunks.
@@ -286,6 +291,10 @@ def compute_fm_log_prob(
             None. Adds the gripper-column and executed-step parts of the
             anchor distance (diagnostic, no graph).
         vel_anchor_per_tau: Return the anchor distance K-resolved ([K, B]).
+        n_exec_steps: Optional int. ALSO return the log-prob over action steps
+            0..n_exec_steps-1 only (the steps MultiStepWrapper executes), from the
+            same forwards: `action_mask` with the later steps zeroed, normalised
+            per row by that mask's own valid count. Requires return_struct.
         return_struct: Return an `FMLogProbResult` instead of the positional
             contract below (which is unchanged when this is False).
 
@@ -456,6 +465,44 @@ def compute_fm_log_prob(
         if anc_n_exec is not None else None
     )
 
+    # --- Executed-prefix log-prob (mask_loss_with_n_action_steps) ---
+    # action_mask with steps >= n_exec_steps zeroed. Multiplied in, not sliced,
+    # so it is bitwise equal to log_probs when the prefix covers every valid step.
+    exec_mask_f32 = None
+    exec_valid_f32 = None
+    if n_exec_steps is not None:
+        if not return_struct:
+            raise ValueError(
+                "n_exec_steps requires return_struct=True: the positional return "
+                "contract has no slot for exec_log_probs."
+            )
+        if (isinstance(n_exec_steps, bool) or not isinstance(n_exec_steps, int)
+                or not (1 <= n_exec_steps <= actions.shape[1])):
+            raise ValueError(
+                f"n_exec_steps={n_exec_steps!r} must be an int in "
+                f"[1, {actions.shape[1]}] (the padded action horizon)"
+            )
+        step_keep = (
+            torch.arange(action_mask.shape[1], device=action_mask.device)
+            < n_exec_steps
+        ).to(action_mask.dtype)
+        exec_mask = action_mask * step_keep[None, :, None]
+        exec_valid = exec_mask.sum(dim=(1, 2))
+        if not bool((exec_valid > 0).all()):
+            raise ValueError(
+                f"n_exec_steps={n_exec_steps} leaves row(s) with no valid "
+                f"action element: {exec_valid.tolist()}"
+            )
+        exec_mask_f32 = exec_mask.float()
+        exec_valid_f32 = exec_valid.float()
+    exec_acc = (
+        torch.zeros(B, device=device, dtype=torch.float32)
+        if n_exec_steps is not None else None
+    )
+    exec_per_tau: list[torch.Tensor] | None = (
+        [] if (n_exec_steps is not None and return_per_tau) else None
+    )
+
     def _dit_velocity(noisy_trajectory, t, dit_params=None):
         """One DiT forward -> pred_velocity.
 
@@ -567,6 +614,13 @@ def compute_fm_log_prob(
         log_probs_accumulated += -per_sample_mse  # already fp32
         if per_tau_log_probs is not None:
             per_tau_log_probs.append(-per_sample_mse)
+        if exec_acc is not None:
+            exec_mse = (
+                (per_element_mse * exec_mask_f32).sum(dim=(1, 2)) / exec_valid_f32
+            )
+            exec_acc += -exec_mse
+            if exec_per_tau is not None:
+                exec_per_tau.append(-exec_mse)
 
         # --- Velocity anchor: masked mean of (v_theta - v_anchor)^2 per row ---
         # Same DiT input (jittered x' included) and the same per-row
@@ -697,6 +751,9 @@ def compute_fm_log_prob(
                     if smooth_moments is not None else None),
             anchor_dist=anchor_dist,
             anchor_split=anchor_split,
+            exec_log_probs=(exec_acc / n_samples if exec_acc is not None else None),
+            exec_per_tau=(torch.stack(exec_per_tau, dim=0)
+                          if exec_per_tau is not None else None),
         )
 
     # Extras are appended in a fixed order so every existing caller's unpacking

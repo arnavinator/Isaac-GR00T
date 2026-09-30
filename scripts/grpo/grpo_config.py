@@ -582,8 +582,9 @@ class GRPOConfig:
     # crossing down the rising edge; see gripper_release.reopen_onset_index.
     # N counts from the onset chunk itself: N=3 keeps onset..onset+2 and drops
     # the rest; N=0 drops the onset chunk too. Everything BEFORE the onset is
-    # always kept. Successes are never touched (their reopen is the release that
-    # completes the task), and anchor groups are all-success by construction.
+    # kept unless pre_close_keep_chunks is set. Successes are never touched
+    # (their reopen is the release that completes the task), and anchor groups
+    # are all-success by construction.
     #
     # None (default) = DISABLED and bit-identical to the pre-feature behavior:
     # no episode is truncated, no gripper state is read, no TB series is added.
@@ -614,6 +615,17 @@ class GRPOConfig:
     # to 4 to restore a comparable step budget. See README "What changes in a
     # training run".
     post_reopen_keep_chunks: int | None = None
+
+    # M = also keep only the M chunks BEFORE the detected close: a failing
+    # episode trains on [close_idx - M, onset + post_reopen_keep_chunks), so its
+    # approach, which nearly duplicates the successes' approach and cancels
+    # their push up, is dropped. The closed phase is always kept. None (default)
+    # = off, bit-identical; 0 = nothing before the close. Requires
+    # post_reopen_keep_chunks. On CoffeeServeMug iter_0001, M=3 keeps the first
+    # chunk commanding the close (any executed substep > 0.5) on 43/43 failures
+    # (M=2: 38/43, or 43/43 counting first substeps only), and with N=3 drops
+    # 71% of failure chunks (vs 52% at N=3 alone). README "Pre-close window".
+    pre_close_keep_chunks: int | None = None
 
     # Hysteresis thresholds on the measured gripper width
     # (`gripper_qpos[0] - gripper_qpos[1]`, metres). Defaults are calibrated for
@@ -664,7 +676,9 @@ class GRPOConfig:
     # phase alone is ~13 chunks on the reference data, so a handful of retained
     # chunks means the detector latched onto something that is not the grasp.
     # Secondary defense: the two state-machine guards above are what actually
-    # prevent the known failure modes. 0 disables the floor.
+    # prevent the known failure modes. 0 disables the floor. Always tested on the
+    # prefix onset + post_reopen_keep_chunks, not on a pre_close_keep_chunks
+    # window, which is short by design.
     post_reopen_min_train_chunks: int = DEFAULT_MIN_TRAIN_CHUNKS
 
     # Mini-batch size (in # of action chunks) for each gradient step within each epoch in update_epochs
@@ -1373,6 +1387,7 @@ class GRPOConfig:
             min_closed_chunks=self.post_reopen_min_closed_chunks,
             min_train_chunks=self.post_reopen_min_train_chunks,
             state_key=self.post_reopen_state_key,
+            pre_close_keep_chunks=self.pre_close_keep_chunks,
         )
 
     def __post_init__(self):
@@ -1700,6 +1715,7 @@ class GRPOConfig:
                 "post_reopen_min_closed_chunks",
                 "post_reopen_min_train_chunks",
                 "post_reopen_state_key",
+                "pre_close_keep_chunks",
             ):
                 value, default = getattr(self, name), _defaults[name]
                 if value != default:

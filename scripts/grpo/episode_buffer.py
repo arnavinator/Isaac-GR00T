@@ -25,7 +25,9 @@ Key difference from grpo_cont.py:
 - FAILING episodes can have their trailing chunks truncated by the post-reopen
   filter (GRPOEpisode.train_chunk_limit), so a failure contributes its negative
   credit to the approach and the failed grasp rather than to the meander that
-  follows. See gripper_release.py and README "Post-reopen truncation".
+  follows. See gripper_release.py and README "Post-reopen truncation". With
+  pre_close_keep_chunks the leading approach chunks are dropped too
+  (GRPOEpisode.train_chunk_start); README "Pre-close window".
 """
 
 import math
@@ -36,7 +38,7 @@ from typing import Iterator
 import numpy as np
 import torch
 
-from gripper_release import PostReopenFilter, post_reopen_detect
+from gripper_release import PostReopenFilter, grasp_train_window
 
 # Divisor for signal-group advantages under GRPOConfig.group_advantage_fixed_std:
 # the largest POPULATION std of a [0, 1] reward (a 50/50 split). The ddof=1 group
@@ -167,15 +169,29 @@ class GRPOEpisode:
     group_id: int = 0                            # Which group this episode belongs to
     env_seed: int = 0                            # Env reset seed (same within a group)
     is_anchor: bool = False                      # Set by compute_advantages for all-success groups
-    # Number of LEADING chunks admitted to training, or None for all of them.
-    # Set by compute_advantages' post-reopen filter on FAILING episodes only
-    # (gripper_release.post_reopen_detect); successes and anchors are never
-    # truncated. Everything downstream reads num_train_chunks, not num_chunks.
+    # Chunks admitted to training are [train_chunk_start, train_chunk_limit);
+    # limit None = to the end. Set by compute_advantages' post-reopen filter on
+    # FAILING episodes only (gripper_release.grasp_train_window); successes and
+    # anchors are never truncated. Everything downstream reads train_chunk_range
+    # / num_train_chunks, not num_chunks.
     train_chunk_limit: int | None = None
+    train_chunk_start: int = 0
 
     @property
     def num_chunks(self) -> int:
         return len(self.actions)
+
+    @property
+    def train_chunk_range(self) -> range:
+        """Episode chunk indices that reach the ref pass and the update.
+
+        Both edges are clamped into [0, num_chunks], and a start past the limit
+        gives an empty range rather than a negative length.
+        """
+        stop = self.num_chunks
+        if self.train_chunk_limit is not None:
+            stop = max(0, min(stop, self.train_chunk_limit))
+        return range(max(0, min(stop, self.train_chunk_start)), stop)
 
     @property
     def num_train_chunks(self) -> int:
@@ -187,9 +203,7 @@ class GRPOEpisode:
         num_chunks stays the raw collected length so the collection-side curves
         and the "Loaded N episodes (M chunks)" log keep their meaning.
         """
-        if self.train_chunk_limit is None:
-            return self.num_chunks
-        return max(0, min(self.num_chunks, self.train_chunk_limit))
+        return len(self.train_chunk_range)
 
 
 class EpisodeBuffer:
@@ -221,7 +235,7 @@ class EpisodeBuffer:
         # Post-reopen truncation bookkeeping (see _apply_post_reopen_filter).
         # `detected` and `episodes_cut` differ: an episode whose reopen is found
         # so late that the retained window runs past the end is a DETECTION but
-        # a correct no-op, so only `detected` is a usable detector hit rate.
+        # a correct no-op at the tail, so only `detected` is a usable hit rate.
         self._n_post_reopen_episodes_cut: int = 0
         self._n_post_reopen_chunks_dropped: int = 0
         self._n_post_reopen_detected: int = 0
@@ -238,6 +252,10 @@ class EpisodeBuffer:
         # tracks how long the gripper stayed closed. A widening spread means
         # near-misses are being suppressed harder than clean whiffs.
         self._post_reopen_kept_lens: list[int] = []
+        # Head-side cuts from pre_close_keep_chunks. The two post_reopen
+        # episodes_cut / chunks_dropped counters above count the TAIL side only.
+        self._n_pre_close_episodes_cut: int = 0
+        self._n_pre_close_chunks_dropped: int = 0
 
     def clear(self):
         """Clear buffer for next iteration.
@@ -270,6 +288,8 @@ class EpisodeBuffer:
         self._n_post_reopen_errors = 0
         self._n_post_reopen_implausible = 0
         self._post_reopen_kept_lens = []
+        self._n_pre_close_episodes_cut = 0
+        self._n_pre_close_chunks_dropped = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -438,8 +458,9 @@ class EpisodeBuffer:
             anchor_max_row_frac: Cap on anchor chunks as a multiple of the
                 signal chunk count. Ignored when there are no signal chunks.
             post_reopen_filter: When set, truncates each FAILING episode after
-                its gripper reopens (see _apply_post_reopen_filter). None
-                (default) leaves every episode at its full length, which is
+                its gripper reopens, and before its close too when
+                pre_close_keep_chunks is set (see _apply_post_reopen_filter).
+                None (default) leaves every episode at its full length, which is
                 bit-identical to the pre-feature behavior.
             fixed_std: When set, SIGNAL groups divide `r - mean` by this
                 constant instead of their own std (FIXED_GROUP_ADV_STD under
@@ -479,6 +500,8 @@ class EpisodeBuffer:
             self._n_post_reopen_errors = 0
             self._n_post_reopen_implausible = 0
             self._post_reopen_kept_lens = []
+            self._n_pre_close_episodes_cut = 0
+            self._n_pre_close_chunks_dropped = 0
             return self.advantages
 
         # Step 0: post-reopen truncation. Runs BEFORE anything that counts
@@ -612,12 +635,18 @@ class EpisodeBuffer:
         would amputate exactly the chunks that earn the positive advantage.
         Anchor groups are all-success by construction and so are never touched.
 
+        With cfg.pre_close_keep_chunks the window gets a front edge as well,
+        anchored at the detected close: only [close_idx - pre_close_keep_chunks,
+        close_idx) survives of the approach. The two edges are cut
+        independently; a failure with no detected reopen, or a refused
+        detection, is kept whole on both sides. README "Pre-close window".
+
         The per-chunk advantage in _build_chunks divides by num_train_chunks,
         not num_chunks, so Σ_chunks A_chunk == A_ep still holds and with it the
         within-group Σ A == 0 invariant. The truncated episode contributes the
         same total gradient weight as before, concentrated on fewer rows.
 
-        Idempotent and self-clearing: every episode's limit is reset first, so
+        Idempotent and self-clearing: every episode's window is reset first, so
         a second call with cfg=None restores full lengths rather than leaving
         the previous call's truncation in place. That matters because
         compute_advantages can legitimately run twice on one buffer.
@@ -643,12 +672,15 @@ class EpisodeBuffer:
         """
         for ep in self.episodes:
             ep.train_chunk_limit = None
+            ep.train_chunk_start = 0
         self._n_post_reopen_episodes_cut = 0
         self._n_post_reopen_chunks_dropped = 0
         self._n_post_reopen_detected = 0
         self._n_post_reopen_errors = 0
         self._n_post_reopen_implausible = 0
         self._post_reopen_kept_lens = []
+        self._n_pre_close_episodes_cut = 0
+        self._n_pre_close_chunks_dropped = 0
         if cfg is None:
             return
 
@@ -663,7 +695,7 @@ class EpisodeBuffer:
                 continue
             n_probed += 1
             try:
-                onset, limit = post_reopen_detect(ep.states, cfg)
+                onset, start, limit = grasp_train_window(ep.states, cfg)
             except (KeyError, ValueError, TypeError, OverflowError) as e:
                 self._n_post_reopen_errors += 1
                 if first_error is None:
@@ -674,7 +706,8 @@ class EpisodeBuffer:
             # `onset` and `limit` answer different questions: onset is None only
             # when no reopen was FOUND (the detector-miss case), while limit is
             # additionally None when the reopen was found so late that the
-            # retained window already covers the episode — a correct no-op.
+            # retained window already covers the tail — a correct no-op there,
+            # though the pre-close window can still cut the head.
             if onset is not None:
                 self._n_post_reopen_detected += 1
             if limit is None:
@@ -688,13 +721,25 @@ class EpisodeBuffer:
                     and onset + cfg.keep_chunks < cfg.min_train_chunks
                 ):
                     self._n_post_reopen_implausible += 1
-                continue
-            if limit >= ep.num_chunks:
-                continue
-            ep.train_chunk_limit = limit
-            self._n_post_reopen_episodes_cut += 1
-            self._n_post_reopen_chunks_dropped += ep.num_chunks - ep.num_train_chunks
-            self._post_reopen_kept_lens.append(ep.num_train_chunks)
+                    continue  # refused: kept whole on both sides
+            elif limit < ep.num_chunks:
+                ep.train_chunk_limit = limit
+            # The start is found on the states but clamped to the actions, so it
+            # can only reach the stop if an episode has more states than actions;
+            # the head cut would then empty the episode, so it is not applied.
+            if start is not None and start < ep.train_chunk_range.stop:
+                ep.train_chunk_start = start
+            # Counted off the resulting range so the clamps apply. The tail and
+            # head counters are per side; kept_lens covers a cut on either.
+            kept = ep.train_chunk_range
+            if kept.stop < ep.num_chunks:
+                self._n_post_reopen_episodes_cut += 1
+                self._n_post_reopen_chunks_dropped += ep.num_chunks - kept.stop
+            if kept.start > 0:
+                self._n_pre_close_episodes_cut += 1
+                self._n_pre_close_chunks_dropped += kept.start
+            if len(kept) < ep.num_chunks:
+                self._post_reopen_kept_lens.append(len(kept))
 
         if first_error is not None:
             if self._n_post_reopen_errors == n_probed:
@@ -736,19 +781,35 @@ class EpisodeBuffer:
         total_fail_chunks = sum(
             ep.num_chunks for ep in self.episodes if not ep.success
         )
+        n_dropped = (
+            self._n_post_reopen_chunks_dropped + self._n_pre_close_chunks_dropped
+        )
         pct = (
-            100.0 * self._n_post_reopen_chunks_dropped / total_fail_chunks
+            100.0 * n_dropped / total_fail_chunks
             if total_fail_chunks
             else 0.0
         )
-        print(
-            f"  Post-reopen truncation (keep {cfg.keep_chunks} chunk(s) from "
-            f"the reopen onset): detected the reopen in "
-            f"{self._n_post_reopen_detected}/{n_fail} failing episode(s) and "
-            f"cut {self._n_post_reopen_episodes_cut}, dropping "
-            f"{self._n_post_reopen_chunks_dropped}/{total_fail_chunks} "
-            f"failure chunks ({pct:.1f}%)."
-        )
+        if cfg.pre_close_keep_chunks is None:
+            print(
+                f"  Post-reopen truncation (keep {cfg.keep_chunks} chunk(s) from "
+                f"the reopen onset): detected the reopen in "
+                f"{self._n_post_reopen_detected}/{n_fail} failing episode(s) and "
+                f"cut {self._n_post_reopen_episodes_cut}, dropping "
+                f"{n_dropped}/{total_fail_chunks} "
+                f"failure chunks ({pct:.1f}%)."
+            )
+        else:
+            print(
+                f"  Post-reopen truncation (keep {cfg.pre_close_keep_chunks} "
+                f"chunk(s) before the close and {cfg.keep_chunks} from the reopen "
+                f"onset): detected the reopen in "
+                f"{self._n_post_reopen_detected}/{n_fail} failing episode(s); "
+                f"cut the head of {self._n_pre_close_episodes_cut} "
+                f"and the tail of {self._n_post_reopen_episodes_cut}, dropping "
+                f"{n_dropped}/{total_fail_chunks} failure chunks ({pct:.1f}%: "
+                f"{self._n_pre_close_chunks_dropped} head, "
+                f"{self._n_post_reopen_chunks_dropped} tail)."
+            )
 
     def _resolve_anchor_groups(
         self,
@@ -859,16 +920,19 @@ class EpisodeBuffer:
         Without the division, long episodes would dominate the gradient purely
         by having more chunks.
 
-        The divisor is `num_train_chunks` — the post-reopen-truncated length,
-        equal to num_chunks when that filter is off. Dividing by the RAW length
+        The divisor is `num_train_chunks` — the length of the retained window
+        [train_chunk_start, train_chunk_limit), equal to num_chunks when that
+        filter is off. Dividing by the RAW length
         while emitting only the kept chunks would shrink a truncated episode's
         total weight to the kept fraction and break Σ A_chunk = 0 within the
         group, silently rebalancing the update toward whichever episodes
         happened not to be cut. Truncation is meant to relocate an episode's
-        credit, not to reduce it.
+        credit, not to reduce it. `chunk_idx` stays the index in the episode,
+        so a head-cut failure's first chunk is not 0.
 
         That relocation is a BUFFER-level property. On the default update path
         (balanced 4/4 minibatches + per-minibatch z-score) the resulting ~2x
+        (~3.6x with the pre-close window)
         per-row magnification is divided straight back out, and every row
         reaches the surrogate at ±0.90 either way; what survives is that an
         episode's realized gradient mass becomes proportional to its retained
@@ -883,9 +947,9 @@ class EpisodeBuffer:
         for ep_idx, (episode, advantage) in enumerate(
             zip(self.episodes, self.advantages)
         ):
-            n_kept = episode.num_train_chunks
-            per_chunk_advantage = float(advantage) / max(n_kept, 1)
-            for chunk_idx in range(n_kept):
+            kept = episode.train_chunk_range
+            per_chunk_advantage = float(advantage) / max(len(kept), 1)
+            for chunk_idx in kept:
                 chunk = ActionChunk(
                     video_frames=episode.video_frames[chunk_idx],
                     state=episode.states[chunk_idx],
@@ -1087,9 +1151,9 @@ class EpisodeBuffer:
             # unchanged. Read `detected` — NOT `episodes_cut` — against the
             # failure count as the detector's hit rate: an episode whose reopen
             # lands within keep_chunks of the end is detected but correctly not
-            # cut, so `episodes_cut` falls as the policy holds its grasp longer
-            # even though nothing is wrong. `errors` > 0 means some episode's
-            # gripper state could not be read at all.
+            # cut at the tail, so `episodes_cut` falls as the policy holds its
+            # grasp longer even though nothing is wrong. `errors` > 0 means some
+            # episode's gripper state could not be read at all.
             "n_post_reopen_episodes_cut": self._n_post_reopen_episodes_cut,
             "n_post_reopen_chunks_dropped": self._n_post_reopen_chunks_dropped,
             "n_post_reopen_detected": self._n_post_reopen_detected,
@@ -1116,6 +1180,11 @@ class EpisodeBuffer:
                 int(max(self._post_reopen_kept_lens))
                 if self._post_reopen_kept_lens else 0
             ),
+            # Head-side cuts from pre_close_keep_chunks (0 when it is off). The
+            # post_reopen episodes_cut / chunks_dropped above are the TAIL side;
+            # the two chunk counters sum to num_chunks - num_train_chunks.
+            "n_pre_close_episodes_cut": self._n_pre_close_episodes_cut,
+            "n_pre_close_chunks_dropped": self._n_pre_close_chunks_dropped,
             # Per-group success rate spread (min/median/max across groups).
             # Reveals when the iter average masks a bimodal "some seeds at
             # 100%, others at 0%" pattern.

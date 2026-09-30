@@ -2,7 +2,22 @@
 
 Covers `gripper_release.py` (the detector primitives) and its wiring through
 the real `EpisodeBuffer.compute_advantages` / `_build_chunks`, plus the
-`GRPOConfig` validation matrix. No GPU, no MuJoCo, no model.
+`GRPOConfig` validation matrix, and the pre-close window
+(`pre_close_keep_chunks`) on top of it. No GPU, no MuJoCo, no model.
+
+The pre-close window's off path was also checked against the PRE-CHANGE modules
+out-of-tree (it cannot live in-tree once merged): main's scripts/grpo tree and
+this one, fed identical random buffers (blips, retries, stepped releases,
+starts-closed, NaN / missing-key / mirrored states, zero-chunk episodes; random
+outcomes, anchors, row budget, fixed_std, post N in 0..30, random detector
+knobs), comparing advantages, every chunk field, stats(), the counters and the
+printed log with pre_close_keep_chunks unset: 3000 cases, identical. The TB
+scalars, the wandb payload and the startup banner matched the same way (480
+emissions, 4 banners). The ON path was checked on 3000 more random buffers
+against a spec of the window rule (reusing the detector primitives). An
+independent audit repeated both checks: a broader off-path driver (4000 buffers;
+96 banners, 3200 TB and 1600 wandb emissions) and an ON-path check against a
+from-scratch re-implementation of the detector (6000 buffers).
 
 Run:  python scripts/grpo/test_gripper_release.py
 """
@@ -28,6 +43,7 @@ from gripper_release import (  # noqa: E402
     post_reopen_chunk_limit,
     post_reopen_detect,
     reopen_onset_index,
+    grasp_train_window,
 )
 
 # Per-episode (success, num_chunks, onset_idx) measured with the SHIPPED
@@ -58,6 +74,27 @@ ITER_0001_CROSS = [
     28, 24, 18, 19, 20, 20, 19, 22, 18, 21, 20, 24,
     22, 19, 17, 23, 20, 24, 31, 22, 20, 26, 23, 19,
     21, 22, 18, 24, 22, 49, 17, 23, 27, 17, 18, 17,
+]
+
+# The detected close (`close_cross_indices(...)[0]`, the first chunk of the
+# sub-close_below dwell) per episode — what `pre_close_keep_chunks` is timed from.
+ITER_0001_CLOSE = [
+    13, 17, 12, 7, 20, 14, 22, 15, 13, 12, 16, 15,
+    18, 15, 10, 12, 12, 11, 11, 13, 10, 12, 10, 15,
+    13, 11, 9, 15, 11, 13, 17, 13, 11, 17, 13, 9,
+    12, 13, 10, 14, 14, 24, 8, 13, 15, 8, 9, 9,
+]
+
+# First chunk of the contiguous close-COMMAND run (action.gripper_close > 0.5 on
+# any of the 8 executed substeps) that leads into each detected close. Credit
+# attaches to a chunk's action, so this is the chunk a pre-close window must
+# reach to keep the failed grasp itself. Both fixtures are re-derived from the
+# raw .npz by `test_real_npz_close_fixtures` when the collection is present.
+ITER_0001_CLOSE_CMD = [
+    11, 15, 11, 5, 18, 11, 21, 13, 11, 10, 13, 13,
+    16, 13, 8, 10, 10, 9, 9, 10, 8, 11, 8, 13,
+    11, 9, 7, 12, 9, 11, 15, 11, 9, 15, 11, 7,
+    10, 11, 8, 12, 13, 22, 6, 11, 13, 6, 8, 6,
 ]
 
 REAL_NPZ_DIR = Path(
@@ -1403,6 +1440,714 @@ def test_real_npz_dir_matches_fixture():
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. Pre-close window (pre_close_keep_chunks)
+# ---------------------------------------------------------------------------
+
+def pc(n, m, **kw):
+    """PostReopenFilter with the pre-close window on."""
+    return PostReopenFilter(n, pre_close_keep_chunks=m, **kw)
+
+
+def test_pre_close_semantics():
+    """M counts chunks strictly BEFORE the close; N still counts from the onset."""
+    # close 13, onset 21, crossing 22, of a 50-chunk episode.
+    st = states_from_widths(failure_widths())
+    assert close_cross_indices(gripper_widths(st))[0] == 13
+    assert grasp_train_window(st, PostReopenFilter(3)) == (21, None, 24), \
+        "off: exactly post_reopen_detect, no head cut"
+    for m, start in ((3, 10), (1, 12), (0, 13), (12, 1)):
+        assert grasp_train_window(st, pc(3, m)) == (21, start, 24), m
+    # The closed phase always survives, even at M=0 with N=0.
+    assert grasp_train_window(st, pc(0, 0)) == (21, 13, 21)
+    # A window that reaches chunk 0 is "no head cut", not a clamp.
+    for m in (13, 99):
+        assert grasp_train_window(st, pc(3, m)) == (21, None, 24), m
+
+    # The start follows the CLOSE: a longer hold moves the onset and the tail
+    # edge, never the head edge.
+    for onset in (18, 21, 30, 45):
+        st = states_from_widths(failure_widths(close_at=13, onset_at=onset))
+        assert grasp_train_window(st, pc(3, 3)) == (onset, 10, onset + 3), onset
+
+    # The motivating example: a 40-chunk failure closing at 27 and reopening
+    # at 35 trains on [0, 37) at N=2, and on [25, 37) once M=2 is added.
+    st = states_from_widths(failure_widths(n=40, close_at=27, onset_at=35))
+    assert grasp_train_window(st, PostReopenFilter(2)) == (35, None, 37)
+    assert grasp_train_window(st, pc(2, 2)) == (35, 25, 37)
+    print("  PASS: [close - M, onset + N); M >= close is no head cut; the head "
+          "edge ignores the hold length")
+
+
+def test_pre_close_inherits_the_close_guards():
+    """The start is timed from the DETECTED close, so the dwell and the
+    observed-open guards protect it exactly as they protect the onset."""
+    # One-chunk dip to 0.030 at chunk 3; real grasp 13-20, onset 21.
+    w = np.array([OPEN_W] * 3 + [0.030] + [OPEN_W] * 9
+                 + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 28)
+    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (21, 10, 24)
+    # Starts closed, re-approaches, real grasp 15-26: the start is 3 before 15,
+    # not 3 before the chunk-0 closed state.
+    w = np.array([0.001] * 3 + [OPEN_W] * 12 + [0.001] * 12
+                 + [RAMP_W, 0.001] + [OPEN_W] * 22)
+    assert close_cross_indices(w)[0] == 15
+    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (29, 12, 32)
+    # min_closed_chunks is honoured: a two-chunk dip is the close at dwell 2.
+    w2 = np.array([OPEN_W] * 3 + [0.030, 0.030] + [OPEN_W] * 8
+                  + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 28)
+    assert grasp_train_window(states_from_widths(w2), pc(3, 3)) == (21, 10, 24)
+    assert grasp_train_window(states_from_widths(w2),
+                              pc(3, 1, min_closed_chunks=2)) == (5, 2, 8)
+    print("  PASS: the head edge follows the dwell-guarded, open-first close")
+
+
+def test_pre_close_edges_are_independent():
+    """A reopen too late for the tail cut still gets its head cut, while a
+    refused (implausible) detection and a miss cut neither side."""
+    # episode_0041's shape: close 24, onset 48 of 50. The N=3 tail window
+    # overruns, but the head is still cut 3 chunks before the close.
+    st = states_from_widths(failure_widths(n=50, close_at=24, onset_at=48))
+    assert grasp_train_window(st, pc(3, 3)) == (48, 21, None)
+
+    # Refused: close 1, onset 4, and onset + N = 4 is below the floor of 5.
+    w = [OPEN_W] + [0.001] * 3 + [RAMP_W] + [OPEN_W] * 45
+    st = states_from_widths(w)
+    assert grasp_train_window(st, pc(0, 0)) == (4, None, None), "refused"
+    # The floor tests the PREFIX onset + N, not the window.
+    assert grasp_train_window(st, pc(1, 0)) == (4, 1, 5)
+    assert grasp_train_window(st, pc(0, 0, min_train_chunks=0)) == (4, 1, 4)
+
+    # No reopen found, and an empty episode: nothing on either side.
+    assert grasp_train_window(states_from_widths([OPEN_W] * 50), pc(3, 3)) \
+        == (None, None, None)
+    assert grasp_train_window([], pc(3, 3)) == (None, None, None)
+    # A misconfiguration still raises, exactly as post_reopen_detect does.
+    expect_raises(
+        ValueError, "never exceeds open_above",
+        lambda: grasp_train_window(
+            [{"gripper_qpos": np.array([[-w_ / 2.0, w_ / 2.0]])}
+             for w_ in failure_widths()], pc(3, 3)),
+        "mirrored convention",
+    )
+    print("  PASS: head and tail cut independently; refusal and miss cut "
+          "neither; misconfig raises")
+
+
+def test_pre_close_validation():
+    cases = [
+        (lambda: pc(3, -1), "pre_close_keep_chunks must be >= 0"),
+        (lambda: pc(3, 2.0), "must be an int or None"),
+        (lambda: pc(3, True), "must be an int or None"),
+        (lambda: pc(3, "3"), "must be an int or None"),
+    ]
+    for fn, match in cases:
+        expect_raises(ValueError, match, fn, "pre_close_keep_chunks validation")
+    # M=0 and N=0 is legal: the window is the closed phase, never empty.
+    assert pc(0, 0).pre_close_keep_chunks == 0
+    assert pc(3, np.int64(3)).pre_close_keep_chunks == 3
+    # The new field is LAST, so positional construction is unchanged.
+    f = PostReopenFilter(4, 0.035, 0.055, 0.004, 3, 5, "gripper_qpos")
+    assert f.pre_close_keep_chunks is None
+    print(f"  PASS: pre_close_keep_chunks validation ({len(cases)} cases)")
+
+
+def test_train_chunk_range_clamps():
+    """`train_chunk_start` is a public field; every clamp must hold."""
+    ep = make_episode(failure_widths(), False)
+    assert ep.train_chunk_range == range(50)
+    ep.train_chunk_start, ep.train_chunk_limit = 11, 24
+    assert ep.train_chunk_range == range(11, 24) and ep.num_train_chunks == 13
+    def edges(e):
+        # Compared as (start, stop): empty ranges all compare equal, so
+        # `range(30, 24) == range(24, 24)` would hide a missing clamp.
+        return e.train_chunk_range.start, e.train_chunk_range.stop
+    ep.train_chunk_start = -3
+    assert edges(ep) == (0, 24), "negative start clamps to 0"
+    ep.train_chunk_start = 30
+    assert edges(ep) == (24, 24), "start past the limit clamps to the limit"
+    assert ep.num_train_chunks == 0
+    ep.train_chunk_limit, ep.train_chunk_start = None, 49
+    assert edges(ep) == (49, 50)
+    ep.train_chunk_start = 60
+    assert edges(ep) == (50, 50) and ep.num_train_chunks == 0
+    ep.train_chunk_limit, ep.train_chunk_start = -5, 3
+    assert edges(ep) == (0, 0), "negative limit clamps to 0"
+    print("  PASS: train_chunk_range clamps start and limit at both ends")
+
+
+def _numbered(ep):
+    """Stamp every per-chunk array with its chunk index."""
+    for i in range(ep.num_chunks):
+        ep.actions[i][:] = i
+        ep.raw_actions[i][:] = i
+        ep.initial_noises[i][:] = i
+        ep.action_masks[i][:] = i
+    return ep
+
+
+def test_pre_close_through_the_buffer():
+    fail = _numbered(make_episode(failure_widths(), False))   # close 13, onset 21
+    late = _numbered(make_episode(                             # close 24, onset 48
+        failure_widths(n=50, close_at=24, onset_at=48), False))
+    b = buffer_from([fail, late, make_episode(success_widths(), True),
+                     make_episode(success_widths(), True)])
+    b.compute_advantages(post_reopen_filter=pc(3, 3))
+
+    assert fail.train_chunk_range == range(10, 24)
+    assert late.train_chunk_range == range(21, 50), "head cut despite no tail cut"
+    for ep in b.episodes:
+        if ep.success:
+            assert ep.train_chunk_range == range(ep.num_chunks), "successes whole"
+
+    # chunk_idx stays the index IN THE EPISODE, and every chunk carries that
+    # chunk's data — not the i-th retained chunk's.
+    chunks = b._build_chunks()
+    by_ep = {}
+    for c in chunks:
+        by_ep.setdefault(c.episode_idx, []).append(c)
+    assert [c.chunk_idx for c in by_ep[0]] == list(range(10, 24))
+    assert [c.chunk_idx for c in by_ep[1]] == list(range(21, 50))
+    assert [c.chunk_idx for c in by_ep[2]] == list(range(42))
+    for c in by_ep[0] + by_ep[1]:
+        ep = b.episodes[c.episode_idx]
+        assert c.state is ep.states[c.chunk_idx]
+        assert c.video_frames is ep.video_frames[c.chunk_idx]
+        for arr in (c.action, c.raw_action, c.initial_noise, c.action_mask):
+            assert np.all(arr == c.chunk_idx), c.chunk_idx
+
+    s = b.stats()
+    assert s["n_post_reopen_detected"] == 2
+    assert s["n_post_reopen_episodes_cut"] == 1, "tail side: only `fail`"
+    assert s["n_post_reopen_chunks_dropped"] == 26
+    assert s["n_pre_close_episodes_cut"] == 2, "head side: both failures"
+    assert s["n_pre_close_chunks_dropped"] == 10 + 21
+    assert s["num_train_chunks"] == 14 + 29 + 2 * 42
+    assert s["num_chunks"] - s["num_train_chunks"] == (
+        s["n_post_reopen_chunks_dropped"] + s["n_pre_close_chunks_dropped"])
+    assert (s["post_reopen_kept_len_min"], s["post_reopen_kept_len_median"],
+            s["post_reopen_kept_len_max"]) == (14, 21.5, 29)
+    print("  PASS: window reaches _build_chunks with episode chunk indices; "
+          "per-side counters right")
+
+
+def test_pre_close_zero_sum_and_magnification():
+    """The window RELOCATES credit like the tail cut does; it must not shrink it."""
+    def mk():
+        return buffer_from([make_episode(failure_widths(onset_at=r), False)
+                            for r in (18, 22, 26)]
+                           + [make_episode(success_widths(), True)])
+    b = mk()
+    adv = b.compute_advantages(post_reopen_filter=pc(3, 3)).copy()
+    chunks = b._build_chunks()
+    for i, ep in enumerate(b.episodes):
+        got = sum(c.advantage for c in chunks if c.episode_idx == i)
+        assert abs(got - adv[i]) < 1e-9, (i, got, adv[i])
+    assert [ep.train_chunk_range for ep in b.episodes[:3]] == \
+        [range(10, 21), range(10, 25), range(10, 29)]
+    assert abs(sum(c.advantage for c in chunks)) < 1e-9
+
+    uncut = mk()
+    uncut.compute_advantages()
+    per_row = {c.episode_idx: c.advantage for c in uncut._build_chunks()}
+    for c in chunks:
+        ep = b.episodes[c.episode_idx]
+        ratio = ep.num_chunks / ep.num_train_chunks
+        assert abs(c.advantage - per_row[c.episode_idx] * ratio) < 1e-12
+    print("  PASS: Σ A_chunk == A_ep, group zero-sum, magnification nc/kept")
+
+
+def test_pre_close_kept_whole_cases():
+    """No detected reopen, a refused detection, an unreadable episode: all whole."""
+    import contextlib
+    import io
+    never = [OPEN_W] * 50
+    for i in range(23, 50):
+        never[i] = MUG_W
+    early = [OPEN_W] + [0.001] * 3 + [RAMP_W] + [OPEN_W] * 45   # onset 4
+    nan = make_episode(failure_widths(), False)
+    nan.states[7] = {"gripper_qpos": np.array([[np.nan, 0.0]])}
+    b = buffer_from([make_episode(never, False), make_episode(early, False), nan,
+                     make_episode(failure_widths(), False),
+                     make_episode(success_widths(), True)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        b.compute_advantages(post_reopen_filter=pc(0, 2))
+    for ep in b.episodes[:3]:
+        assert ep.train_chunk_range == range(ep.num_chunks), ep.episode_idx
+    assert b.episodes[3].train_chunk_range == range(11, 21)
+    s = b.stats()
+    assert (s["n_post_reopen_implausible"], s["n_post_reopen_errors"]) == (1, 1)
+    assert s["n_pre_close_episodes_cut"] == 1
+    print("  PASS: miss, refusal and error all keep the failure whole")
+
+
+def test_pre_close_idempotent_and_self_clearing():
+    b = buffer_from([make_episode(failure_widths(), False),
+                     make_episode(success_widths(), True)])
+    b.compute_advantages(post_reopen_filter=pc(3, 3))
+    first = [(c.chunk_idx, c.advantage) for c in b._build_chunks()]
+    assert b.episodes[0].train_chunk_range == range(10, 24)
+    b.compute_advantages(post_reopen_filter=pc(3, 3))
+    assert [(c.chunk_idx, c.advantage) for c in b._build_chunks()] == first
+
+    # Dropping the window restores the head and leaves the tail cut in place.
+    b.compute_advantages(post_reopen_filter=PostReopenFilter(3))
+    assert b.episodes[0].train_chunk_range == range(0, 24)
+    assert b.stats()["n_pre_close_chunks_dropped"] == 0
+    assert b.stats()["n_pre_close_episodes_cut"] == 0
+    # Fully off: both edges reset, no stale chunk memo.
+    b.compute_advantages(post_reopen_filter=pc(3, 5))
+    b.compute_advantages(post_reopen_filter=None)
+    assert b.episodes[0].train_chunk_start == 0
+    assert b.episodes[0].train_chunk_limit is None
+    assert len(b._build_chunks()) == b.num_chunks
+    # The empty-buffer early return and clear() reset the new counters too.
+    b.compute_advantages(post_reopen_filter=pc(3, 3))
+    b.clear()
+    assert (b._n_pre_close_episodes_cut, b._n_pre_close_chunks_dropped) == (0, 0)
+    b2 = buffer_from([make_episode(failure_widths(), False),
+                      make_episode(success_widths(), True)])
+    b2.compute_advantages(post_reopen_filter=pc(3, 3))
+    b2.episodes = []
+    b2.compute_advantages(post_reopen_filter=pc(3, 3))
+    assert (b2._n_pre_close_episodes_cut, b2._n_pre_close_chunks_dropped) == (0, 0)
+    print("  PASS: idempotent, self-clearing on both edges, no stale memo")
+
+
+def test_pre_close_anchor_budget():
+    """Anchors stay whole; the budget's signal denominator sees the window."""
+    b = buffer_from(
+        [make_episode(success_widths(), True, group_id=0) for _ in range(2)]
+        + [make_episode(success_widths(), True, group_id=1),
+           make_episode(failure_widths(), False, group_id=1)]
+    )
+    b.compute_advantages(anchor_advantage=0.2, include_anchor_groups=True,
+                         post_reopen_filter=pc(3, 3))
+    assert all(ep.num_train_chunks == ep.num_chunks
+               for ep in b.episodes if ep.success)
+    s = b.stats()
+    assert s["n_signal_chunks"] == 42 + 14, s["n_signal_chunks"]
+    assert s["n_anchor_episodes"] == 1 and s["n_anchor_episodes_dropped"] == 1
+    print("  PASS: anchors uncut; the row budget counts the windowed failure")
+
+
+def test_pre_close_dead_group():
+    """An all-fail group is windowed like any failure, and stays dead."""
+    b = buffer_from([make_episode(failure_widths(), False) for _ in range(4)])
+    adv = b.compute_advantages(post_reopen_filter=pc(3, 3))
+    assert [ep.train_chunk_range for ep in b.episodes] == [range(10, 24)] * 4
+    assert np.all(adv == 0.0) and b.stats()["n_signal_chunks"] == 0
+    assert all(c.advantage == 0.0 for c in b._build_chunks())
+    print("  PASS: an all-fail group stays dead after windowing")
+
+
+def test_pre_close_summary_log_line():
+    import contextlib
+    import io
+    # M != N and head count != tail count, so no two fields can be swapped
+    # unnoticed: two failures kept [11, 24) and a late one kept [22, 50).
+    b = buffer_from([make_episode(failure_widths(), False) for _ in range(2)]
+                    + [make_episode(failure_widths(n=50, close_at=24, onset_at=48),
+                                    False),
+                       make_episode(success_widths(), True)])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        b.compute_advantages(post_reopen_filter=pc(3, 2))
+    text = out.getvalue()
+    assert ("keep 2 chunk(s) before the close and 3 from the reopen onset"
+            in text), text
+    assert "in 3/3 failing episode(s)" in text, text
+    assert "cut the head of 3 and the tail of 2" in text, text
+    # head 11 + 11 + 22 = 44, tail 26 + 26 = 52, of 150 failure chunks.
+    assert "dropping 96/150 failure chunks (64.0%: 44 head, 52 tail)" in text, text
+    print("  PASS: the summary line reports both edges with the right numbers")
+
+
+def test_pre_close_config():
+    from grpo_config import GRPOConfig
+    base = dict(env_names=["robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"])
+    f = GRPOConfig(**base, post_reopen_keep_chunks=3,
+                   pre_close_keep_chunks=3).build_post_reopen_filter()
+    assert f == PostReopenFilter(3, pre_close_keep_chunks=3)
+    assert GRPOConfig(**base, post_reopen_keep_chunks=3) \
+        .build_post_reopen_filter().pre_close_keep_chunks is None, "default is OFF"
+    assert GRPOConfig(**base).pre_close_keep_chunks is None
+    c = GRPOConfig(**base, post_reopen_keep_chunks=3, pre_close_keep_chunks=3)
+    c.pre_close_keep_chunks = 5
+    assert c.build_post_reopen_filter().pre_close_keep_chunks == 5, "live rebuild"
+    # M=0 with N=0 is accepted: the window is the closed phase.
+    assert GRPOConfig(**base, post_reopen_keep_chunks=0, pre_close_keep_chunks=0) \
+        .build_post_reopen_filter() == PostReopenFilter(0, pre_close_keep_chunks=0)
+    cases = [
+        # Read only through the filter, so it is inert with the filter off.
+        (dict(pre_close_keep_chunks=3), "post_reopen_keep_chunks is None"),
+        (dict(pre_close_keep_chunks=0), "post_reopen_keep_chunks is None"),
+        (dict(post_reopen_keep_chunks=3, pre_close_keep_chunks=-1),
+         "must be >= 0"),
+        (dict(post_reopen_keep_chunks=3, pre_close_keep_chunks=1.5),
+         "must be an int or None"),
+    ]
+    for kwargs, match in cases:
+        expect_raises(ValueError, match, lambda k=kwargs: GRPOConfig(**base, **k),
+                      f"GRPOConfig({kwargs})")
+    try:
+        import tyro
+    except ImportError:
+        print("  (tyro not installed; CLI parse check skipped)")
+    else:
+        c = tyro.cli(GRPOConfig, args=["--post-reopen-keep-chunks", "3",
+                                       "--pre-close-keep-chunks", "3"])
+        assert (c.post_reopen_keep_chunks, c.pre_close_keep_chunks) == (3, 3)
+        assert tyro.cli(GRPOConfig, args=[]).pre_close_keep_chunks is None
+    print(f"  PASS: GRPOConfig wiring, CLI flag, {len(cases)} rejections")
+
+
+def test_pre_close_custom_key_and_widths():
+    """The close is re-detected with the SAME key and thresholds as the onset."""
+    # A custom state key reaches the second width read too.
+    st = states_from_widths(failure_widths(), key="fingers")
+    assert grasp_train_window(st, pc(3, 3, state_key="fingers")) == (21, 10, 24)
+    # 0.040 is inside the default band but a close at close_below=0.045, so the
+    # close index (and only it) depends on the configured widths.
+    w = [OPEN_W] * 5 + [0.040] * 3 + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 33
+    st = states_from_widths(w)
+    assert close_cross_indices(np.array(w))[0] == 8
+    assert close_cross_indices(np.array(w), 0.045, 0.06)[0] == 5
+    assert grasp_train_window(st, pc(3, 2)) == (16, 6, 19)
+    assert grasp_train_window(
+        st, pc(3, 2, close_below=0.045, open_above=0.06)) == (16, 3, 19)
+    # A gripper that only opens to 0.052 is "open" only at open_above=0.05, so
+    # the observed-open-first rule binds on the configured width as well.
+    w = [0.052] * 5 + [0.001] * 8 + [RAMP_W] + [0.052] * 36
+    assert grasp_train_window(states_from_widths(w), pc(3, 2, open_above=0.05)) \
+        == (13, 3, 16)
+    print("  PASS: the head edge honours a custom state key and custom widths")
+
+
+def test_pre_close_states_outnumber_actions():
+    """A head cut that would empty an episode is not applied.
+
+    The start is found on the states but clamped to the actions, so this is
+    reachable only with more states than actions. _load_single_episode never
+    builds such an episode, but the window must not silently empty one.
+    """
+    w = failure_widths(n=50, close_at=27, onset_at=35)
+    cases = ((20, range(0, 20)),    # start 24 past the 20 actions
+             (24, range(0, 24)),    # start 24 == stop: would be exactly empty
+             (25, range(24, 25)),   # one row left, so the cut applies
+             (30, range(24, 30)))
+    for n_actions, want in cases:
+        ep = make_episode(w, False, n_chunks=n_actions)
+        b = buffer_from([ep, make_episode(success_widths(), True)])
+        b.compute_advantages(post_reopen_filter=pc(3, 3))
+        got = ep.train_chunk_range
+        assert (got.start, got.stop) == (want.start, want.stop), (n_actions, got)
+        assert abs(sum(c.advantage for c in b._build_chunks())) < 1e-9
+    print("  PASS: a head cut past the actions is dropped, not an empty window")
+
+
+def test_pre_close_gap_survey_position():
+    """_per_chunk_gap_survey normalises position over each episode's RETAINED rows.
+
+    A head cut starts a failure's rows mid-episode. Normalising by chunk_idx
+    alone pins every failure row to the late bins, turning an outcome effect
+    into a position effect: r(position) = +0.38 on the buffer below, with a gap
+    that depends on outcome only (+0.007 with the tail cut alone).
+    """
+    import contextlib
+    import io
+    import threading
+    import torch
+    import train_grpo as tg
+    from grpo_config import GRPOConfig
+
+    def buf(filt):
+        eps = []
+        for gid in range(4):
+            # A one-chunk success: zero span, so its position must read 0.
+            eps.append(make_episode([OPEN_W], True, group_id=gid))
+            for k in range(8):
+                if k < 3:
+                    eps.append(make_episode(
+                        success_widths(n=40, close_at=20, onset_at=34), True,
+                        group_id=gid))
+                else:
+                    c = 10 + (7 * gid + k) % 8
+                    eps.append(make_episode(failure_widths(
+                        n=50, close_at=c, onset_at=c + 6 + (3 * gid + k) % 6),
+                        False, group_id=gid))
+        b = buffer_from(eps)
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.compute_advantages(post_reopen_filter=filt)
+        return b
+
+    def survey(b, gap_of):
+        tr = tg.GRPOTrainer.__new__(tg.GRPOTrainer)
+        # A survey size above the chunk count samples every chunk, so no
+        # assertion below depends on which chunks the stratified draw picks.
+        tr.config = GRPOConfig(per_chunk_gap_survey_size=10**6, tau_centers=[0.5])
+        tr.iteration, tr.device = 1, "cpu"
+        tr._model_lock = threading.Lock()
+        tr.model = type("M", (), {"action_head": None})()
+        chunks = [c for c in b._build_chunks() if abs(c.advantage) > 1e-12]
+        for c in chunks:
+            c.ref_log_prob = -1.0
+            c.tau_samples = np.array([0.5], np.float32)
+
+        def prep(entries):
+            valid = [c for c, _ in entries]
+            lp = torch.tensor([c.ref_log_prob - gap_of(c) for c in valid],
+                              dtype=torch.float64)
+            return ({"initial_noise": torch.zeros(len(valid), 2, 2),
+                     "backbone_output": None, "state_features": None,
+                     "embodiment_id": None, "actions": lp,
+                     "action_masks": None}, valid)
+        tr._prepare_batch = prep
+        real = tg.compute_fm_log_prob
+        tg.compute_fm_log_prob = lambda **kw: kw["actions"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return tr._per_chunk_gap_survey(chunks)
+        finally:
+            tg.compute_fm_log_prob = real
+
+    def by_outcome(c):
+        return 0.010 if c.episode_success else 0.020
+
+    for filt in (PostReopenFilter(3), pc(3, 3)):
+        out = survey(buf(filt), by_outcome)
+        assert abs(out["r_position"]) < 0.05, (filt, out["r_position"])
+    # Planting the gap AS the within-window position must read back r = 1.
+    b = buf(pc(3, 3))
+    assert any(ep.train_chunk_range.start > 0 for ep in b.episodes)
+    window = {i: ep.train_chunk_range for i, ep in enumerate(b.episodes)}
+
+    def planted(c):
+        r = window[c.episode_idx]
+        span = r.stop - 1 - r.start
+        return 0.01 + 0.01 * ((c.chunk_idx - r.start) / span if span else 0.0)
+    out = survey(b, planted)
+    assert out["n"] == sum(ep.num_train_chunks for ep in b.episodes), "all sampled"
+    assert out["r_position"] > 0.999, out["r_position"]
+    print("  PASS: the gap survey's position axis ignores the head cut")
+
+
+PRE_CLOSE_TAGS = (
+    "episode/n_pre_close_episodes_cut",
+    "episode/n_pre_close_chunks_dropped",
+)
+
+
+def _pre_close_stats(post, m):
+    import contextlib
+    import io
+    from grpo_config import GRPOConfig
+    b = buffer_from([make_episode(failure_widths(onset_at=o), False)
+                     for o in (18, 21, 24)]
+                    + [make_episode(success_widths(), True)])
+    cfg = GRPOConfig(env_names=["robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"],
+                     post_reopen_keep_chunks=post, pre_close_keep_chunks=m)
+    with contextlib.redirect_stdout(io.StringIO()):
+        b.compute_advantages(post_reopen_filter=cfg.build_post_reopen_filter())
+    return cfg, b.stats()
+
+
+def test_pre_close_tb_emission():
+    runs = [_pre_close_stats(p, m) for p, m in ((None, None), (3, None), (3, 3))]
+    off, post_only, on = (_emit_metrics(c, s) for c, s in runs)
+    for tag in PRE_CLOSE_TAGS:
+        assert tag not in off and tag not in post_only, f"{tag} leaked"
+        assert tag in on, f"{tag} missing with the window on"
+    # Key sets only grow: nothing a lesser configuration emits is lost.
+    assert set(off) <= set(post_only) <= set(on)
+    assert set(on) - set(post_only) == set(PRE_CLOSE_TAGS)
+    # close 13 for all three; onsets 18/21/24 -> windows [10,21) [10,24) [10,27).
+    assert on["episode/n_pre_close_episodes_cut"] == 3
+    assert on["episode/n_pre_close_chunks_dropped"] == 3 * 10
+    assert on["episode/n_post_reopen_chunks_dropped"] == 29 + 26 + 23
+    assert on["episode/num_train_chunks"] == (11 + 14 + 17) + 42
+    assert on["episode/post_reopen_kept_len_min"] == 11
+    assert on["episode/post_reopen_kept_len_max"] == 17
+    print(f"  PASS: {len(PRE_CLOSE_TAGS)} tags gated on the window; a post-only "
+          f"run's key set is unchanged; values correct")
+
+
+def test_pre_close_wandb_payload():
+    """Behavioral: build the payload the real _log_metrics sends to wandb."""
+    import types
+    import train_grpo as tg
+    from grpo_config import GRPOConfig
+    fake_wandb = types.ModuleType("wandb")
+    sent = []
+    fake_wandb.log = lambda d: sent.append(dict(d))
+    saved = sys.modules.get("wandb")
+    sys.modules["wandb"] = fake_wandb
+    pre_keys = {"n_pre_close_episodes_cut", "n_pre_close_chunks_dropped"}
+    post_keys = {"n_post_reopen_episodes_cut", "n_post_reopen_chunks_dropped",
+                 "n_post_reopen_detected", "num_train_chunks"}
+    try:
+        payload = {}
+        for tag, post, m in (("off", None, None), ("post", 3, None),
+                             ("pre", 3, 3)):
+            _, st = _pre_close_stats(post, m)
+            assert pre_keys <= set(st), "stats() reports them unconditionally"
+            tr = tg.GRPOTrainer.__new__(tg.GRPOTrainer)
+            tr.config = GRPOConfig(use_wandb=True, post_reopen_keep_chunks=post,
+                                   pre_close_keep_chunks=m)
+            tr.iteration = 4
+            tr.writer = _RecordingWriter()
+            tr._ref_mse_stats = None
+            tr._chunk_gap_stats = None
+            sent.clear()
+            tg.GRPOTrainer._log_metrics(tr, 4, st, update_stats=None,
+                                        lr=1e-5, iter_time=1.0)
+            payload[tag] = set(sent[0]) if sent else set()
+    finally:
+        if saved is None:
+            sys.modules.pop("wandb", None)
+        else:
+            sys.modules["wandb"] = saved
+    assert payload["off"], "wandb.log was never called"
+    assert not (payload["off"] & (pre_keys | post_keys)), payload["off"]
+    assert post_keys <= payload["post"] and not (payload["post"] & pre_keys)
+    assert (pre_keys | post_keys) <= payload["pre"]
+    assert payload["pre"] - payload["post"] == pre_keys
+    print("  PASS: wandb payload gains the pre-close keys only with the window on")
+
+
+def test_pre_close_banner():
+    import contextlib
+    import io
+    import tempfile
+    import test_vel_anchor as tva
+    lines = {}
+    for m, anchors in ((None, False), (2, False), (None, True), (2, True)):
+        with tempfile.TemporaryDirectory() as tmp:
+            t, _calls, _saves = tva._loop_trainer(tmp, config_overrides=dict(
+                post_reopen_keep_chunks=3, pre_close_keep_chunks=m,
+                include_anchor_groups=anchors))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                t.train()
+        lines[m, anchors] = out.getvalue()
+    off, on = lines[None, False], lines[2, False]
+    assert "Post-reopen truncation: ON" in off
+    assert "Pre-close window" not in off
+    assert "drops ~half the failure rows" in off
+    assert ("Pre-close window: ON (keep 2 chunk(s) BEFORE the close too; each "
+            "cut failure trains on 2 + its closed phase + 3 rows)") in on
+    assert ("NOTE: rows the pre-close window drops also shorten each epoch "
+            "(ceil(live_rows/8) mini-batches); watch train/n_updates.") in on
+    # No step-budget magnitude or --update-epochs remedy is claimed for it.
+    assert "~1/3" not in on and "restores the budget" not in on
+    assert "drops ~half" not in on
+    # The anchor NOTE keeps its pre-feature wording exactly when the window is off.
+    assert ("shrinks the anchor row budget's signal denominator and halves the "
+            "anchor:erosion weight ratio. Re-derive --anchor-advantage (~2x) "
+            "before trusting this pairing.") in lines[None, True]
+    assert ("cuts the anchor:erosion weight ratio (~3.6x at pre-close 3 / post "
+            "3). Re-derive --anchor-advantage (~3.6x) before trusting this "
+            "pairing.") in lines[2, True]
+    print("  PASS: the banner states the window, and its row cost, only when on")
+
+
+def _window_curve(pairs):
+    """(head, tail) failure chunks dropped per (N, M), through the REAL buffer.
+
+    Each fixture row becomes a synthetic trace with the same (num_chunks,
+    close, onset), so the shipped window rule and counters produce the numbers.
+    """
+    import contextlib
+    import io
+    eps = []
+    for (succ, nc, onset), close in zip(ITER_0001, ITER_0001_CLOSE):
+        shape = success_widths if succ else failure_widths
+        ep = make_episode(shape(n=nc, close_at=close, onset_at=onset), bool(succ))
+        assert close_cross_indices(gripper_widths(ep.states))[0] == close
+        assert reopen_onset_index(gripper_widths(ep.states)) == onset
+        eps.append(ep)
+    b = buffer_from(eps)
+    out = {}
+    for n, m in pairs:
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.compute_advantages(
+                post_reopen_filter=PostReopenFilter(n, pre_close_keep_chunks=m))
+        s = b.stats()
+        assert s["n_post_reopen_detected"] == 43
+        out[(n, m)] = (s["n_pre_close_chunks_dropped"],
+                       s["n_post_reopen_chunks_dropped"])
+    return out
+
+
+def test_iter_0001_pre_close_curve():
+    """Every (N, M) number quoted in grpo_config.py and the README."""
+    curve = _window_curve([(3, None), (3, 0), (3, 2), (3, 3), (3, 5), (3, 10),
+                           (2, 3)])
+    fail_total, all_total = 2150, 2321
+    expected = {(3, None): (0, 1123), (3, 0): (541, 1123), (3, 2): (455, 1123),
+                (3, 3): (412, 1123), (3, 5): (326, 1123), (3, 10): (122, 1123),
+                (2, 3): (412, 1165)}
+    for key, want in expected.items():
+        assert curve[key] == want, (key, curve[key], want)
+    # The README table, row by row: (failure %, all-chunk %, optimizer steps at
+    # the default mini_batch_size=8 x update_epochs=2 on one all-live iteration).
+    import math
+    table = {None: (52.2, 48.4, 300), 0: (77.4, 71.7, 166), 2: (73.4, 68.0, 186),
+             3: (71.4, 66.1, 198), 5: (67.4, 62.4, 218), 10: (57.9, 53.6, 270)}
+    for m, (pf, pa, steps) in table.items():
+        d = sum(curve[(3, m)])
+        assert abs(100 * d / fail_total - pf) < 0.05, (m, 100 * d / fail_total)
+        assert abs(100 * d / all_total - pa) < 0.05, (m, 100 * d / all_total)
+        assert 2 * math.ceil((all_total - d) / 8) == steps, m
+    assert 2 * math.ceil(all_total / 8) == 582, "the uncut budget"
+
+    # Why the close is the anchor. Credit attaches to a chunk's action, so the
+    # chunk the window must reach is the first close-COMMAND chunk. It leads
+    # the detected close by 1-3 chunks on all 43 failures, but leads the reopen
+    # onset by 8-26, because the closed phase varies in length.
+    fails = [(c, o, cmd) for (s, _, o), c, cmd in
+             zip(ITER_0001, ITER_0001_CLOSE, ITER_0001_CLOSE_CMD) if not s]
+    by_close = sorted(c - cmd for c, _, cmd in fails)
+    by_onset = sorted(o - cmd for _, o, cmd in fails)
+    assert (by_close[0], by_close[-1]) == (1, 3), by_close
+    assert (by_onset[0], by_onset[-1]) == (8, 26), by_onset
+    kept = {m: sum(1 for x in by_close if x <= m) for m in (0, 2, 3, 5, 10)}
+    assert kept == {0: 0, 2: 38, 3: 43, 5: 43, 10: 43}, kept
+    approach = [3 - x for x in by_close]   # chunks kept before the command at M=3
+    assert (int(np.median(approach)), max(approach)) == (1, 2), approach
+    closed = sorted(o - c for c, o, _ in fails)
+    assert (closed[0], closed[-1]) == (6, 24), closed
+    print("  PASS: iter_0001 pre-close curve (M=3, N=3: 71.4% / 66.1%; close "
+          "command kept in 38/43 at M=2, 43/43 at M=3)")
+
+
+def test_real_npz_close_fixtures():
+    """Re-derive ITER_0001_CLOSE and ITER_0001_CLOSE_CMD from the raw .npz."""
+    if not REAL_NPZ_DIR.is_dir():
+        print(f"  SKIP: {REAL_NPZ_DIR} not present (fixture-only run)")
+        return
+    closes, cmds = [], []
+    for path in sorted(REAL_NPZ_DIR.glob("episode_*.npz")):
+        d = np.load(path, allow_pickle=True)
+        nc = int(d["num_chunks"])
+        w = gripper_widths(
+            [{"gripper_qpos": d[f"state_gripper_qpos_{i}"]} for i in range(nc)]
+        )
+        cmd = [
+            np.asarray(d[f"action_{i}"].item()["action.gripper_close"])
+            .reshape(-1)[:8].max() > 0.5
+            for i in range(nc)
+        ]
+        i = close_cross_indices(w)[0]
+        closes.append(i)
+        while i > 0 and cmd[i - 1]:
+            i -= 1
+        cmds.append(i)
+    assert closes == ITER_0001_CLOSE, "close fixture drift"
+    assert cmds == ITER_0001_CLOSE_CMD, "close-command fixture drift"
+    print(f"  PASS: {len(closes)} real episodes reproduce the close and "
+          f"close-command fixtures")
+
+
 if __name__ == "__main__":
     print("=== post-reopen truncation ===\n")
     print("Detector primitives:")
@@ -1447,4 +2192,26 @@ if __name__ == "__main__":
     test_iter_0001_curve()
     test_monotonicity_guard_is_free_on_real_data()
     test_real_npz_dir_matches_fixture()
+    print("\nPre-close window:")
+    test_pre_close_semantics()
+    test_pre_close_inherits_the_close_guards()
+    test_pre_close_edges_are_independent()
+    test_pre_close_validation()
+    test_train_chunk_range_clamps()
+    test_pre_close_through_the_buffer()
+    test_pre_close_zero_sum_and_magnification()
+    test_pre_close_kept_whole_cases()
+    test_pre_close_idempotent_and_self_clearing()
+    test_pre_close_anchor_budget()
+    test_pre_close_dead_group()
+    test_pre_close_summary_log_line()
+    test_pre_close_config()
+    test_pre_close_custom_key_and_widths()
+    test_pre_close_states_outnumber_actions()
+    test_pre_close_gap_survey_position()
+    test_pre_close_tb_emission()
+    test_pre_close_wandb_payload()
+    test_pre_close_banner()
+    test_iter_0001_pre_close_curve()
+    test_real_npz_close_fixtures()
     print("\nAll tests PASSED.")

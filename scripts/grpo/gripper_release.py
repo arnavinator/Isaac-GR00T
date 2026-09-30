@@ -2,8 +2,8 @@
 
 Self-contained primitives, model-free and MuJoCo-free, so every piece is
 testable on CPU without a DiT or a simulator. ``episode_buffer`` is the only
-consumer; it calls :func:`post_reopen_detect` once per episode and stores the
-limit on ``GRPOEpisode.train_chunk_limit``.
+consumer; it calls :func:`grasp_train_window` once per episode and stores the
+window on ``GRPOEpisode.train_chunk_start`` / ``train_chunk_limit``.
 
 The problem
 -----------
@@ -39,6 +39,15 @@ Credit in a policy-gradient update attaches to a chunk's ACTION, so the two
 profiles above disagree about where to cut by exactly one chunk and the action
 one decides it: ``keep_chunks = 3`` retains the three chunks whose actions are
 still local and drops from the first ballistic command.
+
+``pre_close_keep_chunks = M`` adds a FRONT edge, anchored at the close: the
+failure then trains on ``[close_idx - M, onset + keep_chunks)`` and its approach
+is dropped too. Those approach chunks are near-identical to the approach of the
+successes in the same group, so pushing them down cancels the successes' push
+up. Anchored at the close rather than the reopen because the close-to-onset
+span varies (6-24 chunks on the reference data), while the first chunk that
+commands the close (any executed substep > 0.5) sits 1-3 chunks before
+``close_idx`` on every failure. See README "Pre-close window".
 
 The detector
 ------------
@@ -146,9 +155,9 @@ SOME point, which the approach phase satisfies. Watch
 ratio is the hit rate and is the only thing that reveals them.
 ``episode/n_post_reopen_episodes_cut`` is NOT a hit rate -- an episode whose
 onset lands within ``keep_chunks`` of the end is detected and correctly left
-whole -- and neither counter catches a ``keep_chunks`` so large that nothing is
-ever cut, which is why ``_apply_post_reopen_filter`` prints its summary
-unconditionally.
+uncut at the tail -- and neither counter catches a ``keep_chunks`` so large
+that nothing is ever cut, which is why ``_apply_post_reopen_filter`` prints its
+summary unconditionally.
 
 Scope
 -----
@@ -197,7 +206,8 @@ class PostReopenFilter:
     # width clears `open_above`. `keep_chunks=4` keeps onset, onset+1, onset+2,
     # onset+3 and drops everything from onset+4 to the end; `keep_chunks=0`
     # drops the onset chunk itself. Everything BEFORE the onset -- the whole
-    # approach and the closed phase -- is always kept.
+    # approach and the closed phase -- is kept unless `pre_close_keep_chunks`
+    # trims the approach.
     keep_chunks: int
     close_below: float = DEFAULT_CLOSE_BELOW
     open_above: float = DEFAULT_OPEN_ABOVE
@@ -221,6 +231,12 @@ class PostReopenFilter:
     # cannot see one (`detected` reads a perfect hit rate in exactly that case).
     min_train_chunks: int = DEFAULT_MIN_TRAIN_CHUNKS
     state_key: str = GRIPPER_STATE_KEY
+    # Chunks retained strictly BEFORE the close (``close_idx``, the first
+    # sub-``close_below`` chunk): M keeps [close_idx - M, close_idx) and drops
+    # everything earlier; the closed phase itself is always kept. None
+    # (default) keeps the whole prefix. Last field so positional construction
+    # is unchanged. See README "Pre-close window".
+    pre_close_keep_chunks: "int | None" = None
 
     def __post_init__(self):
         # numbers.Integral, not `int`: numpy integer scalars are the natural
@@ -314,6 +330,22 @@ class PostReopenFilter:
                 f"post_reopen_state_key must be a non-empty string, got "
                 f"{self.state_key!r}"
             )
+        # No emptiness check is needed: the window always holds the closed phase
+        # [close_idx, onset), and the onset is strictly after the close.
+        if self.pre_close_keep_chunks is not None:
+            if isinstance(self.pre_close_keep_chunks, bool) or not isinstance(
+                self.pre_close_keep_chunks, numbers.Integral
+            ):
+                raise ValueError(
+                    f"pre_close_keep_chunks must be an int or None, got "
+                    f"{type(self.pre_close_keep_chunks).__name__}"
+                )
+            if self.pre_close_keep_chunks < 0:
+                raise ValueError(
+                    f"pre_close_keep_chunks must be >= 0, got "
+                    f"{self.pre_close_keep_chunks}. 0 keeps nothing before the "
+                    f"close; leave the knob at None to keep the whole prefix."
+                )
 
 
 def gripper_widths(
@@ -555,3 +587,33 @@ def post_reopen_chunk_limit(
     detector miss from a correct no-op must use that function instead.
     """
     return post_reopen_detect(states, cfg)[1]
+
+
+def grasp_train_window(
+    states: "list[dict[str, np.ndarray]]",
+    cfg: PostReopenFilter,
+) -> "tuple[int | None, int | None, int | None]":
+    """``(onset, start, limit)`` -- the retained window is ``[start, limit)``.
+
+    ``onset`` and ``limit`` are exactly :func:`post_reopen_detect`'s. ``start``
+    is ``close_idx - cfg.pre_close_keep_chunks``, or ``None`` for "keep from
+    chunk 0": the window is off, no reopen was found, the window already
+    reaches chunk 0, or the detection was refused as implausible (a refusal cuts
+    neither side). Otherwise the two edges are independent, so a reopen too
+    late for the tail cut still gets its head cut.
+    """
+    onset, limit = post_reopen_detect(states, cfg)
+    if (
+        onset is None
+        or cfg.pre_close_keep_chunks is None
+        or onset + cfg.keep_chunks < cfg.min_train_chunks
+    ):
+        return onset, None, limit
+    # Widths are re-read only with the window on, so the off path is exactly
+    # post_reopen_detect. A found onset implies a found close on these widths.
+    close_idx, _ = close_cross_indices(
+        gripper_widths(states, cfg.state_key),
+        cfg.close_below, cfg.open_above, cfg.min_closed_chunks,
+    )
+    start = close_idx - cfg.pre_close_keep_chunks
+    return onset, (start if start > 0 else None), limit

@@ -1196,25 +1196,43 @@ class GRPOTrainer:
                 f"{self.config.post_reopen_min_closed_chunks} on "
                 f"'{self.config.post_reopen_state_key}')"
             )
+            pre = self.config.pre_close_keep_chunks
+            if pre is not None:
+                print(
+                    f"    Pre-close window: ON (keep {pre} chunk(s) BEFORE the "
+                    f"close too; each cut failure trains on {pre} + its closed "
+                    f"phase + {self.config.post_reopen_keep_chunks} rows)"
+                )
             # The dominant operational effect, and the one nothing else surfaces:
             # the balanced sampler sizes an epoch as ceil(live_rows/mb_size), so
             # dropping roughly half the rows halves the optimizer steps per
             # iteration at an unchanged learning rate.
-            print(
-                f"    NOTE: this drops ~half the failure rows, which HALVES the "
-                f"optimizer steps per iteration (ceil(live_rows/"
-                f"{self.config.mini_batch_size}) x {self.config.update_epochs} "
-                f"epochs) at an unchanged LR. Consider --update-epochs "
-                f"{self.config.update_epochs * 2} to restore the step budget; "
-                f"watch train/n_updates."
-            )
+            if pre is None:
+                print(
+                    f"    NOTE: this drops ~half the failure rows, which HALVES the "
+                    f"optimizer steps per iteration (ceil(live_rows/"
+                    f"{self.config.mini_batch_size}) x {self.config.update_epochs} "
+                    f"epochs) at an unchanged LR. Consider --update-epochs "
+                    f"{self.config.update_epochs * 2} to restore the step budget; "
+                    f"watch train/n_updates."
+                )
+            else:
+                print(
+                    f"    NOTE: rows the pre-close window drops also shorten each "
+                    f"epoch (ceil(live_rows/{self.config.mini_batch_size}) "
+                    f"mini-batches); watch train/n_updates."
+                )
             if self.config.include_anchor_groups:
                 print(
                     "    NOTE: anchor groups are ON. Anchor rows are never "
                     "truncated while failure rows are, so truncation both "
                     "shrinks the anchor row budget's signal denominator and "
-                    "halves the anchor:erosion weight ratio. Re-derive "
-                    "--anchor-advantage (~2x) before trusting this pairing."
+                    + ("halves the anchor:erosion weight ratio. Re-derive "
+                       "--anchor-advantage (~2x)" if pre is None else
+                       "cuts the anchor:erosion weight ratio (~3.6x at "
+                       "pre-close 3 / post 3). Re-derive --anchor-advantage "
+                       "(~3.6x)")
+                    + " before trusting this pairing."
                 )
             if self.config.init_state_npz_path is not None:
                 print(
@@ -6700,7 +6718,10 @@ class GRPOTrainer:
               than modulating lambda (see the lambda note at the bottom).
           gap vs normalised position in the episode -> does fragility live early or
               late? This is the measurement that settles the recency-weighting
-              direction, which the objective itself does not determine.
+              direction, which the objective itself does not determine. The
+              position is over the episode's RETAINED rows, so under
+              pre_close_keep_chunks a failure's axis is its grasp window and
+              r_position is not comparable to runs without the window.
           gap vs the chunk's own MSE_ref -> are fragile chunks also poorly-fit
               ones? Bears on the MSE_ref growth seen across iterations.
 
@@ -6744,15 +6765,22 @@ class GRPOTrainer:
         if len(usable) < 16:
             return None
 
-        # Normalised position within the parent episode. Computed over ALL chunks
-        # (not the sample) so it is a true fraction: episodes have different
-        # lengths, and successes terminate early, so raw chunk_idx would conflate
+        # Normalised position within the parent episode's RETAINED rows. Computed
+        # over ALL chunks (not the sample) so it is a true fraction: episodes have
+        # different lengths, successes terminate early, and pre_close_keep_chunks
+        # starts a failure's rows mid-episode, so raw chunk_idx would conflate
         # "late in the episode" with "came from a failure".
-        last = {}
+        first, last = {}, {}
         for c in chunks:
-            last[c.episode_idx] = max(last.get(c.episode_idx, 0), c.chunk_idx)
-        pos = {id(c): (c.chunk_idx / last[c.episode_idx]) if last[c.episode_idx] else 0.0
-               for c in usable}
+            e = c.episode_idx
+            first[e] = min(first.get(e, c.chunk_idx), c.chunk_idx)
+            last[e] = max(last.get(e, 0), c.chunk_idx)
+
+        def _position(c) -> float:
+            span = last[c.episode_idx] - first[c.episode_idx]
+            return (c.chunk_idx - first[c.episode_idx]) / span if span else 0.0
+
+        pos = {id(c): _position(c) for c in usable}
 
         # Stratify over 10 position bins x {success, failure}. Without this the
         # gap-vs-position estimate is confounded: failures run to the 50-chunk
@@ -8407,8 +8435,8 @@ class GRPOTrainer:
             # behavior and the filter is quietly doing less than it claims.
             # episodes_cut is NOT a hit rate: an episode whose reopen lands
             # within keep_chunks of the end is detected and correctly left
-            # whole, so this counter falls as the policy learns to hold its
-            # grasp longer even though nothing is wrong.
+            # uncut at the tail, so this counter falls as the policy learns to
+            # hold its grasp longer even though nothing is wrong.
             if self.config.post_reopen_keep_chunks is not None:
                 self.writer.add_scalar(
                     "episode/n_post_reopen_episodes_cut",
@@ -8449,6 +8477,19 @@ class GRPOTrainer:
                     self.writer.add_scalar(
                         f"episode/post_reopen_kept_len_{_k}",
                         stats.get(f"post_reopen_kept_len_{_k}", 0), iteration,
+                    )
+                # Head side of the pre-close window. Gated separately so a
+                # post-only run's key set is unchanged. The tail counters above
+                # stay tail-only, so the two chunk counts sum to num_chunks -
+                # num_train_chunks.
+                if self.config.pre_close_keep_chunks is not None:
+                    self.writer.add_scalar(
+                        "episode/n_pre_close_episodes_cut",
+                        stats.get("n_pre_close_episodes_cut", 0), iteration,
+                    )
+                    self.writer.add_scalar(
+                        "episode/n_pre_close_chunks_dropped",
+                        stats.get("n_pre_close_chunks_dropped", 0), iteration,
                     )
 
             # Raw collected chunk count. Emitted UNCONDITIONALLY: it is a
@@ -9151,6 +9192,12 @@ class GRPOTrainer:
                                    "post_reopen_kept_len_median",
                                    "post_reopen_kept_len_max",
                                    "num_train_chunks"):
+                            log_dict.pop(_k, None)
+                    if self.config.pre_close_keep_chunks is None:
+                        # Same rule, one level down: a post-only run keeps its
+                        # pre-feature key set.
+                        for _k in ("n_pre_close_episodes_cut",
+                                   "n_pre_close_chunks_dropped"):
                             log_dict.pop(_k, None)
                     # per_scene_success is the one NON-SCALAR entry stats()
                     # returns ({env_seed: (n_success, n_total)}), so it is popped

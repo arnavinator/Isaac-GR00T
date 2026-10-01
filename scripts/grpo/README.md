@@ -1006,8 +1006,10 @@ failing episode then trains on
 ```
 
 i.e. the last `M` chunks of the approach, the whole closed phase, and `N` chunks
-from the reopen onset. The successes are untouched, so their approach chunks are
-now pushed up with nothing cancelling them.
+from the reopen onset. A failure that closes and never reopens (it holds to the
+end, or opens only partway) trains on `[close_idx - M, end)`: the head edge needs
+only the close. The successes are untouched, so their approach chunks are now
+pushed up with nothing cancelling them.
 
 ```bash
 uv run python scripts/grpo/train_grpo.py \
@@ -1032,9 +1034,9 @@ chunks 0–36 at `N=2`. Adding `M=2` makes that 25–36.
 **When nothing is cut from the front:**
 
 - a success or an anchor (never truncated);
-- a failure with no detected close→reopen: it never closed, closed and never let
-  go, or the detector missed it. Its approach is still pushed down in full, so
-  watch `episode/n_post_reopen_detected` against the failure count;
+- a failure that never closes, so there is no close to measure `M` from. Its
+  approach is still pushed down in full; `episode/n_pre_close_detected` against
+  the failure count shows how many there are;
 - a detection refused as implausible (`onset + N < post_reopen_min_train_chunks`),
   which is refused on both edges;
 - a close at or before chunk `M`.
@@ -1086,9 +1088,11 @@ every extra chunk is one more near-duplicate of a success's approach.
 - `episode/post_reopen_kept_len_*` now reads `M` + closed phase + `N`, so its
   spread is the close-to-onset spread (6–24 chunks on `iter_0001`).
 
-**Counters.** `episode/n_pre_close_episodes_cut` and
-`episode/n_pre_close_chunks_dropped` (head side) are emitted only when the window
-is on, so a post-only run's key set is unchanged. `n_post_reopen_episodes_cut`
+**Counters.** `episode/n_pre_close_episodes_cut`,
+`episode/n_pre_close_chunks_dropped` (head side) and
+`episode/n_pre_close_detected` (failures with a detected close, reopen or not)
+are emitted only when the window is on, so a post-only run's key set is
+unchanged. `n_post_reopen_episodes_cut`
 and `n_post_reopen_chunks_dropped` stay tail-only, so
 `num_chunks − num_train_chunks` = head + tail. The per-iteration summary line
 splits the drop the same way. Each training row's `chunk_idx` stays its index in

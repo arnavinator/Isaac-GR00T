@@ -41,8 +41,8 @@ one decides it: ``keep_chunks = 3`` retains the three chunks whose actions are
 still local and drops from the first ballistic command.
 
 ``pre_close_keep_chunks = M`` adds a FRONT edge, anchored at the close: the
-failure then trains on ``[close_idx - M, onset + keep_chunks)`` and its approach
-is dropped too. Those approach chunks are near-identical to the approach of the
+failure then trains on ``[close_idx - M, onset + keep_chunks)`` (to the end if
+it closes and never reopens) and its approach is dropped too. Those approach chunks are near-identical to the approach of the
 successes in the same group, so pushing them down cancels the successes' push
 up. Anchored at the close rather than the reopen because the close-to-onset
 span varies (6-24 chunks on the reference data), while the first chunk that
@@ -448,6 +448,25 @@ def close_cross_indices(
     never released before truncation), so first-cycle and last-cycle selection
     give identical onsets on all 43.
     """
+    close_idx, cross_idx = _close_scan(
+        widths, close_below, open_above, min_closed_chunks
+    )
+    if cross_idx is None:
+        return None
+    return close_idx, cross_idx
+
+
+def _close_scan(
+    widths: np.ndarray,
+    close_below: float,
+    open_above: float,
+    min_closed_chunks: int,
+) -> "tuple[int | None, int | None]":
+    """The state machine behind :func:`close_cross_indices`.
+
+    ``(close_idx, cross_idx)``: ``cross_idx`` is None when the gripper closes
+    and is not seen open again; both are None when it never closes.
+    """
     seen_open = False
     close_idx = None
     run_start = None
@@ -469,7 +488,21 @@ def close_cross_indices(
                 run_len = 0
         elif w > open_above:
             return close_idx, int(i)
-    return None
+    return close_idx, None
+
+
+def close_index(
+    widths: np.ndarray,
+    close_below: float = DEFAULT_CLOSE_BELOW,
+    open_above: float = DEFAULT_OPEN_ABOVE,
+    min_closed_chunks: int = DEFAULT_MIN_CLOSED_CHUNKS,
+) -> "int | None":
+    """The close of :func:`close_cross_indices`, whether or not a reopen follows.
+
+    Same state machine and guards (observed open first, then a dwell of
+    ``min_closed_chunks``); None only when the gripper never closes.
+    """
+    return _close_scan(widths, close_below, open_above, min_closed_chunks)[0]
 
 
 def reopen_onset_index(
@@ -592,28 +625,29 @@ def post_reopen_chunk_limit(
 def grasp_train_window(
     states: "list[dict[str, np.ndarray]]",
     cfg: PostReopenFilter,
-) -> "tuple[int | None, int | None, int | None]":
-    """``(onset, start, limit)`` -- the retained window is ``[start, limit)``.
+) -> "tuple[int | None, int | None, int | None, int | None]":
+    """``(close_idx, onset, start, limit)``; the retained window is ``[start, limit)``.
 
-    ``onset`` and ``limit`` are exactly :func:`post_reopen_detect`'s. ``start``
-    is ``close_idx - cfg.pre_close_keep_chunks``, or ``None`` for "keep from
-    chunk 0": the window is off, no reopen was found, the window already
-    reaches chunk 0, or the detection was refused as implausible (a refusal cuts
-    neither side). Otherwise the two edges are independent, so a reopen too
-    late for the tail cut still gets its head cut.
+    ``onset`` and ``limit`` are exactly :func:`post_reopen_detect`'s. With the
+    window off, ``close_idx`` and ``start`` are None and nothing more is read.
+    Otherwise ``close_idx`` is :func:`close_index`, and ``start`` is
+    ``close_idx - cfg.pre_close_keep_chunks``, or None for "keep from chunk 0":
+    the gripper never closed, the window already reaches chunk 0, or a found
+    reopen was refused as implausible (a refusal cuts neither side). The head
+    edge needs only the close, so a failure that closes and never reopens is
+    head-cut too, as is one whose reopen is too late for the tail cut.
     """
     onset, limit = post_reopen_detect(states, cfg)
-    if (
-        onset is None
-        or cfg.pre_close_keep_chunks is None
-        or onset + cfg.keep_chunks < cfg.min_train_chunks
-    ):
-        return onset, None, limit
+    if cfg.pre_close_keep_chunks is None or not states:
+        return None, onset, None, limit
     # Widths are re-read only with the window on, so the off path is exactly
     # post_reopen_detect. A found onset implies a found close on these widths.
-    close_idx, _ = close_cross_indices(
+    close_idx = close_index(
         gripper_widths(states, cfg.state_key),
         cfg.close_below, cfg.open_above, cfg.min_closed_chunks,
     )
+    refused = onset is not None and onset + cfg.keep_chunks < cfg.min_train_chunks
+    if close_idx is None or refused:
+        return close_idx, onset, None, limit
     start = close_idx - cfg.pre_close_keep_chunks
-    return onset, (start if start > 0 else None), limit
+    return close_idx, onset, (start if start > 0 else None), limit

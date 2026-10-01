@@ -256,6 +256,8 @@ class EpisodeBuffer:
         # episodes_cut / chunks_dropped counters above count the TAIL side only.
         self._n_pre_close_episodes_cut: int = 0
         self._n_pre_close_chunks_dropped: int = 0
+        # Failing episodes with a detected close, reopen or not (window on only).
+        self._n_pre_close_detected: int = 0
 
     def clear(self):
         """Clear buffer for next iteration.
@@ -290,6 +292,7 @@ class EpisodeBuffer:
         self._post_reopen_kept_lens = []
         self._n_pre_close_episodes_cut = 0
         self._n_pre_close_chunks_dropped = 0
+        self._n_pre_close_detected = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -502,6 +505,7 @@ class EpisodeBuffer:
             self._post_reopen_kept_lens = []
             self._n_pre_close_episodes_cut = 0
             self._n_pre_close_chunks_dropped = 0
+            self._n_pre_close_detected = 0
             return self.advantages
 
         # Step 0: post-reopen truncation. Runs BEFORE anything that counts
@@ -637,9 +641,10 @@ class EpisodeBuffer:
 
         With cfg.pre_close_keep_chunks the window gets a front edge as well,
         anchored at the detected close: only [close_idx - pre_close_keep_chunks,
-        close_idx) survives of the approach. The two edges are cut
-        independently; a failure with no detected reopen, or a refused
-        detection, is kept whole on both sides. README "Pre-close window".
+        close_idx) survives of the approach. The head edge needs only the close,
+        so a failure that closes and never reopens is head-cut (and keeps its
+        tail); one that never closes, or a refused detection, is kept whole.
+        README "Pre-close window".
 
         The per-chunk advantage in _build_chunks divides by num_train_chunks,
         not num_chunks, so Σ_chunks A_chunk == A_ep still holds and with it the
@@ -681,6 +686,7 @@ class EpisodeBuffer:
         self._post_reopen_kept_lens = []
         self._n_pre_close_episodes_cut = 0
         self._n_pre_close_chunks_dropped = 0
+        self._n_pre_close_detected = 0
         if cfg is None:
             return
 
@@ -695,7 +701,7 @@ class EpisodeBuffer:
                 continue
             n_probed += 1
             try:
-                onset, start, limit = grasp_train_window(ep.states, cfg)
+                close_idx, onset, start, limit = grasp_train_window(ep.states, cfg)
             except (KeyError, ValueError, TypeError, OverflowError) as e:
                 self._n_post_reopen_errors += 1
                 if first_error is None:
@@ -703,6 +709,8 @@ class EpisodeBuffer:
                 continue
             if ep.success:
                 continue  # probed for readability only; never truncated
+            if close_idx is not None:
+                self._n_pre_close_detected += 1
             # `onset` and `limit` answer different questions: onset is None only
             # when no reopen was FOUND (the detector-miss case), while limit is
             # additionally None when the reopen was found so late that the
@@ -802,7 +810,8 @@ class EpisodeBuffer:
             print(
                 f"  Post-reopen truncation (keep {cfg.pre_close_keep_chunks} "
                 f"chunk(s) before the close and {cfg.keep_chunks} from the reopen "
-                f"onset): detected the reopen in "
+                f"onset): detected the close in "
+                f"{self._n_pre_close_detected}/{n_fail} and the reopen in "
                 f"{self._n_post_reopen_detected}/{n_fail} failing episode(s); "
                 f"cut the head of {self._n_pre_close_episodes_cut} "
                 f"and the tail of {self._n_post_reopen_episodes_cut}, dropping "
@@ -1185,6 +1194,9 @@ class EpisodeBuffer:
             # the two chunk counters sum to num_chunks - num_train_chunks.
             "n_pre_close_episodes_cut": self._n_pre_close_episodes_cut,
             "n_pre_close_chunks_dropped": self._n_pre_close_chunks_dropped,
+            # Failures with a detected close, reopen or not: read against the
+            # failure count, the gap is the failures that never closed.
+            "n_pre_close_detected": self._n_pre_close_detected,
             # Per-group success rate spread (min/median/max across groups).
             # Reveals when the iter average masks a bimodal "some seeds at
             # 100%, others at 0%" pattern.

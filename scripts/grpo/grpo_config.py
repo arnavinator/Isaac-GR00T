@@ -617,9 +617,9 @@ class GRPOConfig:
     post_reopen_keep_chunks: int | None = None
 
     # M = also keep only the M chunks BEFORE the detected close: a failing
-    # episode trains on [close_idx - M, onset + post_reopen_keep_chunks), so its
-    # approach, which nearly duplicates the successes' approach and cancels
-    # their push up, is dropped. The closed phase is always kept. None (default)
+    # episode trains on [close_idx - M, onset + post_reopen_keep_chunks), or to
+    # the end if it never reopens, so its approach, which nearly duplicates the
+    # successes' approach and cancels their push up, is dropped. The closed phase is always kept. None (default)
     # = off, bit-identical; 0 = nothing before the close. Requires
     # post_reopen_keep_chunks. On CoffeeServeMug iter_0001, M=3 keeps the first
     # chunk commanding the close (any executed substep > 0.5) on 43/43 failures

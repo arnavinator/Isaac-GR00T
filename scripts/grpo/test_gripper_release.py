@@ -39,6 +39,7 @@ from gripper_release import (  # noqa: E402
     DEFAULT_OPEN_ABOVE,
     PostReopenFilter,
     close_cross_indices,
+    close_index,
     gripper_widths,
     post_reopen_chunk_limit,
     post_reopen_detect,
@@ -1454,27 +1455,27 @@ def test_pre_close_semantics():
     # close 13, onset 21, crossing 22, of a 50-chunk episode.
     st = states_from_widths(failure_widths())
     assert close_cross_indices(gripper_widths(st))[0] == 13
-    assert grasp_train_window(st, PostReopenFilter(3)) == (21, None, 24), \
-        "off: exactly post_reopen_detect, no head cut"
+    assert grasp_train_window(st, PostReopenFilter(3)) == (None, 21, None, 24), \
+        "off: exactly post_reopen_detect, no close read, no head cut"
     for m, start in ((3, 10), (1, 12), (0, 13), (12, 1)):
-        assert grasp_train_window(st, pc(3, m)) == (21, start, 24), m
+        assert grasp_train_window(st, pc(3, m)) == (13, 21, start, 24), m
     # The closed phase always survives, even at M=0 with N=0.
-    assert grasp_train_window(st, pc(0, 0)) == (21, 13, 21)
+    assert grasp_train_window(st, pc(0, 0)) == (13, 21, 13, 21)
     # A window that reaches chunk 0 is "no head cut", not a clamp.
     for m in (13, 99):
-        assert grasp_train_window(st, pc(3, m)) == (21, None, 24), m
+        assert grasp_train_window(st, pc(3, m)) == (13, 21, None, 24), m
 
     # The start follows the CLOSE: a longer hold moves the onset and the tail
     # edge, never the head edge.
     for onset in (18, 21, 30, 45):
         st = states_from_widths(failure_widths(close_at=13, onset_at=onset))
-        assert grasp_train_window(st, pc(3, 3)) == (onset, 10, onset + 3), onset
+        assert grasp_train_window(st, pc(3, 3)) == (13, onset, 10, onset + 3), onset
 
     # The motivating example: a 40-chunk failure closing at 27 and reopening
     # at 35 trains on [0, 37) at N=2, and on [25, 37) once M=2 is added.
     st = states_from_widths(failure_widths(n=40, close_at=27, onset_at=35))
-    assert grasp_train_window(st, PostReopenFilter(2)) == (35, None, 37)
-    assert grasp_train_window(st, pc(2, 2)) == (35, 25, 37)
+    assert grasp_train_window(st, PostReopenFilter(2)) == (None, 35, None, 37)
+    assert grasp_train_window(st, pc(2, 2)) == (27, 35, 25, 37)
     print("  PASS: [close - M, onset + N); M >= close is no head cut; the head "
           "edge ignores the hold length")
 
@@ -1485,42 +1486,42 @@ def test_pre_close_inherits_the_close_guards():
     # One-chunk dip to 0.030 at chunk 3; real grasp 13-20, onset 21.
     w = np.array([OPEN_W] * 3 + [0.030] + [OPEN_W] * 9
                  + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 28)
-    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (21, 10, 24)
+    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (13, 21, 10, 24)
     # Starts closed, re-approaches, real grasp 15-26: the start is 3 before 15,
     # not 3 before the chunk-0 closed state.
     w = np.array([0.001] * 3 + [OPEN_W] * 12 + [0.001] * 12
                  + [RAMP_W, 0.001] + [OPEN_W] * 22)
     assert close_cross_indices(w)[0] == 15
-    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (29, 12, 32)
+    assert grasp_train_window(states_from_widths(w), pc(3, 3)) == (15, 29, 12, 32)
     # min_closed_chunks is honoured: a two-chunk dip is the close at dwell 2.
     w2 = np.array([OPEN_W] * 3 + [0.030, 0.030] + [OPEN_W] * 8
                   + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 28)
-    assert grasp_train_window(states_from_widths(w2), pc(3, 3)) == (21, 10, 24)
+    assert grasp_train_window(states_from_widths(w2), pc(3, 3)) == (13, 21, 10, 24)
     assert grasp_train_window(states_from_widths(w2),
-                              pc(3, 1, min_closed_chunks=2)) == (5, 2, 8)
+                              pc(3, 1, min_closed_chunks=2)) == (3, 5, 2, 8)
     print("  PASS: the head edge follows the dwell-guarded, open-first close")
 
 
 def test_pre_close_edges_are_independent():
     """A reopen too late for the tail cut still gets its head cut, while a
-    refused (implausible) detection and a miss cut neither side."""
+    refused (implausible) detection and a never-closed failure cut neither side."""
     # episode_0041's shape: close 24, onset 48 of 50. The N=3 tail window
     # overruns, but the head is still cut 3 chunks before the close.
     st = states_from_widths(failure_widths(n=50, close_at=24, onset_at=48))
-    assert grasp_train_window(st, pc(3, 3)) == (48, 21, None)
+    assert grasp_train_window(st, pc(3, 3)) == (24, 48, 21, None)
 
     # Refused: close 1, onset 4, and onset + N = 4 is below the floor of 5.
     w = [OPEN_W] + [0.001] * 3 + [RAMP_W] + [OPEN_W] * 45
     st = states_from_widths(w)
-    assert grasp_train_window(st, pc(0, 0)) == (4, None, None), "refused"
+    assert grasp_train_window(st, pc(0, 0)) == (1, 4, None, None), "refused"
     # The floor tests the PREFIX onset + N, not the window.
-    assert grasp_train_window(st, pc(1, 0)) == (4, 1, 5)
-    assert grasp_train_window(st, pc(0, 0, min_train_chunks=0)) == (4, 1, 4)
+    assert grasp_train_window(st, pc(1, 0)) == (1, 4, 1, 5)
+    assert grasp_train_window(st, pc(0, 0, min_train_chunks=0)) == (1, 4, 1, 4)
 
-    # No reopen found, and an empty episode: nothing on either side.
+    # Never closes, and an empty episode: nothing on either side.
     assert grasp_train_window(states_from_widths([OPEN_W] * 50), pc(3, 3)) \
-        == (None, None, None)
-    assert grasp_train_window([], pc(3, 3)) == (None, None, None)
+        == (None, None, None, None)
+    assert grasp_train_window([], pc(3, 3)) == (None, None, None, None)
     # A misconfiguration still raises, exactly as post_reopen_detect does.
     expect_raises(
         ValueError, "never exceeds open_above",
@@ -1656,28 +1657,86 @@ def test_pre_close_zero_sum_and_magnification():
     print("  PASS: Σ A_chunk == A_ep, group zero-sum, magnification nc/kept")
 
 
-def test_pre_close_kept_whole_cases():
-    """No detected reopen, a refused detection, an unreadable episode: all whole."""
+def test_close_index_and_close_without_reopen():
+    """close_index is close_cross_indices' close, reopen or not, and a failure
+    that closes and never reopens trains on [close - M, end)."""
+    import itertools
+    # Exhaustive over 3-valued traces: close_index agrees with
+    # close_cross_indices whenever a cycle exists, and appending an open sample
+    # to a trace that ends closed turns its close into that cycle's close.
+    n_held = 0
+    for length in range(1, 9):
+        for combo in itertools.product((0.001, 0.020, 0.079), repeat=length):
+            w = np.array(combo)
+            c = close_index(w)
+            found = close_cross_indices(w)
+            if found is not None:
+                assert c == found[0], combo
+            elif c is not None:
+                n_held += 1
+                assert close_cross_indices(np.append(w, 0.079)) == (c, length), combo
+            else:
+                assert close_cross_indices(np.append(w, 0.079)) is None, combo
+    assert n_held > 100, n_held
+
+    # Held to the end, and a partial release that never clears open_above.
+    held = [OPEN_W] * 23 + [MUG_W] * 27
+    partial = [OPEN_W] * 13 + [0.001] * 8 + [0.045] * 29
+    for w, close in ((held, 23), (partial, 13)):
+        st = states_from_widths(w)
+        assert post_reopen_detect(st, PostReopenFilter(3)) == (None, None)
+        assert grasp_train_window(st, pc(3, 3)) == (close, None, close - 3, None)
+
+    b = buffer_from([make_episode(held, False), make_episode(partial, False),
+                     make_episode(success_widths(), True)])
+    adv = b.compute_advantages(post_reopen_filter=pc(3, 3)).copy()
+    assert [ep.train_chunk_range for ep in b.episodes[:2]] == \
+        [range(20, 50), range(10, 50)], "head cut, tail kept"
+    chunks = b._build_chunks()
+    for i in range(3):
+        got = sum(c.advantage for c in chunks if c.episode_idx == i)
+        assert abs(got - adv[i]) < 1e-9, i
+    assert abs(sum(c.advantage for c in chunks)) < 1e-9
+    s = b.stats()
+    assert (s["n_pre_close_detected"], s["n_post_reopen_detected"]) == (2, 0)
+    assert (s["n_pre_close_episodes_cut"], s["n_post_reopen_episodes_cut"]) == (2, 0)
+    # With the window off both stay whole, as before the feature.
+    b.compute_advantages(post_reopen_filter=PostReopenFilter(3))
+    assert all(ep.train_chunk_range == range(ep.num_chunks) for ep in b.episodes)
+    print(f"  PASS: close_index matches the cycle's close ({n_held} held traces); "
+          f"a close without a reopen is head-cut, its tail kept")
+
+
+def test_pre_close_cut_and_kept_whole_cases():
+    """A close without a reopen is head-cut; a failure that never closes, a
+    refused detection and an unreadable episode are kept whole."""
     import contextlib
     import io
-    never = [OPEN_W] * 50
+    held = [OPEN_W] * 50                       # closes at 23, never reopens
     for i in range(23, 50):
-        never[i] = MUG_W
-    early = [OPEN_W] + [0.001] * 3 + [RAMP_W] + [OPEN_W] * 45   # onset 4
+        held[i] = MUG_W
+    never = [OPEN_W] * 50                      # never closes
+    early = [OPEN_W] + [0.001] * 3 + [RAMP_W] + [OPEN_W] * 45   # close 1, onset 4
     nan = make_episode(failure_widths(), False)
     nan.states[7] = {"gripper_qpos": np.array([[np.nan, 0.0]])}
-    b = buffer_from([make_episode(never, False), make_episode(early, False), nan,
+    b = buffer_from([make_episode(held, False), make_episode(never, False),
+                     make_episode(early, False), nan,
                      make_episode(failure_widths(), False),
                      make_episode(success_widths(), True)])
     with contextlib.redirect_stdout(io.StringIO()):
         b.compute_advantages(post_reopen_filter=pc(0, 2))
-    for ep in b.episodes[:3]:
+    assert b.episodes[0].train_chunk_range == range(21, 50), "head cut, tail kept"
+    for ep in b.episodes[1:4]:
         assert ep.train_chunk_range == range(ep.num_chunks), ep.episode_idx
-    assert b.episodes[3].train_chunk_range == range(11, 21)
+    assert b.episodes[4].train_chunk_range == range(11, 21)
     s = b.stats()
     assert (s["n_post_reopen_implausible"], s["n_post_reopen_errors"]) == (1, 1)
-    assert s["n_pre_close_episodes_cut"] == 1
-    print("  PASS: miss, refusal and error all keep the failure whole")
+    # Closes: held, early (refused, so not cut) and the normal failure.
+    assert (s["n_pre_close_detected"], s["n_post_reopen_detected"]) == (3, 2)
+    assert (s["n_pre_close_episodes_cut"], s["n_post_reopen_episodes_cut"]) == (2, 1)
+    assert s["n_pre_close_chunks_dropped"] == 21 + 11
+    print("  PASS: a held close is head-cut; never-closed, refused and unreadable "
+          "failures stay whole")
 
 
 def test_pre_close_idempotent_and_self_clearing():
@@ -1703,13 +1762,15 @@ def test_pre_close_idempotent_and_self_clearing():
     # The empty-buffer early return and clear() reset the new counters too.
     b.compute_advantages(post_reopen_filter=pc(3, 3))
     b.clear()
-    assert (b._n_pre_close_episodes_cut, b._n_pre_close_chunks_dropped) == (0, 0)
+    assert (b._n_pre_close_episodes_cut, b._n_pre_close_chunks_dropped,
+            b._n_pre_close_detected) == (0, 0, 0)
     b2 = buffer_from([make_episode(failure_widths(), False),
                       make_episode(success_widths(), True)])
     b2.compute_advantages(post_reopen_filter=pc(3, 3))
     b2.episodes = []
     b2.compute_advantages(post_reopen_filter=pc(3, 3))
-    assert (b2._n_pre_close_episodes_cut, b2._n_pre_close_chunks_dropped) == (0, 0)
+    assert (b2._n_pre_close_episodes_cut, b2._n_pre_close_chunks_dropped,
+            b2._n_pre_close_detected) == (0, 0, 0)
     print("  PASS: idempotent, self-clearing on both edges, no stale memo")
 
 
@@ -1743,11 +1804,15 @@ def test_pre_close_dead_group():
 def test_pre_close_summary_log_line():
     import contextlib
     import io
-    # M != N and head count != tail count, so no two fields can be swapped
-    # unnoticed: two failures kept [11, 24) and a late one kept [22, 50).
+    # Every field distinct, so no two can be swapped unnoticed: two failures
+    # kept [11, 24), a late one kept [22, 50), one held closed from 23 kept
+    # [21, 50), and one that never closes kept whole.
+    held = [OPEN_W] * 23 + [MUG_W] * 27
     b = buffer_from([make_episode(failure_widths(), False) for _ in range(2)]
                     + [make_episode(failure_widths(n=50, close_at=24, onset_at=48),
                                     False),
+                       make_episode(held, False),
+                       make_episode([OPEN_W] * 50, False),
                        make_episode(success_widths(), True)])
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -1755,10 +1820,11 @@ def test_pre_close_summary_log_line():
     text = out.getvalue()
     assert ("keep 2 chunk(s) before the close and 3 from the reopen onset"
             in text), text
-    assert "in 3/3 failing episode(s)" in text, text
-    assert "cut the head of 3 and the tail of 2" in text, text
-    # head 11 + 11 + 22 = 44, tail 26 + 26 = 52, of 150 failure chunks.
-    assert "dropping 96/150 failure chunks (64.0%: 44 head, 52 tail)" in text, text
+    assert ("detected the close in 4/5 and the reopen in 3/5 failing "
+            "episode(s)") in text, text
+    assert "cut the head of 4 and the tail of 2" in text, text
+    # head 11 + 11 + 22 + 21 = 65, tail 26 + 26 = 52, of 250 failure chunks.
+    assert "dropping 117/250 failure chunks (46.8%: 65 head, 52 tail)" in text, text
     print("  PASS: the summary line reports both edges with the right numbers")
 
 
@@ -1805,21 +1871,21 @@ def test_pre_close_custom_key_and_widths():
     """The close is re-detected with the SAME key and thresholds as the onset."""
     # A custom state key reaches the second width read too.
     st = states_from_widths(failure_widths(), key="fingers")
-    assert grasp_train_window(st, pc(3, 3, state_key="fingers")) == (21, 10, 24)
+    assert grasp_train_window(st, pc(3, 3, state_key="fingers")) == (13, 21, 10, 24)
     # 0.040 is inside the default band but a close at close_below=0.045, so the
     # close index (and only it) depends on the configured widths.
     w = [OPEN_W] * 5 + [0.040] * 3 + [0.001] * 8 + [RAMP_W] + [OPEN_W] * 33
     st = states_from_widths(w)
     assert close_cross_indices(np.array(w))[0] == 8
     assert close_cross_indices(np.array(w), 0.045, 0.06)[0] == 5
-    assert grasp_train_window(st, pc(3, 2)) == (16, 6, 19)
+    assert grasp_train_window(st, pc(3, 2)) == (8, 16, 6, 19)
     assert grasp_train_window(
-        st, pc(3, 2, close_below=0.045, open_above=0.06)) == (16, 3, 19)
+        st, pc(3, 2, close_below=0.045, open_above=0.06)) == (5, 16, 3, 19)
     # A gripper that only opens to 0.052 is "open" only at open_above=0.05, so
     # the observed-open-first rule binds on the configured width as well.
     w = [0.052] * 5 + [0.001] * 8 + [RAMP_W] + [0.052] * 36
     assert grasp_train_window(states_from_widths(w), pc(3, 2, open_above=0.05)) \
-        == (13, 3, 16)
+        == (5, 13, 3, 16)
     print("  PASS: the head edge honours a custom state key and custom widths")
 
 
@@ -1934,6 +2000,7 @@ def test_pre_close_gap_survey_position():
 PRE_CLOSE_TAGS = (
     "episode/n_pre_close_episodes_cut",
     "episode/n_pre_close_chunks_dropped",
+    "episode/n_pre_close_detected",
 )
 
 
@@ -1962,11 +2029,22 @@ def test_pre_close_tb_emission():
     assert set(on) - set(post_only) == set(PRE_CLOSE_TAGS)
     # close 13 for all three; onsets 18/21/24 -> windows [10,21) [10,24) [10,27).
     assert on["episode/n_pre_close_episodes_cut"] == 3
+    assert on["episode/n_pre_close_detected"] == 3
     assert on["episode/n_pre_close_chunks_dropped"] == 3 * 10
     assert on["episode/n_post_reopen_chunks_dropped"] == 29 + 26 + 23
     assert on["episode/num_train_chunks"] == (11 + 14 + 17) + 42
     assert on["episode/post_reopen_kept_len_min"] == 11
     assert on["episode/post_reopen_kept_len_max"] == 17
+    import contextlib
+    import io
+    b = buffer_from([make_episode(failure_widths(close_at=2, onset_at=10), False),
+                     make_episode(failure_widths(), False),
+                     make_episode(success_widths(), True)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        b.compute_advantages(post_reopen_filter=runs[2][0].build_post_reopen_filter())
+    tags = _emit_metrics(runs[2][0], b.stats())
+    assert (tags["episode/n_pre_close_detected"],
+            tags["episode/n_pre_close_episodes_cut"]) == (2, 1), tags
     print(f"  PASS: {len(PRE_CLOSE_TAGS)} tags gated on the window; a post-only "
           f"run's key set is unchanged; values correct")
 
@@ -1981,7 +2059,8 @@ def test_pre_close_wandb_payload():
     fake_wandb.log = lambda d: sent.append(dict(d))
     saved = sys.modules.get("wandb")
     sys.modules["wandb"] = fake_wandb
-    pre_keys = {"n_pre_close_episodes_cut", "n_pre_close_chunks_dropped"}
+    pre_keys = {"n_pre_close_episodes_cut", "n_pre_close_chunks_dropped",
+                "n_pre_close_detected"}
     post_keys = {"n_post_reopen_episodes_cut", "n_post_reopen_chunks_dropped",
                  "n_post_reopen_detected", "num_train_chunks"}
     try:
@@ -2033,8 +2112,9 @@ def test_pre_close_banner():
     assert "Post-reopen truncation: ON" in off
     assert "Pre-close window" not in off
     assert "drops ~half the failure rows" in off
-    assert ("Pre-close window: ON (keep 2 chunk(s) BEFORE the close too; each "
-            "cut failure trains on 2 + its closed phase + 3 rows)") in on
+    assert ("Pre-close window: ON (keep 2 chunk(s) BEFORE the close too; a "
+            "failure trains on [close - 2, onset + 3), or [close - 2, end) if it "
+            "never reopens)") in on
     assert ("NOTE: rows the pre-close window drops also shorten each epoch "
             "(ceil(live_rows/8) mini-batches); watch train/n_updates.") in on
     # No step-budget magnitude or --update-epochs remedy is claimed for it.
@@ -2200,7 +2280,8 @@ if __name__ == "__main__":
     test_train_chunk_range_clamps()
     test_pre_close_through_the_buffer()
     test_pre_close_zero_sum_and_magnification()
-    test_pre_close_kept_whole_cases()
+    test_close_index_and_close_without_reopen()
+    test_pre_close_cut_and_kept_whole_cases()
     test_pre_close_idempotent_and_self_clearing()
     test_pre_close_anchor_budget()
     test_pre_close_dead_group()

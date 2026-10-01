@@ -1200,8 +1200,9 @@ class GRPOTrainer:
             if pre is not None:
                 print(
                     f"    Pre-close window: ON (keep {pre} chunk(s) BEFORE the "
-                    f"close too; each cut failure trains on {pre} + its closed "
-                    f"phase + {self.config.post_reopen_keep_chunks} rows)"
+                    f"close too; a failure trains on [close - {pre}, onset + "
+                    f"{self.config.post_reopen_keep_chunks}), or [close - {pre}, "
+                    f"end) if it never reopens)"
                 )
             # The dominant operational effect, and the one nothing else surfaces:
             # the balanced sampler sizes an epoch as ceil(live_rows/mb_size), so
@@ -8491,6 +8492,12 @@ class GRPOTrainer:
                         "episode/n_pre_close_chunks_dropped",
                         stats.get("n_pre_close_chunks_dropped", 0), iteration,
                     )
+                    # Read against the failure count: the gap is the failures
+                    # that never closed, the only ones the head edge cannot cut.
+                    self.writer.add_scalar(
+                        "episode/n_pre_close_detected",
+                        stats.get("n_pre_close_detected", 0), iteration,
+                    )
 
             # Raw collected chunk count. Emitted UNCONDITIONALLY: it is a
             # collection statistic with no dependence on any feature, and it is
@@ -9197,7 +9204,8 @@ class GRPOTrainer:
                         # Same rule, one level down: a post-only run keeps its
                         # pre-feature key set.
                         for _k in ("n_pre_close_episodes_cut",
-                                   "n_pre_close_chunks_dropped"):
+                                   "n_pre_close_chunks_dropped",
+                                   "n_pre_close_detected"):
                             log_dict.pop(_k, None)
                     # per_scene_success is the one NON-SCALAR entry stats()
                     # returns ({env_seed: (n_success, n_total)}), so it is popped

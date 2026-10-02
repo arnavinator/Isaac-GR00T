@@ -24,7 +24,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `smoothness.py` | Trajectory-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, the continuous-action-dim selector and `build_key_dim_span`. Model-free and fully unit-testable. The 4-step chunk rollout lives in `fm_log_prob._smooth_chunk_rollout` (it needs the DiT); the hinge lives in `train_grpo._grpo_update_inner`. |
 | `gripper_release.py` | Post-reopen truncation primitives: `PostReopenFilter`, `gripper_widths`, `close_cross_indices`, `reopen_onset_index`, `post_reopen_detect`, `grasp_train_window`. Model-free and sim-free; detects the close→reopen of a failed grasp from the measured `gripper_qpos` — and the ONSET of that reopen, by walking back down the rising edge — so `episode_buffer` can trim the meander that follows, and (with `pre_close_keep_chunks`) the approach before the close. See README "Post-reopen truncation" and "Pre-close window". |
-| `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy from a saved `interactive_rollout.py` `.npz`, aggregates per-attempt success/num_steps into `results.json`. Subclasses `EpisodeCollector` in init-state mode. |
+| `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy per training scene seed (`--group-seeds`, built through the collector's seed path) or from a saved `interactive_rollout.py` `.npz` (`--obs-path`). Logs each scene's fingerprint and writes per-attempt, per-scene and pooled success/num_steps to `results.json`. Subclasses `EpisodeCollector`. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
 | `test_video_key_filter.py` | Covers the unused-video-key filter (`dropped_video_keys`). |
@@ -41,6 +41,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_calibrate_vel_anchor.py` | CPU suite for `calibrate_vel_anchor.py`: trace-trick norm/cosine vs dense (fresh and relative to a start), interpolation incl. the non-monotone warning and brackets, `--dry-run` command construction parsed back through tyro into `GRPOConfig`, and the cached-episode guard on synthetic TB event files. |
 | `test_group_adv_fixed_std.py` | CPU suite for `group_advantage_fixed_std`: off-path bit-identity with the group-std formula (and against the pre-change module), exact fixed-scale values, zero sum / sign / bounds, unchanged dead/anchor classification and counters, the per-chunk split incl. post-reopen truncation, the chunk memo on re-entry, argument and config validation, the tyro flag, and the `train()` call site. |
 | `test_exec_step_mask.py` | CPU suite for `mask_loss_with_n_action_steps`: the REAL `compute_fm_log_prob` on a stub DiT with one weight row per action step (hand-formula values, exactly-zero gradient on unexecuted steps, bitwise equality when the prefix covers the valid horizon, validation, no RNG), then the real ref pass / `_grpo_update_inner` / probe / `_log_metrics` / banner: surrogate on the executed pair and KL on the full pair, zero step gradient on unexecuted steps, `rho_floor` / `drift/*` on the executed MSE_ref, the ready filter, `ref_mse/exec_*`, config validation, and composition with accumulation, anchors, jitter, PAWS, the balanced sampler, base KL, the velocity anchor, smoothness and the grad probe. |
+| `test_eval_lora_from_npz.py` | CPU suite for `eval_lora_from_npz.py`: `--group-seeds` / `--obs-path` mutual exclusion and validation, seed mode through the real `EpisodeCollector.collect` (one group per seed, no init bundle, nothing recorded per chunk, one fingerprint per seed on its `scene:` line), `_collect` kwargs per mode, per-scene tallies, and `main()` end to end in both modes. |
 
 ---
 
@@ -226,25 +227,37 @@ Caveats:
   base model rather than trying to "uninject" LoRA — `merge_lora_weights`
   (`lora_dit.py:205`) is irreversible and there is no `unmerge` helper.
 
-### Parallel evaluation from a saved sim state via `eval_lora_from_npz.py`
+### Parallel evaluation via `eval_lora_from_npz.py`
 
-`scripts/grpo/eval_lora_from_npz.py` is the eval-side counterpart to the
-"Init from saved sim state" training mode (covered later in this README): it
-loads the same `interactive_rollout.py` `.npz` (`__sim_state__`,
-`__model_xml__`, `__ep_meta__`, optional `__step_info__`) and runs
-`--num-attempts` parallel rollouts, all starting bit-identically from that
-state. Use it to measure how often a LoRA succeeds from a specific
-intermediate state and at what speed — complementary to
-`robocasa_eval_benchmark.py`, which measures end-to-end performance from
-fresh randomized scenes.
+`scripts/grpo/eval_lora_from_npz.py` runs `--num-attempts` parallel rollouts
+of a LoRA policy per scene and reports success. It has two start modes
+(exactly one is required):
+
+- **`--group-seeds S0,S1,...` — training scenes.** Each seed builds its scene
+  through the same collector seed path the trainer uses (`--group-seeds` on
+  `collect_episodes.py`), one group per seed, so a seed from the trainer's
+  frozen pool (`--scene-seed-pool-base`/`-size`) gives that training scene.
+  Every rollout starts at step 0 with the full `--max-episode-steps` budget.
+  Use it for a larger-sample success rate than one 12-rollout training group
+  gives, e.g. 40 attempts per scene on base vs trained checkpoints.
+- **`--obs-path` — a saved state.** The eval-side counterpart to the "Init
+  from saved sim state" training mode (covered later in this README): it loads
+  the same `interactive_rollout.py` `.npz` (`__sim_state__`, `__model_xml__`,
+  `__ep_meta__`, optional `__step_info__`) and starts every attempt
+  bit-identically from it. Use it to measure how often a LoRA succeeds from a
+  specific intermediate state and at what speed.
+
+Both are complementary to `robocasa_eval_benchmark.py`, which measures
+end-to-end performance from fresh randomized scenes.
 
 Within-attempt diversity comes from the server's unseeded `torch.randn`
 during denoising, NOT from env randomness. AsyncVectorEnv subprocess
 workers parallelize the MuJoCo cost: with `--num-envs W < --num-attempts N`,
-the script collects N rollouts over `N // W` sequential turns of W rollouts
-each (mirroring `num_async_vector_env` in training).
+the script collects N rollouts per scene over `N // W` sequential turns of W
+rollouts each (mirroring `num_async_vector_env` in training).
 
-**Terminal 1 — model venv, GRPO server with the LoRA loaded:**
+**Terminal 1 — model venv, GRPO server with the LoRA loaded** (omit
+`--lora-checkpoint` for the base model):
 
 ```bash
 uv run python scripts/grpo/grpo_server.py \
@@ -254,7 +267,19 @@ uv run python scripts/grpo/grpo_server.py \
     --use-sim-policy-wrapper --port 5555
 ```
 
-**Terminal 2 — sim venv:**
+**Terminal 2 — sim venv, training scenes:**
+
+```bash
+gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+    scripts/grpo/eval_lora_from_npz.py \
+    --env-name robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env \
+    --group-seeds 100067,101067,102067,103067 \
+    --num-attempts 40 --num-envs 4 \
+    --output-dir /tmp/eval_iter_0100 \
+    --lora-checkpoint grpo_data/grpo_checkpoints/iter_0100
+```
+
+**... or from a saved state:**
 
 ```bash
 gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
@@ -267,34 +292,53 @@ gr00t/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
     --lora-checkpoint grpo_data/grpo_checkpoints/iter_0100
 ```
 
-The script writes `results.json` to `--output-dir`:
+Each group's scene fingerprint (layout/style ids + sha1 of `model_xml` and
+`sim_state`) is logged on a `scene:` line under its group line, in the same
+format as a pooled training run's log, and stored per scene in
+`results.json`. The script writes `results.json` to `--output-dir`:
 
 ```json
 {
   "lineage": {
-    "obs_path": "...", "lora_checkpoint": "...",
-    "branch_step": 10, "saved_n_action_steps": 8,
-    "consumed_substeps": 80, "remaining_substeps_budget": 400,
-    "seed": 42, "timestamp": "...", "duration_s": 432.5,
+    "obs_path": null, "group_seeds": [100067, 101067, 102067, 103067],
+    "lora_checkpoint": "...", "num_attempts": 40,
+    "branch_step": null, "saved_n_action_steps": null,
+    "consumed_substeps": 0, "remaining_substeps_budget": 480,
+    "seed": 42, "timestamp": "...", "duration_s": 4810.2,
     "...": "..."
   },
   "summary": {
-    "total": 100, "successes": 47, "success_rate": 0.47,
-    "mean_num_steps_all": 234.5,
-    "mean_num_steps_successful": 156.2,
-    "mean_num_steps_failed": 314.6
+    "total": 160, "successes": 121, "success_rate": 0.756,
+    "mean_num_steps_all": 344.1,
+    "mean_num_steps_successful": 301.7,
+    "mean_num_steps_failed": 480.0
   },
-  "attempts": [{"attempt_idx": 0, "success": true, "num_steps": 142,
-                "termination": "success"}, "..."]
+  "per_scene": [{"group_idx": 0, "group_seed": 100067,
+                 "scene_fingerprint": "layout=7 style=10 xml=272eec14 state=2b0f39fb",
+                 "total": 40, "successes": 33, "success_rate": 0.825,
+                 "...": "..."}, "..."],
+  "attempts": [{"attempt_idx": 0, "group_idx": 0, "success": true,
+                "num_steps": 142, "termination": "success"}, "..."]
 }
 ```
 
+With `--obs-path`, `lineage.obs_path` / `branch_step` / `consumed_substeps`
+describe the saved state, `group_seeds` is null, and `per_scene` has one
+entry whose `group_seed` is null (the saved bundle, not the reset seed, sets
+the scene).
+
 Constraints and caveats:
 
-- **`--num-attempts` must be divisible by `--num-envs`** (the script
-  reuses `EpisodeCollector`'s `group_size % num_async_vector_env == 0`
-  invariant). The error message lists divisors of the chosen
-  `--num-attempts` so you can adjust either knob.
+- **Check the fingerprints against the training log.** A training scene
+  seed should print the same `scene:` line as in a pooled training run
+  (e.g. 100067 → `layout=7 style=10 xml=272eec14 state=2b0f39fb`). A
+  mismatch means the eval is not on the training scene.
+- **`--num-attempts` is per scene** and must be divisible by `--num-envs`
+  (the script reuses `EpisodeCollector`'s `group_size % num_async_vector_env
+  == 0` invariant). The error message lists divisors of the chosen
+  `--num-attempts` so you can adjust either knob. Repeated `--group-seeds`
+  entries are rejected.
+- **`--seed` is ignored with `--group-seeds`**, which sets each scene's seed.
 - **`--lora-checkpoint` is metadata only.** The script records the path
   in `results.json` but does NOT load weights itself — the server in
   Terminal 1 is responsible. Mismatch (server running base model or a

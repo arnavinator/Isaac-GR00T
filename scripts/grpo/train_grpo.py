@@ -1197,7 +1197,16 @@ class GRPOTrainer:
                 f"'{self.config.post_reopen_state_key}')"
             )
             pre = self.config.pre_close_keep_chunks
-            if pre is not None:
+            pre_all = self.config.pre_close_all_episodes
+            if pre is not None and pre_all:
+                print(
+                    f"    Pre-close window: ON for ALL episodes (keep {pre} "
+                    f"chunk(s) BEFORE the close; a failure trains on [close - "
+                    f"{pre}, onset + {self.config.post_reopen_keep_chunks}), or "
+                    f"[close - {pre}, end) if it never reopens; a success or "
+                    f"anchor trains on [close - {pre}, end))"
+                )
+            elif pre is not None:
                 print(
                     f"    Pre-close window: ON (keep {pre} chunk(s) BEFORE the "
                     f"close too; a failure trains on [close - {pre}, onset + "
@@ -1223,7 +1232,15 @@ class GRPOTrainer:
                     f"epoch (ceil(live_rows/{self.config.mini_batch_size}) "
                     f"mini-batches); watch train/n_updates."
                 )
-            if self.config.include_anchor_groups:
+            if self.config.include_anchor_groups and pre_all:
+                print(
+                    "    NOTE: anchor groups are ON and the pre-close window "
+                    "covers all episodes, so anchor rows are head-cut too (their "
+                    "tails are kept). The failures-only guidance on "
+                    "--anchor-advantage assumed anchors are never truncated, so "
+                    "re-derive it."
+                )
+            elif self.config.include_anchor_groups:
                 print(
                     "    NOTE: anchor groups are ON. Anchor rows are never "
                     "truncated while failure rows are, so truncation both "
@@ -8481,8 +8498,8 @@ class GRPOTrainer:
                     )
                 # Head side of the pre-close window. Gated separately so a
                 # post-only run's key set is unchanged. The tail counters above
-                # stay tail-only, so the two chunk counts sum to num_chunks -
-                # num_train_chunks.
+                # stay tail-only, so failure head + failure tail + success head
+                # sum to num_chunks - num_train_chunks.
                 if self.config.pre_close_keep_chunks is not None:
                     self.writer.add_scalar(
                         "episode/n_pre_close_episodes_cut",
@@ -8498,6 +8515,24 @@ class GRPOTrainer:
                         "episode/n_pre_close_detected",
                         stats.get("n_pre_close_detected", 0), iteration,
                     )
+                    # The same three for SUCCESSES; the first reads against the
+                    # success count. Only under pre_close_all_episodes.
+                    if self.config.pre_close_all_episodes:
+                        self.writer.add_scalar(
+                            "episode/n_pre_close_success_detected",
+                            stats.get("n_pre_close_success_detected", 0),
+                            iteration,
+                        )
+                        self.writer.add_scalar(
+                            "episode/n_pre_close_success_episodes_cut",
+                            stats.get("n_pre_close_success_episodes_cut", 0),
+                            iteration,
+                        )
+                        self.writer.add_scalar(
+                            "episode/n_pre_close_success_chunks_dropped",
+                            stats.get("n_pre_close_success_chunks_dropped", 0),
+                            iteration,
+                        )
 
             # Raw collected chunk count. Emitted UNCONDITIONALLY: it is a
             # collection statistic with no dependence on any feature, and it is
@@ -9206,6 +9241,11 @@ class GRPOTrainer:
                         for _k in ("n_pre_close_episodes_cut",
                                    "n_pre_close_chunks_dropped",
                                    "n_pre_close_detected"):
+                            log_dict.pop(_k, None)
+                    if not self.config.pre_close_all_episodes:
+                        for _k in ("n_pre_close_success_detected",
+                                   "n_pre_close_success_episodes_cut",
+                                   "n_pre_close_success_chunks_dropped"):
                             log_dict.pop(_k, None)
                     # per_scene_success is the one NON-SCALAR entry stats()
                     # returns ({env_seed: (n_success, n_total)}), so it is popped

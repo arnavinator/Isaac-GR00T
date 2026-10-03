@@ -42,12 +42,14 @@ still local and drops from the first ballistic command.
 
 ``pre_close_keep_chunks = M`` adds a FRONT edge, anchored at the close: the
 failure then trains on ``[close_idx - M, onset + keep_chunks)`` (to the end if
-it closes and never reopens) and its approach is dropped too. Those approach chunks are near-identical to the approach of the
-successes in the same group, so pushing them down cancels the successes' push
-up. Anchored at the close rather than the reopen because the close-to-onset
-span varies (6-24 chunks on the reference data), while the first chunk that
-commands the close (any executed substep > 0.5) sits 1-3 chunks before
-``close_idx`` on every failure. See README "Pre-close window".
+it closes and never reopens) and its approach is dropped too. Those approach
+chunks are near-identical to the approach of the successes in the same group, so
+pushing them down cancels the successes' push up. Anchored at the close rather
+than the reopen because the close-to-onset span varies (6-24 chunks on the
+reference data), while the first chunk that commands the close (any executed
+substep > 0.5) sits 1-3 chunks before ``close_idx`` on every failure.
+``pre_close_all_episodes`` extends the head edge to successes and anchors, which
+keep their tails. See README "Pre-close window".
 
 The detector
 ------------
@@ -237,6 +239,11 @@ class PostReopenFilter:
     # (default) keeps the whole prefix. Last field so positional construction
     # is unchanged. See README "Pre-close window".
     pre_close_keep_chunks: "int | None" = None
+    # True: the head edge also cuts SUCCESSES and anchors, each from its own
+    # close to its end. Their tails are never cut: a success's reopen is the
+    # release that completes the task. False (default): failing episodes only.
+    # Requires pre_close_keep_chunks. See README "Pre-close window".
+    pre_close_all_episodes: bool = False
 
     def __post_init__(self):
         # numbers.Integral, not `int`: numpy integer scalars are the natural
@@ -346,6 +353,18 @@ class PostReopenFilter:
                     f"{self.pre_close_keep_chunks}. 0 keeps nothing before the "
                     f"close; leave the knob at None to keep the whole prefix."
                 )
+        if not isinstance(self.pre_close_all_episodes, bool):
+            raise ValueError(
+                f"pre_close_all_episodes must be a bool, got "
+                f"{type(self.pre_close_all_episodes).__name__}"
+            )
+        if self.pre_close_all_episodes and self.pre_close_keep_chunks is None:
+            raise ValueError(
+                "pre_close_all_episodes=True was set but pre_close_keep_chunks "
+                "is None, which disables the pre-close window entirely -- the "
+                "flag would never be read. Set pre_close_keep_chunks, or leave "
+                "pre_close_all_episodes False."
+            )
 
 
 def gripper_widths(
@@ -625,6 +644,7 @@ def post_reopen_chunk_limit(
 def grasp_train_window(
     states: "list[dict[str, np.ndarray]]",
     cfg: PostReopenFilter,
+    tail: bool = True,
 ) -> "tuple[int | None, int | None, int | None, int | None]":
     """``(close_idx, onset, start, limit)``; the retained window is ``[start, limit)``.
 
@@ -636,8 +656,14 @@ def grasp_train_window(
     reopen was refused as implausible (a refusal cuts neither side). The head
     edge needs only the close, so a failure that closes and never reopens is
     head-cut too, as is one whose reopen is too late for the tail cut.
+
+    ``tail=False`` is for an episode that keeps its tail (a success under
+    ``cfg.pre_close_all_episodes``): ``limit`` is None, and the refusal, which
+    guards the retained tail prefix, does not apply. Only the head edge is left.
     """
     onset, limit = post_reopen_detect(states, cfg)
+    if not tail:
+        limit = None
     if cfg.pre_close_keep_chunks is None or not states:
         return None, onset, None, limit
     # Widths are re-read only with the window on, so the off path is exactly
@@ -646,7 +672,9 @@ def grasp_train_window(
         gripper_widths(states, cfg.state_key),
         cfg.close_below, cfg.open_above, cfg.min_closed_chunks,
     )
-    refused = onset is not None and onset + cfg.keep_chunks < cfg.min_train_chunks
+    refused = (
+        tail and onset is not None and onset + cfg.keep_chunks < cfg.min_train_chunks
+    )
     if close_idx is None or refused:
         return close_idx, onset, None, limit
     start = close_idx - cfg.pre_close_keep_chunks

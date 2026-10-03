@@ -23,7 +23,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `fm_log_prob.py` | FM-loss-as-log-prob surrogate (`compute_fm_log_prob`), jittered timestep sampler (`_sample_jittered_timesteps`), production sampler schedule (`inference_schedule`) and the last-step-differentiable chunk rollout (`_smooth_chunk_rollout`) the roughness constraint measures. |
 | `lora_dit.py` | `apply_lora_to_dit`, `save_lora_checkpoint`, `load_lora_checkpoint`, default target-module list. |
 | `smoothness.py` | Trajectory-roughness ("jerk") constraint primitives: `second_difference`, `roughness_moments`, `pooled_hf`, `roughness_hf`, the continuous-action-dim selector and `build_key_dim_span`. Model-free and fully unit-testable. The 4-step chunk rollout lives in `fm_log_prob._smooth_chunk_rollout` (it needs the DiT); the hinge lives in `train_grpo._grpo_update_inner`. |
-| `gripper_release.py` | Post-reopen truncation primitives: `PostReopenFilter`, `gripper_widths`, `close_cross_indices`, `reopen_onset_index`, `post_reopen_detect`, `grasp_train_window`. Model-free and sim-free; detects the close→reopen of a failed grasp from the measured `gripper_qpos` — and the ONSET of that reopen, by walking back down the rising edge — so `episode_buffer` can trim the meander that follows, and (with `pre_close_keep_chunks`) the approach before the close. See README "Post-reopen truncation" and "Pre-close window". |
+| `gripper_release.py` | Post-reopen truncation primitives: `PostReopenFilter`, `gripper_widths`, `close_cross_indices`, `reopen_onset_index`, `post_reopen_detect`, `grasp_train_window`. Model-free and sim-free; detects the close→reopen of a failed grasp from the measured `gripper_qpos` — and the ONSET of that reopen, by walking back down the rising edge — so `episode_buffer` can trim the meander that follows, and (with `pre_close_keep_chunks`) the approach before the close, of failures or (`pre_close_all_episodes`) of every episode. See README "Post-reopen truncation" and "Pre-close window". |
 | `eval_lora_from_npz.py` | Eval harness: runs N parallel rollouts of a LoRA policy per training scene seed (`--group-seeds`, built through the collector's seed path) or from a saved `interactive_rollout.py` `.npz` (`--obs-path`). Logs each scene's fingerprint and writes per-attempt, per-scene and pooled success/num_steps to `results.json`. Subclasses `EpisodeCollector`. |
 | `test_*.py` | Sanity checks for sim-wrapper / `.npz` key roundtrip. `test_grad_accum.py` drives the real `_grpo_update_inner` on CPU to pin the gradient-accumulation semantics and the PAWS mass accounting / cold start. `test_jitter_metrics.py` does the same for the `jitter/*` / `ref_mse/*` / sign-split / effective-clipfrac instrumentation. `test_anchor_groups.py` does the same for anchor groups (classification, row budget, renorm isolation, sampler/PAWS/epoch exclusions). |
 | `verify_multiturn_gpu.py` | Real-stack check for multi-turn collection / branch-point integrity. Run on the GPU VM in the robocasa venv. |
@@ -31,7 +31,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_smoothness.py` | CPU suite for the trajectory-roughness constraint: HF calibration, the `a_hat = a + (1−τ)r` identity, hinge semantics, dim/horizon selection, the derived sampler schedule, the last-step-differentiable rollout (exact value + gradient localized to the final step), the `compute_fm_log_prob` return contract, both instruments' jitter-invariance, the executed-chunk metrics, `smooth_ref.json` guard rejection **including instrument mismatch**, and `smooth_coef=0` bit-identity (stats, weights and RNG stream) through the real `_grpo_update_inner`. |
 | `verify_render_skip_gpu.py` | Real-stack check for `skip_intermediate_render`: proves the kept frame is byte-identical to the unskipped path against real MuJoCo/EGL rendering, and reports the render count + speedup. Robocasa venv, no model server. |
 | `test_scene_seed_pool.py` | CPU suite for the frozen scene seed pool: base resolution, the stateless cursor + pass alignment, within-iteration seed distinctness (including a non-divisible K), all four config validations plus the pass-alignment warning, `GROUP_SEED_STRIDE` agreement between the two files, byte-identity of the disabled collector argv, the real `EpisodeCollector.collect` consuming `--group-seeds` (and refusing to wrap), and `per_scene_success` → `episode/scene_sr/*` emission through the real `_log_metrics`. |
-| `test_gripper_release.py` | CPU suite for the post-reopen truncation: width extraction (state horizon, flat shape, custom key, eight guards incl. NaN/inf, (0,2), (1,2,2) and non-numeric); the hysteresis state machine on both edges incl. strictness at each threshold, the in-band no-op, the never-closed and never-reopened cases and the first-cycle-only rule; the ONSET walk — rising-edge base, floor-relative margin, the `close_idx < onset <= cross_idx` invariant over 3k+ exhaustive traces, mid-hold blip rejection (`episode_0039` / `episode_0044` shapes), the monotonicity guard against a high plateau touching the crossing, and invariance over the threshold box and the margin plateau; `keep_chunks` counting from the onset and overruns being no-ops; the sign-convention / unit-mismatch guard; the `PostReopenFilter` and `GRPOConfig` validation matrices (incl. the four tuning knobs being a hard error while the feature is off, and `onset_margin ≥ open_width − close_width`); and, through the real `compute_advantages` / `_build_chunks`, off-switch bit-identity, successes and anchors left whole, `Σ A_chunk == A_ep` plus the group zero-sum surviving, the per-row magnification being exactly `num_chunks / num_train_chunks`, idempotence + self-clearing (no stale chunk memo), dead groups staying dead, and the anchor row budget seeing truncated signal counts. The `ITER_0001` / `ITER_0001_CROSS` fixtures pin all 48 real episodes' onset AND crossing (so a regression collapsing the two is caught by name) plus the N → dropped-fraction curve; when that collection is on disk the suite re-derives both from the raw `.npz` and re-runs the 19-threshold-pair and margin-plateau invariance on real widths. The pre-close window section covers `[close_idx - M, onset + N)` semantics (the head edge follows the close, not the hold length, and inherits the dwell and observed-open guards), the two edges being cut independently, refusal / miss / unreadable episodes kept whole, validation, `train_chunk_range` clamps, episode chunk indices and per-chunk data reaching `_build_chunks`, `Σ A_chunk == A_ep` and the magnification under the window, the per-side counters, idempotence, anchors and dead groups, the summary line, the config / tyro flag, a custom state key and custom widths reaching the close re-detection, a head cut that would empty an episode with more states than actions being skipped, `_per_chunk_gap_survey` normalising position over the retained rows (an outcome-only gap reads r(position) ≈ 0 with the window on), TB and behavioral wandb gating, the banner, and the `ITER_0001_CLOSE` / `ITER_0001_CLOSE_CMD` fixtures behind the M → dropped-fraction table (re-derived from the raw `.npz` when present). |
+| `test_gripper_release.py` | CPU suite for the post-reopen truncation: width extraction (state horizon, flat shape, custom key, eight guards incl. NaN/inf, (0,2), (1,2,2) and non-numeric); the hysteresis state machine on both edges incl. strictness at each threshold, the in-band no-op, the never-closed and never-reopened cases and the first-cycle-only rule; the ONSET walk — rising-edge base, floor-relative margin, the `close_idx < onset <= cross_idx` invariant over 3k+ exhaustive traces, mid-hold blip rejection (`episode_0039` / `episode_0044` shapes), the monotonicity guard against a high plateau touching the crossing, and invariance over the threshold box and the margin plateau; `keep_chunks` counting from the onset and overruns being no-ops; the sign-convention / unit-mismatch guard; the `PostReopenFilter` and `GRPOConfig` validation matrices (incl. the four tuning knobs being a hard error while the feature is off, and `onset_margin ≥ open_width − close_width`); and, through the real `compute_advantages` / `_build_chunks`, off-switch bit-identity, successes and anchors left whole, `Σ A_chunk == A_ep` plus the group zero-sum surviving, the per-row magnification being exactly `num_chunks / num_train_chunks`, idempotence + self-clearing (no stale chunk memo), dead groups staying dead, and the anchor row budget seeing truncated signal counts. The `ITER_0001` / `ITER_0001_CROSS` fixtures pin all 48 real episodes' onset AND crossing (so a regression collapsing the two is caught by name) plus the N → dropped-fraction curve; when that collection is on disk the suite re-derives both from the raw `.npz` and re-runs the 19-threshold-pair and margin-plateau invariance on real widths. The pre-close window section covers `[close_idx - M, onset + N)` semantics (the head edge follows the close, not the hold length, and inherits the dwell and observed-open guards), the two edges being cut independently, refusal / miss / unreadable episodes kept whole, validation, `train_chunk_range` clamps, episode chunk indices and per-chunk data reaching `_build_chunks`, `Σ A_chunk == A_ep` and the magnification under the window, the per-side counters, idempotence, anchors and dead groups, the summary line, the config / tyro flag, a custom state key and custom widths reaching the close re-detection, a head cut that would empty an episode with more states than actions being skipped, `_per_chunk_gap_survey` normalising position over the retained rows (an outcome-only gap reads r(position) ≈ 0 with the window on), the `pre_close_all_episodes` flag (success head cut from its own close with no tail cut or refusal, the failure side unchanged by the flag, anchors and the row budget, unreadable / never-closing / past-the-actions successes kept whole, toggling the flag between calls, its counters, second summary line, config / CLI, TB / wandb / banner, and the `iter_0001` table), TB and behavioral wandb gating, the banner, and the `ITER_0001_CLOSE` / `ITER_0001_CLOSE_CMD` fixtures behind the M → dropped-fraction table (re-derived from the raw `.npz` when present). |
 | `test_clip_floor.py` | CPU suite for the per-row MSE-referenced lower clip (`clip_low_mse_coef`), the PAWS `k` floor (`paws_k_floor_at_target`) and the three added diagnostics: off-switch determinism + additivity (the bit-identity-vs-baseline check is an out-of-tree differential, recipe in that test's docstring), the `rho_floor` arithmetic incl. the binding `clip_eps_low` ceiling, agreement of **all six** lower-bound consumers on rows straddling their own floors, positive/anchor-row inertness against the four-case table, both `k` floors and both untouched `k` branches, monotonicity in the coefficient, hand-computed `drift/*` values, `jitter/pos_clip_budget_used`, and the `lora/cos_step_*` cosines incl. the sign flip and the two `L_early` sources. |
 | `test_kl_base_adaptive.py` | CPU suite for the closed-loop base-model trust region (`kl_base_adaptive`): off-switch (no emission, no state touched), deadband semantics on both edges, clamps, the relax floor at the starting coefficient, effect-based `action` on both branches, relax pacing (exactly one move per `patience`, never compounding), a missing/NaN reading holding rather than relaxing, the authority linearisation, a replay against runB's **full** it1-14 archive drift series (never truncate that fixture — a shorter window hid a self-disarm bug), the shipped defaults, and the full validation matrix incl. non-finite and bool knobs, the save/refresh paths, the four-case resume matrix, and a source-level wiring check for `setup()` (unreachable from a `__new__` harness). |
 | `test_grad_probe.py` | CPU suite for the gradient-decomposition probe (`grad_probe_every`), driving the real `_grpo_update_inner` plus the real `_grad_probe_capture_jittered` / `_grad_probe_finish` / `select_grad_probe_rows` / `aggregate_grad_probes`. Covers: off-switch bit-identity (stats, `p.grad`, weights, RNG stream, and a spy proving `torch.autograd.grad` is never called); the probe ON changing **nothing** about the training step (`autograd.grad` really does not accumulate); the decomposition identity `g_jit − g_R = λ²g_P` against a **hand-derived** closed form on a τ- and `noise_for_input`-sensitive analytic stand-in with a known Jacobian (a re-run of autograd would have agreed with a wrong derivation — this caught a missing `w0` factor); `R → 0` as `λ → 0` and monotonicity in `λ`; both legs sharing ε / τ / rows verbatim, with mutants that mismatch the τ **set** and the row **set** and must be detected; the τ-subset path applied to both legs; the row cap and deterministic tie-breaking; the paired-mode fixed-row exclusion pinned against the ~2× diluted alternative; the `jitter_neg > 0` guard on `g_erosion`; hand-computed percentiles/aggregation; skip, failure and cadence accounting; both legs running at the **same θ** at `gradient_accumulation_steps` 1 and 2; the four-way return unpack (roughness constraint × probe); TB emission incl. the `vram/` split and the non-finite drop; and the full config validation matrix. |
@@ -1052,8 +1052,9 @@ failing episode then trains on
 i.e. the last `M` chunks of the approach, the whole closed phase, and `N` chunks
 from the reopen onset. A failure that closes and never reopens (it holds to the
 end, or opens only partway) trains on `[close_idx - M, end)`: the head edge needs
-only the close. The successes are untouched, so their approach chunks are now
-pushed up with nothing cancelling them.
+only the close. By default the successes are untouched, so their approach
+chunks are now pushed up with nothing cancelling them (see "Which episodes"
+below for the option to cut them too).
 
 ```bash
 uv run python scripts/grpo/train_grpo.py \
@@ -1075,9 +1076,31 @@ than any episode.
 Example: a 40-chunk failure that closes at chunk 27 and reopens at 35 trains on
 chunks 0–36 at `N=2`. Adding `M=2` makes that 25–36.
 
+**Which episodes (`--pre-close-all-episodes`).** By default the window cuts
+failing episodes only. With `--pre-close-all-episodes` it cuts every episode:
+successes and anchors train on `[close_idx − M, end)`, from their own close, so
+neither side's approach is trained. Their tails are kept, because a success's
+reopen is the release that completes the task; the tail cut and the
+`post_reopen_min_train_chunks` refusal (which guards that tail prefix) never
+apply to them. The failure side is unchanged by the flag. The flag defaults to
+off, which is bit-identical to a run without it, and it requires
+`--pre-close-keep-chunks` (alone, or with the window off, it is a config error).
+
+On `iter_0001` (only 5 successes, 171 of 2321 chunks) the close is found in all
+five:
+
+| `M` (`N=3`) | success chunks dropped (of 171) | all chunks dropped, failures only | all chunks dropped, all episodes |
+|---|---|---|---|
+| 0 | 85 (49.7%) | 71.7% | 75.4% |
+| 2 | 75 (43.9%) | 68.0% | 71.2% |
+| 3 | 70 (40.9%) | 66.1% | 69.2% |
+| 5 | 60 (35.1%) | 62.4% | 65.0% |
+| 10 | 35 (20.5%) | 53.6% | 55.1% |
+
 **When nothing is cut from the front:**
 
-- a success or an anchor (never truncated);
+- a success or an anchor, unless `--pre-close-all-episodes` is set (then only
+  the three cases below apply to it, with no tail cut and no refusal);
 - a failure that never closes, so there is no close to measure `M` from. Its
   approach is still pushed down in full; `episode/n_pre_close_detected` against
   the failure count shows how many there are;
@@ -1124,11 +1147,16 @@ every extra chunk is one more near-duplicate of a success's approach.
   `A_ep / num_train_chunks`, ≈3.6× its uncut value (≈2× with the tail cut
   alone). The per-minibatch z-score divides it back out on the default path,
   while per-iteration normalization and `group_advantage_fixed_std` keep more of
-  it. With anchors on, re-derive `--anchor-advantage` (the banner suggests
-  ~3.6×).
+  it. With anchors on, re-derive `--anchor-advantage` (failures-only: the
+  banner suggests ~3.6×; with `--pre-close-all-episodes` anchor rows are cut
+  too, so that figure does not apply). The flag magnifies success rows the same
+  way, by `num_chunks / kept` (42/23 ≈ 1.8× for a 42-chunk success that closes at
+  chunk 22, at `M=3`).
 - Balance. The negative pool shrinks, so the balanced sampler starts cycling
   negatives (as the minority class) at a lower success rate than before, and
-  revisits each window row more often per epoch.
+  revisits each window row more often per epoch. With
+  `--pre-close-all-episodes` the positive pool shrinks as well, so the natural
+  positive fraction the sampler sees changes too.
 - `episode/post_reopen_kept_len_*` now reads `M` + closed phase + `N`, so its
   spread is the close-to-onset spread (6–24 chunks on `iter_0001`).
 
@@ -1137,9 +1165,13 @@ every extra chunk is one more near-duplicate of a success's approach.
 `episode/n_pre_close_detected` (failures with a detected close, reopen or not)
 are emitted only when the window is on, so a post-only run's key set is
 unchanged. `n_post_reopen_episodes_cut`
-and `n_post_reopen_chunks_dropped` stay tail-only, so
-`num_chunks − num_train_chunks` = head + tail. The per-iteration summary line
-splits the drop the same way. Each training row's `chunk_idx` stays its index in
+and `n_post_reopen_chunks_dropped` stay tail-only. With
+`--pre-close-all-episodes`, `episode/n_pre_close_success_{detected,episodes_cut,
+chunks_dropped}` are the same three for successes (read `detected` against the
+success count) and are emitted only then, so
+`num_chunks − num_train_chunks` = failure head + failure tail + success head.
+The per-iteration summary line splits the drop the same way, with a second line
+for the successes. Each training row's `chunk_idx` stays its index in
 the episode, so a head-cut failure's first row is not chunk 0. The per-chunk gap
 survey (`per_chunk_gap_survey_size > 0`) normalises position over each episode's
 retained rows, so with the window on a failure's position axis is its grasp

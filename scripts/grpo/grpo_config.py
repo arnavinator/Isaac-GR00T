@@ -207,7 +207,7 @@ class GRPOConfig:
     # Mixing ensures the full trajectory stays in the training distribution,
     # preventing approach-phase drift from lack of gradient signal.
     # 0.0 = never fast-forward, 1.0 = always fast-forward.
-    fast_forward_pct: float = 0.8
+    fast_forward_pct: float = 0.0
 
     # ─── Init from saved sim state (overfitting / curriculum) ────────────────
     # When set, every group's branch point is loaded from this saved-state npz

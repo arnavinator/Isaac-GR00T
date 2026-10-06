@@ -940,11 +940,11 @@ class GRPOConfig:
     # ε' = sqrt(1-λ²)*ε + λ*ξ, with fresh Gaussian ξ sampled per τ per minibatch
     # from the global torch RNG). Each jitter row uses λ = jitter_pos or
     # jitter_neg per its advantage sign. The velocity target a − ε stays at the
-    # ORIGINAL ε in both branches; the cached chunk.ref_log_prob (computed at
-    # original ε) is reused — the bias is O(λ²) and θ-independent, so the
-    # gradient direction is unaffected. In expectation this adds a
-    # Frobenius-norm Jacobian penalty (1-t)²·λ²·‖∇_x v_θ‖_F² (with the per-sign
-    # λ), encouraging the velocity field to be locally smooth around each
+    # ORIGINAL ε in both branches (unless apply_jitter_fix, below); the cached
+    # chunk.ref_log_prob (computed at original ε) is reused — the bias is O(λ²)
+    # and θ-independent, so the gradient direction is unaffected. In expectation
+    # this adds a Frobenius-norm Jacobian penalty (1-t)²·λ²·‖∇_x v_θ‖_F² (with the
+    # per-sign λ), encouraging the velocity field to be locally smooth around each
     # rolled-out trajectory.
     #
     # In the default paired mode this doubles optimizer steps per epoch — halve
@@ -971,6 +971,13 @@ class GRPOConfig:
     #         fixed-vs-jitter gap diagnostic; the loss is trained purely on the
     #         jittered input noise.
     jitter_paired: bool = True
+
+    # Velocity target on jitter rows. False (default): a − ε. Its penalty
+    # λ²(1−τ)²‖∂v/∂x‖² weakens the field's noise cancellation, so ε leaks into the
+    # actions as jerk. True: a − ε′, so a jittered input is trained to land on a.
+    # The penalty becomes λ²‖I + (1−τ)∂v/∂x‖², the endpoint's sensitivity. No effect
+    # with jitter off. README "apply_jitter_fix".
+    apply_jitter_fix: bool = False
 
     # ─── Trajectory-roughness constraint (the "jerk constraint") ─────────────
     # A temporal-smoothness prior on the DiT's generated action chunk along the
@@ -1518,6 +1525,12 @@ class GRPOConfig:
                     f"{_jname} must be in [0.0, 1.0), got {_jval}. "
                     f"Variance preservation requires λ < 1; use 0.0 to disable."
                 )
+        if self.apply_jitter_fix and self.jitter_pos == 0.0 and self.jitter_neg == 0.0:
+            import warnings
+            warnings.warn(
+                "apply_jitter_fix=True has no effect: jitter is off "
+                "(jitter_pos = jitter_neg = 0)."
+            )
 
         # ── Gradient-decomposition probe ─────────────────────────────────────
         # Validated unconditionally, including at grad_probe_every == 0, for the

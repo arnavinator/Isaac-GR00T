@@ -1133,6 +1133,12 @@ class GRPOTrainer:
                     f"matches vanilla at the same update_epochs; no `_fixed` "
                     f"branch metrics)"
                 )
+            if getattr(self.config, "apply_jitter_fix", False):
+                print("  Jitter target: a − ε′ (apply_jitter_fix: jittered "
+                      "inputs are trained to land on a)")
+            else:
+                print("  Jitter target: a − ε (original; --apply-jitter-fix "
+                      "targets a − ε′)")
         if self.config.grad_probe_every > 0:
             # Overhead model: one probe costs one clean forward+backward on
             # `grad_probe_max_rows` rows x `tau subset` taus, against a training
@@ -4716,6 +4722,9 @@ class GRPOTrainer:
                     ),
                     smooth_instrument=self.config.smooth_instrument,
                 )
+                # Only passed when ON, so the default call is byte-identical.
+                if getattr(self.config, "apply_jitter_fix", False):
+                    _fm_kw["apply_jitter_fix"] = True
                 vel_d_row = None
                 exec_log_probs = None
                 _fm_struct_kw: dict = {}
@@ -6859,6 +6868,9 @@ class GRPOTrainer:
                     noise=eps,
                     n_samples=K,
                     noise_for_input=nfi,
+                    # The gap the training ratio sees, i.e. under its target.
+                    **({"apply_jitter_fix": True}
+                       if getattr(self.config, "apply_jitter_fix", False) else {}),
                 )
                 for i, c in enumerate(valid):
                     # gap = MSE(eps') - MSE(eps) = (-lp_jit) - (-ref_log_prob)
@@ -7019,6 +7031,13 @@ class GRPOTrainer:
             noise=ready_noise,
             n_samples=K,
         )
+        # apply_jitter_fix: the jittered leg uses the TRAINING target (a − ε′), so
+        # gap_* / headroom / clip budgets describe the ratio training actually
+        # sees. jacobian_fro_sq and gap_at_tau* keep the original target and stay
+        # ‖∂v/∂x‖ (noise cancellation), comparable across fix on/off runs. That
+        # costs one extra no-grad forward, only when the fix is on.
+        fix = bool(getattr(self.config, "apply_jitter_fix", False))
+        _fix_kw = {"apply_jitter_fix": True} if fix else {}
         with torch.no_grad():
             # noise_for_input=None => DiT input is the original eps for EVERY
             # row, including rows tagged "jitter". This is the clean reference
@@ -7028,7 +7047,8 @@ class GRPOTrainer:
                     **common, noise_for_input=None, return_per_tau=True
                 )  # [K, B]
                 _, lp_jit = compute_fm_log_prob(
-                    **common, noise_for_input=noise_for_input, return_per_tau=True
+                    **common, noise_for_input=noise_for_input, return_per_tau=True,
+                    **_fix_kw,
                 )  # [K, B]
                 vd_clean = vd_jit = None
             else:
@@ -7038,16 +7058,25 @@ class GRPOTrainer:
                             return_struct=True, return_per_tau=True)
                 _rc = compute_fm_log_prob(**common, noise_for_input=None, **_anc)
                 _rj = compute_fm_log_prob(
-                    **common, noise_for_input=noise_for_input, **_anc
+                    **common, noise_for_input=noise_for_input, **_anc, **_fix_kw
                 )
                 lp_clean, lp_jit = _rc.per_tau, _rj.per_tau          # [K, B]
                 vd_clean, vd_jit = _rc.anchor_dist, _rj.anchor_dist  # [K, B]
+            if fix:
+                _, lp_jit_vel = compute_fm_log_prob(
+                    **common, noise_for_input=noise_for_input, return_per_tau=True
+                )  # [K, B], original target a − ε
+            else:
+                lp_jit_vel = lp_jit
 
         # log_prob = -MSE, so (clean - jittered) = MSE_jittered - MSE_clean = gap.
         # Non-negative in expectation; individual rows can go slightly negative
         # from the finite-xi sample, which is why we report means.
         gap_per_tau = (lp_clean - lp_jit).float()          # [K, B]
         gap_row = gap_per_tau.mean(dim=0)                  # [B]
+        # The velocity-Jacobian gap (== gap_per_tau when the fix is off).
+        vgap_per_tau = (lp_clean - lp_jit_vel).float()     # [K, B]
+        vgap_row = vgap_per_tau.mean(dim=0)                # [B]
 
         # Divide out the analytic prefactor to recover the Jacobian norm itself,
         # using the ACTUAL jittered taus (tau_centers +/- N(0, 0.02)) rather than
@@ -7056,7 +7085,7 @@ class GRPOTrainer:
         w_row = ((1.0 - timesteps.float()) ** 2).mean(dim=0)   # [B]
         denom = w_row * (lam_row.float() ** 2)                 # [B]
         jac_row = torch.where(
-            denom > 1e-12, gap_row / denom.clamp_min(1e-12), torch.zeros_like(gap_row)
+            denom > 1e-12, vgap_row / denom.clamp_min(1e-12), torch.zeros_like(vgap_row)
         )
 
         out: dict = {}
@@ -7121,9 +7150,10 @@ class GRPOTrainer:
             # Per-tau profile, POSITIVE rows only: gap scales as lam^2, and
             # lam_pos is typically ~5x lam_neg (25x in the gap), so pooling the
             # signs would make the profile a mixture of two very different
-            # curves. Index k maps to config.tau_centers[k].
+            # curves. Index k maps to config.tau_centers[k]. Velocity-Jacobian
+            # gap, like jacobian_fro_sq (see apply_jitter_fix above).
             for k in range(K):
-                out[f"gap_at_tau{k}"] = float(gap_per_tau[k][jp].mean().item())
+                out[f"gap_at_tau{k}"] = float(vgap_per_tau[k][jp].mean().item())
                 out[f"tau{k}_value"] = float(timesteps[k][jp].float().mean().item())
             # THE jitter metric: how many times more usable log-ratio room a
             # positive row has with jitter than without.

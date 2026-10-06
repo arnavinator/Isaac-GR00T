@@ -178,6 +178,7 @@ def compute_fm_log_prob(
     vel_anchor_per_tau: bool = False,
     n_exec_steps: int | None = None,
     return_struct: bool = False,
+    apply_jitter_fix: bool = False,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...] | FMLogProbResult":
     """Compute FM log-probability surrogate for a batch of action chunks.
 
@@ -212,7 +213,8 @@ def compute_fm_log_prob(
         noise_for_input: Optional [K, B, action_horizon, action_dim] tensor of
             per-K DiT INPUT noise (Jitter-GRPO ε'_k). When provided, the
             noisy_trajectory at timestep k is built from noise_for_input[k]
-            instead of `noise`, while velocity_target stays at (actions - noise).
+            instead of `noise`, while velocity_target stays at (actions - noise)
+            unless `apply_jitter_fix`.
             None = use `noise` for both target and input (current behavior,
             bit-identical when jitter is disabled). The 4-D shape with leading
             K is required so each τ can use an independent ξ-jitter.
@@ -297,6 +299,10 @@ def compute_fm_log_prob(
             per row by that mask's own valid count. Requires return_struct.
         return_struct: Return an `FMLogProbResult` instead of the positional
             contract below (which is unchanged when this is False).
+        apply_jitter_fix: With `noise_for_input`, target `actions - noise_for_input[k]`
+            (a − ε′_k) instead of `actions - noise`, so a jittered input is trained to
+            land on `actions`. Bit-identical when `noise_for_input` is None, and on
+            rows where `noise_for_input[k] == noise`. README "apply_jitter_fix".
 
     Returns:
         log_probs: [B] tensor of FM log-probability surrogates (negative MSE).
@@ -339,7 +345,8 @@ def compute_fm_log_prob(
     # (action, noise) pair, not the interpolation point). In Jitter-GRPO this
     # stays at the ORIGINAL eps even when the DiT input is the jittered
     # eps' = sqrt(1-λ²)·eps + λ·ξ — that asymmetry is what makes the loss in
-    # expectation an FM-loss + Jacobian-norm regularizer.
+    # expectation an FM-loss + Jacobian-norm regularizer. `apply_jitter_fix`
+    # swaps it per-τ to (actions - eps'_k) inside the K-loop.
     velocity_target = actions - eps
 
     # Resolve the per-K input-noise tensor. Only the [K, B, H, D] shape is
@@ -604,7 +611,12 @@ def compute_fm_log_prob(
         # The fp32 cast is cheap (a few hundred KB per minibatch) and keeps
         # gradients differentiable wrt the LoRA-adapted bf16 output.
         pred_v_f32 = pred_velocity.float()
-        target_v_f32 = velocity_target.float()
+        # apply_jitter_fix: target the velocity FROM the input noise, a − ε′_k.
+        # (1−τ)·(v − (a − ε′)) = â(x′) − a, so a jittered input must land on a.
+        if apply_jitter_fix and eps_input_all is not None:
+            target_v_f32 = (actions - eps_input).float()
+        else:
+            target_v_f32 = velocity_target.float()
         mask_f32 = action_mask.float()
 
         per_element_mse = F.mse_loss(pred_v_f32, target_v_f32, reduction="none")

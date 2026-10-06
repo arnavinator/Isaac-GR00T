@@ -41,6 +41,7 @@ Flow-Matching (FM) log-probability surrogate.
 | `test_calibrate_vel_anchor.py` | CPU suite for `calibrate_vel_anchor.py`: trace-trick norm/cosine vs dense (fresh and relative to a start), interpolation incl. the non-monotone warning and brackets, `--dry-run` command construction parsed back through tyro into `GRPOConfig`, and the cached-episode guard on synthetic TB event files. |
 | `test_group_adv_fixed_std.py` | CPU suite for `group_advantage_fixed_std`: off-path bit-identity with the group-std formula (and against the pre-change module), exact fixed-scale values, zero sum / sign / bounds, unchanged dead/anchor classification and counters, the per-chunk split incl. post-reopen truncation, the chunk memo on re-entry, argument and config validation, the tyro flag, and the `train()` call site. |
 | `test_exec_step_mask.py` | CPU suite for `mask_loss_with_n_action_steps`: the REAL `compute_fm_log_prob` on a stub DiT with one weight row per action step (hand-formula values, exactly-zero gradient on unexecuted steps, bitwise equality when the prefix covers the valid horizon, validation, no RNG), then the real ref pass / `_grpo_update_inner` / probe / `_log_metrics` / banner: surrogate on the executed pair and KL on the full pair, zero step gradient on unexecuted steps, `rho_floor` / `drift/*` on the executed MSE_ref, the ready filter, `ref_mse/exec_*`, config validation, and composition with accumulation, anchors, jitter, PAWS, the balanced sampler, base KL, the velocity anchor, smoothness and the grad probe. |
+| `test_jitter_fix.py` | CPU suite for `apply_jitter_fix`. Loss level, on the REAL `compute_fm_log_prob`: off is bit-identical to the kwarg absent; on matches a hand formula with target a − ε′_k; on is bit-identical without jitter and on un-jittered rows; the identity (1−τ)²·MSE = ‖â(x′) − a‖²; a field that lands every input on `a` scores 0 under the fix and ‖ε′ − ε‖² under the original target. Diagnostics: gap/headroom/budgets use the fix target, `jacobian_fro_sq`/`gap_at_tau*` keep the original one, and the extra forward runs only when on. Trainer, via the real ref pass + `_grpo_update`: the flag reaches the training forward and the chunk-gap survey only when on, its value equals the default path at noise = ε′_k, and on with jitter off is bit-identical. Config: default, tyro flag, warning. 9 mutants killed. |
 | `test_eval_lora_from_npz.py` | CPU suite for `eval_lora_from_npz.py`: `--group-seeds` / `--obs-path` mutual exclusion and validation, seed mode through the real `EpisodeCollector.collect` (one group per seed, no init bundle, nothing recorded per chunk, one fingerprint per seed on its `scene:` line), `_collect` kwargs per mode, per-scene tallies, and `main()` end to end in both modes. |
 
 ---
@@ -2683,11 +2684,12 @@ def compute_fm_log_prob(..., noise, noise_for_input=None):
 
 Two design choices:
 
-1. **`velocity_target` stays at the ORIGINAL ε.** It's `actions - noise`,
-   NOT `actions - noise_for_input`. The asymmetry between input and target
-   is what produces the Jacobian regularizer in expectation. Swapping the
-   target to ε' would gain an `O(λ²)` model-independent floor that doesn't
-   shrink as the model improves.
+1. **`velocity_target` stays at the ORIGINAL ε** (unless `apply_jitter_fix`,
+   below). It's `actions - noise`, NOT `actions - noise_for_input`. The
+   asymmetry between input and target is what produces the Jacobian
+   regularizer in expectation. The original reason for not swapping the
+   target to ε′ was an `O(λ²)` model-independent floor. That reasoning
+   misses the model-dependent `2λ²(1−τ)·tr(∂v/∂x)` term the swap also adds.
 
 2. **Per-τ independent ξ_k.** The trainer already probes the FM log-prob
    at `K = len(tau_centers)` different τ values per chunk per minibatch
@@ -2705,6 +2707,44 @@ Two design choices:
 Backward compat: when `noise_for_input=None` (the default), the function
 falls back to `eps_input = eps` and the K-loop is bit-identical to the
 pre-Jitter-GRPO code.
+
+### `apply_jitter_fix`: target a − ε′ (`--apply-jitter-fix`, default off)
+
+**What the original target does.** With target `a − ε` at input ε′, a jittered
+row teaches "from ε′, move by `a − ε`". That lands at `a + (ε′ − ε)`: the
+perturbation is carried into the action. The expected penalty is
+`λ²(1−τ)²‖∂v/∂x‖²`, and shrinking `∂v/∂x` weakens the field's noise
+cancellation. The base model sits at near-perfect cancellation:
+`jitter/jacobian_fro_sq` reads 2.433, against `1/mean((1−τ)²) = 2.44` for
+`∂v/∂x = −I/(1−τ)` on the default τ-centers. Any drop below that lets the
+sampler's initial noise, which is white along the horizon, reach the
+executed chunk as jerk. The v4/v5 denoising-lab notebooks measured this. The
+same noise seed gives the same jitter pattern across checkpoints, scenes and
+runs (corr 0.95–0.997). By `iter_0012`, 4× as much noise gets through as with base.
+
+**What the flag does.** On jitter rows, `compute_fm_log_prob` targets
+`a − ε′_k` per τ. Since `(1−τ)·(v − (a − ε′)) = â(x′) − a` with
+`â = x + (1−τ)v`, the loss reads "from the perturbed input, land on `a`". The
+expected penalty becomes `λ²‖I + (1−τ)∂v/∂x‖²`, the predicted endpoint's
+sensitivity to the input. It is zero for a field that lands every nearby
+input on `a`; the original target penalizes exactly that field. Fixed rows,
+λ = 0 rows, the ref pass and the smoothness instrument are unchanged. With
+jitter off the flag does nothing, and it warns.
+
+**Diagnostics under the flag.** `jitter/gap_pos`, `gap_neg`, `gap_pos_cv/min/max`,
+the headroom metrics, both clip budgets and the chunk-gap survey describe the
+ratio training actually sees, so they use `a − ε′`. `jitter/jacobian_fro_sq`
+and `jitter/gap_at_tau*` keep the original target, so they still measure
+`‖∂v/∂x‖` (noise cancellation) and stay comparable across flag on/off runs.
+That costs one extra no-grad forward per iteration, only when the flag is on.
+The grad probe's `g_jit − g_R` follows the training forward, so under the flag
+`λ²g_P` is the endpoint penalty's gradient.
+
+**Untested on GPU.** The base already cancels most input noise, so the
+penalty should act mainly on the smooth directions where the landing point
+varies with the seed, narrowing the fan around good actions. ξ is already
+fresh per forward pass (per τ, per minibatch, per epoch); there is no fixed
+perturbation to memorize.
 
 ### `_iter_stratified_minibatches`: now yields entries
 

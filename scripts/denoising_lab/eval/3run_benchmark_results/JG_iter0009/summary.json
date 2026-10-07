@@ -1,0 +1,99 @@
+{
+  "strategy_name": "JG_iter0009",
+  "timestamp": "2026-10-07T22:45:11.244002+00:00",
+  "args": {
+    "env_names": [
+      "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env"
+    ],
+    "n_episodes": 30,
+    "seed": 100,
+    "seed_step": 1,
+    "max_episode_steps": [
+      480
+    ],
+    "n_action_steps": 8,
+    "n_envs": 4,
+    "host": "127.0.0.1",
+    "port": 5555
+  },
+  "results": {
+    "robocasa_panda_omron/CoffeeServeMug_PandaOmron_Env": {
+      "n_episodes": 30,
+      "success_rate": 0.6,
+      "mean_reward": 0.6,
+      "mean_length": 46.9,
+      "std_length": 11.3,
+      "mean_duration_s": 68.58,
+      "successes": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true
+      ],
+      "seeds": [
+        100,
+        101,
+        103,
+        102,
+        104,
+        105,
+        106,
+        107,
+        111,
+        108,
+        109,
+        110,
+        115,
+        112,
+        113,
+        114,
+        117,
+        119,
+        116,
+        118,
+        122,
+        121,
+        123,
+        120,
+        124,
+        127,
+        125,
+        126,
+        129,
+        128
+      ]
+    }
+  },
+  "overall": {
+    "total_episodes": 30,
+    "total_envs": 1,
+    "overall_success_rate": 0.6,
+    "total_wall_time_s": 807.73
+  }
+}
